@@ -567,6 +567,30 @@ MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS llm_usage_created_idx ON llm_usage (created_at DESC);",
 
+    # Accountability & Momentum (v0: Daily Anchor + Der Block).
+    # Genau EINE Zeile pro Tag (date PK). Die Spec verlangt priority/block_done/
+    # block_output/evening_done/evening_note; die *_at-Timestamps + block_confirmed
+    # sind reines State-Tracking, damit (a) der Scheduler jede Nachricht idempotent
+    # nur einmal pro Tag sendet (übersteht Neustarts) und (b) der Message-Handler
+    # weiß, worauf eine eingehende Antwort gerade zu buchen ist. evening_* bleiben
+    # in v0 ungenutzt (Feature D „Evening Close-Out" kommt später) — bewusst schon
+    # angelegt, damit später keine zweite Migration nötig ist.
+    """
+    CREATE TABLE IF NOT EXISTS daily_log (
+        date                  DATE PRIMARY KEY,
+        priority              TEXT,
+        anchor_sent_at        TIMESTAMPTZ,
+        block_started_at      TIMESTAMPTZ,
+        block_confirmed       BOOLEAN DEFAULT FALSE,
+        block_end_prompted_at TIMESTAMPTZ,
+        block_done            BOOLEAN,
+        block_output          TEXT,
+        evening_done          BOOLEAN,
+        evening_note          TEXT,
+        created_at            TIMESTAMPTZ DEFAULT NOW()
+    );
+    """,
+
     # Bestandsdaten mit dem alten Sentinel-Wert 'alfred' auf 'mantis' nachziehen
     # (Code liest/schreibt nach der Umbenennung nur noch 'mantis') — idempotent,
     # nach dem ersten Lauf matcht WHERE ...='alfred' keine Zeilen mehr.

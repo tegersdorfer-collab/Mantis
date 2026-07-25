@@ -115,6 +115,20 @@ class MessageHandler:
             resume_idle_cb()
             return
 
+        # Accountability & Momentum: eingehende Antwort auf einen offenen
+        # Anchor/Block-Prompt verbuchen (deterministisch, kein LLM). Bewusst VOR
+        # dem Agenten — sonst würde das Chat-Modell die sekundenkurze Interaktion
+        # in ein Gespräch verwandeln (genau das will die Spec nicht).
+        from domains import accountability
+        acc_reply = accountability.intercept(msg.text)
+        if acc_reply is not None:
+            self.kzg.add("assistant", acc_reply)
+            self._persist_msg("assistant", acc_reply)
+            BUS.emit("response", acc_reply)
+            await self.channel.send(acc_reply)
+            resume_idle_cb()
+            return
+
         # Alpha Progression
         if await self._handle_alpha_progression(msg.text, "telegram"):
             resume_idle_cb()

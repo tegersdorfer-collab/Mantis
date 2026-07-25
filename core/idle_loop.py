@@ -86,6 +86,7 @@ class IdleLoop:
                 log.debug(f"Thermal-Check: {e}")
 
             await self._tick_autopilot()
+            await self._tick_accountability()
 
             if not self.is_user_active():
                 await self._tick_reflection()
@@ -106,6 +107,17 @@ class IdleLoop:
         except Exception as e:
             log.debug(f"Autopilot-Tick: {e}")
             db.log_error("Autopilot-Tick", e)
+
+    async def _tick_accountability(self) -> None:
+        """Accountability & Momentum (Daily Anchor + Der Block). Läuft IMMER —
+        auch wenn Timo gerade aktiv ist —, denn die Prompts sind zeitgebunden.
+        Sendet über den zentralen Autopilot-Pfad (Telegram + Web-Push)."""
+        try:
+            from domains import accountability
+            await accountability.tick(self.autopilot._send, self.dashboard)
+        except Exception as e:
+            log.debug(f"Accountability-Tick: {e}")
+            db.log_error("Accountability-Tick", e)
 
     async def _tick_reflection(self) -> None:
         try:

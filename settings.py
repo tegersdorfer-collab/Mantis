@@ -117,6 +117,15 @@ class MantisSettings(BaseSettings):
     PROACTIVE_WAIT_AFTER_CONV: int = 600
     PROACTIVE_INTERVAL: int = 5400
 
+    # ── Accountability & Momentum (v0: Daily Anchor + Der Block) ──────────────
+    # Ein Nutzer (Timo), Config als simple ENV-Werte. Uhrzeiten im Format "HH:MM"
+    # in lokaler Serverzeit (= OWNER_TIMEZONE). Der Block ist EIN Deep-Work-Fenster
+    # pro Tag; das Blockende ergibt sich aus Start + Dauer.
+    ACCOUNTABILITY_ENABLED: bool = True
+    ACCOUNTABILITY_ANCHOR_TIME: str = "08:00"    # Morgen-Anker ("Was ist das EINE Ding?")
+    ACCOUNTABILITY_BLOCK_START: str = "10:00"    # Blockstart ("Handy weg.")
+    ACCOUNTABILITY_BLOCK_MINUTES: int = 90       # Blockdauer (60–90 min sinnvoll)
+
     # ── Memory ───────────────────────────────────────────────────────────────
     LZG_EMBED_MODEL: str = "qwen3-embedding:0.6b"
     LZG_TOP_K: int = 5
@@ -146,6 +155,17 @@ class MantisSettings(BaseSettings):
                 "⚠️  OWNER_NAME nicht in .env gesetzt – bitte eintragen"
             )
         return v
+
+    @field_validator("ACCOUNTABILITY_ANCHOR_TIME", "ACCOUNTABILITY_BLOCK_START")
+    @classmethod
+    def valid_hhmm(cls, v: str) -> str:
+        try:
+            h, m = v.strip().split(":")
+            if not (0 <= int(h) <= 23 and 0 <= int(m) <= 59):
+                raise ValueError
+        except Exception:
+            raise ValueError(f"Ungültige Uhrzeit '{v}' – erwartet HH:MM (z.B. 08:00)")
+        return v.strip()
 
     @field_validator("THERMAL_TARGET_CELSIUS", "THERMAL_MAX_CELSIUS")
     @classmethod
