@@ -13,6 +13,13 @@ from forge import models as m
 
 log = logging.getLogger(__name__)
 
+# Ab diesem Versuchszähler wird ein Task automatisch geparkt, egal was als
+# Nächstes passiert — muss mit forge.daemon.MAX_CONSECUTIVE_FAILURES
+# übereinstimmen. Sonst hält ein Task, der bei jedem Versuch abstürzt (und
+# dessen park()-Aufruf selbst aus irgendeinem Grund nicht durchkommt), die
+# Spitze der Queue für immer, auch wenn der Daemon selbst längst bremst.
+AUTO_PARK_AFTER_ATTEMPTS = 3
+
 
 def enqueue(title: str, description: str = "", source: str = "timo", priority: int = 50) -> int:
     """Reiht einen neuen Task ein und gibt seine ID zurück."""
@@ -42,11 +49,12 @@ def claim_next() -> dict | None:
     """Der Task, an dem als Nächstes gearbeitet wird.
 
     Zuerst ein bereits laufender (Wiederaufsetzen nach Absturz), sonst der
-    oberste aus der Queue — der wird dabei auf die erste Stufe gesetzt.
+    oberste aus der Queue — der wird dabei auf die erste Stufe gesetzt. Jeder
+    zurückgegebene Task zählt als ein Versuch (siehe `_versuch_zaehlen`).
     """
     laufend = active()
     if laufend is not None:
-        return laufend
+        return _versuch_zaehlen(laufend)
 
     rows = db.query(
         "SELECT * FROM forge_tasks "
@@ -61,30 +69,61 @@ def claim_next() -> dict | None:
     if not set_state(task["id"], m.SPECCING, current=m.QUEUED):
         return None
     task["state"] = m.SPECCING
+    return _versuch_zaehlen(task)
+
+
+def _versuch_zaehlen(task: dict) -> dict | None:
+    """Zählt einen Bearbeitungsversuch am Task. Übersteigt er die Schwelle,
+    wird der Task automatisch geparkt und None zurückgegeben, statt an den
+    Aufrufer weiterzureichen — sonst könnte ein Task, der bei jedem Anlauf
+    abstürzt, ohne dass tick() selbst zum Parken kommt, die Queue für immer
+    blockieren."""
+    versuche = (task.get("attempts") or 0) + 1
+    if versuche > AUTO_PARK_AFTER_ATTEMPTS:
+        park(task["id"], current=task["state"],
+             reason=f"Automatisch geparkt: {versuche} Versuche ohne Erfolg")
+        return None
+    db.execute(
+        "UPDATE forge_tasks SET attempts=%s, updated_at=NOW() WHERE id=%s",
+        (versuche, task["id"]),
+    )
+    task["attempts"] = versuche
     return task
 
 
 def set_state(task_id: int, target: str, current: str) -> bool:
-    """Setzt den Zustand, sofern der Übergang erlaubt ist. Sonst False."""
+    """Setzt den Zustand, sofern der Übergang erlaubt ist. Sonst False.
+
+    Die WHERE-Klausel prüft den erwarteten Ausgangszustand mit (Compare-and-
+    Swap): ohne das könnten zwei Daemonen — oder ein Handlauf neben dem
+    laufenden launchd-Job — denselben Task per read-then-write doppelt claimen
+    und doppelt bezahlen. `db.execute` liefert den rowcount; nur bei genau
+    einer betroffenen Zeile hat DIESER Aufruf den Übergang tatsächlich vollzogen.
+    """
     if not m.can_transition(current, target):
         log.warning(f"Forge: verbotener Übergang {current} → {target} (Task {task_id})")
         return False
-    db.execute(
-        "UPDATE forge_tasks SET state=%s, updated_at=NOW() WHERE id=%s",
-        (target, task_id),
+    betroffen = db.execute(
+        "UPDATE forge_tasks SET state=%s, updated_at=NOW() WHERE id=%s AND state=%s",
+        (target, task_id, current),
     )
-    return True
+    return betroffen == 1
 
 
 def park(task_id: int, current: str, reason: str) -> bool:
-    """Legt den Task zur manuellen Sichtung beiseite. Der Worktree bleibt stehen."""
+    """Legt den Task zur manuellen Sichtung beiseite. Der Worktree bleibt stehen.
+
+    Ebenfalls Compare-and-Swap (siehe `set_state`) — der Rückgabewert muss sich
+    darauf verlassen können, dass der Task tatsächlich geparkt wurde, nicht nur
+    dass der Übergang theoretisch erlaubt gewesen wäre.
+    """
     if not m.can_transition(current, m.PARKED):
         return False
-    db.execute(
-        "UPDATE forge_tasks SET state=%s, parked_reason=%s, updated_at=NOW() WHERE id=%s",
-        (m.PARKED, reason, task_id),
+    betroffen = db.execute(
+        "UPDATE forge_tasks SET state=%s, parked_reason=%s, updated_at=NOW() WHERE id=%s AND state=%s",
+        (m.PARKED, reason, task_id, current),
     )
-    return True
+    return betroffen == 1
 
 
 def pause(task_id: int, reason: str, until: datetime) -> None:

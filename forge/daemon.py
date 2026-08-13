@@ -10,6 +10,7 @@ Claude-Sitzung, und drei Fehlschläge in Folge.
 import logging
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -23,6 +24,10 @@ STOP_FILE = Path.home() / ".mantis-forge-stop"
 MAX_CONSECUTIVE_FAILURES = 3
 IDLE_SLEEP_SECONDS = 60
 BLOCKED_SLEEP_SECONDS = 300
+# Backoff nach einem Fehlschlag: ohne das folgen auf einen Absturz sofort
+# weitere Ticks, ohne jede Bremse — bis zu drei Vollpreis-Claude-Läufe in
+# Sekunden, bevor die Fehler-Spirale überhaupt greift.
+FAILURE_SLEEP_SECONDS = 30
 
 
 def interactive_claude_running() -> bool:
@@ -83,38 +88,71 @@ def _trockenlauf_prompt(task: dict) -> str:
 
 
 def tick() -> str:
-    """Ein Durchlauf. Rückgabe: 'leerlauf' | 'trockenlauf' | 'fehler'."""
+    """Ein Durchlauf. Rückgabe: 'leerlauf' | 'trockenlauf' | 'fehler'.
+
+    Ab dem Moment, in dem `queue.claim_next()` einen Task liefert, steht dessen
+    Zustand in der DB auf einer ACTIVE_STATES-Stufe. Alles danach läuft in
+    einem try/except: jede Ausnahme wird geloggt (mit der echten Task-ID, nie
+    None) und der Task wird bestmöglich geparkt, BEVOR die Ausnahme weiter
+    nach oben gereicht wird — sonst bleibt er aktiv hängen, und der nächste
+    Tick zieht genau denselben poisoned Task wieder, ohne Backoff.
+    """
     task = queue.claim_next()
     if task is None:
         return "leerlauf"
 
     task_id = task["id"]
-    journal.log(task_id, "stage_start", f"Trockenlauf für: {task['title']}")
+    try:
+        journal.log(task_id, "stage_start", f"Trockenlauf für: {task['title']}")
 
-    baum = worktree.create(task_id)
-    ergebnis = runner.run(_trockenlauf_prompt(task), cwd=baum)
+        baum = worktree.create(task_id)
+        ergebnis = runner.run(_trockenlauf_prompt(task), cwd=baum)
 
-    journal.log(
-        task_id,
-        "stage_done" if ergebnis.ok else "stage_failed",
-        (ergebnis.text or ergebnis.error or "")[:2000],
-        tokens_in=ergebnis.tokens_in,
-        tokens_out=ergebnis.tokens_out,
-    )
+        journal.log(
+            task_id,
+            "stage_done" if ergebnis.ok else "stage_failed",
+            (ergebnis.text or ergebnis.error or "")[:2000],
+            tokens_in=ergebnis.tokens_in,
+            tokens_out=ergebnis.tokens_out,
+        )
 
-    if not ergebnis.ok:
-        queue.park(task_id, current=task["state"], reason=f"Trockenlauf fehlgeschlagen: {ergebnis.error}")
-        return "fehler"
+        if not ergebnis.ok:
+            geparkt = queue.park(task_id, current=task["state"],
+                                  reason=f"Trockenlauf fehlgeschlagen: {ergebnis.error}")
+            if not geparkt:
+                journal.log(task_id, "stage_failed", "park() hat den fehlgeschlagenen Task nicht angenommen")
+            return "fehler"
 
-    queue.park(task_id, current=task["state"],
-               reason="Plan-1-Trockenlauf abgeschlossen — Pipeline folgt in Plan 2")
-    return "trockenlauf"
+        geparkt = queue.park(task_id, current=task["state"],
+                              reason="Plan-1-Trockenlauf abgeschlossen — Pipeline folgt in Plan 2")
+        if not geparkt:
+            # Ohne diese Prüfung würde ein verworfener park()-Aufruf als
+            # "trockenlauf" durchgehen: failures würde auf 0 zurückgesetzt und
+            # es gäbe keinen Backoff — eine ungebremste Schleife voller
+            # Vollpreis-Läufe an einem Task, der in Wahrheit aktiv hängen blieb.
+            journal.log(task_id, "stage_failed", "park() hat den erfolgreichen Task nicht angenommen")
+            return "fehler"
+        return "trockenlauf"
+    except Exception as exc:
+        journal.log(task_id, "stage_failed", f"Tick-Absturz bei Task {task_id}: {exc}")
+        try:
+            geparkt = queue.park(task_id, current=task["state"], reason=f"Tick-Absturz: {exc}")
+            if not geparkt:
+                log.error(f"Forge: Task {task_id} nach Absturz nicht parkbar — bleibt aktiv")
+        except Exception:
+            # Das Parken selbst darf die ursprüngliche Ausnahme nicht verdecken.
+            log.exception(f"Forge: Parken nach Absturz für Task {task_id} selbst gescheitert")
+        raise
 
 
 def main() -> None:
     """launchd-Einstieg. Läuft bis zum Not-Aus oder bis zur Fehler-Spirale."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
     db.init_pool()
+    # Die Forge ist bewusst unabhängig vom laufenden Mantis-Assistant (siehe
+    # forge/__init__.py) — sie darf sich also nicht darauf verlassen, dass
+    # irgendein anderer Prozess vor ihr migriert hat.
+    db.run_migrations()
     journal.log(None, "daemon_start", "Forge gestartet")
     log.info("Forge-Daemon gestartet")
 
@@ -137,7 +175,7 @@ def main() -> None:
 
         try:
             ergebnis = tick()
-        except Exception as exc:            # noqa: BLE001 — ein Task darf den Daemon nicht töten
+        except Exception as exc:  # ein Task darf den Daemon nicht töten
             log.exception("Forge-Tick abgestürzt")
             journal.log(None, "stage_failed", f"Tick-Absturz: {exc}")
             ergebnis = "fehler"
@@ -145,6 +183,8 @@ def main() -> None:
         failures = failures + 1 if ergebnis == "fehler" else 0
         if ergebnis == "leerlauf":
             time.sleep(IDLE_SLEEP_SECONDS)
+        elif ergebnis == "fehler":
+            time.sleep(FAILURE_SLEEP_SECONDS)
 
 
 if __name__ == "__main__":

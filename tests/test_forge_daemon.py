@@ -64,6 +64,8 @@ class TestFehlerSpiraleUeberlebtNeustart:
         monkeypatch.setattr(d, "STOP_FILE", stop)
         monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
+        monkeypatch.setattr(d.time, "sleep", lambda *a, **kw: None)
         monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
         monkeypatch.setattr(d, "tick", lambda: "fehler")
         d.main()
@@ -128,6 +130,42 @@ class TestTick:
         assert (11, 22) in gemerkt
 
 
+class TestParkRueckgabeWirdGeprueft:
+    """I4: tick() verwarf früher den Rückgabewert von queue.park() komplett.
+    Lieferte park() False (verbotener Übergang, verlorenes CAS), gab tick()
+    trotzdem "trockenlauf" zurück — failures würde auf 0 zurückgesetzt, und es
+    gäbe keinen Backoff-Sleep: eine ungebremste Schleife voller Vollpreis-Läufe
+    an einem Task, der laut DB in Wahrheit aktiv hängen blieb."""
+
+    def test_park_false_nach_erfolgreichem_lauf_wird_als_fehler_gewertet(self, monkeypatch, frei, tmp_path):
+        monkeypatch.setattr(d.queue, "claim_next",
+                            lambda: {"id": 6, "title": "T", "description": "", "state": m.SPECCING})
+        monkeypatch.setattr(d.worktree, "create", lambda tid, **kw: tmp_path)
+        monkeypatch.setattr(d.runner, "run",
+                            lambda prompt, cwd, timeout=1800: RunResult(ok=True, text="x"))
+        monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
+        monkeypatch.setattr(d.queue, "park", lambda tid, current, reason: False)
+        assert d.tick() == "fehler"
+
+
+class TestFailureBackoff:
+    def test_fehlschlag_bekommt_backoff_sleep(self, monkeypatch, tmp_path):
+        # C2: vor dem Fix schlief main() nur im Leerlauf-Zweig — nach einem
+        # Fehlschlag ging es sofort in den nächsten Tick, bis zu drei
+        # Vollpreis-Claude-Läufe in Sekunden statt in gedrosseltem Abstand.
+        stop = tmp_path / "stop"
+        monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
+        monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
+        monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
+        monkeypatch.setattr(d, "tick", lambda: "fehler")
+        schlaefe = []
+        monkeypatch.setattr(d.time, "sleep", lambda s: schlaefe.append(s))
+        d.main()
+        assert d.FAILURE_SLEEP_SECONDS in schlaefe
+
+
 class TestInteractiveDetection:
     def test_eigener_daemon_zaehlt_nicht_als_interaktiv(self, monkeypatch):
         # Der Forge-Prozess startet selbst `claude`-Kindprozesse. Würden die als
@@ -187,11 +225,13 @@ class TestInteractiveDetection:
 
 class TestTickUeberlebtAbsturz:
     def test_ausnahme_im_runner_fuehrt_nicht_zu_aktivem_task(self, monkeypatch, frei, tmp_path):
-        # tick() selbst fängt Runner-Ausnahmen nicht ab — das übernimmt main()s
-        # eigenes except. Dieser Test belegt, WAS passiert, wenn runner.run()
-        # statt eines RunResult eine Ausnahme wirft: tick() propagiert sie nach
-        # oben, der Task bleibt aber nicht in einem aktiven aber "vergessenen"
-        # Zustand hängen, weil main() den Fehler auffängt und als "fehler" zählt.
+        # C2: tick() fängt eine Ausnahme aus dem Lauf jetzt selbst ab, parkt den
+        # Task VOR dem Weiterreichen (mit der echten Task-ID, nie None) und
+        # wirft danach weiter — main()s eigenes except zählt sie zusätzlich als
+        # Fehlschlag. Vor dem Fix hätte runner.run() einfach durchgeschlagen,
+        # OHNE dass queue.park() je aufgerufen wurde: der Task wäre in
+        # ACTIVE_STATES hängen geblieben und beim nächsten Tick sofort wieder
+        # gezogen worden — dreimal hintereinander, ohne jeden Backoff.
         monkeypatch.setattr(d.queue, "claim_next",
                             lambda: {"id": 4, "title": "T", "description": "", "state": m.SPECCING})
         monkeypatch.setattr(d.worktree, "create", lambda tid, **kw: tmp_path)
@@ -202,8 +242,15 @@ class TestTickUeberlebtAbsturz:
         monkeypatch.setattr(d.runner, "run", _explodiert)
         monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
 
+        geparkt = {}
+        monkeypatch.setattr(d.queue, "park",
+                            lambda tid, current, reason: geparkt.setdefault("aufruf", (tid, reason)) or True)
+
         with pytest.raises(RuntimeError):
             d.tick()
+
+        assert geparkt["aufruf"][0] == 4
+        assert "claude-Prozess abgestürzt" in geparkt["aufruf"][1]
 
     def test_main_faengt_tick_absturz_ab_und_zaehlt_als_fehler(self, monkeypatch, tmp_path):
         # main() darf bei einer Ausnahme aus tick() weder sterben noch sie
@@ -213,6 +260,8 @@ class TestTickUeberlebtAbsturz:
         monkeypatch.setattr(d, "STOP_FILE", stop)
         monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
+        monkeypatch.setattr(d.time, "sleep", lambda *a, **kw: None)
 
         geloggt = []
         monkeypatch.setattr(d.journal, "log", lambda *a, **kw: geloggt.append(a))
@@ -238,9 +287,14 @@ class TestTickUeberlebtAbsturz:
         monkeypatch.setattr(d, "STOP_FILE", stop)
         monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
+        monkeypatch.setattr(d.time, "sleep", lambda *a, **kw: None)
         monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
         monkeypatch.setattr(d.queue, "claim_next",
                             lambda: {"id": 9, "title": "T", "description": "", "state": m.SPECCING})
+        # C2: tick() parkt jetzt real (echtes Modul, kein Stub für tick selbst) —
+        # ohne diesen Stub würde queue.park() gegen die echte (nicht verbundene) DB laufen.
+        monkeypatch.setattr(d.queue, "park", lambda *a, **kw: True)
         monkeypatch.setattr(d.worktree, "create", lambda tid, **kw: tmp_path)
 
         def _runner_explodiert(prompt, cwd, timeout=1800):

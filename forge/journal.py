@@ -31,7 +31,7 @@ def log(task_id: int | None, kind: str, message: str = "",
             "VALUES (%s, %s, %s, %s, %s)",
             (task_id, kind, message, tokens_in, tokens_out),
         )
-    except Exception as exc:            # noqa: BLE001 — Journal darf nie der Grund für einen Abbruch sein
+    except Exception as exc:  # Journal darf nie der Grund für einen Abbruch sein
         _log.error(f"Forge-Journal-Schreibfehler: {exc}")
 
 

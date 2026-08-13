@@ -112,7 +112,8 @@ class TestClaimNext:
         rec = _patch(monkeypatch, rows=[{"id": 3, "state": m.PLANNING}])
         task = q.claim_next()
         assert task["id"] == 3
-        assert rec.executes == []  # kein Zustandswechsel
+        # Kein Zustandswechsel — der einzige Schreibzugriff ist der Versuchszähler (C2).
+        assert not any("SET state=" in sql for sql, _ in rec.executes)
 
     def test_leere_queue_gibt_none(self, monkeypatch):
         _patch(monkeypatch, rows=[])
@@ -133,9 +134,13 @@ class TestClaimNext:
     def test_schreibt_update_mit_speccing_und_task_id(self, monkeypatch):
         rec = _patch_seq(monkeypatch, [[], [{"id": 11, "state": m.QUEUED}]])
         q.claim_next()
-        sql, params = rec.executes[-1]
+        zustands_updates = [(sql, p) for sql, p in rec.executes if "SET state=" in sql]
+        assert len(zustands_updates) == 1
+        sql, params = zustands_updates[0]
         assert "UPDATE" in sql and "state=%s" in sql
-        assert params == (m.SPECCING, 11)
+        # I8: Compare-and-Swap — der erwartete Ausgangszustand steht in der WHERE-Klausel,
+        # sonst könnten zwei Daemonen denselben Task per read-then-write doppelt claimen.
+        assert params == (m.SPECCING, 11, m.QUEUED)
 
     def test_queue_sortiert_nach_prioritaet_absteigend(self, monkeypatch):
         rec = _patch_seq(monkeypatch, [[], [{"id": 11, "state": m.QUEUED}]])
@@ -150,12 +155,49 @@ class TestClaimNext:
         monkeypatch.setattr(q, "set_state", lambda *a, **kw: False)
         assert q.claim_next() is None
 
+    def test_versuchszaehler_wird_erhoeht(self, monkeypatch):
+        # C2: jeder Claim zählt als ein Versuch — sonst kann ein Task, der
+        # immer wieder abstürzt, ohne dass tick() selbst zum Parken kommt, die
+        # Spitze der Queue für immer blockieren.
+        rec = _patch(monkeypatch, rows=[{"id": 3, "state": m.PLANNING, "attempts": 1}])
+        task = q.claim_next()
+        assert task["attempts"] == 2
+        attempts_updates = [p for sql, p in rec.executes if "SET attempts=" in sql]
+        assert attempts_updates == [(2, 3)]
+
+    def test_fehlende_attempts_spalte_zaehlt_als_null(self, monkeypatch):
+        # Bestandstasks ohne den Schlüssel im Dict (z.B. ältere Fixtures) dürfen
+        # nicht crashen — 0 ist der plausible Startwert.
+        _patch(monkeypatch, rows=[{"id": 3, "state": m.PLANNING}])
+        task = q.claim_next()
+        assert task["attempts"] == 1
+
+    def test_ueberschreitet_die_schwelle_wird_automatisch_geparkt(self, monkeypatch):
+        # C2: ein Task, der die Schwelle überschreitet, wird geparkt und
+        # claim_next() gibt None zurück, statt den Task ein weiteres Mal an
+        # den Aufrufer zu reichen — sonst hält ein kaputter Task, dessen
+        # park()-Aufruf aus tick() selbst irgendwann scheitert, die Queue fest.
+        rec = _patch(monkeypatch, rows=[{"id": 5, "state": m.IMPLEMENTING, "attempts": 3}])
+        assert q.claim_next() is None
+        park_aufrufe = [p for sql, p in rec.executes if "parked_reason" in sql]
+        assert len(park_aufrufe) == 1
+        assert park_aufrufe[0][0] == m.PARKED
+        assert park_aufrufe[0][2] == 5
+
+    def test_unter_der_schwelle_bleibt_der_task_aktiv(self, monkeypatch):
+        rec = _patch(monkeypatch, rows=[{"id": 5, "state": m.IMPLEMENTING, "attempts": 2}])
+        task = q.claim_next()
+        assert task is not None
+        assert task["attempts"] == 3
+        assert not any("parked_reason" in sql for sql, _ in rec.executes)
+
 
 class TestSetState:
     def test_erlaubter_uebergang_wird_geschrieben(self, monkeypatch):
         rec = _patch(monkeypatch)
         assert q.set_state(1, m.PLANNING, current=m.SPECCING) is True
-        assert rec.executes[-1][1] == (m.PLANNING, 1)
+        # I8: CAS — Zielzustand, ID und der erwartete Ausgangszustand (WHERE state=%s).
+        assert rec.executes[-1][1] == (m.PLANNING, 1, m.SPECCING)
 
     def test_verbotener_uebergang_schreibt_nichts(self, monkeypatch):
         rec = _patch(monkeypatch)
@@ -167,12 +209,28 @@ class TestSetState:
         q.set_state(1, m.PLANNING, current=m.SPECCING)
         assert "updated_at=NOW()" in rec.executes[-1][0]
 
+    def test_verlorenes_cas_gibt_false(self, monkeypatch):
+        # I8: zwei Daemonen (oder ein Handlauf neben dem launchd-Job) dürfen
+        # denselben Task nicht doppelt claimen. rowcount=0 heißt: ein anderer
+        # war schneller — set_state muss das als False melden, nicht als Erfolg.
+        _patch(monkeypatch)
+        monkeypatch.setattr(q.db, "execute", lambda sql, params=(): 0)
+        assert q.set_state(1, m.PLANNING, current=m.SPECCING) is False
+
 
 class TestPark:
     def test_park_schreibt_grund(self, monkeypatch):
         rec = _patch(monkeypatch)
         assert q.park(5, current=m.GATING, reason="Tests rot") is True
-        assert rec.executes[-1][1] == (m.PARKED, "Tests rot", 5)
+        # I8: CAS auch hier — der erwartete Ausgangszustand steht in der WHERE-Klausel.
+        assert rec.executes[-1][1] == (m.PARKED, "Tests rot", 5, m.GATING)
+
+    def test_verlorenes_cas_gibt_false(self, monkeypatch):
+        # I4 verlässt sich darauf, dass park() einen echten Fehlschlag meldet,
+        # nicht nur einen theoretisch verbotenen Übergang.
+        _patch(monkeypatch)
+        monkeypatch.setattr(q.db, "execute", lambda sql, params=(): 0)
+        assert q.park(5, current=m.GATING, reason="Tests rot") is False
 
 
 class TestPause:
