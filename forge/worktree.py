@@ -35,7 +35,15 @@ def create(task_id: int, base: str = "main", repo: Path | None = None) -> Path:
     """
     ziel = path_for(task_id)
     if ziel.is_dir():
-        return ziel
+        if (ziel / ".git").exists():
+            return ziel
+        # "git worktree add" legt den Verzeichnisinhalt an, BEVOR es .git
+        # schreibt. Ein Absturz mittendrin hinterlässt ein Verzeichnis, das
+        # is_dir() ist, aber kein Worktree — würde das hier kommentarlos
+        # zurückgegeben, liefe Claude in einem Nicht-Repo, und der Task könnte
+        # trotzdem als "erfolgreich" geparkt werden.
+        log.warning(f"Forge: {ziel} ist kein vollständiger Worktree (kein .git) — wird neu angelegt")
+        shutil.rmtree(ziel, ignore_errors=True)
 
     ziel.parent.mkdir(parents=True, exist_ok=True)
     zweig = branch_for(task_id)

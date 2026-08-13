@@ -116,6 +116,25 @@ class TestCreate:
         assert aktueller_zweig == zweig
 
 
+class TestCreatePartiellerWorktree:
+    def test_verzeichnis_ohne_git_wird_als_unfertig_erkannt_und_neu_gebaut(self, repo, forge_root):
+        # I5: "git worktree add" legt den Verzeichnisinhalt an, BEVOR es .git
+        # schreibt. Ein Absturz mittendrin hinterlässt genau das: ein
+        # Verzeichnis, das is_dir() ist, aber kein Worktree. Vor dem Fix hätte
+        # create() das kommentarlos zurückgegeben — Claude liefe in einem
+        # Nicht-Repo, und der Task könnte trotzdem als "erfolgreich" geparkt werden.
+        halbfertig = wt.path_for(20)
+        halbfertig.mkdir(parents=True)
+        (halbfertig / "rest-von-einem-absturz.txt").write_text("Müll")
+
+        pfad = wt.create(20, base="main", repo=repo)
+
+        assert pfad == halbfertig
+        assert (pfad / ".git").exists()
+        assert (pfad / "README.md").read_text() == "hallo\n"
+        assert not (pfad / "rest-von-einem-absturz.txt").exists()
+
+
 class TestExists:
     def test_false_wenn_nichts_da(self, forge_root):
         assert wt.exists(99) is False
