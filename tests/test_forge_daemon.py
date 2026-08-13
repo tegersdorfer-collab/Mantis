@@ -138,6 +138,31 @@ class TestInteractiveDetection:
         monkeypatch.setattr(d.subprocess, "run", lambda *a, **kw: _Fertig())
         assert d.interactive_claude_running() is False
 
+    def test_eigenes_claude_kind_zaehlt_nicht_als_interaktiv(self, monkeypatch):
+        # Der eigentliche Schutzfall: runner.run() startet `claude` als echtes
+        # Kind des Daemons — pgrep liefert dann eine PID ungleich os.getpid(),
+        # aber `ps -o ppid=` auf diese PID liefert die PID des Daemons selbst.
+        # Genau das muss _ist_kind_von_uns() erkennen und herausfiltern, sonst
+        # sperrt sich die Forge nach ihrem ersten Lauf für immer aus.
+        kind_pid = os.getpid() + 1
+
+        class _Fertig:
+            returncode = 0
+            stdout = f"{kind_pid}\n"
+
+        def _fake_run(cmd, *a, **kw):
+            if cmd[0] == "pgrep":
+                return _Fertig()
+            assert cmd[0] == "ps"
+            assert cmd[-1] == str(kind_pid)
+
+            class _Ppid:
+                stdout = f"{os.getpid()}\n"
+            return _Ppid()
+
+        monkeypatch.setattr(d.subprocess, "run", _fake_run)
+        assert d.interactive_claude_running() is False
+
     def test_fremder_pid_zaehlt_als_interaktiv(self, monkeypatch):
         # Gegenprobe zu obigem Test: ein PID, der weder der Daemon selbst noch
         # ein Kind davon ist, MUSS als interaktive Sitzung erkannt werden —
