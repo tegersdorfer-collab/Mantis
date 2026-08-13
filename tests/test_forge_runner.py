@@ -72,6 +72,22 @@ class TestParseFehlerfaelle:
         assert ergebnis.ok is True
         assert ergebnis.tokens_in == 0
 
+    def test_gueltiges_json_ohne_objekt_crasht_nicht(self):
+        # Reproduzierbar: json.loads("null")/("3")/('"text"') liefert None/int/str
+        # zurück. Vor dem Fix rief parse_stream() .get() darauf auf und crashte
+        # mit AttributeError — ein sonst intakter Stream durfte daran nicht scheitern.
+        ergebnis = runner.parse_stream(["null", "3", '"text"'])
+        assert ergebnis.ok is False
+
+    def test_fehlendes_is_error_gilt_als_fehlschlag(self):
+        # is_error FEHLT (nicht: ist False) — für einen unbeaufsichtigten,
+        # geldkostenden Prozess muss "unbekannt" als Fehlschlag gelten, nicht
+        # stillschweigend als Erfolg durchgehen.
+        zeile = json.dumps({"type": "result", "subtype": "success", "result": "ok"})
+        ergebnis = runner.parse_stream([zeile])
+        assert ergebnis.ok is False
+        assert "is_error" in ergebnis.error
+
 
 class TestRateLimitErkennung:
     def test_rate_limit_wird_als_solches_markiert(self):
@@ -145,6 +161,20 @@ class TestRunFehlerpfade:
         with patch("forge.runner.subprocess.run", return_value=fake):
             ergebnis = runner.run("test", Path("/tmp"))
         assert ergebnis.rate_limited is True
+
+    def test_fehlendes_claude_binary_ergibt_spezifischen_fehler(self, monkeypatch):
+        # C1: unter launchd bekommt ein User-Agent nur PATH=/usr/bin:/bin:/usr/sbin:/sbin,
+        # claude liegt aber unter ~/.local/bin. Vor dem Fix wäre subprocess.run(["claude", ...])
+        # mit einem generischen OSError gescheitert ("claude nicht startbar: [Errno 2] ..."),
+        # der sich nicht von "keine Rechte" oder "Datenträger voll" unterscheiden lässt.
+        # Nach dem Fix wird das VOR jedem subprocess-Aufruf erkannt und die Meldung nennt
+        # explizit Binary und die tatsächlich wirksame PATH.
+        monkeypatch.setattr(runner, "CLAUDE_BIN", None)
+        monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        ergebnis = runner.run("test", Path("/tmp"))
+        assert ergebnis.ok is False
+        assert "claude" in ergebnis.error
+        assert "/usr/bin:/bin:/usr/sbin:/sbin" in ergebnis.error
 
     def test_erfolgreicher_lauf_ohne_stderr_bleibt_unveraendert(self):
         # Ein erfolgreicher Lauf soll stderr nicht in die Fehlermeldung mischen —
