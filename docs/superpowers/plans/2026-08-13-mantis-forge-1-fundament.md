@@ -1214,7 +1214,15 @@ Erwartet: mehrere JSON-Zeilen, die letzte mit `"type":"result"`. Prüfen:
 python -c "import json,sys; [print(json.loads(l).get('type'), list(json.loads(l).keys())) for l in open('tests/fixtures/claude_stream_success.jsonl') if l.strip()]"
 ```
 
-**Wenn der Befehl `--verbose` verlangt oder ein anderes Format liefert:** die Aufnahme ist die Wahrheit. Feldnamen in Schritt 3 an die Aufnahme anpassen, nicht umgekehrt. Erwartet werden im Result-Objekt ein Textfeld (`result`), ein Fehler-Flag (`is_error`) und ein `usage`-Objekt mit `input_tokens`/`output_tokens`.
+**Wenn der Befehl `--verbose` verlangt oder ein anderes Format liefert:** die Aufnahme ist die Wahrheit. Feldnamen in Schritt 3 an die Aufnahme anpassen, nicht umgekehrt.
+
+**Bereits am 2026-08-13 an einem echten Lauf verifiziert** (CLI 2.1.126, Fehlerfall): das Result-Event enthält `result`, `is_error`, `subtype`, `usage`, `api_error_status`, `total_cost_usd`, `modelUsage`. Drei Befunde daraus, die in die Implementierung gehören:
+
+1. **`is_error` ist die Autorität, nicht `subtype`.** Der beobachtete Lauf hatte `subtype: "success"` bei `is_error: true`. Wer auf `subtype` prüft, hält Fehlläufe für Erfolge. `parse_stream` prüft korrekt `is_error`.
+2. **`usage` enthält mehr als `input_tokens`/`output_tokens`** — zusätzlich `cache_creation_input_tokens` und `cache_read_input_tokens`. Für Plan 1 genügen die beiden Hauptwerte; die Budget-Rechnung in Plan 3 muss die Cache-Felder mitzählen, sonst rechnet sie zu niedrig.
+3. **`api_error_status`** ist im Fehlerfall gesetzt — in Plan 3 der verlässlichere Weg zur Rate-Limit-Erkennung als Textmarker im Ergebnis.
+
+Was die Aufnahme noch **nicht** belegt: ein erfolgreicher Lauf mit `tokens_in > 0`. Genau dafür ist dieser Schritt da.
 
 - [ ] **Step 2: Test schreiben, der fehlschlägt**
 
@@ -1397,7 +1405,11 @@ def run(prompt: str, cwd: Path, timeout: int = 1800) -> RunResult:
     befehl = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
     try:
         fertig = subprocess.run(
+            # stdin MUSS abgeklemmt werden: ohne DEVNULL wartet die CLI drei Sekunden
+            # auf Eingabe und schreibt eine Warnung — pro Stufe, bei jedem Lauf.
+            # Live gemessen am 2026-08-13.
             befehl, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         return RunResult(ok=False, error=f"Zeitüberschreitung nach {timeout}s")
