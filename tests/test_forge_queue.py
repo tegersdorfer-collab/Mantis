@@ -43,6 +43,31 @@ def _patch(monkeypatch, rows=None, returning=1):
     return rec
 
 
+class _SeqRecorder(_Recorder):
+    """Wie `_Recorder`, aber `query()` liefert bei jedem Aufruf das nächste
+    Ergebnis aus einer vorgegebenen Folge, statt immer dieselben `rows`.
+
+    Wird gebraucht, wenn zwei aufeinanderfolgende SELECTs unterschiedliche
+    Treffer haben müssen — z.B. `active()` leer, aber die Queue nicht."""
+
+    def __init__(self, row_sequence, returning=1):
+        super().__init__(rows=[], returning=returning)
+        self._row_sequence = list(row_sequence)
+
+    def query(self, sql, params=()):
+        self.queries.append((sql, params))
+        if self._row_sequence:
+            return self._row_sequence.pop(0)
+        return []
+
+
+def _patch_seq(monkeypatch, row_sequence, returning=1):
+    rec = _SeqRecorder(row_sequence, returning=returning)
+    for name in ("query", "query_one", "execute", "insert_returning"):
+        monkeypatch.setattr(q.db, name, getattr(rec, name))
+    return rec
+
+
 class TestEnqueue:
     def test_gibt_neue_id_zurueck(self, monkeypatch):
         _patch(monkeypatch, returning=42)
@@ -91,6 +116,38 @@ class TestClaimNext:
 
     def test_leere_queue_gibt_none(self, monkeypatch):
         _patch(monkeypatch, rows=[])
+        assert q.claim_next() is None
+
+    def test_beansprucht_obersten_queued_task(self, monkeypatch):
+        # active() liefert nichts, die Queue hat einen wartenden Task.
+        _patch_seq(monkeypatch, [[], [{"id": 11, "state": m.QUEUED, "priority": 80}]])
+        task = q.claim_next()
+        assert task["id"] == 11
+
+    def test_geclaimter_task_hat_state_speccing(self, monkeypatch):
+        # Nicht nur der DB-Schreibzugriff zählt — auch die In-Memory-Mutation.
+        _patch_seq(monkeypatch, [[], [{"id": 11, "state": m.QUEUED}]])
+        task = q.claim_next()
+        assert task["state"] == m.SPECCING
+
+    def test_schreibt_update_mit_speccing_und_task_id(self, monkeypatch):
+        rec = _patch_seq(monkeypatch, [[], [{"id": 11, "state": m.QUEUED}]])
+        q.claim_next()
+        sql, params = rec.executes[-1]
+        assert "UPDATE" in sql and "state=%s" in sql
+        assert params == (m.SPECCING, 11)
+
+    def test_queue_sortiert_nach_prioritaet_absteigend(self, monkeypatch):
+        rec = _patch_seq(monkeypatch, [[], [{"id": 11, "state": m.QUEUED}]])
+        q.claim_next()
+        sql = rec.queries[-1][0]
+        assert "ORDER BY priority DESC" in sql
+
+    def test_verweigerter_uebergang_gibt_none_statt_halbem_claim(self, monkeypatch):
+        # Kann set_state den Übergang nicht schreiben, darf claim_next keinen
+        # halb-geclaimten Task zurückgeben — lieber None als korrupter Zustand.
+        _patch_seq(monkeypatch, [[], [{"id": 11, "state": m.QUEUED}]])
+        monkeypatch.setattr(q, "set_state", lambda *a, **kw: False)
         assert q.claim_next() is None
 
 
