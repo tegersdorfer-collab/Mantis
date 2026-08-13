@@ -41,3 +41,4 @@ build/
 mlx_models/
 # Roboter-Laufzeit-State
 .robot_last
+Mantis-forge/
