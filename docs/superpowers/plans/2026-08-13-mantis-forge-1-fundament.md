@@ -212,7 +212,7 @@ def can_transition(current: str, target: str) -> bool:
 - [ ] **Step 5: Test laufen lassen, grün bestätigen**
 
 Run: `python -m pytest tests/test_forge_models.py -v`
-Expected: PASS, 11 Tests
+Expected: PASS, 13 Tests
 
 - [ ] **Step 6: Migrationen anhängen**
 
@@ -1522,6 +1522,30 @@ class TestShouldRun:
         assert laeuft is True
 
 
+class TestFehlerSpiraleUeberlebtNeustart:
+    def test_spirale_setzt_die_not_aus_datei(self, monkeypatch, tmp_path):
+        # Der launchd-Job läuft mit KeepAlive=true. Ohne diese Datei würde der
+        # Daemon 30s nach dem Selbst-Stopp mit failures=0 neu starten und
+        # dieselben Fehlläufe erneut verbrennen — die Bremse wäre keine.
+        stop = tmp_path / "stop"
+        monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
+        monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
+        monkeypatch.setattr(d, "tick", lambda: "fehler")
+        d.main()
+        assert stop.exists()
+
+    def test_nach_der_spirale_laeuft_nichts_mehr(self, monkeypatch, tmp_path):
+        stop = tmp_path / "stop"
+        stop.write_text("Fehler-Spirale\n")
+        monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
+        laeuft, grund = d.should_run(failures=0)
+        assert laeuft is False
+        assert "Not-Aus" in grund
+
+
 class TestTick:
     def test_leere_queue_meldet_leerlauf(self, monkeypatch, frei):
         monkeypatch.setattr(d.queue, "claim_next", lambda: None)
@@ -1718,7 +1742,13 @@ def main() -> None:
         if not erlaubt:
             log.info(f"Forge pausiert: {grund}")
             if failures >= MAX_CONSECUTIVE_FAILURES:
-                journal.log(None, "daemon_stop", grund)
+                # Die Bremse MUSS den launchd-Neustart überleben. Der Job läuft mit
+                # KeepAlive=true; ein bloßes return würde 30s später neu starten, den
+                # Zähler auf 0 setzen und dieselben drei Fehlläufe erneut verbrennen —
+                # eine Endlosschleife statt einer Bremse. Die Not-Aus-Datei ist der
+                # einzige Zustand, den ein Neustart nicht vergisst.
+                STOP_FILE.write_text(f"Fehler-Spirale: {grund}\n")
+                journal.log(None, "daemon_stop", f"{grund} — Not-Aus gesetzt, Freigabe durch Timo")
                 return
             time.sleep(BLOCKED_SLEEP_SECONDS)
             continue
@@ -1742,7 +1772,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Test laufen lassen, grün bestätigen**
 
 Run: `python -m pytest tests/test_forge_daemon.py -v`
-Expected: PASS, 11 Tests
+Expected: PASS, 13 Tests
 
 - [ ] **Step 5: Gesamte Test-Suite laufen lassen**
 
