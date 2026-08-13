@@ -53,6 +53,29 @@ class TestLog:
         assert rec.executes[-1][1] == (1, "gate_pass", "", 0, 0)
 
 
+def _boom(sql, params=()):
+    raise RuntimeError("DB nicht erreichbar")
+
+
+class TestLogSchreibfehler:
+    def test_datenbankfehler_wird_nicht_weitergereicht(self, monkeypatch):
+        # Der Daemon ruft journal.log() ständig auf — ein DB-Ausfall darf ihn
+        # nie zum Absturz bringen. Kein try/except hier: j.log() muss selbst
+        # normal zurückkehren.
+        monkeypatch.setattr(j.db, "execute", _boom)
+        j.log(1, "stage_done", "Text")
+
+    def test_datenbankfehler_bleibt_sichtbar_im_log(self, monkeypatch):
+        # Verschluckt werden darf der Fehler nur, wenn er sichtbar bleibt —
+        # sonst wäre ein stiller Datenverlust selbst ein Fehler.
+        monkeypatch.setattr(j.db, "execute", _boom)
+        errors: list[str] = []
+        monkeypatch.setattr(j._log, "error", lambda msg: errors.append(msg))
+        j.log(1, "stage_done", "Text")
+        assert len(errors) == 1
+        assert "DB nicht erreichbar" in errors[0]
+
+
 class TestRecent:
     def test_limit_wird_durchgereicht(self, monkeypatch):
         rec = _patch(monkeypatch, rows=[])
