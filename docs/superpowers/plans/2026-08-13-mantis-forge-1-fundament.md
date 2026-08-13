@@ -1628,6 +1628,7 @@ Claude-Sitzung, und drei Fehlschläge in Folge.
 import logging
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -1731,7 +1732,10 @@ def tick() -> str:
 
 def main() -> None:
     """launchd-Einstieg. Läuft bis zum Not-Aus oder bis zur Fehler-Spirale."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # stream=sys.stdout explizit: ohne das geht alles nach stderr, landet also in
+    # mantis_forge_err.log statt im out.log, das die Verifikation unten (Step 8/9)
+    # tailt — sonst kann diese Verifikation nie grün werden (Finding I3).
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
     db.init_pool()
     journal.log(None, "daemon_start", "Forge gestartet")
     log.info("Forge-Daemon gestartet")
@@ -1830,6 +1834,15 @@ Expected: Journal enthält `stage_start` und `stage_done` mit Token-Zahlen > 0; 
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/timoegersdorfer/Mantis</string>
+    <!-- Ohne das bekommt ein launchd-User-Agent nur PATH=/usr/bin:/bin:/usr/sbin:/sbin —
+         claude liegt aber unter ~/.local/bin. Ohne diesen Eintrag scheitert jeder
+         `claude`-Aufruf mit FileNotFoundError, runner.run() liefert "claude nicht
+         startbar", und jeder Task wird mit null Tokens geparkt, ohne dass es auffällt. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/timoegersdorfer/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <!-- Immer neu starten: nach einem Merge beendet sich der Daemon absichtlich
          mit Code 0, damit er mit frischem Code wieder hochkommt (ab Plan 3). -->
     <key>KeepAlive</key>
@@ -1847,6 +1860,8 @@ Expected: Journal enthält `stage_start` und `stage_done` mit Token-Zahlen > 0; 
 ```
 
 Der Pfad ist derselbe Interpreter, den `start.sh` über `which python3.14` findet — geprüft am 2026-08-13. Weicht `which python3.14` ab, gilt der tatsächliche Wert.
+
+`EnvironmentVariables.PATH` ist nicht optional: ohne sie sieht der Prozess nur die launchd-Grundausstattung `/usr/bin:/bin:/usr/sbin:/sbin`, `claude` liegt aber unter `~/.local/bin`. `git`, `pgrep` und `ps` liegen alle in `/usr/bin`, deshalb bleibt der Ausfall auf `claude`-Läufe beschränkt — und fällt deshalb leicht niemandem auf (gefunden und gefixt am 2026-08-13, siehe Finding C1 im Review).
 
 - [ ] **Step 8: Job laden und beobachten**
 
@@ -1882,6 +1897,31 @@ git commit -m "feat(forge): Daemon mit Not-Aus, Pausenlogik und launchd-Job"
 ```
 
 ---
+
+## Nachtrag: Fixes aus dem Whole-Branch-Review (2026-08-13)
+
+Eine Review vor Plan 2 fand mehrere Fundamentbrüche, die die Code-Blöcke oben
+nicht mehr abbilden (diese Blöcke sind Planungs-Historie, kein Änderungslog).
+Kurzfassung, Details im Fix-Report unter `.superpowers/sdd/final-fix-report.md`:
+
+- **C1**: `EnvironmentVariables.PATH` im plist nachgetragen (siehe Task 7 oben)
+  UND `forge/runner.py` löst `claude` jetzt einmalig über `shutil.which()` auf
+  und meldet ein fehlendes Binary spezifisch statt generisch.
+- **C2**: `daemon.tick()` parkt jetzt in einem `try/except` bevor eine Ausnahme
+  weitergereicht wird; `queue.claim_next()` zählt Versuche und parkt ab drei
+  automatisch; `main()` bekommt einen Backoff-Sleep auf dem Fehlerpfad.
+- **I1**: `gitctl.run()` wirft nicht mehr bei `TimeoutExpired` oder wenn ein
+  Lock zwischen Preflight-Prüfung und Zugriff verschwindet — synthetisches
+  `CompletedProcess` statt Exception, wie der Docstring es immer schon versprach.
+- **I2**: `runner.parse_stream()` crasht nicht mehr an gültigem Nicht-Objekt-JSON
+  und behandelt fehlendes `is_error` als Fehlschlag, nicht als Erfolg.
+- **I4**: `tick()` prüft jetzt den Rückgabewert beider `queue.park()`-Aufrufe.
+- **I5**: `worktree.create()` verlangt `(ziel / ".git").exists()`, bevor ein
+  bestehendes Verzeichnis als fertiger Worktree gilt.
+- **I6**: `gitctl.stale_locks()` löst das git-Verzeichnis über
+  `git rev-parse --git-dir` auf statt `.git/` anzunehmen.
+- **I8**: `daemon.main()` ruft jetzt `db.run_migrations()`; `queue.set_state()`
+  und `queue.park()` sind Compare-and-Swap (`WHERE id=%s AND state=%s`).
 
 ## Abnahme für Plan 1
 
