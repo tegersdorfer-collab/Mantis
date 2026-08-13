@@ -207,3 +207,78 @@ class TestRun:
         # (ein Mock würde das schlucken, egal was übergeben wird).
         ergebnis = gitctl.run("dieser-befehl-existiert-nicht", cwd=tmp_path)
         assert ergebnis.returncode != 0
+
+    def test_timeout_ergibt_completedprocess_statt_exception(self, tmp_path, monkeypatch):
+        # I1: der Docstring versprach schon immer "wirft nicht" — vor dem Fix
+        # schlug subprocess.TimeoutExpired trotzdem ungefangen durch. worktree.py
+        # behandelt das Ergebnis von gitctl.run() immer als CompletedProcess
+        # (.returncode, .stderr) — eine durchschlagende Exception hätte dort
+        # gecrasht statt sauber als Fehlschlag beim Aufrufer anzukommen.
+        monkeypatch.setattr(gitctl, "clear_stale_locks", lambda repo: [])
+
+        def timeout_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 300))
+
+        monkeypatch.setattr(subprocess, "run", timeout_run)
+        ergebnis = gitctl.run("status", cwd=tmp_path, timeout=5)
+        assert isinstance(ergebnis, subprocess.CompletedProcess)
+        assert ergebnis.returncode != 0
+        assert "5" in ergebnis.stderr
+
+    def test_verschwundener_lock_waehrend_preflight_ergibt_completedprocess_statt_exception(
+        self, tmp_path, monkeypatch,
+    ):
+        # I1: zweiter dokumentierter, aber ungefangener Wurf — .exists() und
+        # os.path.getmtime() im Preflight laufen ohne Guard dazwischen; ein Lock
+        # kann in genau diesem Fenster verschwinden (der git-Prozess, der ihn
+        # hielt, wird fertig). Vor dem Fix eine ungefangene FileNotFoundError.
+        def kaputter_preflight(repo):
+            raise FileNotFoundError("Lock verschwand zwischen exists() und getmtime()")
+
+        monkeypatch.setattr(gitctl, "clear_stale_locks", kaputter_preflight)
+        ergebnis = gitctl.run("status", cwd=tmp_path)
+        assert isinstance(ergebnis, subprocess.CompletedProcess)
+        assert ergebnis.returncode != 0
+        assert "verschwand" in ergebnis.stderr
+
+
+class TestGitDirInLinkedWorktree:
+    def test_lock_im_verlinkten_worktree_wird_erkannt(self, tmp_path, monkeypatch):
+        # I6: das Haupt-Repo hat .git als VERZEICHNIS, ein linked worktree hat
+        # .git als DATEI, die auf <hauptrepo>/.git/worktrees/<name> zeigt. Vor
+        # dem Fix baute stale_locks() blind <repo>/.git/index.lock — dieser Pfad
+        # existiert in einem linked worktree nie, der Preflight war dort ein
+        # stiller No-Op. Echtes Repo, echter linked worktree — kein Mock von git.
+        monkeypatch.setattr(gitctl, "git_process_running", lambda: False)
+
+        hauptrepo = tmp_path / "haupt"
+        hauptrepo.mkdir()
+
+        def g(*args):
+            subprocess.run(["git", *args], cwd=str(hauptrepo), check=True, capture_output=True)
+
+        g("init", "-b", "main")
+        g("config", "user.email", "test@example.com")
+        g("config", "user.name", "Test")
+        (hauptrepo / "README.md").write_text("hallo\n")
+        g("add", "README.md")
+        g("commit", "-m", "init")
+
+        worktree_pfad = tmp_path / "wt1"
+        g("worktree", "add", "-b", "wt1", str(worktree_pfad), "main")
+
+        echtes_git_verzeichnis = hauptrepo / ".git" / "worktrees" / "wt1"
+        assert echtes_git_verzeichnis.is_dir()  # Voraussetzung des Tests
+
+        lock = echtes_git_verzeichnis / "index.lock"
+        lock.write_text("")
+        wann = time.time() - 3600
+        os.utime(lock, (wann, wann))
+
+        assert gitctl.stale_locks(worktree_pfad) == [lock]
+
+    def test_git_dir_faellt_auf_punkt_git_zurueck_wenn_rev_parse_scheitert(self, tmp_path):
+        # Kein echtes Repo (kein "git init") — git rev-parse --git-dir muss hier
+        # scheitern. _git_dir() darf dann nicht crashen, sondern fällt auf die
+        # alte Annahme <repo>/.git zurück (deckungsgleich mit dem Verhalten vor I6).
+        assert gitctl._git_dir(tmp_path) == tmp_path / ".git"
