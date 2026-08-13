@@ -242,6 +242,7 @@ Das Journal ist die Quelle für Dashboard-View und `forge_status`.
 | Tests rot | `parked`, Worktree bleibt zur Sichtung |
 | Review `fail` | max. 2 Fix-Runden, dann `parked` |
 | Merge-Konflikt | `parked` (tritt selten auf, da nur ein Task läuft) |
+| Stale git-Lock (`index.lock`, `HEAD.lock`, `objects/maintenance.lock`) | Preflight vor jedem git-Schreibvorgang: Lock-Datei ohne zugehörigen laufenden git-Prozess und älter als 10 Minuten → entfernen und im Journal vermerken. Lock **mit** laufendem Prozess → warten, nach 5 Min `parked`. Ohne diese Prüfung bleibt die Forge stumm hängen (real passiert: 19 Tage unbemerkt blockiert) |
 | Health-Check nach Neustart rot | Auto-Revert, Neustart, `parked` |
 | Rate-Limit | `paused_ratelimit`, Schlaf bis Reset, gleiche Stufe weiter |
 | Daemon-Absturz | launchd `KeepAlive`, Wiederaufsetzen auf letzter Stufengrenze |

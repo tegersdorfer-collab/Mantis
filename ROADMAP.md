@@ -22,6 +22,15 @@ Zuerst die volle Ideen-Sammlung nach Thema, danach die Priorisierung nach **Effe
 - Watchdog/Auto-Restart härten (launchd KeepAlive verifizieren, Heartbeat)
 - Secrets-Hygiene (.env-Audit, gcal-Token-Rotation, nichts im Git)
 - Abhängigkeiten pinnen + Update-Strategie
+- **`refs/.DS_Store` aus den git-Refs entfernen** — Finder-Artefakt in `.git/refs/`,
+  `git fsck` meldet `badRefName`/`badRefContent`. Harmlos, aber es verrauscht jede
+  Integritätsprüfung; zusätzlich `.DS_Store` global in `.gitignore` + `core.excludesFile`
+  absichern, damit es nicht wiederkommt (gefunden 2026-08-13)
+- **Repo-Gesundheitscheck als wiederkehrende Prüfung** — am 2026-07-25 lagen drei stale
+  Lock-Dateien (`index.lock`, `HEAD.lock`, `objects/maintenance.lock`, alle 0 Bytes) im
+  Repo und blockierten **jeden Schreibvorgang für 19 Tage unbemerkt**. Braucht eine
+  regelmäßige Prüfung (Locks ohne zugehörigen git-Prozess, `git fsck`) mit Meldung an
+  Mantis (gefunden 2026-08-13)
 
 ### B. Voice-Pipeline *(tägliche UX, Latenz)*
 - **Streaming LLM→TTS** durchgängig verketten — größter Latenz-Hebel (noch offen)
