@@ -19,10 +19,29 @@ log = logging.getLogger(__name__)
 # Flag, um bis zum Reset zu schlafen, statt den Task zu parken.
 _RATE_LIMIT_MARKER = ("usage limit reached", "rate limit", "rate_limit")
 
-# Modi, die für einen unbeaufsichtigten Daemon in Frage kommen. bypassPermissions
-# ist bewusst NICHT dabei: ein Prozess, der nachts ohne Aufsicht läuft, darf sich
-# nicht selbst alle Rechte erteilen — das ist der ganze Sinn der Profile.
-_ERLAUBTE_MODI = frozenset({"acceptEdits", "dontAsk", "plan", "default", "auto"})
+# Modi, die für einen unbeaufsichtigten Daemon in Frage kommen. Ein Modus kommt
+# NUR dann in dieses Set, wenn eine Aufnahme (siehe tests/fixtures/permission_probe.md)
+# belegt hat, dass er --allowedTools tatsächlich durchsetzt — plausibel klingen oder
+# in `claude --help` aufgeführt sein reicht nicht. `acceptEdits` sah ebenso plausibel
+# aus und hat sich in Probe (b1) als wirkungslos für Datei-Edits erwiesen: eine Datei
+# entstand, obwohl `Write` nicht in `--allowedTools` stand. `auto`, `default` und
+# `plan` sind aus demselben Grund draußen — sie wurden schlicht nie gemessen, und ein
+# ungemessener Modus in einer Sicherheitsschranke ist derselbe Fehler, nur unbewiesen.
+# `bypassPermissions` ist zusätzlich bewusst nie zu erwägen: ein Prozess, der nachts
+# ohne Aufsicht läuft, darf sich nicht selbst alle Rechte erteilen. Bis zur nächsten
+# Aufnahme ist `dontAsk` der einzige belegte Modus (Proben b2/b3).
+_ERLAUBTE_MODI = frozenset({"dontAsk"})
+
+# Modi, die nachweislich NICHT durchsetzen und deshalb eine erklärende statt einer
+# generischen Ablehnung verdienen, wenn sie versucht werden. Die Quelle je Eintrag
+# ist die Probe in tests/fixtures/permission_probe.md.
+_WIDERLEGTE_MODI = {
+    "acceptEdits": (
+        "gemessen als wirkungslos für Datei-Edits (tests/fixtures/permission_probe.md, "
+        "Probe b1, 2026-08-14): --allowedTools wurde ignoriert, eine Datei entstand, "
+        "obwohl 'Write' nicht erlaubt war. Nutze stattdessen 'dontAsk'."
+    ),
+}
 
 # Einmal beim Import aufgelöst, nicht bei jedem Lauf: ein launchd-User-Agent
 # bekommt standardmäßig nur PATH=/usr/bin:/bin:/usr/sbin:/sbin — dort liegt
@@ -50,12 +69,14 @@ class PermissionProfile:
     `allowed` folgt der CLI-Syntax (verifiziert 2026-08-14): Tool-Namen oder
     Muster wie "Bash(git *)", von der CLI leerzeichengetrennt erwartet.
 
-    Der Default-Modus ist ABSICHTLICH `dontAsk`, nicht `acceptEdits`: die
-    Aufnahme in tests/fixtures/permission_probe.md (Probe b1) zeigt, dass
-    `acceptEdits` einen Write-Aufruf durchwinkt, obwohl `Write` nicht in
-    `allowed` stand — das Profil wäre für Datei-Edits wirkungslos. `dontAsk`
-    verweigert denselben Zugriff nachweislich korrekt (sichtbar in
-    `permission_denials`) und hängt dabei nicht.
+    Der Default-Modus ist `dontAsk`, und `mode` akzeptiert aktuell AUSSCHLIESSLICH
+    `dontAsk` (siehe `_ERLAUBTE_MODI`): die Aufnahme in
+    tests/fixtures/permission_probe.md (Probe b1) zeigt, dass `acceptEdits` einen
+    Write-Aufruf durchwinkt, obwohl `Write` nicht in `allowed` stand — das Profil
+    wäre für Datei-Edits wirkungslos, deshalb wird `acceptEdits` hier verweigert,
+    nicht nur als Default vermieden. `dontAsk` verweigert denselben Zugriff
+    nachweislich korrekt (sichtbar in `permission_denials`) und hängt dabei nicht.
+    Ein weiterer Modus kommt erst dann dazu, wenn eine ebensolche Aufnahme ihn belegt.
     """
     allowed: tuple[str, ...]
     mode: str = "dontAsk"
@@ -67,7 +88,15 @@ class PermissionProfile:
             if not tool or not tool.strip():
                 raise ValueError(f"Ungültiger Werkzeugname im Rechteprofil: {tool!r}")
         if self.mode not in _ERLAUBTE_MODI:
-            raise ValueError(f"Unzulässiger Permission-Modus: {self.mode}")
+            grund = _WIDERLEGTE_MODI.get(self.mode)
+            if grund:
+                raise ValueError(f"Permission-Modus {self.mode!r} abgelehnt: {grund}")
+            raise ValueError(
+                f"Unzulässiger Permission-Modus: {self.mode!r} — nicht in _ERLAUBTE_MODI. "
+                "Ein Modus gehört erst dann in dieses Set, wenn eine Aufnahme in "
+                "tests/fixtures/permission_probe.md belegt, dass er --allowedTools "
+                "durchsetzt."
+            )
 
 
 def _ist_rate_limit(text: str) -> bool:

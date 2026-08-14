@@ -32,19 +32,23 @@ class TestProfilWirdUebergeben:
     def test_erlaubte_tools_landen_im_befehl(self, monkeypatch, tmp_path):
         auf = _Aufzeichnung()
         monkeypatch.setattr(runner.subprocess, "run", auf)
-        profil = runner.PermissionProfile(allowed=("Read", "Grep"), mode="acceptEdits")
+        profil = runner.PermissionProfile(allowed=("Read", "Grep"), mode="dontAsk")
         runner.run("egal", cwd=tmp_path, profile=profil)
         assert "--allowedTools" in auf.befehl
         i = auf.befehl.index("--allowedTools")
         assert auf.befehl[i + 1] == "Read Grep"
 
     def test_modus_landet_im_befehl(self, monkeypatch, tmp_path):
+        # dontAsk ist aktuell der einzige zulässige Modus (siehe _ERLAUBTE_MODI) —
+        # trotzdem wird er hier explizit übergeben statt über den Default zu laufen,
+        # damit dieser Test bei einer künftigen Erweiterung von _ERLAUBTE_MODI
+        # weiterhin die Übergabe prüft, nicht nur den Default.
         auf = _Aufzeichnung()
         monkeypatch.setattr(runner.subprocess, "run", auf)
         runner.run("egal", cwd=tmp_path,
-                   profile=runner.PermissionProfile(allowed=("Read",), mode="acceptEdits"))
+                   profile=runner.PermissionProfile(allowed=("Read",), mode="dontAsk"))
         i = auf.befehl.index("--permission-mode")
-        assert auf.befehl[i + 1] == "acceptEdits"
+        assert auf.befehl[i + 1] == "dontAsk"
 
     def test_ohne_profil_keine_rechte_flags(self, monkeypatch, tmp_path):
         # Rückwärtskompatibel: bestehende Aufrufer aus Plan 1 ändern sich nicht.
@@ -64,7 +68,7 @@ class TestProfilWirdUebergeben:
         # Ein Profil ohne Tools ist fast immer ein Konfigurationsfehler und
         # würde als 30-Minuten-Hänger enden statt als Fehlermeldung.
         with pytest.raises(ValueError):
-            runner.PermissionProfile(allowed=(), mode="acceptEdits")
+            runner.PermissionProfile(allowed=(), mode="dontAsk")
 
     def test_stdin_bleibt_abgeklemmt(self, monkeypatch, tmp_path):
         # Regressionsschutz für den Plan-1-Befund (3s Wartezeit pro Lauf).
@@ -82,7 +86,7 @@ class TestProfilWirdUebergeben:
 
         monkeypatch.setattr(runner.subprocess, "run", _run)
         runner.run("egal", cwd=tmp_path,
-                   profile=runner.PermissionProfile(allowed=("Read",), mode="acceptEdits"))
+                   profile=runner.PermissionProfile(allowed=("Read",), mode="dontAsk"))
         assert gesehen["stdin"] == runner.subprocess.DEVNULL
 
 
@@ -96,18 +100,43 @@ class TestProfilValidierungUeberDenAuftragHinaus:
         # Leerzeichen in --allowedTools machen — eine CLI-Zeile, die niemand
         # absichtlich so geschrieben hätte und die sich schwer debuggen lässt.
         with pytest.raises(ValueError):
-            runner.PermissionProfile(allowed=("Read", ""), mode="acceptEdits")
+            runner.PermissionProfile(allowed=("Read", ""), mode="dontAsk")
 
     def test_nur_leerzeichen_als_werkzeugname_wird_verweigert(self):
         # "   " ist kein leerer String, aber genauso ein kaputter Tool-Name.
         with pytest.raises(ValueError):
-            runner.PermissionProfile(allowed=("Read", "   "), mode="acceptEdits")
+            runner.PermissionProfile(allowed=("Read", "   "), mode="dontAsk")
 
     def test_ungueltiger_modus_wird_verweigert(self):
         # Tippfehler wie "acceptedits" (Groß/Kleinschreibung) dürfen nicht
         # stillschweigend als gültiger Modus durchgehen.
         with pytest.raises(ValueError):
             runner.PermissionProfile(allowed=("Read",), mode="acceptedits")
+
+
+class TestAcceptEditsWirdVerweigert:
+    """Umkehrung der ursprünglichen Annahme: Task 1 hat gemessen (siehe
+    tests/fixtures/permission_probe.md, Probe b1), dass `acceptEdits`
+    --allowedTools für Datei-Edits stillschweigend ignoriert — ein Lauf mit
+    `--allowedTools "Read"` hat trotzdem geschrieben. Ein Rechteprofil in diesem
+    Modus wäre reine Dekoration, deshalb wird der Modus jetzt hart abgelehnt statt
+    nur nicht mehr der Default zu sein."""
+
+    def test_acceptedits_wird_abgelehnt(self):
+        with pytest.raises(ValueError):
+            runner.PermissionProfile(allowed=("Read",), mode="acceptEdits")
+
+    def test_fehlermeldung_nennt_die_messung(self):
+        # Wer das hier trifft, soll in einem Blick verstehen WARUM, nicht nur DASS.
+        with pytest.raises(ValueError, match="permission_probe.md"):
+            runner.PermissionProfile(allowed=("Read",), mode="acceptEdits")
+
+    def test_andere_ungemessene_modi_ebenfalls_abgelehnt(self):
+        # auto, default und plan standen früher mit im Set, waren aber nie
+        # gemessen — derselbe Lückenschluss gilt für sie alle.
+        for modus in ("auto", "default", "plan"):
+            with pytest.raises(ValueError):
+                runner.PermissionProfile(allowed=("Read",), mode=modus)
 
 
 class TestDefaultModusNachMessung:

@@ -217,11 +217,38 @@ Expected: FAIL mit `AttributeError: module 'forge.runner' has no attribute 'Perm
 
 In `forge/runner.py` ergänzen (den bestehenden `RunResult`- und `parse_stream`-Code nicht anfassen):
 
+> Der Codeblock unten war der ursprüngliche Entwurf. Die Messung aus Step 1 /
+> Befund 8 hat ihn überholt: `acceptEdits` setzt `--allowedTools` für
+> Datei-Edits außer Kraft, und `auto`/`default`/`plan` wurden nie gemessen.
+> `_ERLAUBTE_MODI` enthält deshalb nur, was eine Aufnahme in
+> `tests/fixtures/permission_probe.md` belegt hat — aktuell ausschließlich
+> `dontAsk`. Ein Modus kommt erst dazu, wenn eine ebensolche Aufnahme ihn
+> nachweist; das gilt als Regel für den Code, nicht nur für diesen Task.
+
 ```python
-# Modi, die für einen unbeaufsichtigten Daemon in Frage kommen. bypassPermissions
-# ist bewusst NICHT dabei: ein Prozess, der nachts ohne Aufsicht läuft, darf sich
-# nicht selbst alle Rechte erteilen — das ist der ganze Sinn der Profile.
-_ERLAUBTE_MODI = frozenset({"acceptEdits", "dontAsk", "plan", "default", "auto"})
+# Modi, die für einen unbeaufsichtigten Daemon in Frage kommen. Ein Modus kommt
+# NUR dann in dieses Set, wenn eine Aufnahme (siehe tests/fixtures/permission_probe.md)
+# belegt hat, dass er --allowedTools tatsächlich durchsetzt — plausibel klingen oder
+# in `claude --help` aufgeführt sein reicht nicht. `acceptEdits` sah ebenso plausibel
+# aus und hat sich in Probe (b1) als wirkungslos für Datei-Edits erwiesen: eine Datei
+# entstand, obwohl `Write` nicht in `--allowedTools` stand. `auto`, `default` und
+# `plan` sind aus demselben Grund draußen — sie wurden schlicht nie gemessen, und ein
+# ungemessener Modus in einer Sicherheitsschranke ist derselbe Fehler, nur unbewiesen.
+# `bypassPermissions` ist zusätzlich bewusst nie zu erwägen: ein Prozess, der nachts
+# ohne Aufsicht läuft, darf sich nicht selbst alle Rechte erteilen. Bis zur nächsten
+# Aufnahme ist `dontAsk` der einzige belegte Modus (Proben b2/b3).
+_ERLAUBTE_MODI = frozenset({"dontAsk"})
+
+# Modi, die nachweislich NICHT durchsetzen und deshalb eine erklärende statt einer
+# generischen Ablehnung verdienen, wenn sie versucht werden. Die Quelle je Eintrag
+# ist die Probe in tests/fixtures/permission_probe.md.
+_WIDERLEGTE_MODI = {
+    "acceptEdits": (
+        "gemessen als wirkungslos für Datei-Edits (tests/fixtures/permission_probe.md, "
+        "Probe b1, 2026-08-14): --allowedTools wurde ignoriert, eine Datei entstand, "
+        "obwohl 'Write' nicht erlaubt war. Nutze stattdessen 'dontAsk'."
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -230,15 +257,35 @@ class PermissionProfile:
 
     `allowed` folgt der CLI-Syntax (verifiziert 2026-08-14): Tool-Namen oder
     Muster wie "Bash(git *)", von der CLI leerzeichengetrennt erwartet.
+
+    Der Default-Modus ist `dontAsk`, und `mode` akzeptiert aktuell AUSSCHLIESSLICH
+    `dontAsk` (siehe `_ERLAUBTE_MODI`): die Aufnahme in
+    tests/fixtures/permission_probe.md (Probe b1) zeigt, dass `acceptEdits` einen
+    Write-Aufruf durchwinkt, obwohl `Write` nicht in `allowed` stand — das Profil
+    wäre für Datei-Edits wirkungslos, deshalb wird `acceptEdits` hier verweigert,
+    nicht nur als Default vermieden. `dontAsk` verweigert denselben Zugriff
+    nachweislich korrekt (sichtbar in `permission_denials`) und hängt dabei nicht.
+    Ein weiterer Modus kommt erst dann dazu, wenn eine ebensolche Aufnahme ihn belegt.
     """
     allowed: tuple[str, ...]
-    mode: str = "acceptEdits"
+    mode: str = "dontAsk"
 
     def __post_init__(self):
         if not self.allowed:
             raise ValueError("Rechteprofil ohne Tools — der Lauf könnte nur hängen bleiben")
+        for tool in self.allowed:
+            if not tool or not tool.strip():
+                raise ValueError(f"Ungültiger Werkzeugname im Rechteprofil: {tool!r}")
         if self.mode not in _ERLAUBTE_MODI:
-            raise ValueError(f"Unzulässiger Permission-Modus: {self.mode}")
+            grund = _WIDERLEGTE_MODI.get(self.mode)
+            if grund:
+                raise ValueError(f"Permission-Modus {self.mode!r} abgelehnt: {grund}")
+            raise ValueError(
+                f"Unzulässiger Permission-Modus: {self.mode!r} — nicht in _ERLAUBTE_MODI. "
+                "Ein Modus gehört erst dann in dieses Set, wenn eine Aufnahme in "
+                "tests/fixtures/permission_probe.md belegt, dass er --allowedTools "
+                "durchsetzt."
+            )
 ```
 
 und in `run()` die Signatur um `profile: PermissionProfile | None = None` erweitern, sowie vor dem Aufruf:
@@ -252,7 +299,9 @@ und in `run()` die Signatur um `profile: PermissionProfile | None = None` erweit
 - [ ] **Step 5: Test laufen lassen, grün bestätigen**
 
 Run: `python3.14 -m pytest tests/test_forge_runner_rechte.py -v`
-Expected: PASS, 6 Tests
+Expected: PASS, 14 Tests (die ursprünglichen 6 plus Härtungstests aus der Messung:
+Tool-Namen-Validierung, `dontAsk`-Default und die Ablehnung von `acceptEdits`
+mitsamt Begründung)
 
 - [ ] **Step 6: Lint und Commit**
 
