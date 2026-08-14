@@ -41,3 +41,7 @@ build/
 mlx_models/
 # Roboter-Laufzeit-State
 .robot_last
+# Forge-Worktrees (forge/__init__.py: FORGE_ROOT) liegen unter ~/Mantis-forge —
+# bewusst ein Geschwisterverzeichnis AUSSERHALB dieses Repos, nicht darunter.
+# Ein .gitignore-Eintrag dafür kann hier nie greifen; das ist beabsichtigt und
+# kein vergessenes Aufräumen.

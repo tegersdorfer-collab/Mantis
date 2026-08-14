@@ -596,6 +596,42 @@ MIGRATIONS = [
     # nach dem ersten Lauf matcht WHERE ...='alfred' keine Zeilen mehr.
     "UPDATE tasks SET assigned_to='mantis' WHERE assigned_to='alfred';",
     "UPDATE calendar_events SET source='mantis' WHERE source='alfred';",
+
+    # ── Forge: semi-autonomes Entwicklungssystem ─────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS forge_tasks (
+        id            SERIAL PRIMARY KEY,
+        title         TEXT NOT NULL,
+        description   TEXT,
+        source        TEXT NOT NULL DEFAULT 'timo',
+        priority      INTEGER NOT NULL DEFAULT 50,
+        state         TEXT NOT NULL DEFAULT 'queued',
+        worktree_path TEXT,
+        branch        TEXT,
+        spec_path     TEXT,
+        plan_path     TEXT,
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        refusals      INTEGER NOT NULL DEFAULT 0,
+        pause_reason  TEXT,
+        paused_until  TIMESTAMPTZ,
+        parked_reason TEXT,
+        created_at    TIMESTAMPTZ DEFAULT NOW(),
+        updated_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS forge_journal (
+        id         SERIAL PRIMARY KEY,
+        task_id    INTEGER REFERENCES forge_tasks(id) ON DELETE CASCADE,
+        ts         TIMESTAMPTZ DEFAULT NOW(),
+        kind       TEXT NOT NULL,
+        message    TEXT,
+        tokens_in  INTEGER NOT NULL DEFAULT 0,
+        tokens_out INTEGER NOT NULL DEFAULT 0
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS forge_journal_ts_idx ON forge_journal(ts DESC);",
+    "CREATE INDEX IF NOT EXISTS forge_tasks_state_idx ON forge_tasks(state, priority DESC);",
 ]
 
 

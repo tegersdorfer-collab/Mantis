@@ -212,7 +212,7 @@ def can_transition(current: str, target: str) -> bool:
 - [ ] **Step 5: Test laufen lassen, grün bestätigen**
 
 Run: `python -m pytest tests/test_forge_models.py -v`
-Expected: PASS, 11 Tests
+Expected: PASS, 13 Tests
 
 - [ ] **Step 6: Migrationen anhängen**
 
@@ -1214,7 +1214,15 @@ Erwartet: mehrere JSON-Zeilen, die letzte mit `"type":"result"`. Prüfen:
 python -c "import json,sys; [print(json.loads(l).get('type'), list(json.loads(l).keys())) for l in open('tests/fixtures/claude_stream_success.jsonl') if l.strip()]"
 ```
 
-**Wenn der Befehl `--verbose` verlangt oder ein anderes Format liefert:** die Aufnahme ist die Wahrheit. Feldnamen in Schritt 3 an die Aufnahme anpassen, nicht umgekehrt. Erwartet werden im Result-Objekt ein Textfeld (`result`), ein Fehler-Flag (`is_error`) und ein `usage`-Objekt mit `input_tokens`/`output_tokens`.
+**Wenn der Befehl `--verbose` verlangt oder ein anderes Format liefert:** die Aufnahme ist die Wahrheit. Feldnamen in Schritt 3 an die Aufnahme anpassen, nicht umgekehrt.
+
+**Bereits am 2026-08-13 an einem echten Lauf verifiziert** (CLI 2.1.126, Fehlerfall): das Result-Event enthält `result`, `is_error`, `subtype`, `usage`, `api_error_status`, `total_cost_usd`, `modelUsage`. Drei Befunde daraus, die in die Implementierung gehören:
+
+1. **`is_error` ist die Autorität, nicht `subtype`.** Der beobachtete Lauf hatte `subtype: "success"` bei `is_error: true`. Wer auf `subtype` prüft, hält Fehlläufe für Erfolge. `parse_stream` prüft korrekt `is_error`.
+2. **`usage` enthält mehr als `input_tokens`/`output_tokens`** — zusätzlich `cache_creation_input_tokens` und `cache_read_input_tokens`. Für Plan 1 genügen die beiden Hauptwerte; die Budget-Rechnung in Plan 3 muss die Cache-Felder mitzählen, sonst rechnet sie zu niedrig.
+3. **`api_error_status`** ist im Fehlerfall gesetzt — in Plan 3 der verlässlichere Weg zur Rate-Limit-Erkennung als Textmarker im Ergebnis.
+
+Was die Aufnahme noch **nicht** belegt: ein erfolgreicher Lauf mit `tokens_in > 0`. Genau dafür ist dieser Schritt da.
 
 - [ ] **Step 2: Test schreiben, der fehlschlägt**
 
@@ -1397,7 +1405,11 @@ def run(prompt: str, cwd: Path, timeout: int = 1800) -> RunResult:
     befehl = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
     try:
         fertig = subprocess.run(
+            # stdin MUSS abgeklemmt werden: ohne DEVNULL wartet die CLI drei Sekunden
+            # auf Eingabe und schreibt eine Warnung — pro Stufe, bei jedem Lauf.
+            # Live gemessen am 2026-08-13.
             befehl, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         return RunResult(ok=False, error=f"Zeitüberschreitung nach {timeout}s")
@@ -1510,6 +1522,30 @@ class TestShouldRun:
         assert laeuft is True
 
 
+class TestFehlerSpiraleUeberlebtNeustart:
+    def test_spirale_setzt_die_not_aus_datei(self, monkeypatch, tmp_path):
+        # Der launchd-Job läuft mit KeepAlive=true. Ohne diese Datei würde der
+        # Daemon 30s nach dem Selbst-Stopp mit failures=0 neu starten und
+        # dieselben Fehlläufe erneut verbrennen — die Bremse wäre keine.
+        stop = tmp_path / "stop"
+        monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
+        monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
+        monkeypatch.setattr(d, "tick", lambda: "fehler")
+        d.main()
+        assert stop.exists()
+
+    def test_nach_der_spirale_laeuft_nichts_mehr(self, monkeypatch, tmp_path):
+        stop = tmp_path / "stop"
+        stop.write_text("Fehler-Spirale\n")
+        monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
+        laeuft, grund = d.should_run(failures=0)
+        assert laeuft is False
+        assert "Not-Aus" in grund
+
+
 class TestTick:
     def test_leere_queue_meldet_leerlauf(self, monkeypatch, frei):
         monkeypatch.setattr(d.queue, "claim_next", lambda: None)
@@ -1592,6 +1628,7 @@ Claude-Sitzung, und drei Fehlschläge in Folge.
 import logging
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -1695,7 +1732,10 @@ def tick() -> str:
 
 def main() -> None:
     """launchd-Einstieg. Läuft bis zum Not-Aus oder bis zur Fehler-Spirale."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # stream=sys.stdout explizit: ohne das geht alles nach stderr, landet also in
+    # mantis_forge_err.log statt im out.log, das die Verifikation unten (Step 8/9)
+    # tailt — sonst kann diese Verifikation nie grün werden (Finding I3).
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
     db.init_pool()
     journal.log(None, "daemon_start", "Forge gestartet")
     log.info("Forge-Daemon gestartet")
@@ -1706,7 +1746,13 @@ def main() -> None:
         if not erlaubt:
             log.info(f"Forge pausiert: {grund}")
             if failures >= MAX_CONSECUTIVE_FAILURES:
-                journal.log(None, "daemon_stop", grund)
+                # Die Bremse MUSS den launchd-Neustart überleben. Der Job läuft mit
+                # KeepAlive=true; ein bloßes return würde 30s später neu starten, den
+                # Zähler auf 0 setzen und dieselben drei Fehlläufe erneut verbrennen —
+                # eine Endlosschleife statt einer Bremse. Die Not-Aus-Datei ist der
+                # einzige Zustand, den ein Neustart nicht vergisst.
+                STOP_FILE.write_text(f"Fehler-Spirale: {grund}\n")
+                journal.log(None, "daemon_stop", f"{grund} — Not-Aus gesetzt, Freigabe durch Timo")
                 return
             time.sleep(BLOCKED_SLEEP_SECONDS)
             continue
@@ -1730,7 +1776,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Test laufen lassen, grün bestätigen**
 
 Run: `python -m pytest tests/test_forge_daemon.py -v`
-Expected: PASS, 11 Tests
+Expected: PASS, 13 Tests
 
 - [ ] **Step 5: Gesamte Test-Suite laufen lassen**
 
@@ -1788,6 +1834,15 @@ Expected: Journal enthält `stage_start` und `stage_done` mit Token-Zahlen > 0; 
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/timoegersdorfer/Mantis</string>
+    <!-- Ohne das bekommt ein launchd-User-Agent nur PATH=/usr/bin:/bin:/usr/sbin:/sbin —
+         claude liegt aber unter ~/.local/bin. Ohne diesen Eintrag scheitert jeder
+         `claude`-Aufruf mit FileNotFoundError, runner.run() liefert "claude nicht
+         startbar", und jeder Task wird mit null Tokens geparkt, ohne dass es auffällt. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/timoegersdorfer/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <!-- Immer neu starten: nach einem Merge beendet sich der Daemon absichtlich
          mit Code 0, damit er mit frischem Code wieder hochkommt (ab Plan 3). -->
     <key>KeepAlive</key>
@@ -1805,6 +1860,8 @@ Expected: Journal enthält `stage_start` und `stage_done` mit Token-Zahlen > 0; 
 ```
 
 Der Pfad ist derselbe Interpreter, den `start.sh` über `which python3.14` findet — geprüft am 2026-08-13. Weicht `which python3.14` ab, gilt der tatsächliche Wert.
+
+`EnvironmentVariables.PATH` ist nicht optional: ohne sie sieht der Prozess nur die launchd-Grundausstattung `/usr/bin:/bin:/usr/sbin:/sbin`, `claude` liegt aber unter `~/.local/bin`. `git`, `pgrep` und `ps` liegen alle in `/usr/bin`, deshalb bleibt der Ausfall auf `claude`-Läufe beschränkt — und fällt deshalb leicht niemandem auf (gefunden und gefixt am 2026-08-13, siehe Finding C1 im Review).
 
 - [ ] **Step 8: Job laden und beobachten**
 
@@ -1840,6 +1897,31 @@ git commit -m "feat(forge): Daemon mit Not-Aus, Pausenlogik und launchd-Job"
 ```
 
 ---
+
+## Nachtrag: Fixes aus dem Whole-Branch-Review (2026-08-13)
+
+Eine Review vor Plan 2 fand mehrere Fundamentbrüche, die die Code-Blöcke oben
+nicht mehr abbilden (diese Blöcke sind Planungs-Historie, kein Änderungslog).
+Kurzfassung, Details im Fix-Report unter `.superpowers/sdd/final-fix-report.md`:
+
+- **C1**: `EnvironmentVariables.PATH` im plist nachgetragen (siehe Task 7 oben)
+  UND `forge/runner.py` löst `claude` jetzt einmalig über `shutil.which()` auf
+  und meldet ein fehlendes Binary spezifisch statt generisch.
+- **C2**: `daemon.tick()` parkt jetzt in einem `try/except` bevor eine Ausnahme
+  weitergereicht wird; `queue.claim_next()` zählt Versuche und parkt ab drei
+  automatisch; `main()` bekommt einen Backoff-Sleep auf dem Fehlerpfad.
+- **I1**: `gitctl.run()` wirft nicht mehr bei `TimeoutExpired` oder wenn ein
+  Lock zwischen Preflight-Prüfung und Zugriff verschwindet — synthetisches
+  `CompletedProcess` statt Exception, wie der Docstring es immer schon versprach.
+- **I2**: `runner.parse_stream()` crasht nicht mehr an gültigem Nicht-Objekt-JSON
+  und behandelt fehlendes `is_error` als Fehlschlag, nicht als Erfolg.
+- **I4**: `tick()` prüft jetzt den Rückgabewert beider `queue.park()`-Aufrufe.
+- **I5**: `worktree.create()` verlangt `(ziel / ".git").exists()`, bevor ein
+  bestehendes Verzeichnis als fertiger Worktree gilt.
+- **I6**: `gitctl.stale_locks()` löst das git-Verzeichnis über
+  `git rev-parse --git-dir` auf statt `.git/` anzunehmen.
+- **I8**: `daemon.main()` ruft jetzt `db.run_migrations()`; `queue.set_state()`
+  und `queue.park()` sind Compare-and-Swap (`WHERE id=%s AND state=%s`).
 
 ## Abnahme für Plan 1
 
