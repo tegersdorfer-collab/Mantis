@@ -8,6 +8,8 @@ eine Leitung in einen Agenten mit Schreibrechten. Der Zaun wird gebaut, bevor
 die Leitung aufgeht, nicht danach.
 """
 
+import re
+
 # Lang genug für echte Aufgabenbeschreibungen, kurz genug, dass niemand über die
 # Beschreibung einen zweiten Systemprompt einschleust.
 MAX_FELDLAENGE = 4000
@@ -20,10 +22,21 @@ def umzaeunen(text: str | None, marke: str) -> str:
     if len(inhalt) > MAX_FELDLAENGE:
         inhalt = inhalt[:MAX_FELDLAENGE] + "\n[… gekürzt]"
 
-    # Eingebettete Marker würden den Zaun schließen; danach gelesenes gälte als
-    # Anweisung. Das Ersetzen ist bewusst plump und irreversibel — hier soll
-    # nichts rekonstruierbar sein, nur unschädlich.
-    inhalt = inhalt.replace(f"<{marke}>", f"({marke})").replace(f"</{marke}>", f"(/{marke})")
+    # Der Leser dieses Zauns ist ein Sprachmodell, kein XML-Parser. Ein LLM
+    # erkennt "</marke>", "</Marke >" und "< /MARKE>" alle als dieselbe
+    # Tag-Struktur — Groß-/Kleinschreibung und Whitespace rund um Namen und
+    # Slash sind für die Erkennung als "Ende der Daten" irrelevant, auch wenn
+    # sie für einen echten XML-Parser drei verschiedene (oder ungültige)
+    # Tokens wären. Ein exakter String-Vergleich schützt also nur gegen einen
+    # Gegner, der sich an XML-Grammatik hält — nicht gegen einen, der weiß,
+    # wie das Modell tatsächlich liest. Deshalb matchen wir hier bewusst
+    # case- und whitespace-tolerant über re.escape(marke), statt exakt auf
+    # f"<{marke}>" zu vergleichen.
+    #
+    # Das Ersetzen bleibt bewusst plump und irreversibel — hier soll nichts
+    # rekonstruierbar sein, nur unschädlich.
+    muster = re.compile(rf"<\s*(/?)\s*{re.escape(marke)}\s*>", re.IGNORECASE)
+    inhalt = muster.sub(lambda m: f"({m.group(1)}{marke})", inhalt)
 
     return f"<{marke}>\n{inhalt}\n</{marke}>"
 
