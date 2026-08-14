@@ -16,6 +16,7 @@ Rückgabewerte:
               einen verlorenen Task verwandeln.
 """
 import logging
+import re
 from pathlib import Path
 
 from forge import gate, gitctl, journal, models as m, queue, runner, stages
@@ -145,6 +146,30 @@ def _verwirf_review_artefakte(worktree: Path) -> None:
                         f"({datei}): {exc}")
 
 
+class _PfadUngueltig(Exception):
+    """Der von einer Stufe gelieferte Pfad-Kandidat übersteht die Normalisierung
+    nicht (leer, absolut, oder mit einer '..'-Komponente). Trägt bewusst den
+    ROHEN, unbereinigten Text: die bereinigte Fassung ist ja gerade als
+    unbrauchbar verworfen worden, und wenn diese Prüfung selbst einmal auf
+    eine neue, hier nicht bedachte Formatierung trifft, ist der rohe Modelltext
+    das Einzige, was den Fund noch diagnostizierbar macht (siehe Akzeptanzlauf
+    2026-08-14: `Erwartetes Artefakt fehlt: ...` allein verriet nicht, dass die
+    Antwort in Backticks steckte)."""
+
+    def __init__(self, roh: str):
+        self.roh = roh
+        super().__init__(roh)
+
+
+# Eine Codezaun-Zeile für sich (```, ```python, ~~~) ist niemals der Pfad
+# selbst — sie markiert nur den Rand eines Blocks, in den ein Modell den Pfad
+# trotz Anweisung setzen kann.
+_ZAUN_ZEILE = re.compile(r"^(`{3,}|~{3,})\s*[\w.+-]*$")
+
+# Markdown-Link-Form: [irgendein Text](der/eigentliche/pfad.md)
+_MARKDOWN_LINK = re.compile(r"^\[[^\]]*\]\(([^)]+)\)$")
+
+
 def _erwarteter_pfad_und_feld(stufe: stages.Stage, task: dict,
                                ergebnis: runner.RunResult) -> tuple[str | None, str | None]:
     """Der Artefakt-Pfad, den diese Stufe versprochen hat, plus das Feld, in
@@ -155,11 +180,17 @@ def _erwarteter_pfad_und_feld(stufe: stages.Stage, task: dict,
     der Task hier lokal um das frisch gelieferte Feld angereichert, bevor
     stufe.artefakt() aufgerufen wird; review und implement/fix ignorieren den
     Task ohnehin (konstantes Ziel bzw. gar keins).
+
+    Wirft _PfadUngueltig, wenn der Kandidat auch nach Normalisierung nicht
+    wie ein Repo-relativer Pfad aussieht — siehe _bereinige_pfad.
     """
     feld = _ARTEFAKT_FELD_JE_STUFE.get(stufe.name)
     if feld is None:
         return stufe.artefakt(task), None
-    kandidat = _letzte_zeile(ergebnis.text)
+    roh = _letzte_zeile(ergebnis.text)
+    kandidat = _bereinige_pfad(roh)
+    if not _ist_gueltiger_relativer_pfad(kandidat):
+        raise _PfadUngueltig(roh)
     angereichert = {**task, feld: kandidat}
     return stufe.artefakt(angereichert), feld
 
@@ -168,9 +199,63 @@ def _letzte_zeile(text: str) -> str:
     """Die Prompts von spec und plan verlangen 'am Ende nur den Pfad' — das
     Modell kann trotzdem Freitext davor setzen (z.B. eine 'Annahme:'-Zeile,
     die derselbe Prompt ausdrücklich erlaubt). Die letzte nicht-leere Zeile
-    ist robuster als der gesamte Text."""
+    ist robuster als der gesamte Text.
+
+    Reine Codezaun-Zeilen zählen dabei nicht als Kandidat: setzt ein Modell
+    den Pfad in einen ```-Block, ist sonst die SCHLIESSENDE Zaun-Zeile die
+    'letzte nicht-leere Zeile', nicht der Pfad selbst."""
     zeilen = [z.strip() for z in (text or "").splitlines() if z.strip()]
-    return zeilen[-1] if zeilen else ""
+    kandidaten = [z for z in zeilen if not _ZAUN_ZEILE.match(z)]
+    return kandidaten[-1] if kandidaten else ""
+
+
+def _bereinige_pfad(roh: str) -> str:
+    """Entfernt die Verpackung, mit der ein Modell einen Pfad trotz expliziter
+    Anweisung ('antworte am Ende nur mit dem Pfad') umgibt: Markdown-Link-
+    Klammern, Backticks, Anführungszeichen, ein schließender Satzpunkt und ein
+    führendes './'. Bewusst konservativ — der Pfad selbst wird nie
+    umgeschrieben, nur seine Verpackung entfernt.
+
+    Belegt durch den Akzeptanzlauf vom 2026-08-14: die echte Modellantwort war
+    '`docs/superpowers/specs/2026-08-14-ist-wochenende-design.md`' (der sonst
+    korrekte Pfad in Backticks) — der bis dahin unbereinigte Pfad-Check verfehlte
+    das existierende Artefakt, weil er wortwörtlich nach einer Datei suchte, deren
+    Name die Backticks mit einschließt.
+    """
+    pfad = (roh or "").strip()
+
+    link = _MARKDOWN_LINK.match(pfad)
+    if link:
+        pfad = link.group(1).strip()
+
+    # Backticks und Anführungszeichen können ineinander verschachtelt sein
+    # (z.B. Anführungszeichen um Backticks) — deshalb wird abwechselnd
+    # gestrippt, bis eine Runde nichts mehr ändert.
+    vorher = None
+    while vorher != pfad:
+        vorher = pfad
+        pfad = pfad.strip().strip("`").strip("'\"").strip()
+
+    if pfad.endswith(".") and not pfad.endswith(".."):
+        pfad = pfad[:-1]
+
+    while pfad.startswith("./"):
+        pfad = pfad[2:]
+
+    return pfad.strip()
+
+
+def _ist_gueltiger_relativer_pfad(pfad: str) -> bool:
+    """Sieht das nach der Bereinigung noch wie ein Repo-relativer Pfad aus?
+
+    Weder ein absoluter Pfad noch eine '..'-Komponente lässt sich sinnvoll
+    unter dem Worktree einordnen — beides muss zum Park führen statt zu einem
+    Dateisystem-Zugriff außerhalb des vorgesehenen Bereichs."""
+    if not pfad:
+        return False
+    if pfad.startswith("/"):
+        return False
+    return ".." not in pfad.split("/")
 
 
 def _park(task_id: int, state: str, grund: str) -> None:
@@ -261,7 +346,13 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
         _park(task_id, state, f"Stufe '{stufe.name}' fehlgeschlagen: {ergebnis.error} (Task {task_id})")
         return "geparkt"
 
-    erwartet, feld = _erwarteter_pfad_und_feld(stufe, task, ergebnis)
+    try:
+        erwartet, feld = _erwarteter_pfad_und_feld(stufe, task, ergebnis)
+    except _PfadUngueltig as exc:
+        _park(task_id, state,
+              f"Von Stufe '{stufe.name}' gelieferter Pfad sieht auch nach Normalisierung nicht wie "
+              f"ein Repo-relativer Pfad aus — roher Modelltext: {exc.roh!r} (Task {task_id})")
+        return "geparkt"
     if erwartet is not None:
         if not _artefakt_vorhanden(worktree, erwartet):
             _park(task_id, state,

@@ -439,3 +439,106 @@ class TestPfadExtraktion:
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
         assert ("spec_path", "docs/specs/y-design.md") in stubs["artefakte"]
+
+
+class TestPfadNormalisierung:
+    """Akzeptanzlauf 2026-08-14: der Spec-Agent lieferte einen Pfad in
+    Markdown-Backticks; der Artefakt-Check suchte wortwörtlich danach
+    (inklusive der Backticks) und parkte den Task, obwohl die Datei
+    tatsächlich existierte. Jeder Test hier prüft eine Verpackungsform, die
+    ein reales Modell trotz der Prompt-Anweisung 'antworte am Ende nur mit
+    dem Pfad' hinzufügen kann."""
+
+    ECHTER_PFAD = "docs/superpowers/specs/2026-08-14-ist-wochenende-design.md"
+
+    def test_exakte_antwort_aus_dem_akzeptanzlauf(self, monkeypatch, stubs, tmp_path):
+        # Die WÖRTLICHE Modellantwort aus dem Journal-Eintrag des Laufs, der
+        # den Bug aufgedeckt hat — keine Nacherzählung, sondern das Original.
+        text = f"`{self.ECHTER_PFAD}`"
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=text)))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "weiter"
+        assert ("spec_path", self.ECHTER_PFAD) in stubs["artefakte"]
+
+    def test_backticks_werden_entfernt(self, monkeypatch, stubs, tmp_path):
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=True, text="`docs/specs/x-design.md`")))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        # Ohne die Bereinigung würde hier der Pfad MIT Backticks landen, und
+        # _artefakt_vorhanden würde exakt diese (falsche) Zeichenkette prüfen.
+        assert ("spec_path", "docs/specs/x-design.md") in stubs["artefakte"]
+
+    def test_umschliessender_codezaun_wird_entfernt(self, monkeypatch, stubs, tmp_path):
+        text = "Hier ist die Spec:\n\n```\ndocs/specs/x-design.md\n```"
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=text)))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        # Ohne Zaun-Erkennung wäre die 'letzte nicht-leere Zeile' die
+        # schließende Zaun-Zeile '```', nicht der Pfad.
+        assert ("spec_path", "docs/specs/x-design.md") in stubs["artefakte"]
+
+    def test_anfuehrungszeichen_werden_entfernt(self, monkeypatch, stubs, tmp_path):
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=True, text='"docs/specs/x-design.md"')))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ("spec_path", "docs/specs/x-design.md") in stubs["artefakte"]
+
+    def test_markdown_link_form_wird_aufgeloest(self, monkeypatch, stubs, tmp_path):
+        text = "[Design-Spec](docs/specs/x-design.md)"
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=text)))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        # Ohne Auflösung landete die komplette Link-Syntax im Feld statt
+        # nur des Pfads dahinter.
+        assert ("spec_path", "docs/specs/x-design.md") in stubs["artefakte"]
+
+    def test_umgebende_leerzeichen_und_abschliessender_punkt_werden_entfernt(self, monkeypatch, stubs, tmp_path):
+        text = "   docs/specs/x-design.md.   "
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=text)))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        # Ohne die Bereinigung bliebe entweder der Satzpunkt am Pfad kleben,
+        # oder das umgebende Leerzeichen würde die Existenzprüfung verfehlen.
+        assert ("spec_path", "docs/specs/x-design.md") in stubs["artefakte"]
+
+    def test_fuehrendes_punkt_slash_wird_entfernt(self, monkeypatch, stubs, tmp_path):
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=True, text="./docs/specs/x-design.md")))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ("spec_path", "docs/specs/x-design.md") in stubs["artefakte"]
+
+    def test_absoluter_pfad_wird_abgelehnt(self, monkeypatch, stubs, tmp_path):
+        # Ein absoluter Pfad lässt sich nicht sinnvoll unter dem Worktree
+        # einordnen — das darf niemals als 'Artefakt fehlt' durchgehen,
+        # sondern muss als eigene, diagnostizierbare Park-Ursache auffallen.
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=True, text="/etc/passwd")))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "geparkt"
+        grund = stubs["parks"][-1][1]
+        assert "/etc/passwd" in grund
+        assert stubs["artefakte"] == []
+
+    def test_pfad_mit_elternverzeichnis_wird_abgelehnt(self, monkeypatch, stubs, tmp_path):
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=True, text="docs/../../../etc/passwd")))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "geparkt"
+        grund = stubs["parks"][-1][1]
+        assert "docs/../../../etc/passwd" in grund
+        assert stubs["artefakte"] == []
+
+    def test_park_grund_zeigt_den_rohen_modelltext_nicht_nur_den_bereinigten(self, monkeypatch, stubs, tmp_path):
+        # Kern der Anforderung: wenn die Ablehnung selbst auf eine neue,
+        # unvorhergesehene Formatierung trifft, ist der ROHE Text das Einzige,
+        # was den Fund noch diagnostizierbar macht.
+        roh = "  `/absolute/pfad.md`  "
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=roh)))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "geparkt"
+        grund = stubs["parks"][-1][1]
+        assert roh.strip() in grund
