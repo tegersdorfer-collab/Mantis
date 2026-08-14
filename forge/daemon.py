@@ -1,8 +1,13 @@
 """Hauptschleife der Forge.
 
 Plan 1 (Fundament): ein Task, ein Worktree, ein Claude-Lauf, Journal, parken.
-Gemerged wird noch nichts — die Pipeline kommt in Plan 2, Merge und
-Neustart-Etikette in Plan 3.
+Plan 2 (dieser Stand): der Trockenlauf ist der vollen fünfstufigen Pipeline
+(forge/pipeline.py) und dem deterministischen Gate (forge/gate.py) gewichen.
+`tick()` bringt einen Task pro Aufruf genau eine Stufe weiter; meldet die
+Pipeline "fertig" (Zustand GATING erreicht), lässt der Daemon selbst das Gate
+laufen. Ein grünes Gate bringt den Task nach `awaiting_restart_window`, wo er
+liegen bleibt — Merge und Neustart-Etikette folgen erst in Plan 3. Gemerged
+wird hier noch nichts.
 
 Der Daemon hält sich an zwei Bremsen: Not-Aus-Datei und drei Fehlschläge in Folge.
 
@@ -20,7 +25,8 @@ from pathlib import Path
 
 from core import db
 
-from forge import journal, queue, runner, worktree
+from forge import gate, journal, pipeline, queue, worktree
+from forge import models as m
 
 log = logging.getLogger(__name__)
 
@@ -43,20 +49,53 @@ def should_run(failures: int) -> tuple[bool, str]:
     return True, "frei"
 
 
-def _trockenlauf_prompt(task: dict) -> str:
-    """Plan-1-Prompt: nur orientieren, nichts ändern."""
-    return (
-        "Du arbeitest in einem isolierten git-Worktree des Mantis-Projekts.\n"
-        f"Anstehende Aufgabe: {task['title']}\n"
-        f"{task.get('description') or ''}\n\n"
-        "Das ist ein Trockenlauf. Ändere KEINE Dateien und committe nichts. "
-        "Lies dich ein und antworte in höchstens 10 Zeilen: welche Dateien wären "
-        "für diese Aufgabe relevant, und wo liegt die größte Unsicherheit?"
-    )
+def _park(task_id: int, current: str, reason: str) -> None:
+    """Parkt und journalt den Grund. Wie forge.pipeline._park: ein verworfener
+    park()-Aufruf darf nicht spurlos bleiben, sonst hält ein Task, den nichts
+    mehr bewegen kann, die Queue fest, ohne dass irgendwo sichtbar wird warum."""
+    journal.log(task_id, "stage_failed", reason)
+    if not queue.park(task_id, current=current, reason=reason):
+        journal.log(task_id, "stage_failed",
+                     f"park() hat Task {task_id} nicht angenommen (Zustand '{current}')")
+
+
+def _gate_und_abschliessen(task_id: int, baum: Path) -> str:
+    """Der Task steht in GATING. Lässt das deterministische Gate laufen und
+    schließt ihn ab — grün bringt ihn nach `awaiting_restart_window`, wo er
+    liegen bleibt (Merge und Neustart-Etikette folgen erst in Plan 3), rot
+    parkt ihn mit allen gesammelten Gründen.
+
+    Rückgabe: 'fertig' bei grünem Gate, 'geparkt' bei rotem oder wenn der
+    Zustandswechsel selbst scheitert (CAS verloren).
+    """
+    ergebnis = gate.pruefe(baum)
+    if ergebnis.ok:
+        journal.log(task_id, "gate_pass", "Gate bestanden — wartet auf Neustart-Fenster (Plan 3)")
+        if not queue.set_state(task_id, m.AWAITING_RESTART, current=m.GATING):
+            # CAS verloren — "fertig" zurückzugeben würde einen Fortschritt
+            # vorgaukeln, der laut DB nie stattfand.
+            _park(task_id, m.GATING,
+                  f"Zustandswechsel {m.GATING} -> {m.AWAITING_RESTART} schlug fehl (Task {task_id})")
+            return "geparkt"
+        return "fertig"
+
+    gruende = "; ".join(ergebnis.gruende)
+    journal.log(task_id, "gate_fail", gruende)
+    _park(task_id, m.GATING, f"Gate rot: {gruende}")
+    return "geparkt"
 
 
 def tick() -> str:
-    """Ein Durchlauf. Rückgabe: 'leerlauf' | 'trockenlauf' | 'fehler'.
+    """Ein Durchlauf. Rückgabe: 'leerlauf' | 'weiter' | 'fertig' | 'geparkt' | 'fehler'.
+
+    Bringt den aktiven (oder nächsten) Task genau eine Pipeline-Stufe weiter
+    (forge/pipeline.py). Meldet die Pipeline "fertig", ist der Task in GATING
+    angekommen — dann läuft hier direkt im Anschluss das Gate. Ein Task, der
+    bereits VOR diesem Tick in GATING steht (Wiederaufnahme nach einem
+    Absturz zwischen "fertig" und dem Gate-Lauf), überspringt die Pipeline
+    ganz: sie kennt den Zustand GATING nicht (deckt nur speccing..reviewing
+    ab) und würde ihn sonst mit "Kein Stufen-Handler" parken, ohne dass das
+    Gate je gelaufen wäre.
 
     Ab dem Moment, in dem `queue.claim_next()` einen Task liefert, steht dessen
     Zustand in der DB auf einer ACTIVE_STATES-Stufe. Alles danach läuft in
@@ -64,47 +103,39 @@ def tick() -> str:
     None) und der Task wird bestmöglich geparkt, BEVOR die Ausnahme weiter
     nach oben gereicht wird — sonst bleibt er aktiv hängen, und der nächste
     Tick zieht genau denselben poisoned Task wieder, ohne Backoff.
+
+    pipeline.eine_stufe() fängt ihre eigenen Ausnahmen bereits ab (nie mehr
+    eine Exception aus einem Claude-Lauf) — das try/except hier bleibt trotzdem
+    stehen, es sichert weiterhin echte Absturzquellen wie worktree.create()
+    und einen unerwarteten Fehler im Gate-Anschluss selbst ab.
     """
     task = queue.claim_next()
     if task is None:
         return "leerlauf"
 
     task_id = task["id"]
+    state = task["state"]
     try:
-        journal.log(task_id, "stage_start", f"Trockenlauf für: {task['title']}")
-
         baum = worktree.create(task_id)
-        ergebnis = runner.run(_trockenlauf_prompt(task), cwd=baum)
 
-        journal.log(
-            task_id,
-            "stage_done" if ergebnis.ok else "stage_failed",
-            (ergebnis.text or ergebnis.error or "")[:2000],
-            tokens_in=ergebnis.tokens_in,
-            tokens_out=ergebnis.tokens_out,
-        )
+        if state == m.GATING:
+            return _gate_und_abschliessen(task_id, baum)
 
-        if not ergebnis.ok:
-            geparkt = queue.park(task_id, current=task["state"],
-                                  reason=f"Trockenlauf fehlgeschlagen: {ergebnis.error}")
-            if not geparkt:
-                journal.log(task_id, "stage_failed", "park() hat den fehlgeschlagenen Task nicht angenommen")
-            return "fehler"
+        ergebnis = pipeline.eine_stufe(task, baum)
 
-        geparkt = queue.park(task_id, current=task["state"],
-                              reason="Plan-1-Trockenlauf abgeschlossen — Pipeline folgt in Plan 2")
-        if not geparkt:
-            # Ohne diese Prüfung würde ein verworfener park()-Aufruf als
-            # "trockenlauf" durchgehen: failures würde auf 0 zurückgesetzt und
-            # es gäbe keinen Backoff — eine ungebremste Schleife voller
-            # Vollpreis-Läufe an einem Task, der in Wahrheit aktiv hängen blieb.
-            journal.log(task_id, "stage_failed", "park() hat den erfolgreichen Task nicht angenommen")
-            return "fehler"
-        return "trockenlauf"
+        if ergebnis == "fertig":
+            # eine_stufe() hat den Übergang bereits nach GATING vollzogen —
+            # `state` muss das nachziehen, damit park() im Absturzfall (siehe
+            # except unten) mit dem tatsächlichen DB-Zustand als CAS-Basis
+            # arbeitet, nicht mit dem veralteten Ausgangszustand.
+            state = m.GATING
+            return _gate_und_abschliessen(task_id, baum)
+
+        return ergebnis
     except Exception as exc:
         journal.log(task_id, "stage_failed", f"Tick-Absturz bei Task {task_id}: {exc}")
         try:
-            geparkt = queue.park(task_id, current=task["state"], reason=f"Tick-Absturz: {exc}")
+            geparkt = queue.park(task_id, current=state, reason=f"Tick-Absturz: {exc}")
             if not geparkt:
                 log.error(f"Forge: Task {task_id} nach Absturz nicht parkbar — bleibt aktiv")
         except Exception:
