@@ -44,6 +44,15 @@ SPEC_VERZEICHNIS = "docs/superpowers/specs"
 PLAN_VERZEICHNIS = "docs/superpowers/plans"
 VERDIKT_DATEI = ".forge/review.json"
 
+# Die Review-Stufe hat absichtlich kein Bash und kann sich also KEINEN eigenen
+# Diff erzeugen (kein `git diff`, kein sonstiger Befehl) — sonst könnte sie
+# sich eine ihr genehme Sicht auf die Änderung zusammenbauen, statt die
+# tatsächliche zu prüfen. Stattdessen liest sie den Diff aus dieser Datei.
+# WICHTIG: forge/pipeline.py (Task 6) MUSS diese Datei schreiben, BEVOR die
+# Review-Stufe läuft — ohne sie prüft review eine Spec ohne jede Sicht auf
+# das, was tatsächlich geändert wurde, und das Gate-Urteil stünde auf nichts.
+DIFF_DATEI = ".forge/diff.patch"
+
 
 @dataclass(frozen=True)
 class Stage:
@@ -105,7 +114,9 @@ def _review_prompt(task: dict, kontext: dict) -> str:
     return (
         _kopf(task) + "\n\n"
         f"Die Spec liegt unter: {kontext.get('spec_path', '(unbekannt)')}\n"
-        "Prüfe den Diff dieses Branches gegen die Spec. Du hast den "
+        f"Der Diff dieses Branches gegen die Spec liegt unter: {DIFF_DATEI}. Das "
+        "ist deine einzige verlässliche Sicht auf die Änderung — lies diese "
+        "Datei, statt einen eigenen Diff zu erzeugen. Du hast den "
         "Entstehungsverlauf NICHT gesehen und sollst ihm auch nicht vertrauen.\n"
         f"Schreibe dein Urteil als JSON nach {VERDIKT_DATEI}:\n"
         '{"verdict": "pass" oder "fail", "findings": [{"severity": "critical|important|minor", '

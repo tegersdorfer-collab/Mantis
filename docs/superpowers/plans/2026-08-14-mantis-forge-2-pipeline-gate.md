@@ -592,6 +592,13 @@ class TestPrompts:
     def test_review_prompt_verlangt_das_verdikt_als_datei(self):
         text = s.fuer_state(m.REVIEWING).baue_prompt(self._task(), kontext={})
         assert ".forge/review.json" in text
+
+    def test_review_prompt_verweist_auf_die_diff_datei(self):
+        # review hat kein Bash und kann sich also keinen eigenen Diff erzeugen
+        # (kein `git diff`) — der Prompt muss stattdessen auf die Datei
+        # verweisen, die die Pipeline (Task 6) vorher schreibt.
+        text = s.fuer_state(m.REVIEWING).baue_prompt(self._task(), kontext={})
+        assert s.DIFF_DATEI in text
 ```
 
 - [ ] **Step 2: Test laufen lassen, Fehlschlag bestätigen**
@@ -649,6 +656,15 @@ from forge.runner import PermissionProfile
 SPEC_VERZEICHNIS = "docs/superpowers/specs"
 PLAN_VERZEICHNIS = "docs/superpowers/plans"
 VERDIKT_DATEI = ".forge/review.json"
+
+# Die Review-Stufe hat absichtlich kein Bash und kann sich also KEINEN eigenen
+# Diff erzeugen (kein `git diff`, kein sonstiger Befehl) — sonst könnte sie
+# sich eine ihr genehme Sicht auf die Änderung zusammenbauen, statt die
+# tatsächliche zu prüfen. Stattdessen liest sie den Diff aus dieser Datei.
+# WICHTIG: forge/pipeline.py (Task 6) MUSS diese Datei schreiben, BEVOR die
+# Review-Stufe läuft — ohne sie prüft review eine Spec ohne jede Sicht auf
+# das, was tatsächlich geändert wurde, und das Gate-Urteil stünde auf nichts.
+DIFF_DATEI = ".forge/diff.patch"
 
 
 @dataclass(frozen=True)
@@ -711,7 +727,9 @@ def _review_prompt(task: dict, kontext: dict) -> str:
     return (
         _kopf(task) + "\n\n"
         f"Die Spec liegt unter: {kontext.get('spec_path', '(unbekannt)')}\n"
-        "Prüfe den Diff dieses Branches gegen die Spec. Du hast den "
+        f"Der Diff dieses Branches gegen die Spec liegt unter: {DIFF_DATEI}. Das "
+        "ist deine einzige verlässliche Sicht auf die Änderung — lies diese "
+        "Datei, statt einen eigenen Diff zu erzeugen. Du hast den "
         "Entstehungsverlauf NICHT gesehen und sollst ihm auch nicht vertrauen.\n"
         f"Schreibe dein Urteil als JSON nach {VERDIKT_DATEI}:\n"
         '{"verdict": "pass" oder "fail", "findings": [{"severity": "critical|important|minor", '
@@ -1216,6 +1234,8 @@ git commit -m "feat(forge): deterministisches Gate"
 - Ändert außerdem: `forge.runner.RunResult` bekommt ein Feld `denials: list[dict]`, gefüllt aus `permission_denials` des Result-Events; `parse_stream` liest es mit.
 
 **Warum das Feld hier dazukommt:** Die Messung aus Task 1 hat gezeigt, dass ein verweigertes Tool `is_error` **nicht** setzt — der Lauf sieht wie ein Erfolg aus, nur ohne Ergebnis. Ohne `denials` würde eine Stufe mit zu engem Rechteprofil als „Artefakt fehlt" geparkt, und niemand käme darauf, dass in Wahrheit die Rechte zu eng waren. Die Pipeline muss deshalb: bei nicht-leerem `denials` mit einem Grund parken, der die verweigerten Tools **beim Namen nennt**. Schreibe dafür einen Test, der genau diese Unterscheidung prüft — gleicher `ok=True`, einmal mit und einmal ohne `denials`, und die Park-Gründe müssen sich unterscheiden.
+
+**Diff-Artefakt für die Review-Stufe:** `review` hat kein `Bash` (siehe Task 1/3) und kann sich also keinen eigenen Diff erzeugen. Bevor `eine_stufe` die Review-Stufe laufen lässt, muss die Pipeline deshalb `forge.stages.DIFF_DATEI` (`.forge/diff.patch`) im Worktree mit dem Diff dieses Branches gegen seine Basis befüllen — sonst prüft review eine Spec ohne jede Sicht auf die tatsächliche Änderung, und das Gate-Urteil stünde auf nichts.
 
 - [ ] **Step 1: Test schreiben, der fehlschlägt**
 

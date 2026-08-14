@@ -154,6 +154,13 @@ class TestPrompts:
         text = s.fuer_state(m.REVIEWING).baue_prompt(self._task(), kontext={})
         assert ".forge/review.json" in text
 
+    def test_review_prompt_verweist_auf_die_diff_datei(self):
+        # review hat kein Bash und kann sich also keinen eigenen Diff erzeugen
+        # (kein `git diff`) — der Prompt muss stattdessen auf die Datei
+        # verweisen, die die Pipeline (Task 6) vorher schreibt.
+        text = s.fuer_state(m.REVIEWING).baue_prompt(self._task(), kontext={})
+        assert s.DIFF_DATEI in text
+
     def test_kein_prompt_interpoliert_rohe_taskfelder_direkt(self):
         # Ein manipulierter Titel darf nirgends unzensiert im Prompt landen —
         # jede Stufe muss durch aufgabenblock()/umzaeunen() gehen, sonst wäre
