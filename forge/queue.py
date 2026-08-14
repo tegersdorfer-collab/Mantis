@@ -132,3 +132,26 @@ def pause(task_id: int, reason: str, until: datetime) -> None:
         "UPDATE forge_tasks SET pause_reason=%s, paused_until=%s, updated_at=NOW() WHERE id=%s",
         (reason, until, task_id),
     )
+
+
+# Nur diese Felder dürfen über setze_artefakt geschrieben werden. Der Feldname
+# geht in den SQL-Text — ohne Whitelist wäre das eine Injection-Stelle mitten in
+# der Datenschicht, erreichbar über einen Pfad, den ein Agent bestimmt hat.
+_ARTEFAKT_FELDER = frozenset({"spec_path", "plan_path", "worktree_path", "branch"})
+
+
+def setze_artefakt(task_id: int, feld: str, pfad: str) -> None:
+    """Hinterlegt den Pfad eines Stufen-Artefakts."""
+    if feld not in _ARTEFAKT_FELDER:
+        raise ValueError(f"Unzulässiges Artefakt-Feld: {feld}")
+    db.execute(f"UPDATE forge_tasks SET {feld}=%s, updated_at=NOW() WHERE id=%s", (pfad, task_id))
+
+
+def zaehle_fixrunde(task_id: int) -> int:
+    """Erhöht den Fix-Runden-Zähler und gibt den neuen Stand zurück."""
+    zeile = db.query_one(
+        "UPDATE forge_tasks SET refusals=refusals+1, updated_at=NOW() "
+        "WHERE id=%s RETURNING refusals",
+        (task_id,),
+    )
+    return int(zeile["refusals"]) if zeile else 0
