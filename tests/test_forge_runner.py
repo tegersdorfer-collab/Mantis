@@ -29,6 +29,15 @@ class TestParseEchteAufnahme:
         assert ergebnis.tokens_in > 0
         assert ergebnis.tokens_out > 0
 
+    def test_cache_tokens_werden_gezaehlt(self):
+        # Diese echte Aufnahme zeigt genau das Missverhältnis, das Plan 3s
+        # Budget-Reserve ohne diese Felder um Größenordnungen falsch rechnen
+        # ließe: 3 input_tokens/5 output_tokens gegen 10102 cache_read und
+        # 8779 cache_creation.
+        ergebnis = runner.parse_stream(FIXTURE.read_text().splitlines())
+        assert ergebnis.cache_read == 10102
+        assert ergebnis.cache_creation == 8779
+
 
 class TestParseFehlerfaelle:
     def test_fehlerhafter_lauf_ist_nicht_ok(self):

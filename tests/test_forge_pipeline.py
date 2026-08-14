@@ -286,6 +286,18 @@ class TestTokenWeiterleitung:
         treffer = [e for e in stubs["journal"] if e[1].get("tokens_in") == 3 and e[1].get("tokens_out") == 5]
         assert treffer, f"tokens_in/out nicht korrekt weitergereicht: {stubs['journal']}"
 
+    def test_cache_felder_landen_unverfaelscht_im_journal(self, monkeypatch, stubs, tmp_path):
+        # Gemessen (tests/fixtures/claude_stream_success.jsonl): 10102 cache_read
+        # und 8779 cache_creation gegen nur 3/5 tokens_in/out — Plan 3s
+        # Budget-Reserve rechnet mit den Cache-Feldern, nicht nur mit tokens_in/out.
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=True, text="x", cache_read=10102, cache_creation=8779)))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        treffer = [e for e in stubs["journal"]
+                   if e[1].get("cache_read") == 10102 and e[1].get("cache_creation") == 8779]
+        assert treffer, f"cache_read/cache_creation nicht korrekt weitergereicht: {stubs['journal']}"
+
 
 class TestFehlgeschlagenerGitDiffParkt:
     """Kritischer Fund 2: `git diff` mit non-zero returncode (kaputter Ref,

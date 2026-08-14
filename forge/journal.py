@@ -21,15 +21,22 @@ KINDS = frozenset({
 
 
 def log(task_id: int | None, kind: str, message: str = "",
-        tokens_in: int = 0, tokens_out: int = 0) -> None:
-    """Schreibt ein Ereignis. Fehler hier dürfen den Daemon nie stoppen."""
+        tokens_in: int = 0, tokens_out: int = 0,
+        cache_read: int = 0, cache_creation: int = 0) -> None:
+    """Schreibt ein Ereignis. Fehler hier dürfen den Daemon nie stoppen.
+
+    cache_read/cache_creation additiv angehängt (siehe forge/runner.py,
+    RunResult): erst mit der zugehörigen Migration in core/db.py hat
+    forge_journal die passenden Spalten dafür.
+    """
     if kind not in KINDS:
         _log.debug(f"Forge-Journal: unbekannte Ereignisart '{kind}' — wird trotzdem geschrieben")
     try:
         db.execute(
-            "INSERT INTO forge_journal (task_id, kind, message, tokens_in, tokens_out) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            (task_id, kind, message, tokens_in, tokens_out),
+            "INSERT INTO forge_journal "
+            "(task_id, kind, message, tokens_in, tokens_out, cache_read, cache_creation) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (task_id, kind, message, tokens_in, tokens_out, cache_read, cache_creation),
         )
     except Exception as exc:  # Journal darf nie der Grund für einen Abbruch sein
         _log.error(f"Forge-Journal-Schreibfehler: {exc}")

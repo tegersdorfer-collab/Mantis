@@ -632,6 +632,13 @@ MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS forge_journal_ts_idx ON forge_journal(ts DESC);",
     "CREATE INDEX IF NOT EXISTS forge_tasks_state_idx ON forge_tasks(state, priority DESC);",
+
+    # forge_journal: Cache-Token-Spalten (siehe forge/runner.py RunResult) —
+    # gemessen an einer echten Aufnahme lagen cache_read/cache_creation um
+    # Größenordnungen über tokens_in/tokens_out; ohne diese Spalten würde
+    # journal.log() Werte entgegennehmen, die nirgendwo persistiert werden.
+    "ALTER TABLE forge_journal ADD COLUMN IF NOT EXISTS cache_read INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE forge_journal ADD COLUMN IF NOT EXISTS cache_creation INTEGER NOT NULL DEFAULT 0;",
 ]
 
 

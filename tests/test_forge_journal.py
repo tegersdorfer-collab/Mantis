@@ -31,8 +31,9 @@ def _patch(monkeypatch, rows=None):
 class TestLog:
     def test_schreibt_alle_felder(self, monkeypatch):
         rec = _patch(monkeypatch)
-        j.log(3, "stage_done", "Spec fertig", tokens_in=100, tokens_out=250)
-        assert rec.executes[-1][1] == (3, "stage_done", "Spec fertig", 100, 250)
+        j.log(3, "stage_done", "Spec fertig", tokens_in=100, tokens_out=250,
+              cache_read=10102, cache_creation=8779)
+        assert rec.executes[-1][1] == (3, "stage_done", "Spec fertig", 100, 250, 10102, 8779)
 
     def test_task_id_darf_none_sein(self, monkeypatch):
         rec = _patch(monkeypatch)
@@ -50,7 +51,7 @@ class TestLog:
     def test_defaults_sind_null_tokens(self, monkeypatch):
         rec = _patch(monkeypatch)
         j.log(1, "gate_pass")
-        assert rec.executes[-1][1] == (1, "gate_pass", "", 0, 0)
+        assert rec.executes[-1][1] == (1, "gate_pass", "", 0, 0, 0, 0)
 
 
 def _boom(sql, params=()):

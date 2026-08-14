@@ -66,6 +66,14 @@ class RunResult:
     # Feld wäre eine zu eng berechtigte Stufe von einer, deren Artefakt aus
     # anderem Grund fehlt, nicht zu unterscheiden.
     denials: list[dict] = field(default_factory=list)
+    # Gemessen an einer echten Aufnahme (tests/fixtures/claude_stream_success.jsonl):
+    # 3 input_tokens/5 output_tokens standen dort 10102 cache_read_input_tokens und
+    # 8779 cache_creation_input_tokens gegenüber — ohne diese beiden Felder wäre
+    # Plan 3s Budget-Reserve um Größenordnungen falsch, weil sie nur auf tokens_in/
+    # tokens_out rechnet. Additiv ans Ende gehängt, damit bestehende positionale
+    # Konstruktionsaufrufe von RunResult unverändert bleiben.
+    cache_read: int = 0
+    cache_creation: int = 0
 
 
 @dataclass(frozen=True)
@@ -140,6 +148,10 @@ def parse_stream(lines: Iterable[str]) -> RunResult:
     verbrauch = schluss.get("usage") or {}
     tokens_in = int(verbrauch.get("input_tokens") or 0)
     tokens_out = int(verbrauch.get("output_tokens") or 0)
+    # Cache-Felder: bei realen Läufen um Größenordnungen größer als tokens_in/
+    # tokens_out (siehe RunResult-Docstring) — Plan 3s Budget-Reserve braucht sie.
+    cache_read = int(verbrauch.get("cache_read_input_tokens") or 0)
+    cache_creation = int(verbrauch.get("cache_creation_input_tokens") or 0)
     # Der einzige verlässliche Marker für ein verweigertes Tool (siehe
     # permission_probe.md, Probe b2) — is_error bleibt dabei false.
     denials = schluss.get("permission_denials") or []
@@ -154,6 +166,7 @@ def parse_stream(lines: Iterable[str]) -> RunResult:
         return RunResult(
             ok=False, text=text, tokens_in=tokens_in, tokens_out=tokens_out,
             error=fehler, rate_limited=_ist_rate_limit(text), raw=ereignisse, denials=denials,
+            cache_read=cache_read, cache_creation=cache_creation,
         )
 
     if ist_fehler:
@@ -162,10 +175,12 @@ def parse_stream(lines: Iterable[str]) -> RunResult:
         return RunResult(
             ok=False, text=text, tokens_in=tokens_in, tokens_out=tokens_out,
             error=fehler, rate_limited=_ist_rate_limit(text), raw=ereignisse, denials=denials,
+            cache_read=cache_read, cache_creation=cache_creation,
         )
 
     return RunResult(ok=True, text=text, tokens_in=tokens_in, tokens_out=tokens_out,
-                      raw=ereignisse, denials=denials)
+                      raw=ereignisse, denials=denials,
+                      cache_read=cache_read, cache_creation=cache_creation)
 
 
 def run(prompt: str, cwd: Path, timeout: int = 1800, profile: PermissionProfile | None = None) -> RunResult:

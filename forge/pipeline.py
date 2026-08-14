@@ -243,6 +243,8 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
         (ergebnis.text or ergebnis.error or "")[:2000],
         tokens_in=ergebnis.tokens_in,
         tokens_out=ergebnis.tokens_out,
+        cache_read=ergebnis.cache_read,
+        cache_creation=ergebnis.cache_creation,
     )
 
     if ergebnis.rate_limited:
