@@ -19,6 +19,11 @@ log = logging.getLogger(__name__)
 # Flag, um bis zum Reset zu schlafen, statt den Task zu parken.
 _RATE_LIMIT_MARKER = ("usage limit reached", "rate limit", "rate_limit")
 
+# Modi, die für einen unbeaufsichtigten Daemon in Frage kommen. bypassPermissions
+# ist bewusst NICHT dabei: ein Prozess, der nachts ohne Aufsicht läuft, darf sich
+# nicht selbst alle Rechte erteilen — das ist der ganze Sinn der Profile.
+_ERLAUBTE_MODI = frozenset({"acceptEdits", "dontAsk", "plan", "default", "auto"})
+
 # Einmal beim Import aufgelöst, nicht bei jedem Lauf: ein launchd-User-Agent
 # bekommt standardmäßig nur PATH=/usr/bin:/bin:/usr/sbin:/sbin — dort liegt
 # `claude` nicht. Ohne diese Prüfung landet die Suche erst in subprocess.run(),
@@ -36,6 +41,33 @@ class RunResult:
     error: str | None = None
     rate_limited: bool = False
     raw: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PermissionProfile:
+    """Womit ein einzelner Lauf arbeiten darf.
+
+    `allowed` folgt der CLI-Syntax (verifiziert 2026-08-14): Tool-Namen oder
+    Muster wie "Bash(git *)", von der CLI leerzeichengetrennt erwartet.
+
+    Der Default-Modus ist ABSICHTLICH `dontAsk`, nicht `acceptEdits`: die
+    Aufnahme in tests/fixtures/permission_probe.md (Probe b1) zeigt, dass
+    `acceptEdits` einen Write-Aufruf durchwinkt, obwohl `Write` nicht in
+    `allowed` stand — das Profil wäre für Datei-Edits wirkungslos. `dontAsk`
+    verweigert denselben Zugriff nachweislich korrekt (sichtbar in
+    `permission_denials`) und hängt dabei nicht.
+    """
+    allowed: tuple[str, ...]
+    mode: str = "dontAsk"
+
+    def __post_init__(self):
+        if not self.allowed:
+            raise ValueError("Rechteprofil ohne Tools — der Lauf könnte nur hängen bleiben")
+        for tool in self.allowed:
+            if not tool or not tool.strip():
+                raise ValueError(f"Ungültiger Werkzeugname im Rechteprofil: {tool!r}")
+        if self.mode not in _ERLAUBTE_MODI:
+            raise ValueError(f"Unzulässiger Permission-Modus: {self.mode}")
 
 
 def _ist_rate_limit(text: str) -> bool:
@@ -97,14 +129,22 @@ def parse_stream(lines: Iterable[str]) -> RunResult:
     return RunResult(ok=True, text=text, tokens_in=tokens_in, tokens_out=tokens_out, raw=ereignisse)
 
 
-def run(prompt: str, cwd: Path, timeout: int = 1800) -> RunResult:
-    """Führt einen headless Lauf im angegebenen Worktree aus."""
+def run(prompt: str, cwd: Path, timeout: int = 1800, profile: PermissionProfile | None = None) -> RunResult:
+    """Führt einen headless Lauf im angegebenen Worktree aus.
+
+    Ohne `profile` erbt der Lauf die Rechte aus ~/.claude/settings.json des
+    aufrufenden Users — das ist das Verhalten aus Plan 1 und bleibt für
+    bestehende Aufrufer unverändert. Mit `profile` wird der Lauf explizit auf
+    die dort genannten Werkzeuge und den Permission-Modus eingeschränkt.
+    """
     if CLAUDE_BIN is None:
         fehler = f"claude-Binary nicht im PATH gefunden (PATH={os.environ.get('PATH', '')})"
         log.warning(f"Forge-Runner: {fehler}")
         return RunResult(ok=False, error=fehler)
 
     befehl = [CLAUDE_BIN, "-p", prompt, "--output-format", "stream-json", "--verbose"]
+    if profile is not None:
+        befehl += ["--allowedTools", " ".join(profile.allowed), "--permission-mode", profile.mode]
     try:
         fertig = subprocess.run(
             # stdin MUSS abgeklemmt werden: ohne DEVNULL wartet die CLI drei Sekunden
