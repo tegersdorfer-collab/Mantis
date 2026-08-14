@@ -4,12 +4,16 @@ Plan 1 (Fundament): ein Task, ein Worktree, ein Claude-Lauf, Journal, parken.
 Gemerged wird noch nichts — die Pipeline kommt in Plan 2, Merge und
 Neustart-Etikette in Plan 3.
 
-Der Daemon hält sich an drei Bremsen: Not-Aus-Datei, laufende interaktive
-Claude-Sitzung, und drei Fehlschläge in Folge.
+Der Daemon hält sich an zwei Bremsen: Not-Aus-Datei und drei Fehlschläge in Folge.
+
+Bewusst KEINE Bremse: eine parallel laufende interaktive Claude-Sitzung. Timo
+hat sich am 2026-08-14 dagegen entschieden — die Forge soll durchlaufen, auch
+während er selbst arbeitet. Der Preis: beide ziehen vom selben Kontingent, und
+auf 16 GB RAM konkurriert die Test-Suite mit allem anderen. Ab Plan 3 ist die
+Budget-Reserve die einzige Schranke dagegen; sie muss entsprechend
+konservativ ausgelegt sein.
 """
 import logging
-import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -30,48 +34,12 @@ BLOCKED_SLEEP_SECONDS = 300
 FAILURE_SLEEP_SECONDS = 30
 
 
-def interactive_claude_running() -> bool:
-    """Läuft eine interaktive Claude-Code-Sitzung von Timo?
-
-    Die eigenen Kindprozesse zählen nicht — sonst sperrt sich die Forge selbst aus.
-    """
-    try:
-        fertig = subprocess.run(["pgrep", "-x", "claude"], capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if fertig.returncode != 0:
-        return False
-
-    eigene = {os.getpid()}
-    for zeile in fertig.stdout.split():
-        try:
-            pid = int(zeile)
-        except ValueError:
-            continue
-        if pid in eigene or _ist_kind_von_uns(pid):
-            continue
-        return True
-    return False
-
-
-def _ist_kind_von_uns(pid: int) -> bool:
-    """Hängt der Prozess unter diesem Daemon?"""
-    try:
-        fertig = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
-                                capture_output=True, text=True, timeout=5)
-        return int(fertig.stdout.strip() or -1) == os.getpid()
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return False
-
-
 def should_run(failures: int) -> tuple[bool, str]:
     """Darf gerade gearbeitet werden? Zweiter Rückgabewert ist der Grund."""
     if STOP_FILE.exists():
         return False, f"Not-Aus aktiv ({STOP_FILE})"
     if failures >= MAX_CONSECUTIVE_FAILURES:
         return False, f"{failures} Fehlschläge in Folge — Daemon hält an"
-    if interactive_claude_running():
-        return False, "interaktive Claude-Sitzung läuft"
     return True, "frei"
 
 

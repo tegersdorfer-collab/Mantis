@@ -15,9 +15,8 @@ from forge.runner import RunResult
 
 @pytest.fixture
 def frei(monkeypatch, tmp_path):
-    """Standardlage: kein Not-Aus, keine interaktive Sitzung."""
+    """Standardlage: kein Not-Aus."""
     monkeypatch.setattr(d, "STOP_FILE", tmp_path / "kein-stop")
-    monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
 
 
 class TestShouldRun:
@@ -29,18 +28,10 @@ class TestShouldRun:
         stop = tmp_path / "stop"
         stop.write_text("")
         monkeypatch.setattr(d, "STOP_FILE", stop)
-        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
         laeuft, grund = d.should_run(failures=0)
         assert laeuft is False
         assert "Not-Aus" in grund
 
-    def test_interaktive_sitzung_pausiert(self, monkeypatch, tmp_path):
-        # Sonst konkurrieren Timo und die Forge um dasselbe Limit und um die 16 GB.
-        monkeypatch.setattr(d, "STOP_FILE", tmp_path / "kein-stop")
-        monkeypatch.setattr(d, "interactive_claude_running", lambda: True)
-        laeuft, grund = d.should_run(failures=0)
-        assert laeuft is False
-        assert "interaktive" in grund.lower()
 
     def test_fehler_spirale_stoppt(self, frei):
         laeuft, grund = d.should_run(failures=d.MAX_CONSECUTIVE_FAILURES)
@@ -62,7 +53,6 @@ class TestFehlerSpiraleUeberlebtNeustart:
         # dieselben Fehlläufe erneut verbrennen — die Bremse wäre keine.
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
-        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d.time, "sleep", lambda *a, **kw: None)
@@ -75,7 +65,6 @@ class TestFehlerSpiraleUeberlebtNeustart:
         stop = tmp_path / "stop"
         stop.write_text("Fehler-Spirale\n")
         monkeypatch.setattr(d, "STOP_FILE", stop)
-        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
         laeuft, grund = d.should_run(failures=0)
         assert laeuft is False
         assert "Not-Aus" in grund
@@ -155,7 +144,6 @@ class TestFailureBackoff:
         # Vollpreis-Claude-Läufe in Sekunden statt in gedrosseltem Abstand.
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
-        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
@@ -165,62 +153,6 @@ class TestFailureBackoff:
         d.main()
         assert d.FAILURE_SLEEP_SECONDS in schlaefe
 
-
-class TestInteractiveDetection:
-    def test_eigener_daemon_zaehlt_nicht_als_interaktiv(self, monkeypatch):
-        # Der Forge-Prozess startet selbst `claude`-Kindprozesse. Würden die als
-        # interaktive Sitzung gelten, würde sich die Forge selbst aussperren.
-        class _Fertig:
-            returncode = 0
-            stdout = f"{os.getpid()}\n"
-        monkeypatch.setattr(d.subprocess, "run", lambda *a, **kw: _Fertig())
-        assert d.interactive_claude_running() is False
-
-    def test_eigenes_claude_kind_zaehlt_nicht_als_interaktiv(self, monkeypatch):
-        # Der eigentliche Schutzfall: runner.run() startet `claude` als echtes
-        # Kind des Daemons — pgrep liefert dann eine PID ungleich os.getpid(),
-        # aber `ps -o ppid=` auf diese PID liefert die PID des Daemons selbst.
-        # Genau das muss _ist_kind_von_uns() erkennen und herausfiltern, sonst
-        # sperrt sich die Forge nach ihrem ersten Lauf für immer aus.
-        kind_pid = os.getpid() + 1
-
-        class _Fertig:
-            returncode = 0
-            stdout = f"{kind_pid}\n"
-
-        def _fake_run(cmd, *a, **kw):
-            if cmd[0] == "pgrep":
-                return _Fertig()
-            assert cmd[0] == "ps"
-            assert cmd[-1] == str(kind_pid)
-
-            class _Ppid:
-                stdout = f"{os.getpid()}\n"
-            return _Ppid()
-
-        monkeypatch.setattr(d.subprocess, "run", _fake_run)
-        assert d.interactive_claude_running() is False
-
-    def test_fremder_pid_zaehlt_als_interaktiv(self, monkeypatch):
-        # Gegenprobe zu obigem Test: ein PID, der weder der Daemon selbst noch
-        # ein Kind davon ist, MUSS als interaktive Sitzung erkannt werden —
-        # sonst würde eine echte Sitzung von Timo einfach ignoriert.
-        fremd_pid = 999999
-
-        class _Fertig:
-            returncode = 0
-            stdout = f"{fremd_pid}\n"
-
-        def _fake_run(cmd, *a, **kw):
-            if cmd[0] == "pgrep":
-                return _Fertig()
-            # ps -o ppid= -p <fremd_pid>: soll NICHT die eigene PID liefern.
-            class _Ppid:
-                stdout = "1\n"
-            return _Ppid()
-
-        monkeypatch.setattr(d.subprocess, "run", _fake_run)
-        assert d.interactive_claude_running() is True
 
 
 class TestTickUeberlebtAbsturz:
@@ -258,7 +190,6 @@ class TestTickUeberlebtAbsturz:
         # Fehler-Spirale-Bremse nicht vor einem kaputten Runner.
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
-        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d.time, "sleep", lambda *a, **kw: None)
@@ -285,7 +216,6 @@ class TestTickUeberlebtAbsturz:
         # stirbt der ganze Daemon-Prozess an einem einzigen kaputten Lauf.
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
-        monkeypatch.setattr(d, "interactive_claude_running", lambda: False)
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d.time, "sleep", lambda *a, **kw: None)
