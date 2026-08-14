@@ -88,27 +88,41 @@ def _denial_namen(denials: list[dict]) -> str:
     return ", ".join(namen) or "(unbenannt)"
 
 
-def _schreibe_diff(worktree: Path) -> bool:
+def _schreibe_diff(worktree: Path) -> str | None:
     """Befüllt stages.DIFF_DATEI mit dem Diff des Branches gegen seine Basis.
+    Gibt bei Erfolg None zurück, sonst eine Fehlermeldung.
 
     Die Review-Stufe hat kein Bash und kann sich keinen eigenen Diff
     erzeugen — ohne diese Datei prüfte sie eine Spec ohne jede Sicht auf die
-    tatsächliche Änderung. Ein fehlgeschlagener `git diff` (z.B. kein
-    passender Merge-Base) wird wie in forge/gate.py nachsichtig behandelt und
-    ergibt einen leeren, aber vorhandenen Diff — erst ein tatsächlicher
-    Schreibfehler (Berechtigung, Platte voll, kaputter Pfad) parkt den Task,
-    denn NUR dann fehlt das Artefakt wirklich statt nur leer zu sein.
+    tatsächliche Änderung. Die Analogie zu forge.gate.py's Nachsicht bei
+    fehlendem Diff trägt hier NICHT: gate.py's Nachsicht landet immer noch auf
+    einem harten Blocker ("keine Änderungen im Branch"), aber ein leerer,
+    fälschlich als Erfolg durchgereichter Diff hier gäbe einem LLM die
+    Möglichkeit, ein vertrauenswürdig aussehendes 'pass'-Urteil über eine
+    Änderung zu fällen, die es nie gesehen hat — und genau dieses Urteil
+    füttert das Gate. Deshalb gilt die strikte Lesart: schon ein
+    fehlgeschlagenes `git diff` (returncode != 0 — kaputter Ref, kaputtes
+    Worktree, exakt das, wovor forge/gitctl.py sich sorgt) parkt den Task,
+    statt einen leeren Diff als Erfolg auszugeben. Ein tatsächlicher
+    Schreibfehler (Berechtigung, Platte voll, kaputter Pfad) ist die zweite,
+    unabhängige Fehlerursache.
     """
     worktree = Path(worktree)
     ergebnis = gitctl.run("diff", f"{BASIS_BRANCH}...HEAD", cwd=worktree)
+    if ergebnis.returncode != 0:
+        fehler = (f"git diff fehlgeschlagen (returncode {ergebnis.returncode}): "
+                  f"{(ergebnis.stderr or '').strip()[:300]}")
+        log.warning(f"Forge-Pipeline: {fehler}")
+        return fehler
     ziel = worktree / stages.DIFF_DATEI
     try:
         ziel.parent.mkdir(parents=True, exist_ok=True)
         ziel.write_text(ergebnis.stdout or "")
     except OSError as exc:
-        log.warning(f"Forge-Pipeline: Diff-Artefakt konnte nicht geschrieben werden: {exc}")
-        return False
-    return True
+        fehler = f"Diff-Artefakt konnte nicht geschrieben werden: {exc}"
+        log.warning(f"Forge-Pipeline: {fehler}")
+        return fehler
+    return None
 
 
 def _verwirf_review_artefakte(worktree: Path) -> None:
@@ -212,10 +226,11 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
     elif state == m.REVIEWING:
         # Nur die eigentliche Review-Stufe braucht den Diff — sie hat kein
         # Bash. Die Fix-Stufe hat Bash und kommt notfalls selbst zurecht.
-        if not _schreibe_diff(worktree):
+        diff_fehler = _schreibe_diff(worktree)
+        if diff_fehler is not None:
             _park(task_id, state,
-                  f"Diff-Artefakt ({stages.DIFF_DATEI}) konnte nicht geschrieben werden — "
-                  f"Review würde ohne Sicht auf die Änderung laufen (Task {task_id})")
+                  f"Diff-Artefakt ({stages.DIFF_DATEI}) nicht nutzbar: {diff_fehler} — "
+                  f"Review würde ohne verlässliche Sicht auf die Änderung laufen (Task {task_id})")
             return "geparkt"
 
     journal.log(task_id, "stage_start", f"Stufe '{stufe.name}' für Task {task_id}")

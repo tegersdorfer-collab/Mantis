@@ -69,7 +69,25 @@ class TestErfolgreicheStufe:
         assert any("stage_done" in str(e) for e in stubs["journal"])
 
     def test_letzte_kettenstufe_meldet_fertig(self, monkeypatch, stubs, tmp_path):
+        # Kritischer Fund 2: dieser Test lief ursprünglich gegen tmp_path, kein
+        # git-Repo — `git diff` schlägt dort fehl, und die frühere nachsichtige
+        # Lesart von _schreibe_diff schluckte das (leerer, aber "erfolgreicher"
+        # Diff). Nach der Korrektur parkt ein fehlgeschlagenes `git diff`
+        # stattdessen den Task. Der Zweck dieses Tests war nie, das zu prüfen —
+        # er soll belegen, dass die Kette bei GATING "fertig" meldet. Deshalb
+        # wird gitctl.run hier gestubbt (wie in TestDiffArtefakt), damit ein
+        # erfolgreicher, leerer Diff genau das simuliert, was ein echtes Repo
+        # ohne Änderungen liefern würde.
         _verdikt(tmp_path, "pass")
+
+        def _fake_gitctl(*args, cwd=None, timeout=300):
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(pl.gitctl, "run", _fake_gitctl)
         monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="egal")))
         assert pl.eine_stufe(_task(m.REVIEWING), tmp_path) == "fertig"
 
@@ -267,6 +285,31 @@ class TestTokenWeiterleitung:
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
         treffer = [e for e in stubs["journal"] if e[1].get("tokens_in") == 3 and e[1].get("tokens_out") == 5]
         assert treffer, f"tokens_in/out nicht korrekt weitergereicht: {stubs['journal']}"
+
+
+class TestFehlgeschlagenerGitDiffParkt:
+    """Kritischer Fund 2: `git diff` mit non-zero returncode (kaputter Ref,
+    kaputtes Worktree) darf nicht als leerer, aber 'erfolgreicher' Diff
+    durchgehen — sonst könnte die Review-Stufe ein Urteil über eine Änderung
+    fällen, die sie nie gesehen hat, und dieses Urteil füttert das Gate."""
+
+    def test_git_diff_fehlschlag_parkt_statt_review_laufen_zu_lassen(self, monkeypatch, stubs, tmp_path):
+        def _kaputtes_gitctl(*args, cwd=None, timeout=300):
+            class _R:
+                returncode = 128
+                stdout = ""
+                stderr = "fatal: bad revision 'main...HEAD'"
+            return _R()
+
+        monkeypatch.setattr(pl.gitctl, "run", _kaputtes_gitctl)
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="egal")))
+        ergebnis = pl.eine_stufe(_task(m.REVIEWING), tmp_path)
+        assert ergebnis == "geparkt"
+        # Review darf gar nicht erst gelaufen sein.
+        assert stubs["profile"] == []
+        grund = stubs["parks"][-1][1]
+        assert "git diff" in grund
+        assert "128" in grund
 
 
 class TestKritisch1FixRundeErzwingtErneutesReview:
