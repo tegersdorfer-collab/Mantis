@@ -84,29 +84,38 @@ class TestRechteprofile:
         for stufe in s.ALLE_STUFEN:
             assert isinstance(stufe.profile, PermissionProfile)
 
-    def test_spec_write_ist_auf_das_spec_verzeichnis_beschraenkt(self):
-        # Gemessen (CLI 2.1.126, 2026-08-14, siehe Modul-Docstring): Pfad-Muster
-        # greifen bei `Write` genauso wie bei `Bash`. Ein unbepfadetes "Write"
-        # dürfte spec jede Datei im Worktree anlegen lassen, auch forge/gate.py.
+    def test_spec_write_ist_unbepfadet(self):
+        # ACHTUNG: NICHT auf ein Pfad-Muster wie "Write(docs/.../specs/**)"
+        # umstellen. Das wurde versucht (f1fc16a) und war ein Fehlschluss: zwei
+        # Proben gegen die echte CLI (2.1.126, 2026-08-14, siehe Proben (e)/(f)
+        # in tests/fixtures/permission_probe.md und der Modul-Docstring) zeigen,
+        # dass `Write(<muster>)` auch einen Write INNERHALB des Musters
+        # verweigert — bepfadetes Write ist in dieser CLI-Version gemessen
+        # wirkungslos, nicht nur ungetestet. Damit hätte spec auf JEDEM Lauf
+        # 0 Dateien geschrieben, und weil ein verweigertes Tool `is_error`
+        # nicht setzt, wäre das lautlos passiert. Der Schutz kommt stattdessen
+        # daher, dass spec kein Edit/Bash hat, plus dem Gate als Backstop.
         erlaubt = s.fuer_state(m.SPECCING).profile.allowed
-        assert "Write" not in erlaubt, "bare Write hebelt die Pfadbeschränkung aus"
-        treffer = [a for a in erlaubt if a.startswith("Write(")]
-        assert treffer, "spec-Profil hat keinen bepfadeten Write-Grant"
-        assert s.SPEC_VERZEICHNIS in treffer[0]
+        assert "Write" in erlaubt
+        assert not any(a.startswith("Write(") for a in erlaubt), (
+            "bepfadetes Write ist gemessen wirkungslos, siehe Modul-Docstring"
+        )
 
-    def test_plan_write_ist_auf_das_plan_verzeichnis_beschraenkt(self):
+    def test_plan_write_ist_unbepfadet(self):
+        # Siehe Kommentar bei test_spec_write_ist_unbepfadet — dieselbe Messung.
         erlaubt = s.fuer_state(m.PLANNING).profile.allowed
-        assert "Write" not in erlaubt, "bare Write hebelt die Pfadbeschränkung aus"
-        treffer = [a for a in erlaubt if a.startswith("Write(")]
-        assert treffer, "plan-Profil hat keinen bepfadeten Write-Grant"
-        assert s.PLAN_VERZEICHNIS in treffer[0]
+        assert "Write" in erlaubt
+        assert not any(a.startswith("Write(") for a in erlaubt), (
+            "bepfadetes Write ist gemessen wirkungslos, siehe Modul-Docstring"
+        )
 
-    def test_review_write_ist_auf_die_verdiktdatei_beschraenkt(self):
+    def test_review_write_ist_unbepfadet(self):
+        # Siehe Kommentar bei test_spec_write_ist_unbepfadet — dieselbe Messung.
         erlaubt = s.fuer_state(m.REVIEWING).profile.allowed
-        assert "Write" not in erlaubt, "bare Write hebelt die Pfadbeschränkung aus"
-        treffer = [a for a in erlaubt if a.startswith("Write(")]
-        assert treffer, "review-Profil hat keinen bepfadeten Write-Grant"
-        assert s.VERDIKT_DATEI in treffer[0]
+        assert "Write" in erlaubt
+        assert not any(a.startswith("Write(") for a in erlaubt), (
+            "bepfadetes Write ist gemessen wirkungslos, siehe Modul-Docstring"
+        )
 
     def test_implement_und_fix_behalten_unbepfadetes_write(self):
         # Diese beiden dürfen legitim breit schreiben — der Pin oben soll nicht

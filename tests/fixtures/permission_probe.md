@@ -135,6 +135,65 @@ bei `Bash(git *)` — das Muster grenzt den Grant auf den angegebenen Pfad ein,
 nicht nur den Tool-Namen. Damit ist `Write(<verzeichnis>/**)` bzw.
 `Write(<datei>)` eine belegte, keine bloß plausible Einschränkung.
 
+## (e) Pfad-Muster bei `Write` — Schreiben INNERHALB des Musters (Nachtrag, 2026-08-14, CLI 2.1.126)
+
+Probe (d) hat nur belegt, dass ein Write AUSSERHALB des angegebenen Musters
+verweigert wird. Das war eine Lücke in der Schlussfolgerung, nicht in der
+Messung selbst: "Write außerhalb wird verweigert" ist genauso mit "das Muster
+grenzt korrekt ein" vereinbar wie mit "Write(<muster>) verweigert
+grundsätzlich alles". Ob ein Write INNERHALB des Musters durchgeht, wurde nie
+geprüft — diese Probe schließt die Lücke, im echten `spec`-Zielverzeichnis
+von Plan 2 / Task 3, das bereits existierte.
+
+Befehl:
+```
+claude -p "Schreibe eine Design-Spec nach docs/superpowers/specs/2026-08-14-test-design.md ..." \
+  --output-format stream-json --verbose \
+  --allowedTools "Write(docs/superpowers/specs/**) Read" --permission-mode dontAsk < /dev/null
+```
+Ziel `docs/superpowers/specs/2026-08-14-test-design.md` liegt **innerhalb**
+des erlaubten Musters, das Zielverzeichnis existierte bereits.
+
+- kam sauber zurück, kein Hänger
+- `permission_denials`: `["Bash", "Write"]`
+- Dateien angelegt: **0**
+
+Der Write-Aufruf für eine Datei, die exakt unter das erlaubte Muster fällt,
+wurde trotzdem verweigert.
+
+## (f) Kontrollprobe mit absolutem Pfad-Muster (Nachtrag, 2026-08-14, CLI 2.1.126)
+
+Um auszuschließen, dass (e) an der relativen Pfadschreibweise lag, dieselbe
+Frage mit einem absoluten Muster wiederholt:
+
+Befehl:
+```
+claude -p "Schreibe eine Design-Spec nach /tmp/forge-gp2/docs/specs/... ..." \
+  --output-format stream-json --verbose \
+  --allowedTools "Write(/tmp/forge-gp2/docs/specs/**) Read" --permission-mode dontAsk < /dev/null
+```
+
+- Dateien angelegt: **0**
+
+Auch mit absolutem Muster wird ein Write innerhalb des eigenen Musters
+verweigert.
+
+**Ergebnis (e)+(f):** Die in Probe (d) gezogene Schlussfolgerung — "Pfad-Muster
+grenzen den Write-Grant korrekt auf den angegebenen Pfad ein" — war **falsch**.
+Sie beruhte allein darauf, dass ein Write AUSSERHALB des Musters verweigert
+wurde, und das ist mit einer korrekt funktionierenden Einschränkung genauso
+vereinbar wie mit einem `Write(<muster>)`, das *grundsätzlich* jeden
+Schreibzugriff verweigert, unabhängig vom Pfad. Proben (e) und (f) zeigen
+genau das: ein Write, dessen Ziel exakt innerhalb des erlaubten Musters liegt,
+wird ebenso verweigert wie eines außerhalb — mit relativem wie mit absolutem
+Pfad. `Write(<muster>)` funktioniert in CLI 2.1.126 nicht als
+Scoping-Mechanismus. Nur bare `Write` (siehe Probe (a)) funktioniert.
+`forge/stages.py` (Commit f1fc16a) hatte `spec`, `plan` und `review` auf
+bepfadetes `Write` umgestellt — damit hätten diese drei Stufen auf **jedem**
+Lauf 0 Dateien geschrieben, und weil ein verweigertes Tool `is_error` nicht
+setzt (siehe Probe (b2)), wäre das lautlos passiert. Die Umstellung wurde
+zurückgenommen.
+
 ## Fazit
 
 Die entscheidende Frage aus der Aufgabenstellung — hängt Probe (b) bis zum

@@ -45,6 +45,7 @@
    - **`acceptEdits` setzt `--allowedTools` für Datei-Edits außer Kraft.** Ein Lauf mit `--allowedTools "Read"` hat die Datei trotzdem geschrieben. Ein Rechteprofil in diesem Modus ist wirkungslos. **Alle Stufen laufen deshalb mit `dontAsk`.**
    - `dontAsk` verhält sich symmetrisch korrekt: Erlaubtes läuft, Unerlaubtes wird verweigert, und beides kehrt sauber zurück. **Kein Modus hängt** — die ursprüngliche Sorge um 30-Minuten-Hänger ist ausgeräumt.
    - **`is_error` bleibt `false`, auch wenn ein Tool verweigert wurde.** Das Modell erklärt die Ablehnung in Prosa und beendet den Turn regulär. Der einzige verlässliche Marker ist das Array `permission_denials` im Result-Event. Eine Stufe mit zu engem Profil sieht also wie ein Erfolg aus — deshalb muss `runner.parse_stream` dieses Feld durchreichen und die Pipeline es auswerten (siehe Task 6).
+9. **Bepfadetes `Write(<muster>)` wurde gemessen NICHT zu funktionieren** (CLI 2.1.126, 2026-08-14, Proben (d)–(f) in `tests/fixtures/permission_probe.md`): ein Write innerhalb des Musters wird ebenso verweigert wie eines außerhalb. Die ursprüngliche Einschränkung von `spec`/`plan`/`review` auf `Write(<eigenes Artefakt>)` (Commit `f1fc16a`) beruhte auf einem Fehlschluss und wurde zurückgenommen — diese drei Stufen laufen mit bare `Write`, geschützt durch fehlendes `Edit`/`Bash` plus die Sperrzonen-Prüfung des Gates.
 
 ## Neu in diesem Plan: der Agent schreibt
 
@@ -610,21 +611,32 @@ läuft über Artefakte im Worktree, nie über Gesprächsverlauf — deshalb steh
 jedem Prompt, wo das Ergebnis der Vorstufe liegt, statt es mitzuschicken.
 
 Die Rechteprofile sind die einzige Schranke zwischen einem unbeaufsichtigten
-Agenten und dem Dateisystem. Sie sind absichtlich eng: nur `implementing` und
-`fix` dürfen editieren und Befehle ausführen. `spec`, `plan` und `review`
-bekommen zwar `Write`, aber ausschließlich bepfadet auf ihr eigenes Artefakt —
-spec nur innerhalb von SPEC_VERZEICHNIS, plan nur innerhalb von
-PLAN_VERZEICHNIS, review nur auf VERDIKT_DATEI. Ein unbepfadetes `Write` in
-diesen drei Profilen könnte sonst jede Datei im Worktree anlegen oder
-überschreiben, einschließlich forge/gate.py selbst.
+Agenten und dem Dateisystem. Sie sind absichtlich eng: nur `implement` und
+`fix` dürfen editieren und Befehle ausführen (`Edit`, `Bash`). `spec`, `plan`
+und `review` bekommen `Write`, aber NICHT bepfadet. Diese drei Stufen könnten
+also grundsätzlich jede Datei im Worktree anlegen oder überschreiben,
+einschließlich forge/gate.py. Der eigentliche Schutz dagegen ist zweifach:
+(1) keine der drei Stufen hat `Edit` oder `Bash` — sie können also nur neue
+Dateien anlegen, keine bestehenden gezielt verändern und keine Befehle
+ausführen; (2) das deterministische Gate (forge/gate.py, Sperrzonen-Prüfung,
+siehe Plan-Task 5) bewertet den entstandenen Diff nach dem Lauf und weist
+Änderungen an gesperrten Pfaden zurück, unabhängig davon, welche Stufe sie
+verursacht hat. Das Rechteprofil ist die erste, das Gate die zweite und
+verlässlichere Schranke.
 
-Dass Pfad-Muster in --allowedTools für `Write` tatsächlich greifen (nicht nur
-für `Bash`, siehe `Bash(git *)` in tests/fixtures/permission_probe.md, Probe
-c) ist gemessen (CLI 2.1.126, 2026-08-14): ein Lauf mit
-`--allowedTools "Write(docs/**) Read"` hat außerhalb von docs/ keine Datei
-angelegt, `permission_denials` enthielt den verweigerten `Write`-Aufruf, und
-der Lauf kehrte sauber zurück. Die Einschränkung unten ist also belegt, nicht
-nur plausibel.
+Fehlgeschlagener Versuch (2026-08-14): `Write(<pfad>/**)` sollte das Write
+dieser drei Stufen auf ihr eigenes Artefaktverzeichnis beschränken (Probe (d)
+in tests/fixtures/permission_probe.md). Zwei weitere Proben gegen die echte
+CLI (2.1.126) zeigen, dass ein Write INNERHALB des angegebenen Musters
+ebenfalls verweigert wird (Proben (e) und (f) ebendort) —
+`Write(<muster>)` verweigert in dieser CLI-Version grundsätzlich jeden
+Schreibzugriff, unabhängig vom Pfad. Die frühere Schlussfolgerung aus Probe
+(d) war ein Fehlschluss: sie hatte nur belegt, dass ein Write AUSSERHALB des
+Musters verweigert wird — das ist mit "das Muster grenzt korrekt ein" genauso
+vereinbar wie mit "Write(<muster>) verweigert grundsätzlich alles", und es
+war Letzteres. Nur bare `Write` (siehe Probe (a)) funktioniert. Deshalb unten
+bare `Write` — NICHT wieder auf ein Pfad-Muster umstellen, ohne eine neue
+Messung, die das Gegenteil zeigt.
 """
 from dataclasses import dataclass
 from typing import Callable
@@ -722,19 +734,17 @@ def _fix_prompt(task: dict, kontext: dict) -> str:
 # Die Kette: vier Stufen, lückenlos von speccing bis gating.
 STAGES: tuple[Stage, ...] = (
     Stage("spec", m.SPECCING, m.PLANNING,
-          PermissionProfile(allowed=("Read", "Grep", "Glob", f"Write({SPEC_VERZEICHNIS}/**)"),
-                            mode="dontAsk"),
+          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _spec_prompt, lambda t: t.get("spec_path")),
     Stage("plan", m.PLANNING, m.IMPLEMENTING,
-          PermissionProfile(allowed=("Read", "Grep", "Glob", f"Write({PLAN_VERZEICHNIS}/**)"),
-                            mode="dontAsk"),
+          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _plan_prompt, lambda t: t.get("plan_path")),
     Stage("implement", m.IMPLEMENTING, m.REVIEWING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                             mode="dontAsk"),
           _implement_prompt, lambda t: None),
     Stage("review", m.REVIEWING, m.GATING,
-          PermissionProfile(allowed=("Read", "Grep", "Glob", f"Write({VERDIKT_DATEI})"), mode="dontAsk"),
+          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _review_prompt, lambda t: VERDIKT_DATEI),
 )
 
