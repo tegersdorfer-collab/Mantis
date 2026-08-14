@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import json
 import subprocess
+from pathlib import Path
 
 from forge import gate
 
@@ -99,6 +100,76 @@ class TestVerdikt:
             {"verdict": "pass", "findings": ["irgendwas ist komisch"]}))
         ok, befunde = gate.lies_verdikt(tmp_path)
         assert ok is True and befunde == []
+
+    def test_top_level_null_ist_kein_pass(self, tmp_path):
+        # json.loads("null") ist gültiges JSON, aber daten.get(...) würde auf
+        # None mit AttributeError sterben, wenn hier nicht abgefangen wird.
+        (tmp_path / ".forge").mkdir()
+        (tmp_path / ".forge" / "review.json").write_text("null")
+        ok, befunde = gate.lies_verdikt(tmp_path)
+        assert ok is False
+        assert befunde and befunde[0]["severity"] == "critical"
+
+    def test_top_level_liste_ist_kein_pass(self, tmp_path):
+        # Genauso gültiges JSON: eine bloße Liste statt eines Objekts.
+        (tmp_path / ".forge").mkdir()
+        (tmp_path / ".forge" / "review.json").write_text(json.dumps([1, 2, 3]))
+        ok, befunde = gate.lies_verdikt(tmp_path)
+        assert ok is False
+        assert befunde and befunde[0]["severity"] == "critical"
+
+    def test_top_level_string_ist_kein_pass(self, tmp_path):
+        (tmp_path / ".forge").mkdir()
+        (tmp_path / ".forge" / "review.json").write_text(json.dumps("pass"))
+        ok, befunde = gate.lies_verdikt(tmp_path)
+        assert ok is False
+        assert befunde and befunde[0]["severity"] == "critical"
+
+    def test_top_level_zahl_ist_kein_pass(self, tmp_path):
+        (tmp_path / ".forge").mkdir()
+        (tmp_path / ".forge" / "review.json").write_text("42")
+        ok, befunde = gate.lies_verdikt(tmp_path)
+        assert ok is False
+        assert befunde and befunde[0]["severity"] == "critical"
+
+    def test_unlesbare_datei_ist_kein_pass(self, tmp_path, monkeypatch):
+        # Datei existiert und ist gültiges JSON, aber das Lesen selbst schlägt
+        # fehl (z.B. Rechteproblem) — muss denselben fail-closed-Pfad wie
+        # kaputtes JSON nehmen, nicht die Exception durchreichen.
+        (tmp_path / ".forge").mkdir()
+        (tmp_path / ".forge" / "review.json").write_text(json.dumps({"verdict": "pass"}))
+
+        def kaputtes_lesen(self, *args, **kwargs):
+            raise PermissionError("keine Leserechte")
+
+        monkeypatch.setattr(Path, "read_text", kaputtes_lesen)
+        ok, befunde = gate.lies_verdikt(tmp_path)
+        assert ok is False
+        assert befunde and befunde[0]["severity"] == "critical"
+
+    def test_fehlendes_findings_feld_gilt_als_leer(self, tmp_path):
+        # "findings" fehlt komplett (kein leeres [], sondern gar kein Key) —
+        # daten.get("findings") or [] fängt das ab.
+        (tmp_path / ".forge").mkdir()
+        (tmp_path / ".forge" / "review.json").write_text(json.dumps({"verdict": "pass"}))
+        ok, befunde = gate.lies_verdikt(tmp_path)
+        assert ok is True and befunde == []
+
+    def test_findings_als_dict_statt_liste_ist_kein_pass(self, tmp_path):
+        (tmp_path / ".forge").mkdir()
+        (tmp_path / ".forge" / "review.json").write_text(json.dumps(
+            {"verdict": "pass", "findings": {"severity": "critical"}}))
+        ok, befunde = gate.lies_verdikt(tmp_path)
+        assert ok is False
+        assert befunde and befunde[0]["severity"] == "critical"
+
+    def test_fehlendes_verdict_feld_ist_kein_pass(self, tmp_path):
+        # Kein "verdict"-Key, keine harten Befunde — daten.get("verdict") == "pass"
+        # ist False für None, nicht True durch irgendeine Sonderbehandlung.
+        (tmp_path / ".forge").mkdir()
+        (tmp_path / ".forge" / "review.json").write_text(json.dumps({"findings": []}))
+        ok, befunde = gate.lies_verdikt(tmp_path)
+        assert ok is False and befunde == []
 
 
 class TestSchwellen:
@@ -223,3 +294,58 @@ class TestPruefe:
         ergebnis = gate.pruefe(tmp_path)
         assert ergebnis.ok is False
         assert any("ruff" in g.lower() for g in ergebnis.gruende)
+
+    def test_pruefe_wirft_nicht_bei_nicht_objekt_verdikt(self, tmp_path, monkeypatch):
+        # Reproduktion des Critical-Befunds: ein review.json mit "null" statt
+        # eines Objekts darf pruefe() nicht mit AttributeError zum Absturz
+        # bringen (das würde den Daemon-Tick mitreißen), sondern muss fail-closed
+        # als Gate-Grund landen.
+        self._stub_sauberer_git(monkeypatch)
+        self._stub_subprocess(monkeypatch)
+        (tmp_path / ".forge").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".forge" / "review.json").write_text("null")
+        ergebnis = gate.pruefe(tmp_path)  # darf nicht werfen
+        assert ergebnis.ok is False
+        assert any("Review-Verdikt negativ" in g for g in ergebnis.gruende)
+
+    def test_diff_genau_an_der_grenze_ist_ok(self, tmp_path, monkeypatch):
+        # Grenzwerttest: exakt MAX_DIFF_ZEILEN darf noch durchgehen (">" nicht
+        # ">="). Ohne diesen Test würde ein künftiges Vertippen von ">" zu ">="
+        # unbemerkt bleiben.
+        self._stub_sauberer_git(monkeypatch, numstat=f"{gate.MAX_DIFF_ZEILEN}\t0\tcore/foo.py\n")
+        self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        ergebnis = gate.pruefe(tmp_path)
+        assert ergebnis.ok is True
+        assert not any("Diff zu groß" in g for g in ergebnis.gruende)
+
+    def test_diff_ein_ueber_der_grenze_ist_nicht_ok(self, tmp_path, monkeypatch):
+        self._stub_sauberer_git(monkeypatch, numstat=f"{gate.MAX_DIFF_ZEILEN + 1}\t0\tcore/foo.py\n")
+        self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        ergebnis = gate.pruefe(tmp_path)
+        assert ergebnis.ok is False
+        assert any("Diff zu groß" in g for g in ergebnis.gruende)
+
+    def test_binaere_datei_ergibt_eigenen_gate_grund(self, tmp_path, monkeypatch):
+        # git diff --numstat meldet binäre Dateien als "-\t-\t<pfad>". Ohne
+        # explizite Behandlung zählt das als 0 Zeilen und könnte einen großen
+        # Blob unbemerkt an MAX_DIFF_ZEILEN vorbeischleusen.
+        self._stub_sauberer_git(monkeypatch, numstat="-\t-\tassets/logo.png\n")
+        self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        ergebnis = gate.pruefe(tmp_path)
+        assert ergebnis.ok is False
+        gruende_text = " ".join(ergebnis.gruende)
+        assert "binär" in gruende_text.lower()
+        assert "assets/logo.png" in gruende_text
+
+    def test_binaere_datei_zaehlt_nicht_faelschlich_als_diff_groesse(self, tmp_path, monkeypatch):
+        # Die binäre Zeile darf nicht in die Zeilensumme einfließen (0 statt
+        # einer geratenen Zahl) — der eigene Grund ist die richtige Meldung,
+        # nicht ein aufgeblähter "Diff zu groß"-Text.
+        self._stub_sauberer_git(monkeypatch, numstat="-\t-\tassets/logo.png\n")
+        self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        ergebnis = gate.pruefe(tmp_path)
+        assert not any("Diff zu groß" in g for g in ergebnis.gruende)

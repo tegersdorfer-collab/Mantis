@@ -84,6 +84,16 @@ def lies_verdikt(worktree: Path) -> tuple[bool, list[dict]]:
     except (OSError, json.JSONDecodeError) as exc:
         return False, [{"severity": "critical", "what": f"Review-Urteil unlesbar: {exc}"}]
 
+    # json.loads akzeptiert auch nicht-Objekt-Werte auf oberster Ebene (null,
+    # eine Liste, ein String, eine Zahl) — gültiges JSON, aber kein Urteil.
+    # Ohne diese Prüfung würde daten.get(...) weiter unten mit AttributeError
+    # sterben, sobald ein Review-Agent eine leicht falsche JSON-Form schreibt.
+    # Derselbe Grundsatz gilt schon für das verschachtelte "findings"-Feld
+    # (isinstance-Check unten) — hier wird er nur auf die oberste Ebene erweitert.
+    if not isinstance(daten, dict):
+        art = type(daten).__name__
+        return False, [{"severity": "critical", "what": f"Review-Urteil hat unerwartete Form: {art} statt Objekt"}]
+
     befunde = daten.get("findings") or []
     if not isinstance(befunde, list):
         return False, [{"severity": "critical", "what": "findings ist keine Liste"}]
@@ -106,18 +116,36 @@ def _geaenderte_dateien(worktree: Path, basis: str) -> list[str]:
     return [z for z in ergebnis.stdout.splitlines() if z.strip()]
 
 
-def _diff_groesse(worktree: Path, basis: str) -> int:
+def _diff_groesse(worktree: Path, basis: str) -> tuple[int, list[str]]:
+    """Zeilenzahl und binäre Dateien aus einem Diff.
+
+    Für binäre Dateien meldet "git diff --numstat" die Spalten als "-" statt
+    als Zahlen (Format: "-<TAB>-<TAB><Pfad>").
+    "-".isdigit() ist False, also würde eine binäre Datei sonst mit 0 Zeilen
+    durchgehen und die MAX_DIFF_ZEILEN-Grenze umgehen können — ausgerechnet in
+    diesem Modul, der letzten Prüfung vor einem unbeaufsichtigten Merge (Plan 3).
+    Ein großer Blob außerhalb einer Sperrzone dürfte also nie einfach 0 Zeilen
+    zählen. Statt ihn zu schätzen (wie viele "Zeilen" hat ein Bild?), bekommt
+    er einen eigenen, expliziten Gate-Grund mit Dateinamen.
+    """
     ergebnis = gitctl.run("diff", "--numstat", f"{basis}...HEAD", cwd=worktree)
     if ergebnis.returncode != 0:
-        return 0
+        return 0, []
     summe = 0
+    binaere: list[str] = []
     for zeile in ergebnis.stdout.splitlines():
         teile = zeile.split("\t")
-        if len(teile) >= 2:
-            for wert in teile[:2]:
-                if wert.isdigit():
-                    summe += int(wert)
-    return summe
+        if len(teile) < 2:
+            continue
+        hinzu, entfernt = teile[0], teile[1]
+        if hinzu == "-" and entfernt == "-":
+            pfad = teile[2] if len(teile) >= 3 else "<unbekannter Pfad>"
+            binaere.append(pfad)
+            continue
+        for wert in (hinzu, entfernt):
+            if wert.isdigit():
+                summe += int(wert)
+    return summe, binaere
 
 
 def _tests_pruefen(worktree: Path) -> str | None:
@@ -172,9 +200,11 @@ def pruefe(worktree: Path, basis: str = "main") -> GateErgebnis:
     if verboten:
         gruende.append(f"Sperrzone berührt: {', '.join(verboten)}")
 
-    groesse = _diff_groesse(baum, basis)
+    groesse, binaere = _diff_groesse(baum, basis)
     if groesse > MAX_DIFF_ZEILEN:
         gruende.append(f"Diff zu groß: {groesse} Zeilen (Grenze {MAX_DIFF_ZEILEN})")
+    if binaere:
+        gruende.append(f"binäre Änderung erkannt: {', '.join(binaere)}")
 
     tests_grund = _tests_pruefen(baum)
     if tests_grund:
