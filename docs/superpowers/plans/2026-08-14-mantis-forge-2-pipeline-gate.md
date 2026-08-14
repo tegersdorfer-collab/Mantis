@@ -41,6 +41,10 @@
    - `--allowedTools, --allowed-tools <tools...>` — Komma- oder leerzeichengetrennt, Muster erlaubt: `"Bash(git *) Edit"`
    - `--disallowedTools, --disallowed-tools <tools...>` — gleiche Form
    - `--permission-mode <mode>` — `acceptEdits | auto | bypassPermissions | default | dontAsk | plan`
+8. **Gemessen in Task 1 am 2026-08-14, unabhängig gegengeprüft — und es widerlegt den ursprünglichen Entwurf dieses Plans:**
+   - **`acceptEdits` setzt `--allowedTools` für Datei-Edits außer Kraft.** Ein Lauf mit `--allowedTools "Read"` hat die Datei trotzdem geschrieben. Ein Rechteprofil in diesem Modus ist wirkungslos. **Alle Stufen laufen deshalb mit `dontAsk`.**
+   - `dontAsk` verhält sich symmetrisch korrekt: Erlaubtes läuft, Unerlaubtes wird verweigert, und beides kehrt sauber zurück. **Kein Modus hängt** — die ursprüngliche Sorge um 30-Minuten-Hänger ist ausgeräumt.
+   - **`is_error` bleibt `false`, auch wenn ein Tool verweigert wurde.** Das Modell erklärt die Ablehnung in Prosa und beendet den Turn regulär. Der einzige verlässliche Marker ist das Array `permission_denials` im Result-Event. Eine Stufe mit zu engem Profil sieht also wie ein Erfolg aus — deshalb muss `runner.parse_stream` dieses Feld durchreichen und die Pipeline es auswerten (siehe Task 6).
 
 ## Neu in diesem Plan: der Agent schreibt
 
@@ -148,7 +152,7 @@ class TestProfilWirdUebergeben:
     def test_erlaubte_tools_landen_im_befehl(self, monkeypatch, tmp_path):
         auf = _Aufzeichnung()
         monkeypatch.setattr(runner.subprocess, "run", auf)
-        profil = runner.PermissionProfile(allowed=("Read", "Grep"), mode="acceptEdits")
+        profil = runner.PermissionProfile(allowed=("Read", "Grep"), mode="dontAsk")
         runner.run("egal", cwd=tmp_path, profile=profil)
         assert "--allowedTools" in auf.befehl
         i = auf.befehl.index("--allowedTools")
@@ -158,7 +162,7 @@ class TestProfilWirdUebergeben:
         auf = _Aufzeichnung()
         monkeypatch.setattr(runner.subprocess, "run", auf)
         runner.run("egal", cwd=tmp_path,
-                   profile=runner.PermissionProfile(allowed=("Read",), mode="acceptEdits"))
+                   profile=runner.PermissionProfile(allowed=("Read",), mode="dontAsk"))
         i = auf.befehl.index("--permission-mode")
         assert auf.befehl[i + 1] == "acceptEdits"
 
@@ -182,7 +186,7 @@ class TestProfilWirdUebergeben:
         # würde als 30-Minuten-Hänger enden statt als Fehlermeldung.
         import pytest
         with pytest.raises(ValueError):
-            runner.PermissionProfile(allowed=(), mode="acceptEdits")
+            runner.PermissionProfile(allowed=(), mode="dontAsk")
 
     def test_stdin_bleibt_abgeklemmt(self, monkeypatch, tmp_path):
         # Regressionsschutz für den Plan-1-Befund (3s Wartezeit pro Lauf).
@@ -200,7 +204,7 @@ class TestProfilWirdUebergeben:
 
         monkeypatch.setattr(runner.subprocess, "run", _run)
         runner.run("egal", cwd=tmp_path,
-                   profile=runner.PermissionProfile(allowed=("Read",), mode="acceptEdits"))
+                   profile=runner.PermissionProfile(allowed=("Read",), mode="dontAsk"))
         assert gesehen["stdin"] == runner.subprocess.DEVNULL
 ```
 
@@ -476,6 +480,14 @@ class TestReihenfolge:
 
 
 class TestRechteprofile:
+    def test_jede_stufe_nutzt_dontask(self):
+        # Gemessen am 2026-08-14 und unabhängig gegengeprüft: unter
+        # `acceptEdits` ignoriert die CLI --allowedTools für Datei-Edits — eine
+        # Datei entstand, obwohl Write nicht erlaubt war. In diesem Modus wäre
+        # das gesamte Rechteprofil Dekoration. Nur `dontAsk` verweigert wirklich.
+        for stufe in s.ALLE_STUFEN:
+            assert stufe.profile.mode == "dontAsk"
+
     def test_keine_stufe_darf_alles(self):
         for stufe in s.ALLE_STUFEN:
             assert stufe.profile.mode != "bypassPermissions"
@@ -648,17 +660,17 @@ def _fix_prompt(task: dict, kontext: dict) -> str:
 # Die Kette: vier Stufen, lückenlos von speccing bis gating.
 STAGES: tuple[Stage, ...] = (
     Stage("spec", m.SPECCING, m.PLANNING,
-          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="acceptEdits"),
+          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _spec_prompt, lambda t: t.get("spec_path")),
     Stage("plan", m.PLANNING, m.IMPLEMENTING,
-          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="acceptEdits"),
+          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _plan_prompt, lambda t: t.get("plan_path")),
     Stage("implement", m.IMPLEMENTING, m.REVIEWING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
-                            mode="acceptEdits"),
+                            mode="dontAsk"),
           _implement_prompt, lambda t: None),
     Stage("review", m.REVIEWING, m.GATING,
-          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="acceptEdits"),
+          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _review_prompt, lambda t: VERDIKT_DATEI),
 )
 
@@ -669,7 +681,7 @@ STAGES: tuple[Stage, ...] = (
 FIX_STAGE = Stage(
     "fix", m.REVIEWING, m.GATING,
     PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
-                      mode="acceptEdits"),
+                      mode="dontAsk"),
     _fix_prompt, lambda t: None,
 )
 
@@ -1127,6 +1139,9 @@ git commit -m "feat(forge): deterministisches Gate"
 - Produces:
   - `forge.pipeline.MAX_FIXRUNDEN: int`
   - `forge.pipeline.eine_stufe(task: dict, worktree: Path) -> str` — Rückgabe: `"weiter" | "fertig" | "geparkt" | "fehler"`
+- Ändert außerdem: `forge.runner.RunResult` bekommt ein Feld `denials: list[dict]`, gefüllt aus `permission_denials` des Result-Events; `parse_stream` liest es mit.
+
+**Warum das Feld hier dazukommt:** Die Messung aus Task 1 hat gezeigt, dass ein verweigertes Tool `is_error` **nicht** setzt — der Lauf sieht wie ein Erfolg aus, nur ohne Ergebnis. Ohne `denials` würde eine Stufe mit zu engem Rechteprofil als „Artefakt fehlt" geparkt, und niemand käme darauf, dass in Wahrheit die Rechte zu eng waren. Die Pipeline muss deshalb: bei nicht-leerem `denials` mit einem Grund parken, der die verweigerten Tools **beim Namen nennt**. Schreibe dafür einen Test, der genau diese Unterscheidung prüft — gleicher `ok=True`, einmal mit und einmal ohne `denials`, und die Park-Gründe müssen sich unterscheiden.
 
 - [ ] **Step 1: Test schreiben, der fehlschlägt**
 
