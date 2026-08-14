@@ -60,6 +60,12 @@ class RunResult:
     error: str | None = None
     rate_limited: bool = False
     raw: list[dict] = field(default_factory=list)
+    # Aus `permission_denials` des Result-Events (siehe tests/fixtures/
+    # permission_probe.md, Probe b2). Ein verweigertes Tool setzt `is_error`
+    # NICHT — der Lauf sieht wie ein Erfolg aus, nur ohne Ergebnis. Ohne dieses
+    # Feld wäre eine zu eng berechtigte Stufe von einer, deren Artefakt aus
+    # anderem Grund fehlt, nicht zu unterscheiden.
+    denials: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,9 @@ def parse_stream(lines: Iterable[str]) -> RunResult:
     verbrauch = schluss.get("usage") or {}
     tokens_in = int(verbrauch.get("input_tokens") or 0)
     tokens_out = int(verbrauch.get("output_tokens") or 0)
+    # Der einzige verlässliche Marker für ein verweigertes Tool (siehe
+    # permission_probe.md, Probe b2) — is_error bleibt dabei false.
+    denials = schluss.get("permission_denials") or []
 
     ist_fehler = schluss.get("is_error")
     if ist_fehler is None:
@@ -144,7 +153,7 @@ def parse_stream(lines: Iterable[str]) -> RunResult:
         log.warning(f"Forge-Runner: {fehler}")
         return RunResult(
             ok=False, text=text, tokens_in=tokens_in, tokens_out=tokens_out,
-            error=fehler, rate_limited=_ist_rate_limit(text), raw=ereignisse,
+            error=fehler, rate_limited=_ist_rate_limit(text), raw=ereignisse, denials=denials,
         )
 
     if ist_fehler:
@@ -152,10 +161,11 @@ def parse_stream(lines: Iterable[str]) -> RunResult:
         log.warning(f"Forge-Runner: Lauf fehlgeschlagen: {fehler}")
         return RunResult(
             ok=False, text=text, tokens_in=tokens_in, tokens_out=tokens_out,
-            error=fehler, rate_limited=_ist_rate_limit(text), raw=ereignisse,
+            error=fehler, rate_limited=_ist_rate_limit(text), raw=ereignisse, denials=denials,
         )
 
-    return RunResult(ok=True, text=text, tokens_in=tokens_in, tokens_out=tokens_out, raw=ereignisse)
+    return RunResult(ok=True, text=text, tokens_in=tokens_in, tokens_out=tokens_out,
+                      raw=ereignisse, denials=denials)
 
 
 def run(prompt: str, cwd: Path, timeout: int = 1800, profile: PermissionProfile | None = None) -> RunResult:
