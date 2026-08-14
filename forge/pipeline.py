@@ -111,6 +111,26 @@ def _schreibe_diff(worktree: Path) -> bool:
     return True
 
 
+def _verwirf_review_artefakte(worktree: Path) -> None:
+    """Löscht das (jetzt veraltete) Review-Urteil und den zugehörigen Diff,
+    nachdem eine Fix-Runde erfolgreich abgeschlossen wurde.
+
+    Ohne das läse die nächste REVIEWING-Stufe (_hat_negatives_verdikt) exakt
+    dasselbe Vor-Fix-Urteil erneut und würde den Task sofort wieder in die
+    Fix-Stufe zurückschicken, OHNE dass die eigentliche Review-Stufe je
+    gelaufen wäre — das ist Kritischer Fund 1. `missing_ok=True`, weil ein
+    fehlgeschlagener Fix-Lauf (parkt vorher) oder ein bereits aufgeräumter
+    Worktree hier nichts vorfinden muss.
+    """
+    for pfad in (stages.VERDIKT_DATEI, stages.DIFF_DATEI):
+        datei = Path(worktree) / pfad
+        try:
+            datei.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning(f"Forge-Pipeline: veraltetes Review-Artefakt konnte nicht gelöscht werden "
+                        f"({datei}): {exc}")
+
+
 def _erwarteter_pfad_und_feld(stufe: stages.Stage, task: dict,
                                ergebnis: runner.RunResult) -> tuple[str | None, str | None]:
     """Der Artefakt-Pfad, den diese Stufe versprochen hat, plus das Feld, in
@@ -247,4 +267,10 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
         _park(task_id, state,
               f"Zustandswechsel {state} -> {ziel} schlug fehl (Task {task_id})")
         return "geparkt"
+    if ist_fix:
+        # Kritischer Fund 1: das Vor-Fix-Urteil (und der Diff, den es beurteilt
+        # hat) sind jetzt veraltet — ohne diesen Schnitt läse die nächste
+        # REVIEWING-Stufe dasselbe Urteil erneut und würde nie wirklich neu
+        # reviewen.
+        _verwirf_review_artefakte(worktree)
     return "fertig" if ziel == m.GATING else "weiter"

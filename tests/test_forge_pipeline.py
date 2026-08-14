@@ -269,6 +269,72 @@ class TestTokenWeiterleitung:
         assert treffer, f"tokens_in/out nicht korrekt weitergereicht: {stubs['journal']}"
 
 
+class TestKritisch1FixRundeErzwingtErneutesReview:
+    """Kritischer Fund 1, reproduziert über genau drei aufeinanderfolgende
+    eine_stufe()-Aufrufe an EINEM Worktree:
+
+    Tick 1: REVIEWING mit bereits vorliegendem negativem (Vor-Fix-)Urteil
+            -> Fix-Stufe läuft, Task geht nach IMPLEMENTING.
+    Tick 2: IMPLEMENTING läuft durch, Task geht zurück nach REVIEWING.
+    Tick 3: Ohne den Fix in Task 6 fände _hat_negatives_verdikt dasselbe
+            Vor-Fix-Urteil noch vor und schickte den Task sofort wieder in
+            die Fix-Stufe, OHNE dass Review je gelaufen wäre. Mit dem Fix
+            muss Tick 3 die echte Review-Stufe anfordern.
+    """
+
+    def test_dritter_tick_laeuft_review_stufe_nicht_fix_stufe(self, monkeypatch, stubs, tmp_path):
+        _verdikt(tmp_path, "fail", [{"severity": "important", "what": "x"}])
+
+        def _fake_gitctl(*args, cwd=None, timeout=300):
+            class _R:
+                returncode = 0
+                stdout = "+ diff\n"
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(pl.gitctl, "run", _fake_gitctl)
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="gefixt")))
+        # Artefakt-Pflicht ist hier nicht der Prüfgegenstand — implement/fix
+        # versprechen ohnehin kein Artefakt (siehe _ARTEFAKT_FELD_JE_STUFE),
+        # nur die Review-Stufe (VERDIKT_DATEI) tut es in Tick 3.
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+
+        task = _task(m.REVIEWING)
+
+        # Tick 1: negatives Vor-Fix-Urteil liegt vor -> Fix-Stufe.
+        ergebnis1 = pl.eine_stufe(task, tmp_path)
+        assert ergebnis1 == "weiter"
+        assert stubs["states"][-1] == (5, m.IMPLEMENTING)
+        # Die Fix-Stufe ist an ihrem Rechteprofil erkennbar (Edit erlaubt).
+        assert "Edit" in " ".join(stubs["profile"][-1].allowed)
+        # Kritischer Fund 1: das Vor-Fix-Urteil muss jetzt weg sein.
+        assert not (tmp_path / pl.stages.VERDIKT_DATEI).is_file()
+        task["state"] = m.IMPLEMENTING
+
+        # Tick 2: IMPLEMENTING läuft durch, Task geht zurück nach REVIEWING.
+        ergebnis2 = pl.eine_stufe(task, tmp_path)
+        assert ergebnis2 == "weiter"
+        assert stubs["states"][-1] == (5, m.REVIEWING)
+        task["state"] = m.REVIEWING
+
+        # Tick 3: kein Verdikt mehr vorhanden -> _hat_negatives_verdikt ist
+        # False -> die echte Review-Stufe muss laufen, nicht die Fix-Stufe.
+        stubs["journal"].clear()
+        ergebnis3 = pl.eine_stufe(task, tmp_path)
+
+        # Die Review-Stufe hat KEIN Edit im Profil — die Fix-Stufe hätte es.
+        assert "Edit" not in " ".join(stubs["profile"][-1].allowed)
+        # Der stage_start-Journaleintrag muss 'review' nennen, nicht 'fix'.
+        stage_start = next(e for e in stubs["journal"] if e[0][1] == "stage_start")
+        meldung = stage_start[0][2]
+        assert "'review'" in meldung
+        assert "'fix'" not in meldung
+        # Review ist die letzte Kettenstufe (next_state=GATING) — mit dem
+        # gestubbten Artefakt-Check meldet die Kette entsprechend "fertig".
+        assert ergebnis3 == "fertig"
+        assert stubs["states"][-1] == (5, m.GATING)
+
+
 class TestUnbekannterZustandDiagnose:
     def test_parkgrund_nennt_den_unbekannten_zustand(self, monkeypatch, stubs, tmp_path):
         pl.eine_stufe(_task(m.QUEUED), tmp_path)
