@@ -84,6 +84,37 @@ class TestRechteprofile:
         for stufe in s.ALLE_STUFEN:
             assert isinstance(stufe.profile, PermissionProfile)
 
+    def test_spec_write_ist_auf_das_spec_verzeichnis_beschraenkt(self):
+        # Gemessen (CLI 2.1.126, 2026-08-14, siehe Modul-Docstring): Pfad-Muster
+        # greifen bei `Write` genauso wie bei `Bash`. Ein unbepfadetes "Write"
+        # dürfte spec jede Datei im Worktree anlegen lassen, auch forge/gate.py.
+        erlaubt = s.fuer_state(m.SPECCING).profile.allowed
+        assert "Write" not in erlaubt, "bare Write hebelt die Pfadbeschränkung aus"
+        treffer = [a for a in erlaubt if a.startswith("Write(")]
+        assert treffer, "spec-Profil hat keinen bepfadeten Write-Grant"
+        assert s.SPEC_VERZEICHNIS in treffer[0]
+
+    def test_plan_write_ist_auf_das_plan_verzeichnis_beschraenkt(self):
+        erlaubt = s.fuer_state(m.PLANNING).profile.allowed
+        assert "Write" not in erlaubt, "bare Write hebelt die Pfadbeschränkung aus"
+        treffer = [a for a in erlaubt if a.startswith("Write(")]
+        assert treffer, "plan-Profil hat keinen bepfadeten Write-Grant"
+        assert s.PLAN_VERZEICHNIS in treffer[0]
+
+    def test_review_write_ist_auf_die_verdiktdatei_beschraenkt(self):
+        erlaubt = s.fuer_state(m.REVIEWING).profile.allowed
+        assert "Write" not in erlaubt, "bare Write hebelt die Pfadbeschränkung aus"
+        treffer = [a for a in erlaubt if a.startswith("Write(")]
+        assert treffer, "review-Profil hat keinen bepfadeten Write-Grant"
+        assert s.VERDIKT_DATEI in treffer[0]
+
+    def test_implement_und_fix_behalten_unbepfadetes_write(self):
+        # Diese beiden dürfen legitim breit schreiben — der Pin oben soll nicht
+        # versehentlich auch diese Stufen einschränken.
+        for state_name in ("implement", "fix"):
+            stufe = next(st for st in s.ALLE_STUFEN if st.name == state_name)
+            assert "Write" in stufe.profile.allowed
+
 
 class TestPrompts:
     def _task(self):

@@ -112,6 +112,29 @@ claude -p "Fuehre 'git status' aus und antworte nur mit der ersten Zeile der Aus
 
 Das Bash-Muster greift wie erwartet.
 
+## (d) Pfad-Muster bei `Write` (Nachtrag, 2026-08-14, gleiche CLI-Version 2.1.126)
+
+Frage: Greift ein Pfad-Muster wie `Bash(git *)` aus Probe (c) auch bei `Write`,
+oder gilt das nur für `Bash`? Relevant, weil `spec`, `plan` und `review` in
+Plan 2 / Task 3 ein `Write` bekommen, das nicht den ganzen Worktree treffen
+darf (u.a. nicht `forge/gate.py`).
+
+Befehl (Wegwerf-Verzeichnis, `docs/` existierte, Ziel außerhalb davon):
+```
+claude -p "Lege die Datei geheim.txt im aktuellen Verzeichnis an ..." \
+  --output-format stream-json --verbose \
+  --allowedTools "Write(docs/**) Read" --permission-mode dontAsk < /dev/null
+```
+
+- kam sauber zurück, kein Hänger
+- `permission_denials` enthielt den `Write`-Aufruf für `geheim.txt`
+- `geheim.txt` (außerhalb von `docs/`) wurde **nicht** angelegt
+
+**Ergebnis:** Pfad-Muster in `--allowedTools` wirken bei `Write` genauso wie
+bei `Bash(git *)` — das Muster grenzt den Grant auf den angegebenen Pfad ein,
+nicht nur den Tool-Namen. Damit ist `Write(<verzeichnis>/**)` bzw.
+`Write(<datei>)` eine belegte, keine bloß plausible Einschränkung.
+
 ## Fazit
 
 Die entscheidende Frage aus der Aufgabenstellung — hängt Probe (b) bis zum
