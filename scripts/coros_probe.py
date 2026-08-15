@@ -6,9 +6,14 @@ Ausführen (nach scripts/coros_auth.py):
   cd /Users/timoegersdorfer/Mantis
   python3 scripts/coros_probe.py
 
-Schreibt nach tests/fixtures/coros/. Die Feldnamen der COROS-Antworten sind
-nirgends dokumentiert — diese Dateien sind die Grundlage für das Mapping in
+Schreibt nach data/coros_samples/ (gitignored). Die Feldnamen der COROS-Antworten
+sind nirgends dokumentiert — diese Dateien sind die Grundlage für das Mapping in
 Phase B. Reines Lese-Werkzeug, ändert nichts an Mantis.
+
+ACHTUNG — personenbezogene Daten: queryUserInfo liefert Geburtsdatum, Größe und
+Gewicht, querySportRecords die Startkoordinaten von Läufen (de facto die
+Heimadresse). Vor jeder Verwendung außerhalb dieses Rechners — insbesondere vor
+einem Commit — von Hand durchsehen und redigieren.
 """
 import json
 import sys
@@ -25,7 +30,7 @@ load_dotenv(ROOT / ".env")
 from domains.coros import oauth
 from domains.coros.client import CorosClient
 
-OUT = ROOT / "tests" / "fixtures" / "coros"
+OUT = ROOT / "data" / "coros_samples"
 
 # Nur lesende Tools. downloadActivityFitFiles bleibt bewusst draußen (Limit 50/Tag).
 WANTED = [
@@ -71,29 +76,28 @@ def guess_args(schema: dict) -> dict:
 
 
 def main():
-    OUT.mkdir(parents=True, exist_ok=True)
     try:
         oauth.access_token()
     except oauth.CorosNotAuthorized as e:
         print(f"❌ {e}")
         sys.exit(1)
+    OUT.mkdir(parents=True, exist_ok=True)
 
     with CorosClient() as c:
         tools = c.list_tools()
         (OUT / "_tools.json").write_text(
             json.dumps(tools, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"📚 {len(tools)} Tools im Katalog → tests/fixtures/coros/_tools.json")
+        print(f"📚 {len(tools)} Tools im Katalog → data/coros_samples/_tools.json")
 
         by_name = {t["name"]: t for t in tools}
         unknown = [n for n in WANTED if n not in by_name]
         if unknown:
             print(f"⚠️  Nicht im Katalog (Doku veraltet?): {', '.join(unknown)}")
 
+        available = [n for n in WANTED if n in by_name]
         ok = fail = 0
-        for name in WANTED:
-            tool = by_name.get(name)
-            if not tool:
-                continue
+        for i, name in enumerate(available):
+            tool = by_name[name]
             args = guess_args(tool.get("inputSchema"))
             try:
                 result = c.call_tool(name, args)
@@ -106,12 +110,16 @@ def main():
                 print(f"  ❌ {name}  args={args}  → {e}")
             (OUT / f"{name}.json").write_text(
                 json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
-            time.sleep(1)  # höflich bleiben
+            if i < len(available) - 1:
+                time.sleep(1)  # höflich bleiben
 
     print(f"\n{ok} erfolgreich, {fail} fehlgeschlagen. Dateien in {OUT}")
     if fail:
         print("Bei Fehlschlägen: das inputSchema in _tools.json ansehen und die "
               "Argumente in WANTED/guess_args nachziehen.")
+    print("\n⚠️  Enthält personenbezogene Daten (Geburtsdatum, Größe, Gewicht aus "
+          "queryUserInfo; GPS-Startkoordinaten aus querySportRecords). Von Hand "
+          "durchsehen und redigieren, bevor davon irgendetwas ins Repo kommt.")
 
 
 if __name__ == "__main__":

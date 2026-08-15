@@ -12,8 +12,9 @@ python3 scripts/coros_auth.py
 
 Öffnet den COROS-Login im Browser. Nach der Zustimmung liegt das Token in
 `data/coros_token.json` (Rechte 0600, gitignored). Der Refresh-Token hält die
-Verbindung; das Skript muss nur erneut laufen, wenn du den Zugriff im
-COROS-Account entziehst.
+Verbindung; das Skript muss nur erneut laufen, wenn der Zugriff im COROS-Account
+entzogen wurde, der Refresh-Token abgelaufen ist oder die Token-Datei nicht
+lesbar ist.
 
 ## Region
 
@@ -38,13 +39,19 @@ versucht `access_token()` weiterhin zuerst den alten Refresh.
 python3 scripts/coros_probe.py
 ```
 
-Schreibt Tool-Katalog und Beispiel-Antworten nach `tests/fixtures/coros/`.
+Schreibt Tool-Katalog und Beispiel-Antworten nach `data/coros_samples/`
+(gitignored, da unter `data/`).
+
+**Achtung, personenbezogene Daten:** `queryUserInfo` enthält Geburtsdatum, Größe
+und Gewicht, `querySportRecords` die Startkoordinaten von Läufen (de facto die
+Heimadresse). Die Dumps sind absichtlich außerhalb der Versionskontrolle — vor
+jeder Verwendung außerhalb dieses Rechners von Hand durchsehen und redigieren.
 
 ## Wenn es klemmt
 
 | Symptom | Ursache |
 |---|---|
 | `COROS nicht autorisiert` | Kein Token-File — `scripts/coros_auth.py` laufen lassen |
-| `COROS-Refresh abgelehnt` | Zugriff im COROS-Account entzogen — neu autorisieren |
+| `COROS-Refresh abgelehnt` | Zugriff entzogen, Refresh-Token abgelaufen oder Token-Datei unlesbar — neu autorisieren |
 | Alle Tools 401 | Falsche Region, siehe oben (und `data/coros_token.json` löschen!) |
-| Tool meldet fehlende Parameter | `inputSchema` in `tests/fixtures/coros/_tools.json` ansehen |
+| Tool meldet fehlende Parameter | `inputSchema` in `data/coros_samples/_tools.json` ansehen |
