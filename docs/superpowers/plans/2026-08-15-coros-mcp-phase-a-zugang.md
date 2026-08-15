@@ -1099,6 +1099,26 @@ git commit -m "feat(coros): Erkundungs-Skript, Fixtures und Setup-Doku"
 
 ---
 
+## Abweichungen vom Plan
+
+- **Callback-Loop statt einzelnem `handle_request()`.** `scripts/coros_auth.py`
+  ruft `server.handle_request()` in einer Schleife auf, bis ein Callback mit
+  `code` oder `error` ankommt, statt genau einmal — Browser schicken vorher oft
+  einen Favicon- o.ä. Request, den ein einzelner `handle_request()`-Aufruf als
+  (leeren) Callback fehlinterpretiert hätte.
+- **Fehlerausgabe erst verengt, dann gezielt wieder freigegeben.** Die Callback-
+  Fehlerpfade geben nicht mehr `result` im Klartext aus (der `code` darf nicht
+  im Terminal landen), aber `error`/`error_description` — die Diagnosefelder der
+  OAuth-Spec — werden wieder verbatim ausgegeben; alles andere bleibt auf
+  Feldnamen reduziert.
+- **Fixture-Ziel: `data/coros_samples/` statt `tests/fixtures/coros/`.** Der Plan
+  hier hatte ursprünglich `tests/fixtures/coros/` vorgesehen; das liegt aber
+  nicht unter `data/` und ist damit nicht gitignored. Die Dumps enthalten
+  personenbezogene Daten (Geburtsdatum, Größe, Gewicht, GPS-Startkoordinaten).
+  Die Spec (`docs/superpowers/specs/2026-08-15-coros-mcp-health-sync-design.md`,
+  Abschnitt „Bauabschnitte") sah von Anfang an `data/coros_samples/` vor — dem
+  wird hier gefolgt.
+
 ## Abschluss der Phase
 
 Danach steht: Mantis ist bei COROS autorisiert, kann Tools aufrufen, und die echten
