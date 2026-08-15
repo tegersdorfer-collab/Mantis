@@ -6,7 +6,6 @@ Der Browser-Flow selbst wird nicht automatisiert getestet.
 
 import base64
 import hashlib
-import json
 import os
 import sys
 from urllib.parse import parse_qs, urlparse
