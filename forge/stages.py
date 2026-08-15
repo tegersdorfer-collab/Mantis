@@ -54,6 +54,24 @@ VERDIKT_DATEI = ".forge/review.json"
 DIFF_DATEI = ".forge/diff.patch"
 
 
+# Zeitbudget für die reinen Lese-/Schreib-Stufen (spec, plan, review): sie
+# erzeugen genau ein Dokument bzw. lesen eine Diff-Datei und urteilen — 1800s
+# waren dafür in der Praxis (Akzeptanzlauf 2026-08-14) reichlich.
+STANDARD_TIMEOUT_SEKUNDEN = 1800
+
+# implement/fix arbeiten testgetrieben über mehrere Dateien: fehlschlagenden
+# Test schreiben, Implementierung, Tests der ganzen Suite laufen lassen (1142+
+# Fälle), committen — oft in mehreren Runden. Der Akzeptanzlauf vom
+# 2026-08-14 zeigt genau das Muster, das eine einheitliche Grenze bricht: die
+# Stufe hatte ihre Arbeit bereits fertig UND committet, lief aber trotzdem in
+# die 1800s-Grenze, weil das Modell danach noch weiterarbeitete (z.B. eigene
+# Verifikation). Das Dreifache des Lese-Budgets gibt genug Luft für mehrere
+# Test-Läufe der vollen Suite, ohne einen echt hängenden Lauf endlos offen zu
+# lassen — 1800s bleiben für die drei Lese-Stufen unverändert, weil dort
+# dieselbe Begründung nicht zutrifft (kein Testlauf, kein Mehrdateien-Umbau).
+IMPLEMENT_TIMEOUT_SEKUNDEN = 5400
+
+
 @dataclass(frozen=True)
 class Stage:
     name: str
@@ -62,6 +80,7 @@ class Stage:
     profile: PermissionProfile
     baue_prompt: Callable[[dict, dict], str]
     artefakt: Callable[[dict], str | None]
+    timeout: int = STANDARD_TIMEOUT_SEKUNDEN
 
 
 def _kopf(task: dict) -> str:
@@ -148,7 +167,7 @@ STAGES: tuple[Stage, ...] = (
     Stage("implement", m.IMPLEMENTING, m.REVIEWING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                             mode="dontAsk"),
-          _implement_prompt, lambda t: None),
+          _implement_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN),
     Stage("review", m.REVIEWING, m.GATING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _review_prompt, lambda t: VERDIKT_DATEI),
@@ -162,7 +181,7 @@ FIX_STAGE = Stage(
     "fix", m.REVIEWING, m.GATING,
     PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                       mode="dontAsk"),
-    _fix_prompt, lambda t: None,
+    _fix_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN,
 )
 
 ALLE_STUFEN: tuple[Stage, ...] = STAGES + (FIX_STAGE,)

@@ -320,7 +320,9 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
 
     journal.log(task_id, "stage_start", f"Stufe '{stufe.name}' für Task {task_id}")
     prompt = stufe.baue_prompt(task, _kontext(task))
-    ergebnis = runner.run(prompt, cwd=worktree, profile=stufe.profile)
+    # Fund 2 (Akzeptanzlauf 2026-08-15): implement/fix bekommen ein größeres
+    # Zeitbudget als die drei Lese-Stufen — siehe forge/stages.py.
+    ergebnis = runner.run(prompt, cwd=worktree, profile=stufe.profile, timeout=stufe.timeout)
 
     journal.log(
         task_id,

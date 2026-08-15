@@ -542,3 +542,56 @@ class TestPfadNormalisierung:
         assert ergebnis == "geparkt"
         grund = stubs["parks"][-1][1]
         assert roh.strip() in grund
+
+
+# ---------------------------------------------------------------------------
+# Akzeptanzlauf 2026-08-15, Fund 2: implement/fix arbeiten testgetrieben über
+# mehrere Dateien und laufen legitim länger als ein einzelner Dokument-Lauf —
+# jede Stufe muss ihr eigenes Zeitbudget an runner.run durchreichen.
+# ---------------------------------------------------------------------------
+
+
+class TestFund2StufenspezifischesTimeout:
+    def test_timeout_wird_je_stufe_durchgereicht(self, monkeypatch, stubs, tmp_path):
+        aufgezeichnete_timeouts = []
+
+        def _run(prompt, cwd, timeout=1800, profile=None):
+            aufgezeichnete_timeouts.append(timeout)
+            return RunResult(ok=True, text="x")
+
+        def _gitctl_erfolg(*args, cwd=None, timeout=300):
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(pl.runner, "run", _run)
+        monkeypatch.setattr(pl.gitctl, "run", _gitctl_erfolg)  # review braucht _schreibe_diff
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+
+        pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        pl.eine_stufe(_task(m.PLANNING), tmp_path)
+        pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path)
+        pl.eine_stufe(_task(m.REVIEWING), tmp_path)  # kein Verdikt vorhanden -> echte review-Stufe
+
+        _verdikt(tmp_path, "fail", [{"severity": "important", "what": "x"}])
+        pl.eine_stufe(_task(m.REVIEWING), tmp_path)  # jetzt negatives Verdikt -> fix-Stufe
+
+        erwartet = [
+            pl.stages.fuer_state(m.SPECCING).timeout,
+            pl.stages.fuer_state(m.PLANNING).timeout,
+            pl.stages.fuer_state(m.IMPLEMENTING).timeout,
+            pl.stages.fuer_state(m.REVIEWING).timeout,
+            pl.stages.FIX_STAGE.timeout,
+        ]
+        assert aufgezeichnete_timeouts == erwartet
+        # Der Kern der Anforderung: implement/fix bekommen NICHT dasselbe
+        # Budget wie die drei Lese-Stufen.
+        assert erwartet[2] == pl.stages.IMPLEMENT_TIMEOUT_SEKUNDEN
+        assert erwartet[4] == pl.stages.IMPLEMENT_TIMEOUT_SEKUNDEN
+        assert erwartet[0] == erwartet[1] == erwartet[3] == pl.stages.STANDARD_TIMEOUT_SEKUNDEN
+        assert erwartet[2] != erwartet[0]
+
+    def test_implement_und_fix_haben_ein_groesseres_budget_als_die_lese_stufen(self):
+        assert pl.stages.IMPLEMENT_TIMEOUT_SEKUNDEN > pl.stages.STANDARD_TIMEOUT_SEKUNDEN
