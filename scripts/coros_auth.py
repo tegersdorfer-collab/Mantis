@@ -35,7 +35,13 @@ def main():
     meta = oauth.discover(issuer)
 
     tok = oauth.load_token()
-    client_id = tok["client_id"] if tok and tok.get("client_id") else oauth.register_client(meta)
+    # Ein gespeicherter client_id gehört zum Issuer, bei dem er registriert wurde.
+    # Kommt der Login diesmal von einem anderen Issuer (Regions-Wechsel EU/US/CN),
+    # ist die alte client_id dort unbekannt — dann neu registrieren.
+    if tok and tok.get("client_id") and tok.get("issuer") == meta["issuer"]:
+        client_id = tok["client_id"]
+    else:
+        client_id = oauth.register_client(meta)
     print(f"🪪 Client-ID: {client_id}")
 
     verifier, challenge = oauth.pkce_pair()
@@ -82,11 +88,20 @@ def main():
     while not ("code" in result or "error" in result):
         server.handle_request()
 
+    # Wichtig: der error-Check muss vor dem state-Check stehen. Manche Provider
+    # schicken bei einem Fehler kein state-Parameter zurück — dann würde der
+    # state-Check zuerst greifen und "State stimmt nicht" melden, obwohl der Server
+    # eigentlich einen aussagekräftigen Fehler geliefert hat.
+    if "error" in result:
+        # error/error_description sind laut OAuth-Spec die Diagnosefelder — keine
+        # Geheimnisse, im Gegensatz zum code. Nur diese beiden werden im Klartext
+        # ausgegeben, alles andere bleibt auf Feldnamen reduziert.
+        print(f"❌ Autorisierung abgelehnt: {result.get('error')}")
+        if result.get("error_description"):
+            print(f"   {result['error_description']}")
+        sys.exit(1)
     if result.get("state") != state:
         print(f"❌ State stimmt nicht — Abbruch. Parameter: {list(result.keys())}")
-        sys.exit(1)
-    if "error" in result:
-        print(f"❌ Autorisierung abgelehnt. Parameter: {list(result.keys())}")
         sys.exit(1)
     if "code" not in result:
         print(f"❌ Kein Code zurückgekommen. Parameter: {list(result.keys())}")

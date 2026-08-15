@@ -15,9 +15,11 @@ import os
 import secrets
 import time
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
+
+import config
 
 log = logging.getLogger("mantis.coros")
 
@@ -66,6 +68,14 @@ def register_client(meta: dict) -> str:
     return resp.json()["client_id"]
 
 
+def _resource() -> str:
+    """Kanonische Resource-URI (RFC 8707) — Herkunft der konfigurierten COROS-MCP-URL,
+    ohne Pfad. Aus der Konfiguration abgeleitet statt hart codiert, damit eine
+    Regions-Umschaltung (COROS_MCP_URL) automatisch die richtige URI liefert."""
+    parts = urlsplit(config.COROS_MCP_URL)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
 def build_authorize_url(meta: dict, client_id: str, challenge: str, state: str) -> str:
     return meta["authorization_endpoint"] + "?" + urlencode({
         "response_type": "code",
@@ -75,6 +85,7 @@ def build_authorize_url(meta: dict, client_id: str, challenge: str, state: str) 
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "resource": _resource(),
     })
 
 
@@ -92,6 +103,7 @@ def exchange_code(meta: dict, client_id: str, code: str, verifier: str) -> dict:
         "redirect_uri": REDIRECT_URI,
         "client_id": client_id,
         "code_verifier": verifier,
+        "resource": _resource(),
     })
     return _to_token(raw, meta, client_id)
 

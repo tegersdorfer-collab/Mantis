@@ -25,6 +25,13 @@ COROS_MCP_URL=https://mcpus.coros.com/mcp
 
 Verfügbar sind `mcpeu`, `mcpus` und `mcpcn`.
 
+**Beim Wechseln der Region immer zuerst `data/coros_token.json` löschen.**
+`oauth.access_token()` refresht gegen den `token_endpoint`, der *im Token selbst*
+gespeichert ist — eine alte Datei redet also unbegrenzt weiter mit der alten
+Region, egal was in `COROS_MCP_URL` steht. `scripts/coros_auth.py` erkennt einen
+Issuer-Wechsel zwar und registriert dann neu, aber ohne gelöschte Token-Datei
+versucht `access_token()` weiterhin zuerst den alten Refresh.
+
 ## Nachsehen, was das MCP liefert
 
 ```bash
@@ -39,5 +46,5 @@ Schreibt Tool-Katalog und Beispiel-Antworten nach `tests/fixtures/coros/`.
 |---|---|
 | `COROS nicht autorisiert` | Kein Token-File — `scripts/coros_auth.py` laufen lassen |
 | `COROS-Refresh abgelehnt` | Zugriff im COROS-Account entzogen — neu autorisieren |
-| Alle Tools 401 | Falsche Region, siehe oben |
+| Alle Tools 401 | Falsche Region, siehe oben (und `data/coros_token.json` löschen!) |
 | Tool meldet fehlende Parameter | `inputSchema` in `tests/fixtures/coros/_tools.json` ansehen |

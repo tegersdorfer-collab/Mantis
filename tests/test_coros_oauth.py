@@ -54,6 +54,16 @@ def test_authorize_url_carries_all_required_params():
     assert q["scope"] == [oauth.SCOPES]
 
 
+def test_authorize_url_carries_resource_from_configured_mcp_url(monkeypatch):
+    """RFC 8707: die Autorisierungsanfrage muss die kanonische Resource-URI tragen,
+    abgeleitet von COROS_MCP_URL — nicht hart codiert, damit ein Regions-Wechsel
+    (EU/US/CN) automatisch die richtige URI liefert."""
+    monkeypatch.setattr(oauth.config, "COROS_MCP_URL", "https://mcpus.coros.com/mcp")
+    url = oauth.build_authorize_url(META, "cid-1", "chal-1", "state-1")
+    q = parse_qs(urlparse(url).query)
+    assert q["resource"] == ["https://mcpus.coros.com"]
+
+
 def test_needs_refresh_true_when_no_token():
     assert oauth.needs_refresh({}) is True
 
