@@ -82,6 +82,11 @@ class MantisSettings(BaseSettings):
     HEALTH_API_URL: str = ""
     CALENDAR_ICS_URLS: str = ""
 
+    # ── COROS ────────────────────────────────────────────────────────────────
+    # Offizielles COROS-MCP. EU-Route als Default; mcpus/mcpcn falls der Account
+    # dort liegt. Siehe docs/coros-setup.md.
+    COROS_MCP_URL: str = "https://mcpeu.coros.com/mcp"
+
     # ── Database ─────────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql://localhost:5432/mantis"
 
