@@ -53,28 +53,43 @@ def main():
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            result.update({k: v[0] for k, v in params.items()})
-            ok = "code" in result and result.get("state") == state
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            parsed = urllib.parse.urlparse(self.path)
+            # Nur Callback-Pfad als Auth-Redirect akzeptieren
+            if parsed.path == "/callback":
+                params = urllib.parse.parse_qs(parsed.query)
+                params_flat = {k: v[0] for k, v in params.items()}
+                # Nur als Callback akzeptieren, wenn code oder error vorhanden
+                if "code" in params_flat or "error" in params_flat:
+                    result.update(params_flat)
+                    ok = "code" in result and result.get("state") == state
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    body = ("<h2>✅ COROS verbunden.</h2><p>Fenster kann zu.</p>" if ok
+                            else "<h2>❌ Fehlgeschlagen.</h2><p>Siehe Terminal.</p>")
+                    self.wfile.write(body.encode("utf-8"))
+                    return
+            # Stray requests (favicon, etc.) — einfach ignorieren
+            self.send_response(204)
             self.end_headers()
-            body = ("<h2>✅ COROS verbunden.</h2><p>Fenster kann zu.</p>" if ok
-                    else "<h2>❌ Fehlgeschlagen.</h2><p>Siehe Terminal.</p>")
-            self.wfile.write(body.encode("utf-8"))
 
         def log_message(self, *_):
             pass
 
     print(f"⏳ Warte auf den Callback auf Port {PORT} …")
-    with http.server.HTTPServer(("127.0.0.1", PORT), Handler) as srv:
-        srv.handle_request()
+    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    # Mehrere Requests erlauben (Browser schickt evtl. zuerst favicon etc.)
+    while not ("code" in result or "error" in result):
+        server.handle_request()
 
     if result.get("state") != state:
-        print(f"❌ State stimmt nicht — Abbruch. Antwort: {result}")
+        print(f"❌ State stimmt nicht — Abbruch. Parameter: {list(result.keys())}")
+        sys.exit(1)
+    if "error" in result:
+        print(f"❌ Autorisierung abgelehnt. Parameter: {list(result.keys())}")
         sys.exit(1)
     if "code" not in result:
-        print(f"❌ Kein Code zurückgekommen: {result}")
+        print(f"❌ Kein Code zurückgekommen. Parameter: {list(result.keys())}")
         sys.exit(1)
 
     tok = oauth.exchange_code(meta, client_id, result["code"], verifier)
