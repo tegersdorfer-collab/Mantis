@@ -6,7 +6,11 @@ SDK (2.0.0) zieht httpx2, starlette, uvicorn, sse-starlette und opentelemetry na
 drei Nachrichten: initialize, notifications/initialized, tools/call.
 
 Der Server antwortet je nach Laune als application/json oder als text/event-stream;
-beides wird hier gleich behandelt.
+beides wird hier gleich behandelt. Die SSE-Antwort wird gestreamt gelesen: der
+Server darf den Stream laut Spec offen halten und mit Keep-Alives füllen, statt ihn
+nach der Antwort zu schließen. Würde der Body erst komplett gepuffert, könnte ein
+solcher Keep-Alive-Stream den Aufruf für immer blockieren (der httpx-Read-Timeout
+wird pro gelesenem Chunk zurückgesetzt, nicht für den gesamten Request).
 """
 import json
 import logging
@@ -51,6 +55,7 @@ class CorosClient:
     def __init__(self, base_url: str | None = None, http: httpx.Client | None = None,
                  token_provider=oauth.access_token):
         self.base_url = base_url or config.COROS_MCP_URL
+        self._owns_http = http is None
         self._http = http or httpx.Client(timeout=60)
         self._token_provider = token_provider
         self._session_id: str | None = None
@@ -69,33 +74,53 @@ class CorosClient:
             h["Mcp-Session-Id"] = self._session_id
         return h
 
-    def _post(self, body: dict, force_refresh: bool = False) -> httpx.Response:
-        return self._http.post(self.base_url, json=body, headers=self._headers(force_refresh))
-
     @staticmethod
     def _decode(resp: httpx.Response) -> dict:
-        """JSON-RPC-Antwort aus JSON- oder SSE-Body holen."""
+        """JSON-RPC-Antwort aus JSON- oder SSE-Body lesen.
+
+        SSE wird zeilenweise aus dem offenen Stream gelesen; sobald ein `data:`-Frame
+        mit `result` oder `error` da ist, wird sofort zurückgegeben, ohne auf das Ende
+        des Streams zu warten. Eine `data:`-Zeile, die kein JSON ist (Keep-Alive), wird
+        übersprungen statt einen Fehler zu werfen.
+        """
         if "text/event-stream" in resp.headers.get("Content-Type", ""):
-            for line in resp.text.splitlines():
-                if line.startswith("data:"):
+            for line in resp.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                try:
                     msg = json.loads(line[5:].strip())
-                    if "result" in msg or "error" in msg:
-                        return msg
+                except json.JSONDecodeError:
+                    continue  # Keep-Alive-Zeile ohne JSON — ignorieren
+                if "result" in msg or "error" in msg:
+                    return msg
             raise CorosToolError("SSE-Antwort ohne verwertbares data-Feld")
+        resp.read()
         return resp.json()
 
+    def _send(self, body: dict) -> tuple[httpx.Headers, dict]:
+        """Eine JSON-RPC-Anfrage senden und die Antwort decodieren.
+
+        Bei 401 genau ein Refresh-Versuch — das ist die einzige Stelle für dieses
+        Verhalten, geteilt zwischen `_request` (tools/list, tools/call) und
+        `_handshake` (initialize).
+        """
+        with self._http.stream("POST", self.base_url, json=body,
+                               headers=self._headers()) as resp:
+            if resp.status_code != 401:
+                resp.raise_for_status()
+                return resp.headers, self._decode(resp)
+
+        log.info("COROS: 401 — Token wird erneuert und der Aufruf einmal wiederholt")
+        with self._http.stream("POST", self.base_url, json=body,
+                               headers=self._headers(force_refresh=True)) as resp:
+            resp.raise_for_status()
+            return resp.headers, self._decode(resp)
+
     def _request(self, method: str, params: dict) -> dict:
-        """Eine JSON-RPC-Anfrage; bei 401 genau ein Refresh-Versuch."""
         self._next_id += 1
         body = {"jsonrpc": "2.0", "id": self._next_id, "method": method, "params": params}
 
-        resp = self._post(body)
-        if resp.status_code == 401:
-            log.info("COROS: 401 — Token wird erneuert und der Aufruf einmal wiederholt")
-            resp = self._post(body, force_refresh=True)
-        resp.raise_for_status()
-
-        msg = self._decode(resp)
+        _, msg = self._send(body)
         if "error" in msg:
             raise CorosToolError(f"{method}: {msg['error'].get('message', msg['error'])}")
         return msg.get("result") or {}
@@ -112,15 +137,12 @@ class CorosClient:
                 "clientInfo": {"name": "mantis", "version": "1.0"},
             },
         }
-        resp = self._post(body)
-        if resp.status_code == 401:
-            resp = self._post(body, force_refresh=True)
-        resp.raise_for_status()
-        self._decode(resp)
-        self._session_id = resp.headers.get("Mcp-Session-Id") or self._session_id
+        headers, _ = self._send(body)
+        self._session_id = headers.get("Mcp-Session-Id") or self._session_id
         # Pflicht laut Spec: der Server darf vorher keine Tool-Aufrufe annehmen.
-        self._http.post(self.base_url, headers=self._headers(),
-                        json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        resp = self._http.post(self.base_url, headers=self._headers(),
+                               json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        resp.raise_for_status()
         self._ready = True
 
     # ── öffentlich ──────────────────────────────────────────────────────────
@@ -136,7 +158,8 @@ class CorosClient:
         return result
 
     def close(self) -> None:
-        self._http.close()
+        if self._owns_http:
+            self._http.close()
 
     def __enter__(self):
         return self
