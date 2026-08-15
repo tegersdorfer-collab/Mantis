@@ -595,3 +595,108 @@ class TestFund2StufenspezifischesTimeout:
 
     def test_implement_und_fix_haben_ein_groesseres_budget_als_die_lese_stufen(self):
         assert pl.stages.IMPLEMENT_TIMEOUT_SEKUNDEN > pl.stages.STANDARD_TIMEOUT_SEKUNDEN
+
+
+# ---------------------------------------------------------------------------
+# Akzeptanzlauf 2026-08-15, Fund 1: ein Timeout allein darf bereits geleistete,
+# bezahlte Arbeit nicht wegwerfen. implement/fix committen ihre Arbeit selbst,
+# bevor sie (vom Modell aus gesehen) 'fertig' sind — läuft der Prozess danach
+# über die Zeitgrenze, steht der Commit trotzdem schon auf dem Branch.
+# ---------------------------------------------------------------------------
+
+
+_ZEITUEBERSCHREITUNG = "Zeitüberschreitung nach 1800s"
+
+
+class TestFund1ZeitueberschreitungLiefertTrotzdem:
+    def test_implement_timeout_mit_neuem_commit_gilt_als_erfolg(self, monkeypatch, stubs, tmp_path):
+        def _gitctl(*args, cwd=None, timeout=300):
+            class _R:
+                returncode = 0
+                stdout = "1\n" if args[:1] == ("rev-list",) else ""
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(pl.gitctl, "run", _gitctl)
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=False, error=_ZEITUEBERSCHREITUNG)))
+        ergebnis = pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path)
+
+        assert ergebnis == "weiter"
+        assert stubs["states"][-1] == (5, m.REVIEWING)
+        assert stubs["parks"] == []
+        stage_done = [e for e in stubs["journal"] if e[0][1] == "stage_done"]
+        assert any("Zeitüberschreitung" in str(e) for e in stage_done), (
+            "der Journal-Eintrag muss den Timeout-trotz-Erfolg-Fall erkennbar machen"
+        )
+
+    def test_implement_timeout_ohne_neuen_commit_parkt(self, monkeypatch, stubs, tmp_path):
+        def _gitctl(*args, cwd=None, timeout=300):
+            class _R:
+                returncode = 0
+                stdout = "0\n" if args[:1] == ("rev-list",) else ""
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(pl.gitctl, "run", _gitctl)
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=False, error=_ZEITUEBERSCHREITUNG)))
+        ergebnis = pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path)
+
+        assert ergebnis == "geparkt"
+        assert stubs["parks"]
+        assert stubs["states"] == []
+
+    def test_spec_timeout_mit_bereits_bekanntem_artefakt_gilt_als_erfolg(self, monkeypatch, stubs, tmp_path):
+        # Die Modellantwort ist bei einem Timeout leer (kein Text aus dem
+        # abgebrochenen Prozess) — der übliche Pfad-Parsing-Weg hat also
+        # nichts zu lesen. Ist der Pfad aus einem früheren Anlauf bereits am
+        # Task hinterlegt UND existiert die Datei, zählt das als Produkt.
+        pfad = "docs/superpowers/specs/2026-08-15-bekannt-design.md"
+        ziel = tmp_path / pfad
+        ziel.parent.mkdir(parents=True)
+        ziel.write_text("# Spec")
+
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=False, error=_ZEITUEBERSCHREITUNG)))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING, spec_path=pfad), tmp_path)
+
+        assert ergebnis == "weiter"
+        assert stubs["states"][-1] == (5, m.PLANNING)
+        assert stubs["parks"] == []
+
+    def test_spec_timeout_findet_artefakt_ueber_verzeichnis_fallback(self, monkeypatch, stubs, tmp_path):
+        # Kein bekannter Pfad am Task (Erstversuch) — der Fallback muss das
+        # jüngste, seit Stufenstart geschriebene File im Artefaktverzeichnis
+        # finden, wie in der Aufgabenstellung gefordert.
+        fester_start = 1_800_000_000.0
+        monkeypatch.setattr(pl.time, "time", lambda: fester_start)
+
+        verzeichnis = tmp_path / pl.stages.SPEC_VERZEICHNIS
+        verzeichnis.mkdir(parents=True)
+        alt = verzeichnis / "alt-design.md"
+        alt.write_text("# Alt")
+        os.utime(alt, (fester_start - 100, fester_start - 100))
+        neu = verzeichnis / "2026-08-15-neu-design.md"
+        neu.write_text("# Neu")
+        os.utime(neu, (fester_start + 5, fester_start + 5))
+
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=False, error=_ZEITUEBERSCHREITUNG)))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+
+        assert ergebnis == "weiter"
+        assert ("spec_path", f"{pl.stages.SPEC_VERZEICHNIS}/2026-08-15-neu-design.md") in stubs["artefakte"]
+
+    def test_zeitueberschreitung_ohne_produkt_erkennung_wuerde_hier_nicht_parken(self, monkeypatch, stubs,
+                                                                                  tmp_path):
+        # Gegenprobe zur Selbstprüfung: derselbe Timeout-Fehlertext, aber ohne
+        # jedes Produkt (leeres Verzeichnis, kein Commit) — muss weiterhin
+        # parken. Ohne diesen Test könnte die Erkennung 'jeder Timeout ist
+        # ein Erfolg' geworden sein, ohne dass ein Test das auffängt.
+        monkeypatch.setattr(pl.runner, "run",
+                            _lauf(stubs, RunResult(ok=False, error=_ZEITUEBERSCHREITUNG)))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "geparkt"
+        assert stubs["parks"]
+        assert "Zeitüberschreitung" in stubs["parks"][-1][1] or _ZEITUEBERSCHREITUNG in stubs["parks"][-1][1]

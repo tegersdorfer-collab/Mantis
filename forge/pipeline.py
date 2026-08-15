@@ -15,8 +15,10 @@ Rückgabewerte:
               Wartezeit ein. Ein Park hier würde jede Kontingentgrenze in
               einen verlorenen Task verwandeln.
 """
+import json
 import logging
 import re
+import time
 from pathlib import Path
 
 from forge import gate, gitctl, journal, models as m, queue, runner, stages
@@ -42,6 +44,84 @@ _ARTEFAKT_FELD_JE_STUFE = {"spec": "spec_path", "plan": "plan_path"}
 def _artefakt_vorhanden(worktree: Path, pfad: str) -> bool:
     """Existiert das von der Stufe versprochene Artefakt im Worktree?"""
     return (Path(worktree) / pfad).is_file()
+
+
+def _ist_timeout(ergebnis: runner.RunResult) -> bool:
+    """Erkennt einen an der Zeitgrenze gescheiterten Lauf an forge.runner.run's
+    eigenem Fehlertext ('Zeitüberschreitung nach <n>s', siehe dort). Ein Timeout
+    ist der einzige Fehlschlag-Grund, bei dem sich ein Blick auf das tatsächliche
+    Produkt lohnt — bei jedem anderen Fehler (Absturz, is_error) hat der Lauf gar
+    nicht erst geliefert."""
+    return "Zeitüberschreitung nach" in (ergebnis.error or "")
+
+
+def _juengste_datei_seit(verzeichnis: Path, seit: float) -> Path | None:
+    """Die zuletzt geänderte Datei in `verzeichnis`, sofern sie jünger als `seit`
+    ist — Fallback für spec/plan, wenn ein Timeout keine Modellantwort (und
+    damit keinen geparsten Pfad) hinterlassen hat, das Artefakt aber trotzdem
+    geschrieben wurde."""
+    if not verzeichnis.is_dir():
+        return None
+    kandidaten = [d for d in verzeichnis.iterdir() if d.is_file() and d.stat().st_mtime >= seit]
+    if not kandidaten:
+        return None
+    return max(kandidaten, key=lambda d: d.stat().st_mtime)
+
+
+def _hat_neuen_commit(worktree: Path) -> bool:
+    """Trägt der Branch mindestens einen Commit, der über BASIS_BRANCH
+    hinausgeht? Das ist das Produkt von implement/fix — beide versprechen kein
+    Artefakt-Dokument, sondern einen committeten Codestand."""
+    ergebnis = gitctl.run("rev-list", "--count", f"{BASIS_BRANCH}..HEAD", cwd=worktree)
+    if ergebnis.returncode != 0:
+        return False
+    try:
+        return int((ergebnis.stdout or "0").strip()) > 0
+    except ValueError:
+        return False
+
+
+def _verdikt_lesbar(worktree: Path) -> bool:
+    """Liegt VERDIKT_DATEI vor und lässt sie sich als JSON parsen? Das ist das
+    Produkt der review-Stufe — ob das Urteil selbst 'pass' oder 'fail' ist,
+    spielt hier keine Rolle, nur ob die Stufe überhaupt geliefert hat."""
+    datei = Path(worktree) / stages.VERDIKT_DATEI
+    if not datei.is_file():
+        return False
+    try:
+        json.loads(datei.read_text())
+        return True
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+
+def _timeout_produkt(stufe: stages.Stage, task: dict, worktree: Path, start: float) -> tuple[bool, str | None]:
+    """Akzeptanzlauf 2026-08-15, Fund 1: eine Zeitüberschreitung darf bereits
+    geleistete, bezahlte Arbeit nicht wegwerfen. Prüft, ob die Stufe ihr Produkt trotz
+    eigenem Timeout geliefert hat, und liefert für spec/plan zusätzlich den
+    gefundenen Pfad zurück (auf dem üblichen Weg über die Modellantwort steht
+    er nicht zur Verfügung — bei einem Timeout ist die Antwort leer).
+
+    Definition 'Produkt' je Stufe (siehe Aufgabenstellung):
+      spec/plan   — das Artefakt-Dokument existiert
+      implement/fix — mindestens ein neuer Commit auf dem Task-Branch
+      review      — VERDIKT_DATEI existiert und lässt sich parsen
+    """
+    if stufe.name in _ARTEFAKT_FELD_JE_STUFE:
+        feld = _ARTEFAKT_FELD_JE_STUFE[stufe.name]
+        bekannt = task.get(feld)
+        if bekannt and _artefakt_vorhanden(worktree, bekannt):
+            return True, bekannt
+        verzeichnis = Path(worktree) / (stages.SPEC_VERZEICHNIS if stufe.name == "spec" else stages.PLAN_VERZEICHNIS)
+        neuestes = _juengste_datei_seit(verzeichnis, start)
+        if neuestes is None:
+            return False, None
+        return True, str(neuestes.relative_to(worktree))
+    if stufe.name in ("implement", "fix"):
+        return _hat_neuen_commit(worktree), None
+    if stufe.name == "review":
+        return _verdikt_lesbar(worktree), None
+    return False, None
 
 
 def _kontext(task: dict) -> dict:
@@ -322,17 +402,42 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
     prompt = stufe.baue_prompt(task, _kontext(task))
     # Fund 2 (Akzeptanzlauf 2026-08-15): implement/fix bekommen ein größeres
     # Zeitbudget als die drei Lese-Stufen — siehe forge/stages.py.
+    start = time.time()
     ergebnis = runner.run(prompt, cwd=worktree, profile=stufe.profile, timeout=stufe.timeout)
 
-    journal.log(
-        task_id,
-        "stage_done" if ergebnis.ok else "stage_failed",
-        (ergebnis.text or ergebnis.error or "")[:2000],
-        tokens_in=ergebnis.tokens_in,
-        tokens_out=ergebnis.tokens_out,
-        cache_read=ergebnis.cache_read,
-        cache_creation=ergebnis.cache_creation,
-    )
+    # Fund 1 (Akzeptanzlauf 2026-08-15): ein Timeout ist nicht automatisch ein
+    # Fehlschlag. Der Lauf kann sein Produkt bereits geliefert (implement/fix
+    # bereits committet) haben, bevor er über die Zeitgrenze lief — das kostet
+    # echtes Geld und darf nicht weggeworfen werden, nur weil der Prozess
+    # danach noch weiterlief. rate_limited wird hier bewusst ausgeklammert:
+    # dessen Sonderpfad (Zustand unverändert, kein Park) gilt unabhängig
+    # davon, ob zufällig auch ein Produkt vorläge.
+    zeitueberschreitung_pfad = None
+    zeitueberschreitung_geliefert = False
+    if not ergebnis.ok and not ergebnis.rate_limited and _ist_timeout(ergebnis):
+        zeitueberschreitung_geliefert, zeitueberschreitung_pfad = _timeout_produkt(stufe, task, worktree, start)
+
+    if ergebnis.ok:
+        journal.log(
+            task_id, "stage_done", (ergebnis.text or "")[:2000],
+            tokens_in=ergebnis.tokens_in, tokens_out=ergebnis.tokens_out,
+            cache_read=ergebnis.cache_read, cache_creation=ergebnis.cache_creation,
+        )
+    elif zeitueberschreitung_geliefert:
+        hinweis = (f"Zeitüberschreitung ({ergebnis.error}), aber Produkt der Stufe '{stufe.name}' "
+                    f"trotzdem vorhanden" + (f": {zeitueberschreitung_pfad}" if zeitueberschreitung_pfad
+                                              else " (neuer Commit auf dem Branch)") + " — als Erfolg gewertet.")
+        journal.log(
+            task_id, "stage_done", hinweis,
+            tokens_in=ergebnis.tokens_in, tokens_out=ergebnis.tokens_out,
+            cache_read=ergebnis.cache_read, cache_creation=ergebnis.cache_creation,
+        )
+    else:
+        journal.log(
+            task_id, "stage_failed", (ergebnis.text or ergebnis.error or "")[:2000],
+            tokens_in=ergebnis.tokens_in, tokens_out=ergebnis.tokens_out,
+            cache_read=ergebnis.cache_read, cache_creation=ergebnis.cache_creation,
+        )
 
     if ergebnis.rate_limited:
         # Zustand bewusst unverändert lassen — siehe Modul-Docstring.
@@ -344,12 +449,18 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
               f"(Task {task_id}) — Rechteprofil vermutlich zu eng")
         return "geparkt"
 
-    if not ergebnis.ok:
+    if not ergebnis.ok and not zeitueberschreitung_geliefert:
         _park(task_id, state, f"Stufe '{stufe.name}' fehlgeschlagen: {ergebnis.error} (Task {task_id})")
         return "geparkt"
 
     try:
-        erwartet, feld = _erwarteter_pfad_und_feld(stufe, task, ergebnis)
+        if zeitueberschreitung_geliefert and stufe.name in _ARTEFAKT_FELD_JE_STUFE:
+            # Der übliche Weg liest den Pfad aus der Modellantwort — bei einem
+            # Timeout ist die Antwort leer. Der Fallback-Fund aus
+            # _timeout_produkt tritt an ihre Stelle.
+            erwartet, feld = zeitueberschreitung_pfad, _ARTEFAKT_FELD_JE_STUFE[stufe.name]
+        else:
+            erwartet, feld = _erwarteter_pfad_und_feld(stufe, task, ergebnis)
     except _PfadUngueltig as exc:
         _park(task_id, state,
               f"Von Stufe '{stufe.name}' gelieferter Pfad sieht auch nach Normalisierung nicht wie "
