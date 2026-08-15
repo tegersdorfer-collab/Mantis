@@ -100,13 +100,18 @@ und aus demselben Grund: so ist der Teil, der am ehesten falsch ist, direkt test
 
 ### MCP-Transport
 
-Offizielles `mcp`-SDK (neue Dependency in `requirements.txt`), eingebunden über
-`streamablehttp_client` mit eigener `httpx.Auth`, die den Bearer aus `oauth.py` zieht.
+Handgeschriebener Client auf dem vorhandenen `httpx`, **keine neue Dependency**.
 
-Wenn das SDK auf Python 3.14 nicht sauber läuft, ist der Rückfallplan ein handgeschriebener
-Client in `client.py`: `initialize` + `tools/call` als JSON-RPC über POST, Antwort als
-SSE-Frame — rund 120 Zeilen httpx, keine neue Dependency. Die Schnittstelle nach außen
-(`call_tool`) ist in beiden Fällen dieselbe, die Entscheidung also lokal.
+Ursprünglich war das offizielle `mcp`-SDK vorgesehen. Bei der Planung geprüft: `mcp` 2.0.0
+zieht `httpx2>=2.5.0`, `starlette`, `uvicorn`, `sse-starlette`, `opentelemetry-api`,
+`pyjwt[crypto]` und `python-multipart` nach — ein zweiter kompletter HTTP-Stack neben dem
+`httpx`, das Mantis schon nutzt, für einen reinen Client-Anwendungsfall. Das ist für 16 GB
+RAM und "einfacher Code > Abstraktion" die falsche Richtung.
+
+Gebraucht werden drei Nachrichten: `initialize`, `notifications/initialized`, `tools/call`,
+als JSON-RPC über POST, Antwort wahlweise als JSON oder SSE-Frame. Rund 150 Zeilen. Die
+Schnittstelle nach außen (`call_tool`) ist dieselbe, die hier getroffene Entscheidung also
+jederzeit umkehrbar.
 
 ### Genutzte COROS-Tools
 
