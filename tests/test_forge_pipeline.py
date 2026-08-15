@@ -17,7 +17,8 @@ from forge.runner import RunResult
 @pytest.fixture
 def stubs(monkeypatch):
     """Sammelt alle Seiteneffekte, statt sie auszuführen."""
-    aufz = {"states": [], "parks": [], "journal": [], "artefakte": [], "profile": [], "fixrunden": 0}
+    aufz = {"states": [], "parks": [], "journal": [], "artefakte": [], "profile": [], "fixrunden": 0,
+            "gitctl": []}
 
     monkeypatch.setattr(pl.queue, "set_state",
                         lambda tid, target, current: aufz["states"].append((tid, target)) or True)
@@ -32,6 +33,20 @@ def stubs(monkeypatch):
         aufz["fixrunden"] += 1
         return aufz["fixrunden"]
     monkeypatch.setattr(pl.queue, "zaehle_fixrunde", _fixrunde)
+
+    # Default: jeder gitctl-Aufruf gelingt. Tests, die ein Diff oder einen
+    # gescheiterten Commit brauchen, überschreiben pl.gitctl.run lokal — das
+    # hier ist nur der Fallback für Tests, die kein echtes Git-Repo unter
+    # tmp_path haben (spec/plan committen jetzt ihr Artefakt, siehe Fund 3).
+    def _gitctl_erfolg(*args, cwd=None, timeout=300):
+        aufz["gitctl"].append((args, cwd))
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _R()
+    monkeypatch.setattr(pl.gitctl, "run", _gitctl_erfolg)
     return aufz
 
 
@@ -700,3 +715,94 @@ class TestFund1ZeitueberschreitungLiefertTrotzdem:
         assert ergebnis == "geparkt"
         assert stubs["parks"]
         assert "Zeitüberschreitung" in stubs["parks"][-1][1] or _ZEITUEBERSCHREITUNG in stubs["parks"][-1][1]
+
+
+# ---------------------------------------------------------------------------
+# Akzeptanzlauf 2026-08-15, Fund 3: das Gate und die Review-Stufe urteilen
+# über `git diff main...HEAD` — ein unkommittetes Spec-/Plan-Dokument bleibt
+# für beide unsichtbar, obwohl die Stufe ihre Aufgabe erfüllt hat.
+# ---------------------------------------------------------------------------
+
+
+class TestFund3ArtefaktWirdCommittet:
+    def test_erfolgreiche_spec_stufe_committet_nur_ihr_artefakt(self, monkeypatch, stubs, tmp_path):
+        pfad = "docs/superpowers/specs/2026-08-15-x-design.md"
+        aufgezeichnete_aufrufe = []
+
+        def _gitctl(*args, cwd=None, timeout=300):
+            aufgezeichnete_aufrufe.append(args)
+
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(pl.gitctl, "run", _gitctl)
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=pfad)))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+
+        assert ergebnis == "weiter"
+        assert aufgezeichnete_aufrufe == [
+            ("add", "--", pfad),
+            ("commit", "-m", "docs(forge): Artefakt der Stufe 'spec' für Task 5 committet", "--", pfad),
+        ], (
+            "muss exakt diesen einen Pfad committen, nie 'git add -A' oder eine andere Datei"
+        )
+
+    def test_commit_wird_journalt(self, monkeypatch, stubs, tmp_path):
+        pfad = "docs/superpowers/specs/2026-08-15-x-design.md"
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=pfad)))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+
+        pl.eine_stufe(_task(m.SPECCING), tmp_path)
+
+        assert any(pfad in str(e) for e in stubs["journal"] if e[0][1] == "stage_done" and pfad in str(e[0][2]))
+
+    def test_fehlgeschlagener_commit_parkt_den_task(self, monkeypatch, stubs, tmp_path):
+        pfad = "docs/superpowers/specs/2026-08-15-x-design.md"
+
+        def _kaputtes_gitctl(*args, cwd=None, timeout=300):
+            class _R:
+                returncode = 128
+                stdout = ""
+                stderr = "fatal: pathspec did not match any files"
+            return _R()
+
+        monkeypatch.setattr(pl.gitctl, "run", _kaputtes_gitctl)
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=pfad)))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+
+        assert ergebnis == "geparkt"
+        assert stubs["parks"]
+        # Der Zustandswechsel darf nicht vollzogen worden sein — sonst gälte
+        # eine Stufe als abgeschlossen, deren Artefakt gar nicht sichtbar ist.
+        assert stubs["states"] == []
+
+    def test_implement_und_fix_committen_nichts_zusaetzliches(self, monkeypatch, stubs, tmp_path):
+        # implement/fix versprechen kein Artefakt-Dokument (siehe
+        # _ARTEFAKT_FELD_JE_STUFE) — der Commit-Schritt gilt ausdrücklich nur
+        # für spec/plan, sonst würde hier ein bereits vom Agenten selbst
+        # committeter Diff ein zweites Mal (und diesmal fälschlich pauschal)
+        # committet.
+        aufrufe = []
+
+        def _gitctl(*args, cwd=None, timeout=300):
+            aufrufe.append(args)
+
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(pl.gitctl, "run", _gitctl)
+        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="fertig")))
+        ergebnis = pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path)
+
+        assert ergebnis == "weiter"
+        assert aufrufe == []

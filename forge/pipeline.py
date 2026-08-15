@@ -226,6 +226,32 @@ def _verwirf_review_artefakte(worktree: Path) -> None:
                         f"({datei}): {exc}")
 
 
+def _committe_artefakt(worktree: Path, stufe_name: str, task_id: int, pfad: str) -> str | None:
+    """Akzeptanzlauf 2026-08-15, Fund 3: committet das Artefakt einer spec- oder
+    plan-Stufe mit explizitem Pfad. Gibt bei Erfolg None zurück, sonst eine
+    Fehlermeldung.
+
+    Das Gate (forge/gate.py) und die Review-Stufe urteilen ausschließlich über
+    `git diff main...HEAD` — ein unkommittetes Dokument im Worktree ist für
+    beide unsichtbar, obwohl die Stufe ihre Aufgabe vollständig erfüllt hat.
+    Bewusst ZWEI git-Aufrufe mit demselben expliziten Pfad (`add` dann
+    `commit`), nie `git add -A` oder `git commit -a`: der Worktree kann noch
+    andere, nicht zu dieser Stufe gehörende Änderungen enthalten (z.B. ein
+    Artefakt einer vorherigen, geparkten Stufe), und die dürfen hier nicht
+    versehentlich mit hineinrutschen.
+    """
+    hinzugefuegt = gitctl.run("add", "--", pfad, cwd=worktree)
+    if hinzugefuegt.returncode != 0:
+        return (f"git add fehlgeschlagen (returncode {hinzugefuegt.returncode}): "
+                f"{(hinzugefuegt.stderr or '').strip()[:300]}")
+    nachricht = f"docs(forge): Artefakt der Stufe '{stufe_name}' für Task {task_id} committet"
+    committet = gitctl.run("commit", "-m", nachricht, "--", pfad, cwd=worktree)
+    if committet.returncode != 0:
+        return (f"git commit fehlgeschlagen (returncode {committet.returncode}): "
+                f"{(committet.stderr or '').strip()[:300]}")
+    return None
+
+
 class _PfadUngueltig(Exception):
     """Der von einer Stufe gelieferte Pfad-Kandidat übersteht die Normalisierung
     nicht (leer, absolut, oder mit einer '..'-Komponente). Trägt bewusst den
@@ -473,6 +499,18 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
             return "geparkt"
         if feld is not None:
             queue.setze_artefakt(task_id, feld, erwartet)
+            # Akzeptanzlauf 2026-08-15, Fund 3: ohne diesen Commit sieht das
+            # Gate (git diff main...HEAD) das Spec-/Plan-Dokument nie — es
+            # bliebe für Gate und Review unsichtbar, obwohl die Stufe ihre
+            # Aufgabe erfüllt hat.
+            commit_fehler = _committe_artefakt(worktree, stufe.name, task_id, erwartet)
+            if commit_fehler is not None:
+                _park(task_id, state,
+                      f"Artefakt-Commit fehlgeschlagen (Stufe '{stufe.name}'): {commit_fehler} "
+                      f"(Task {task_id})")
+                return "geparkt"
+            journal.log(task_id, "stage_done",
+                         f"Artefakt der Stufe '{stufe.name}' committet: {erwartet}")
 
     # Die Fix-Stufe teilt sich REVIEWING mit der Review-Stufe, aber ihr
     # next_state (GATING, siehe forge/stages.py) gilt hier NICHT: nach einem
