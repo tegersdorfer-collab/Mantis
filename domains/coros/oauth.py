@@ -121,6 +121,13 @@ def refresh(meta: dict, client_id: str, refresh_token: str) -> dict:
 
 
 def _to_token(raw: dict, meta: dict, client_id: str) -> dict:
+    if "access_token" not in raw:
+        # 200 OK ohne access_token — kaputte/abweichende Server-Antwort. Nur die
+        # Feldnamen nennen, nicht den Body: der könnte trotzdem sensible Werte tragen.
+        raise CorosNotAuthorized(
+            "COROS-Token-Endpoint hat kein access_token geliefert — "
+            f"erhaltene Felder: {sorted(raw.keys())}"
+        )
     return {
         "client_id": client_id,
         "access_token": raw["access_token"],
