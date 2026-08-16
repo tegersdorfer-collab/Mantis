@@ -42,6 +42,50 @@ Am 2026-08-15 live gegen `https://mcpeu.coros.com` geprüft:
 Ein selbstgebauter Client ist damit zulässig, obwohl die COROS-Doku nur
 "verifizierte Plattformen" (ChatGPT, Claude, …) nennt.
 
+## Nachtrag 2026-08-16 — was Phase A widerlegt hat
+
+Phase A hat den Zugang gebaut und die echten Antworten geholt. Vier Annahmen dieses
+Dokuments waren falsch. Sie sind unten im Text korrigiert; hier steht, was sich geändert hat
+und warum, damit Phase B nicht gegen die alte Fassung gebaut wird.
+
+1. **Es gibt kein JSON.** Kein einziges der 22 Tools deklariert ein `outputSchema` oder
+   liefert `structuredContent`. Jede Antwort ist ein Textblock in einem `content`-Feld —
+   LLM-erzeugte Prosa mit fester Zeilenstruktur:
+
+   ```
+   --- 20260811 ---
+   Steps: 12,500 | Calories: 1,200 kcal | Exercise: 25 min
+   Stress: Avg 50
+   Sleep Summary:
+     Total: 6h 0min | Deep: 1h 0min | Light: 3h 30min | REM: 1h 15min | Awake: 15 min
+   ```
+
+   `mapping.py` ist damit ein **Textparser**, kein Feldmapping. Das ist der größte
+   Unterschied zur ursprünglichen Planung und der Grund, warum Phase B strengere
+   Fehlerregeln braucht als vorgesehen (siehe "Fehlerverhalten").
+
+2. **Das MCP ist serverseitig LLM-gestützt.** Belegt durch eine Fehlermeldung des Servers:
+   "Tool call anomalies detected. High risk of session context pollution or request exceeds
+   the LLM capability boundary. Resolution Strategy: … 2. Upgrade or switch to a
+   high-capacity model instance." Formatstabilität ist folglich nicht zugesichert. Der
+   Parser muss Formatabweichungen als Fehler behandeln, nicht als fehlende Werte.
+
+3. **Fehler kommen teilweise mit `isError: false`.** `querySleepData` und
+   `queryTrainingSchedule` lieferten die "anomalies"-Meldung als *erfolgreiches* Ergebnis.
+   Das `isError`-Flag allein genügt nicht; es braucht eine inhaltliche Prüfung.
+
+4. **Die Historie ist klein und passt in einen Aufruf.** Timos Daten beginnen am
+   **2026-03-05**; im Zeitraum bis 2026-08-16 gibt es **94 Tage mit Daten** (71 Kalendertage
+   ohne) und **21 Aktivitäten insgesamt**. `queryDailyHealthData` mit `days=1000` liefert
+   die komplette Historie in 18 KB. Der geplante Backfill mit 30-Tage-Fenstern, Wasserstand
+   in der `settings`-Tabelle und Wiederaufsetzen nach Abbruch ist damit **überflüssig** —
+   ein Aufruf genügt. Der Abschnitt "Sync-Verhalten" ist entsprechend vereinfacht.
+
+Außerdem beobachtet, ohne Designfolge: das Datumsformat der Tools ist `yyyyMMdd`, nicht ISO;
+mehrere Tagestools nehmen statt eines Datumsbereichs nur einen Rückblick-Zähler `days`; und
+COROS liefert vereinzelt kaputte Zeitstempel (ein `Nap Window` im Jahr 1982). Der Parser
+darf an solchen Werten nicht ersticken und sie nicht übernehmen.
+
 ## Ist-Zustand
 
 ```
@@ -64,7 +108,7 @@ Genau eine Funktion wechselt die Quelle:
 
 ```
 idle_loop._tick_health ─┐
-orchestrator.py:240 ────┴→ dashboard.refresh_health() → coros.importer.sync_recent()
+orchestrator.py:240 ────┴→ dashboard.refresh_health() → coros.importer.sync()
 ```
 
 `idle_loop.py`, `orchestrator.py`, `health_scores.py`, `_helpers._health_dict`,
@@ -77,7 +121,7 @@ gesamte Grund für diesen Zuschnitt: der Umbau endet an der Tabellengrenze.
 |---|---|---|
 | `domains/coros/oauth.py` | DCR, PKCE-Flow, Token laden/refreshen | httpx |
 | `domains/coros/client.py` | MCP-Session, `call_tool(name, args) -> dict` | oauth |
-| `domains/coros/mapping.py` | COROS-JSON → `health_data`-Spalten, **reine Funktionen** | — |
+| `domains/coros/mapping.py` | COROS-**Prosa** → `health_data`-Spalten, **reine Funktionen** | — |
 | `domains/coros/importer.py` | Tages-Sync, Backfill, Workout-Import | client, mapping, health, fitness |
 | `scripts/coros_auth.py` | einmaliger Browser-Login durch Timo | oauth |
 
@@ -150,16 +194,19 @@ denselben Umbau.
 
 ### Sync-Verhalten
 
-- **`sync_recent()`** (der 1800-s-Tick): holt die letzten **3 Tage** und upsertet sie neu.
-  Drei statt einem, weil die Uhr verzögert synchronisiert und COROS Werte nachträglich
-  korrigiert. Kosten sind vernachlässigbar, `ON CONFLICT DO UPDATE` ist idempotent.
-- **`backfill()`**: läuft rückwärts von heute in **30-Tage-Fenstern**, 1 s Pause zwischen
-  Fenstern. Wasserstand als ISO-Datum in der `settings`-Tabelle unter
-  `coros_backfill_cursor`, damit ein Abbruch fortsetzbar ist. Abbruch, wenn **zwei
-  aufeinanderfolgende Fenster** komplett leer sind (Account-Beginn erreicht) oder wenn
-  `coros_backfill_done` gesetzt ist.
-- Der Erst-Backfill über die gesamte Account-Historie läuft als Hintergrund-Task, nicht
-  im Request. Angestoßen wird er einmalig am Ende von `scripts/coros_auth.py`.
+*Vereinfacht nach dem Nachtrag: die Historie passt in einen Aufruf, ein gefensterter
+Backfill mit Wasserstand ist unnötig.*
+
+- **`sync(days: int = 14)`** — eine Funktion für beides. Holt die letzten `days` Tage und
+  upsertet sie. Vierzehn statt drei im Regelbetrieb, weil die Uhr verzögert synchronisiert,
+  COROS Werte nachträglich korrigiert und der Aufruf bei 94 Tagen Gesamthistorie ohnehin
+  billig ist. `ON CONFLICT DO UPDATE` macht das idempotent.
+- **Erst-Import**: derselbe Aufruf mit `days=365` — `MAX_LOOKBACK_DAYS` deckelt jeden
+  größeren Wert ohnehin, weil manche Tools jenseits davon mit einem Fehlertext statt
+  Daten antworten. Deckt die komplette Historie (94 Tage) reichlich ab, in einem
+  Rutsch. Kein Wasserstand, kein Fenster, kein Wiederaufsetzen — ein fehlgeschlagener
+  Lauf wird einfach wiederholt.
+- Angestoßen wird der Erst-Import einmalig von Hand; danach übernimmt der 1800-s-Tick.
 
 ## Abriss
 
@@ -201,11 +248,14 @@ Leitlinie ist das Ventilator-Muster: freundlich degradieren statt crashen.
 
 | Fall | Verhalten |
 |---|---|
-| Kein Token-File | `sync_recent()` gibt 0 zurück, loggt einmal "COROS nicht autorisiert — `python3 scripts/coros_auth.py`" |
+| Kein Token-File | `sync()` gibt 0 zurück, loggt einmal "COROS nicht autorisiert — `python3 scripts/coros_auth.py`" |
 | Netz weg / MCP 5xx | Warnung ins Log, bestehende Daten bleiben, nächster Tick versucht erneut |
 | Refresh-Token abgelaufen | Eine Telegram-Nachricht "COROS neu autorisieren", danach stumm bis zur Reparatur |
 | Einzelnes Tool schlägt fehl | Die anderen Felder des Tages werden trotzdem geschrieben — Teildaten sind besser als keine |
+| Antwort mit `isError: false`, aber Fehlertext im Inhalt | Als Fehler behandeln. Der Parser prüft den Text auf die bekannten Server-Fehlermuster, bevor er ihn zu parsen versucht |
 | Unbekanntes Antwortformat | Feld wird übersprungen und einmal pro Prozess geloggt, nie geraten |
+| Wert außerhalb plausibler Grenzen | Verworfen, nicht geschrieben. Bei Prosa ist eine falsch geparste Zahl schlimmer als eine fehlende — sie sieht aus wie eine Messung |
+| Ein ganzer Tagesblock unparsebar | Der Tag wird übersprungen, die übrigen Tage der Antwort werden geschrieben |
 
 ## Testing
 
@@ -234,6 +284,7 @@ nirgends dokumentiert.** `mapping.py` lässt sich nicht blind schreiben.
 
 | Risiko | Umgang |
 |---|---|
+| **Das Antwortformat ist LLM-erzeugte Prosa und kann sich ändern** | Das größte Risiko dieses Entwurfs. Gegenmittel ist ausschließlich Strenge: jeder Parser erwartet ein exaktes Muster, verwirft implausible Werte und meldet Formatabweichungen, statt still etwas Falsches zu schreiben. Ein fehlender Wert degradiert sichtbar (die Scores sagen "zu wenig Daten"); ein falsch geparster Wert sieht aus wie eine Messung und vergiftet die Baselines. |
 | COROS schließt DCR oder ändert Tool-Namen | Der Importer degradiert freundlich; die Tabelle behält alles Bisherige. Wiederherstellung wäre ein neuer Ingest, kein Datenverlust. |
 | Antwortformate weichen von der Doku ab | Genau dafür Phase A. Kein Mapping ohne echte Antwort. |
 | Cloud-Abhängigkeit widerspricht "lokal first" | Bewusst akzeptiert: die Daten liegen ohnehin in der COROS-Cloud, sobald die Uhr synchronisiert. Neu ist der Abruf, nicht der Abfluss. |

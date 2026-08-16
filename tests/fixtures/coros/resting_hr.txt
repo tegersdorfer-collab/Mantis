@@ -1,0 +1,6 @@
+Resting Heart Rate — Last 7 days
+========================
+
+2026-08-12: No data
+2026-08-11: 47 bpm
+2026-08-10: 46 bpm

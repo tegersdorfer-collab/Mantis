@@ -1,0 +1,10 @@
+Fitness Assessment Overview
+========================
+
+VO2max: 47
+Running Level: 70
+Threshold Pace: 5:00 /km
+5 km Prediction: 24:00
+10 km Prediction: 50:00
+Half Marathon Prediction: 1:50:00
+Marathon Prediction: 3:50:00

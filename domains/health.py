@@ -153,6 +153,25 @@ def process_health_data(data: dict) -> int:
     return 1
 
 
+def upsert_day(day: str, fields: dict) -> bool:
+    """Einen Tag in health_data schreiben. Formatunabhängig — wer die Felder
+    erzeugt hat, ist nicht die Sache dieser Domäne.
+
+    Idempotent über ON CONFLICT; leere Feld-Dicts werden nicht geschrieben.
+    """
+    if not day or not fields:
+        return False
+    cols = list(fields.keys())
+    updates = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols)
+    sql = (
+        f"INSERT INTO health_data (date, {', '.join(cols)}, updated_at) "
+        f"VALUES (%s, {', '.join(['%s'] * len(cols))}, NOW()) "
+        f"ON CONFLICT (date) DO UPDATE SET {updates}, updated_at=NOW()"
+    )
+    db.execute(sql, tuple([day] + [fields[c] for c in cols]))
+    return True
+
+
 def import_health() -> int:
     """Fallback-Poll: holt health_latest.json von der Swift-App."""
     url = getattr(config, "HEALTH_API_URL", "")

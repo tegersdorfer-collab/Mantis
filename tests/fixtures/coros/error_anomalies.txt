@@ -1,0 +1,1 @@
+Tool call anomalies detected. High risk of session context pollution or request exceeds the LLM capability boundary. Resolution Strategy: 1. Initialize a new session to reset context; 2. Upgrade or switch to a high-capacity model instance.

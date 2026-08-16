@@ -1,0 +1,6 @@
+Average Heart Rate — Last 7 days
+========================
+
+2026-08-12: 72 bpm (Min: 48, Max: 120)
+2026-08-11: 85 bpm (Min: 52, Max: 140)
+2026-08-10: No data

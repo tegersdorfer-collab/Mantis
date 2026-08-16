@@ -96,7 +96,11 @@ class DashboardReader:
         ) for r in rows]
 
     def refresh_health(self) -> int:
-        return health_d.import_from_icloud()
+        """Health-Daten aus der COROS-Cloud nachziehen (früher: BodyOS-Poll)."""
+        # Der Import steht bewusst in der Funktion: domains/coros/importer.py zieht
+        # client.py und damit config nach, und tools/dashboard.py wird sehr früh importiert.
+        from domains.coros import importer
+        return importer.sync()
 
     # ── Kalender ────────────────────────────────────────────────────────────────
     def get_upcoming_events(self, days: int = 7) -> list[CalendarItem]:

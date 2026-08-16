@@ -1,0 +1,32 @@
+Sleep Data
+========================
+Note: each record below is dated by its wake-up day.
+
+2026-08-10
+Sleep Score: 77
+Main Sleep: 7h 5min
+Deep Sleep Ratio: 22%
+Light Sleep Ratio: 58%
+REM Ratio: 16%
+Awake Ratio: 4%
+Awake Time: 18 min
+Awake Count (>5 min): 2
+Main Sleep Window: 2026-08-09 22:35 - 2026-08-10 05:58
+Naps Total: 25 min
+Nap Window: 1982-08-10 12:10 - 1982-08-10 12:35
+
+2026-08-11
+Sleep Score: 38
+Main Sleep: 5h 25min
+Deep Sleep Ratio: 13%
+Light Sleep Ratio: 62%
+REM Ratio: 8%
+Awake Ratio: 17%
+Awake Time: 1h 5min
+Awake Count (>5 min): 4
+Main Sleep Window: 2026-08-10 23:05 - 2026-08-11 05:25
+Naps Total: 0 min
+
+2026-08-12
+Sleep Score: No data
+Main Sleep: 0 min
