@@ -237,7 +237,11 @@ class Orchestrator:
     async def _init_skills(self) -> None:
         """Skills binden + dynamische Skills aus vorherigen Sessions laden."""
         try:
-            self._dashboard.refresh_health()
+            # In den Thread ausgelagert: refresh_health() macht bis zu 8 sequenzielle
+            # COROS-MCP-Aufrufe (je eine LLM-Generierung serverseitig, 60s Timeout) —
+            # synchron im Event-Loop wären das im schlechtesten Fall ~8 Minuten Blockade
+            # beim Start.
+            await asyncio.to_thread(self._dashboard.refresh_health)
         except Exception as e:
             log.debug(f"Health-Refresh beim Start: {e}")
 
