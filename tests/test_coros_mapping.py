@@ -226,10 +226,36 @@ def test_sleep_no_data_score_is_omitted():
     assert "2026-08-12" not in days
 
 
-def test_sleep_does_not_emit_stage_columns():
-    # Die Anteile sind Prozente; die absoluten Stunden kommen aus parse_daily_health.
+def test_sleep_derives_stage_hours_from_ratios():
+    # Die Phasen stehen hier als Anteil der Hauptschlafzeit, nicht als Dauer.
+    # parse_daily_health liefert die exakteren Dauern, aber nur ~14 Tage zurück —
+    # deshalb rechnen wir sie hier aus, damit ältere Tage nicht leer bleiben.
     day = mapping.parse_sleep(_fix("sleep_data.txt"))["2026-08-10"]
-    assert set(day) == {"sleep_score"}
+    assert day["sleep_duration"] == 7.08          # 7h 5min
+    assert day["sleep_deep"] == 1.56              # 22 % davon
+    assert day["sleep_core"] == 4.11              # 58 % (COROS nennt es "Light")
+    assert day["sleep_rem"] == 1.13               # 16 %
+
+
+def test_sleep_awake_time_is_read_directly_not_from_ratio():
+    # "Awake Time" steht als Dauer da — der Anteil wäre die ungenauere Quelle.
+    days = mapping.parse_sleep(_fix("sleep_data.txt"))
+    assert days["2026-08-10"]["sleep_awake"] == 0.3      # 18 min
+    assert days["2026-08-11"]["sleep_awake"] == 1.08     # 1h 5min
+
+
+def test_sleep_reads_bedtime_window():
+    day = mapping.parse_sleep(_fix("sleep_data.txt"))["2026-08-10"]
+    assert day["sleep_start"] == "22:35"
+    assert day["sleep_end"] == "05:58"
+
+
+def test_sleep_reads_awake_count_and_naps():
+    days = mapping.parse_sleep(_fix("sleep_data.txt"))
+    assert days["2026-08-10"]["sleep_awake_count"] == 2
+    assert days["2026-08-10"]["nap_duration"] == 0.42     # 25 min
+    # 0 min Nickerchen ist eine echte Aussage, kein fehlender Wert.
+    assert days["2026-08-11"]["nap_duration"] == 0.0
 
 
 def test_sleep_ignores_corrupt_1982_nap_window():
@@ -347,12 +373,10 @@ def test_avg_hr_all_no_data_returns_empty_without_raising():
 
 def test_training_load_per_day():
     day = mapping.parse_training_load(_fix("training_load.txt"))["2026-08-12"]
-    assert day == {"training_load_short": 12, "training_load_long": 60}
-
-
-def test_training_load_ignores_ratio_and_comment():
-    day = mapping.parse_training_load(_fix("training_load.txt"))["2026-08-11"]
-    assert set(day) == {"training_load_short", "training_load_long"}
+    assert day == {
+        "training_load_short": 12, "training_load_long": 60,
+        "training_load_ratio": 0.2, "training_load_trend": "Decreasing",
+    }
 
 
 def test_training_load_unrecognisable_text_raises_when_no_day_markers():
@@ -362,8 +386,8 @@ def test_training_load_unrecognisable_text_raises_when_no_day_markers():
 
 # ── tageslose Parser ────────────────────────────────────────────────────────
 
-def test_fitness_overview_reads_vo2max_only():
-    assert mapping.parse_fitness_overview(_fix("fitness_overview.txt")) == {"vo2max": 47}
+def test_fitness_overview_reads_vo2max():
+    assert mapping.parse_fitness_overview(_fix("fitness_overview.txt"))["vo2max"] == 47
 
 
 def test_fitness_overview_does_not_confuse_running_level_with_vo2max():
@@ -372,7 +396,7 @@ def test_fitness_overview_does_not_confuse_running_level_with_vo2max():
 
 
 def test_recovery_reads_percentage():
-    assert mapping.parse_recovery(_fix("recovery.txt")) == {"recovery_pct": 82}
+    assert mapping.parse_recovery(_fix("recovery.txt"))["recovery_pct"] == 82
 
 
 def test_recovery_no_data_returns_empty_without_raising():
@@ -391,3 +415,77 @@ def test_flat_parsers_raise_when_label_absent():
 def test_flat_parsers_reject_error_text():
     with pytest.raises(mapping.CorosFormatError):
         mapping.parse_recovery(_fix("error_anomalies.txt"))
+
+
+# ── neue Felder: Puls im Schlaf ─────────────────────────────────────────────
+
+def test_daily_health_reads_sleep_heart_rate():
+    day = mapping.parse_daily_health(_fix("daily_health.txt"))["2026-08-10"]
+    assert day["sleep_hr_avg"] == 55
+    assert day["sleep_hr_min"] == 45
+    assert day["sleep_hr_max"] == 70
+
+
+def test_daily_health_day_without_sleep_summary_has_no_sleep_hr():
+    day = mapping.parse_daily_health(_fix("daily_health.txt"))["2026-08-12"]
+    assert "sleep_hr_avg" not in day
+
+
+# ── neue Felder: Trainingslast ──────────────────────────────────────────────
+
+def test_training_load_reads_ratio_and_trend():
+    day = mapping.parse_training_load(_fix("training_load.txt"))["2026-08-12"]
+    assert day["training_load_ratio"] == 0.2
+    assert day["training_load_trend"] == "Decreasing"
+
+
+# ── neue Felder: Fitness-Assessment ─────────────────────────────────────────
+
+def test_fitness_overview_reads_level_and_pace_in_seconds():
+    f = mapping.parse_fitness_overview(_fix("fitness_overview.txt"))
+    assert f["running_level"] == 70
+    assert f["threshold_pace_sec"] == 300          # 5:00 /km
+
+
+def test_fitness_overview_reads_race_predictions_in_seconds():
+    f = mapping.parse_fitness_overview(_fix("fitness_overview.txt"))
+    assert f["race_5k_sec"] == 1440                # 24:00
+    assert f["race_10k_sec"] == 3000               # 50:00
+    assert f["race_half_sec"] == 6600              # 1:50:00
+    assert f["race_marathon_sec"] == 13800         # 3:50:00
+
+
+# ── neue Felder: Erholung ───────────────────────────────────────────────────
+
+def test_recovery_reads_level_text_and_remaining_hours():
+    r = mapping.parse_recovery(_fix("recovery.txt"))
+    assert r["recovery_level"] == "Moderate training allowed"
+    assert r["recovery_full_h"] == 4.0
+
+
+# ── neue Quelle: Profil ─────────────────────────────────────────────────────
+
+def test_user_info_reads_weight():
+    assert mapping.parse_user_info(_fix("user_info.txt"))["weight"] == 61.4
+
+
+def test_user_info_reads_profile_fields():
+    p = mapping.parse_user_info(_fix("user_info.txt"))
+    assert p["height_cm"] == 168
+    assert p["birthday"] == "1994-11-02"
+    assert p["gender"] == "Female"
+    assert p["nickname"] == "Testkonto"
+
+
+def test_user_info_rejects_error_text():
+    with pytest.raises(mapping.CorosFormatError):
+        mapping.parse_user_info(_fix("error_anomalies.txt"))
+
+
+# ── neue Quelle: Kopfzeile der Tagesantwort ─────────────────────────────────
+
+def test_daily_header_reads_hrv_baseline():
+    # Steht in der Kopfzeile, gilt also für den ganzen Abruf — ein Momentanwert,
+    # kein Tageswert. Landet deshalb in health_assessment, nicht in health_data.
+    h = mapping.parse_daily_header(_fix("daily_health.txt"))
+    assert h["hrv_baseline"] == 50

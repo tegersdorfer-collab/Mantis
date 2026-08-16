@@ -40,6 +40,28 @@ def upsert_day(day: str, fields: dict) -> bool:
     return rowcount > 0
 
 
+def upsert_assessment(day: str, fields: dict) -> bool:
+    """Eine Momentaufnahme in health_assessment schreiben.
+
+    Getrennt von upsert_day, weil die Werte hier keinen Tagesbezug haben: COROS
+    liefert VO2max, Erholung und Renn-Prognosen als aktuellen Stand ohne Verlauf.
+    Abgelegt wird unter dem Tag des Abrufs, damit über die Zeit trotzdem eine
+    Reihe entsteht. Gleiche Idempotenz-Regel wie upsert_day.
+    """
+    if not day or not fields:
+        return False
+    cols = list(fields.keys())
+    updates = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols)
+    changed = " OR ".join(f"health_assessment.{c} IS DISTINCT FROM EXCLUDED.{c}" for c in cols)
+    sql = (
+        f"INSERT INTO health_assessment (date, {', '.join(cols)}, updated_at) "
+        f"VALUES (%s, {', '.join(['%s'] * len(cols))}, NOW()) "
+        f"ON CONFLICT (date) DO UPDATE SET {updates}, updated_at=NOW() "
+        f"WHERE {changed}"
+    )
+    return db.execute(sql, tuple([day] + [fields[c] for c in cols])) > 0
+
+
 def recent(days: int = 7) -> list[dict]:
     return db.query(
         "SELECT * FROM health_data WHERE date >= CURRENT_DATE - %s ORDER BY date DESC",

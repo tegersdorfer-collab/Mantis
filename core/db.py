@@ -669,6 +669,45 @@ MIGRATIONS = [
     # Review-Stufe liest das, um NICHT dasselbe Modell zu wählen: ein Modell,
     # das seinen eigenen Code abnimmt, sieht nur aus wie ein Review.
     "ALTER TABLE forge_tasks ADD COLUMN IF NOT EXISTS implement_model TEXT;",
+
+    # COROS: die restlichen Tageswerte, die die Tools schon liefern.
+    "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS sleep_start         TIME;",
+    "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS sleep_end           TIME;",
+    "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS sleep_awake_count   INT;",
+    "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS nap_duration        DOUBLE PRECISION;",
+    "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS sleep_hr_avg        DOUBLE PRECISION;",
+    "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS sleep_hr_min        DOUBLE PRECISION;",
+    "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS sleep_hr_max        DOUBLE PRECISION;",
+    "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS training_load_ratio DOUBLE PRECISION;",
+
+    # COROS: Momentaufnahmen ohne Verlauf. Eigene Tabelle statt Spalten in
+    # health_data, wo sie auf einer von hunderten Zeilen stünden.
+    """
+    CREATE TABLE IF NOT EXISTS health_assessment (
+        date              DATE PRIMARY KEY,
+        vo2max            DOUBLE PRECISION,
+        hrv_baseline      DOUBLE PRECISION,
+        running_level     DOUBLE PRECISION,
+        threshold_pace_sec INT,
+        race_5k_sec       INT,
+        race_10k_sec      INT,
+        race_half_sec     INT,
+        race_marathon_sec INT,
+        recovery_pct      DOUBLE PRECISION,
+        recovery_full_h   DOUBLE PRECISION,
+        recovery_level    TEXT,
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
+    # Der Trend ist COROS' eigene Einschätzung je Tag ("Decreasing") — Text, aber
+    # mit Tagesbezug, gehört also zu den Tageswerten.
+    "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS training_load_trend TEXT;",
+
+    # vo2max und recovery_pct wandern nach health_assessment. Sie hatten keine
+    # Leser (das Scoring nutzt sie nicht) und je genau einen Wert, der beim
+    # nächsten Sync neu geschrieben wird — doppelte Wahrheit wäre schlimmer.
+    "ALTER TABLE health_data DROP COLUMN IF EXISTS vo2max;",
+    "ALTER TABLE health_data DROP COLUMN IF EXISTS recovery_pct;",
 ]
 
 

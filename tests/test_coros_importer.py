@@ -25,6 +25,7 @@ RESPONSES = {
     "queryTrainingLoadAssessment":    "training_load.txt",
     "queryFitnessAssessmentOverview": "fitness_overview.txt",
     "queryRecoveryStatus":            "recovery.txt",
+    "queryUserInfo":                  "user_info.txt",
 }
 
 
@@ -147,10 +148,9 @@ def test_collect_logs_zero_days_when_a_source_yields_nothing(caplog):
 def test_flat_metrics_land_on_the_most_recent_day():
     days = importer.collect(FakeClient(), days=14)
     newest = max(days)
-    assert days[newest]["vo2max"] == 47
-    assert days[newest]["recovery_pct"] == 82
+    assert days[newest]["weight"] == 61.4
     older = sorted(days)[0]
-    assert "vo2max" not in days[older]
+    assert "weight" not in days[older]
 
 
 def test_sync_writes_every_day_and_counts_them(written):
@@ -236,3 +236,87 @@ def test_dashboard_refresh_health_calls_the_coros_importer(monkeypatch):
     monkeypatch.setattr("domains.coros.importer.sync", fake_sync)
     assert DashboardReader().refresh_health() == 7
     assert seen["days"] == 14
+
+
+# ── neue Quellen und die Prioritätsregel ────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def assessed(monkeypatch):
+    """Sammelt, was upsert_assessment geschrieben hätte."""
+    rows: dict[str, dict] = {}
+
+    def fake_upsert(day, fields):
+        if not fields:
+            return False
+        rows.setdefault(day, {}).update(fields)
+        return True
+
+    monkeypatch.setattr(importer.health, "upsert_assessment", fake_upsert)
+    return rows
+
+
+@pytest.fixture(autouse=True)
+def stored(monkeypatch):
+    """Sammelt, was db.set_setting geschrieben hätte."""
+    kv: dict[str, object] = {}
+    monkeypatch.setattr(importer.db, "set_setting", lambda k, v: kv.__setitem__(k, v))
+    return kv
+
+
+def test_exact_durations_win_over_ratios_derived_from_percentages():
+    # Beide Quellen liefern 2026-08-10: queryDailyHealthData exakt (Deep 1h30),
+    # querySleepData gerechnet (22 % von 7h5 = 1.56). Die exakte muss gewinnen.
+    days = importer.collect(FakeClient(), days=14)
+    assert days["2026-08-10"]["sleep_deep"] == 1.5
+
+
+def test_derived_stages_fill_days_the_exact_source_does_not_cover(monkeypatch):
+    # queryDailyHealthData kennt 2026-08-20 ohne Sleep-Block, querySleepData
+    # liefert dort Anteile — die gerechneten Phasen müssen die Lücke füllen.
+    texts = {
+        "querySleepData": (
+            "Sleep Data\n====\n\n2026-08-20\nSleep Score: 70\n"
+            "Main Sleep: 8h 0min\nDeep Sleep Ratio: 25%\n"
+        ),
+        "queryDailyHealthData": "--- 20260820 ---\nSteps: 1,000 | Calories: 100 kcal\n",
+    }
+
+    class OnlySleepAndDaily(FakeClient):
+        def call_tool(self, name, arguments):
+            if name not in texts:
+                raise RuntimeError("in diesem Test nicht benutzt")
+            return {"content": [{"type": "text", "text": texts[name]}]}
+
+    days = importer.collect(OnlySleepAndDaily(), days=14)
+    assert days["2026-08-20"]["sleep_deep"] == 2.0     # 25 % von 8 h
+    assert days["2026-08-20"]["steps"] == 1000
+
+
+def test_weight_from_user_info_lands_on_the_newest_day(written):
+    importer.sync(days=14, client=FakeClient())
+    newest = max(written)
+    assert written[newest]["weight"] == 61.4
+
+
+def test_profile_fields_go_to_settings_not_into_health_data(written, stored):
+    importer.sync(days=14, client=FakeClient())
+    assert stored["coros_height_cm"] == 168
+    assert stored["coros_birthday"] == "1994-11-02"
+    assert stored["coros_gender"] == "Female"
+    assert stored["coros_nickname"] == "Testkonto"
+    assert not any("height_cm" in f for f in written.values())
+
+
+def test_assessment_goes_to_its_own_table(written, assessed):
+    importer.sync(days=14, client=FakeClient())
+    day = assessed[max(assessed)]
+    assert day["vo2max"] == 47
+    assert day["recovery_pct"] == 82
+    assert day["recovery_level"] == "Moderate training allowed"
+    assert day["race_marathon_sec"] == 13800
+    assert day["hrv_baseline"] == 50
+
+
+def test_assessment_fields_stay_out_of_health_data(written, assessed):
+    importer.sync(days=14, client=FakeClient())
+    assert not any("vo2max" in f or "recovery_pct" in f for f in written.values())

@@ -10,6 +10,7 @@ besser als keine.
 import logging
 from datetime import date, timedelta
 
+from core import db
 from domains import health
 from domains.coros import mapping, oauth
 from domains.coros.client import CorosClient, payload
@@ -27,19 +28,36 @@ log = logging.getLogger("mantis.coros")
 MAX_LOOKBACK_DAYS = 365
 
 # (Tool, Parser, braucht Datumsbereich) — tageslose Parser stehen weiter unten.
+#
+# Die Reihenfolge entscheidet: spätere Quellen überschreiben frühere (dict.update).
+# querySleepData steht deshalb VOR queryDailyHealthData — es rechnet die Phasen aus
+# Prozentanteilen und deckt dafür die ganze Historie ab, während queryDailyHealthData
+# exakte Dauern liefert, aber nur für die jüngsten Tage. So füllt die gerechnete
+# Quelle die Lücken und die exakte gewinnt, wo es beide gibt.
 _DAY_SOURCES = [
-    ("queryDailyHealthData",        mapping.parse_daily_health,  False),
     ("querySleepData",              mapping.parse_sleep,         True),
+    ("queryDailyHealthData",        mapping.parse_daily_health,  False),
     ("querySleepHrv",               mapping.parse_sleep_hrv,     True),
     ("queryRestingHeartRate",       mapping.parse_resting_hr,    False),
     ("queryAvgHeartRate",           mapping.parse_avg_hr,        False),
     ("queryTrainingLoadAssessment", mapping.parse_training_load, False),
 ]
 
+# Tageslos, aber ein echter Tageswert → jüngster erfasster Tag in health_data.
 _FLAT_SOURCES = [
+    ("queryUserInfo", mapping.parse_user_info),
+]
+
+# Momentaufnahmen ohne Verlauf → health_assessment. Eigene Tabelle, weil sie als
+# Spalten in health_data auf genau einer von hunderten Zeilen stünden und damit
+# jede Abfrage und jeden Coverage-Wert im Scoring verwässern würden.
+_ASSESSMENT_SOURCES = [
     ("queryFitnessAssessmentOverview", mapping.parse_fitness_overview),
     ("queryRecoveryStatus",            mapping.parse_recovery),
 ]
+
+# Aus queryUserInfo, aber konstant — gehört nicht in eine Tages-Tabelle.
+_PROFILE_KEYS = ("height_cm", "birthday", "gender", "nickname")
 
 
 def _build_client() -> CorosClient:
@@ -63,14 +81,24 @@ def _args(days: int, needs_range: bool) -> dict:
             "days": days}
 
 
-def collect(client, days: int) -> dict[str, dict]:
-    """Alle Quellen abfragen und je Tag zusammenführen."""
-    merged: dict[str, dict] = {}
+def collect_all(client, days: int) -> tuple[dict[str, dict], dict, dict]:
+    """Alle Quellen abfragen und nach Zielort sortiert zurückgeben.
 
+    Liefert (Tageswerte, Momentaufnahme, Profil): health_data, health_assessment
+    und settings. Die Rohantworten werden je Tool nur einmal geholt — die
+    Kopfzeile von queryDailyHealthData trägt Momentanwerte, der Rumpf Tageswerte.
+    """
+    responses: dict[str, str] = {}
+
+    def fetch(tool: str, args: dict) -> str:
+        if tool not in responses:
+            responses[tool] = str(payload(client.call_tool(tool, args)))
+        return responses[tool]
+
+    merged: dict[str, dict] = {}
     for tool, parse, needs_range in _DAY_SOURCES:
         try:
-            text = payload(client.call_tool(tool, _args(days, needs_range)))
-            parsed = parse(str(text))
+            parsed = parse(fetch(tool, _args(days, needs_range)))
             for day, fields in parsed.items():
                 merged.setdefault(day, {}).update(fields)
             # Eine Zeile je Quelle, auch bei 0 Tagen — sonst ist ein degradierter
@@ -80,21 +108,42 @@ def collect(client, days: int) -> dict[str, dict]:
         except Exception as e:
             log.warning(f"COROS: {tool} übersprungen ({type(e).__name__}: {e})")
 
+    assessment: dict = {}
+    profile: dict = {}
     if not merged:
-        return merged
+        return merged, assessment, profile
 
-    # Tageslose Metriken beschreiben den aktuellen Stand → jüngster erfasster Tag.
     newest = max(merged)
     for tool, parse in _FLAT_SOURCES:
         try:
-            text = payload(client.call_tool(tool, {}))
-            fields = parse(str(text))
+            fields = parse(fetch(tool, {}))
+            profile.update({k: fields.pop(k) for k in _PROFILE_KEYS if k in fields})
             merged[newest].update(fields)
             log.info(f"COROS: {tool} lieferte {len(fields)} Felder")
         except Exception as e:
             log.warning(f"COROS: {tool} übersprungen ({type(e).__name__}: {e})")
 
-    return merged
+    for tool, parse in _ASSESSMENT_SOURCES:
+        try:
+            fields = parse(fetch(tool, {}))
+            assessment.update(fields)
+            log.info(f"COROS: {tool} lieferte {len(fields)} Felder")
+        except Exception as e:
+            log.warning(f"COROS: {tool} übersprungen ({type(e).__name__}: {e})")
+
+    # Die Kopfzeile der Tagesantwort gilt für den ganzen Abruf, nicht für einen Tag.
+    if text := responses.get("queryDailyHealthData"):
+        try:
+            assessment.update(mapping.parse_daily_header(text))
+        except Exception as e:
+            log.warning(f"COROS: Kopfzeile übersprungen ({type(e).__name__}: {e})")
+
+    return merged, assessment, profile
+
+
+def collect(client, days: int) -> dict[str, dict]:
+    """Nur die Tageswerte — schmale Sicht auf collect_all() für Aufrufer und Tests."""
+    return collect_all(client, days)[0]
 
 
 def sync(days: int = 14, client=None) -> int:
@@ -115,7 +164,7 @@ def sync(days: int = 14, client=None) -> int:
         return 0
 
     try:
-        days_data = collect(c, days)
+        days_data, assessment, profile = collect_all(c, days)
     except Exception as e:
         log.warning(f"COROS-Sync fehlgeschlagen: {e}")
         return 0
@@ -143,6 +192,21 @@ def sync(days: int = 14, client=None) -> int:
     if failed:
         log.warning(f"COROS-Sync: {failed} von {len(days_data)} Tagen nicht geschrieben "
                     f"(zuletzt: {last_error})")
+
+    # Momentaufnahme und Profil je in einem eigenen try: ein Fehler dort darf die
+    # bereits geschriebenen Tageswerte nicht entwerten — sie sind der Hauptzweck.
+    if assessment and days_data:
+        try:
+            health.upsert_assessment(max(days_data), assessment)
+        except Exception as e:
+            log.warning(f"COROS: Assessment nicht geschrieben ({type(e).__name__}: {e})")
+    if profile:
+        try:
+            for key, value in profile.items():
+                db.set_setting(f"coros_{key}", value)
+        except Exception as e:
+            log.warning(f"COROS: Profil nicht gespeichert ({type(e).__name__}: {e})")
+
     if written:
         log.info(f"🩺 COROS: {written} Tage geschrieben")
     return written

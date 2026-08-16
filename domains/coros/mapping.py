@@ -91,6 +91,37 @@ def parse_duration_h(raw: str) -> float | None:
     return round(hours * 100) / 100
 
 
+def parse_float(raw: str) -> float | None:
+    """'61.4 kg' → 61.4, '42 ms' → 42.0, 'No data' → None."""
+    if raw is None:
+        return None
+    m = re.search(r"-?\d+(?:[.,]\d+)?", raw)
+    return float(m.group().replace(",", ".")) if m else None
+
+
+def parse_clock_sec(raw: str) -> int | None:
+    """'5:00' → 300, '1:40:24' → 6024. Uhrzeit-Notation in Sekunden.
+
+    Zwei Gruppen sind Minuten:Sekunden, drei sind Stunden:Minuten:Sekunden — so
+    liefert COROS Schwellentempo und Renn-Prognosen.
+    """
+    if raw is None:
+        return None
+    m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", raw)
+    if not m:
+        return None
+    a, b, c = m.group(1), m.group(2), m.group(3)
+    if c is None:
+        return int(a) * 60 + int(b)
+    return int(a) * 3600 + int(b) * 60 + int(c)
+
+
+def _iso_date(raw: str) -> str | None:
+    """'1994-11-02 (Age: 31)' → '1994-11-02'."""
+    m = re.search(r"\d{4}-\d{2}-\d{2}", raw or "")
+    return m.group() if m else None
+
+
 # Plausibilitätsgrenzen (inklusive). Bewusst weit — sie sollen Parser-Ausrutscher
 # abfangen (verklebte Zahlen, verrutschte Felder), keine ungewöhnlichen Tage.
 LIMITS: dict[str, tuple[float, float]] = {
@@ -111,6 +142,21 @@ LIMITS: dict[str, tuple[float, float]] = {
     "vo2max":           (10, 100),
     "recovery_pct":     (0, 100),
     "sleep_score":      (0, 100),
+    "sleep_awake_count": (0, 50),
+    "nap_duration":     (0, 12),
+    "sleep_hr_avg":     (20, 220),
+    "sleep_hr_min":     (20, 220),
+    "sleep_hr_max":     (20, 250),
+    "training_load_ratio": (0, 10),
+    "hrv_baseline":     (1, 300),
+    "running_level":    (0, 200),
+    "threshold_pace_sec": (60, 1_200),
+    "race_5k_sec":      (300, 36_000),
+    "race_10k_sec":     (600, 36_000),
+    "race_half_sec":    (1_200, 72_000),
+    "race_marathon_sec": (2_400, 144_000),
+    "recovery_full_h":  (0, 336),
+    "height_cm":        (50, 250),
     "training_load_short": (0, 2_000),
     "training_load_long":  (0, 2_000),
     "weight":           (20, 400),
@@ -132,6 +178,16 @@ def _put(target: dict, col: str, value) -> None:
     """Nur setzen, wenn ein plausibler Wert da ist. Kein None, keine 0 aus Versehen."""
     v = sane(col, value)
     if v is not None:
+        target[col] = v
+
+
+def _put_text(target: dict, col: str, value: str | None) -> None:
+    """Für Spalten, die Text tragen (Uhrzeiten, COROS' eigene Einschätzungen).
+
+    Getrennt von _put, weil LIMITS numerisch vergleicht — ein String dort hinein
+    wäre ein TypeError. Geprüft wird nur, dass überhaupt etwas dasteht.
+    """
+    if value and (v := value.strip()):
         target[col] = v
 
 
@@ -185,6 +241,12 @@ def parse_daily_health(text: str) -> dict[str, dict]:
         elif stripped.startswith("Stress:"):
             _put(fields, "stress_avg", parse_int(stripped.split("Avg", 1)[1])
                  if "Avg" in stripped else None)
+        elif stripped.startswith("Sleep HR:"):
+            for label, col in (("Avg", "sleep_hr_avg"), ("Min", "sleep_hr_min"),
+                               ("Max", "sleep_hr_max")):
+                mm = re.search(rf"\b{label}\s+(\d+)", stripped)
+                if mm:
+                    _put(fields, col, parse_int(mm.group(1)))
         elif stripped.startswith("Total:"):
             for label, col in (("Total", "sleep_duration"), ("Deep", "sleep_deep"),
                                ("Light", "sleep_core"), ("REM", "sleep_rem"),
@@ -207,32 +269,87 @@ def parse_daily_health(text: str) -> dict[str, dict]:
 _ISO_DAY_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}):?$")
 
 
-def parse_sleep(text: str) -> dict[str, dict]:
-    """querySleepData → {'2026-08-10': {'sleep_score': 77}, …}.
+# COROS nennt die Leichtschlafphase "Light", health_data nennt die Spalte
+# sleep_core — dieselbe Phase, anderer Name.
+_WINDOW_RE = re.compile(r"(\d{1,2}:\d{2})\s*-\s*\S+\s+(\d{1,2}:\d{2})")
 
-    Nur der Sleep Score. Die Phasen liefert dieses Tool bloß als Prozentanteile;
-    absolute Stunden kommen aus parse_daily_health, und zwei Quellen für dieselbe
-    Spalte wären eine Fehlerquelle ohne Gewinn.
+_STAGE_RATIOS = {
+    "Deep Sleep Ratio": "sleep_deep",
+    "Light Sleep Ratio": "sleep_core",
+    "REM Ratio": "sleep_rem",
+}
+
+
+def parse_sleep(text: str) -> dict[str, dict]:
+    """querySleepData → {'2026-08-10': {'sleep_score': 77, 'sleep_deep': 1.56, …}, …}.
+
+    Die Phasen stehen hier als Prozentanteil der Hauptschlafzeit; die absoluten
+    Stunden werden daraus gerechnet. parse_daily_health liefert dieselben Phasen
+    als exakte Dauer, aber nur für die jüngsten Tage — deshalb steht diese Quelle
+    in _DAY_SOURCES *vor* ihr und wird von der genaueren überschrieben.
 
     Fehlt jeder Tagesmarker (JJJJ-MM-TT), wird das nicht als leeres Ergebnis
     gewertet, sondern als CorosFormatError — siehe Moduldocstring.
     """
     check_response(text)
     out: dict[str, dict] = {}
-    day: str | None = None
     saw_day_marker = False
+    day: str | None = None
+    raw: dict = {}
+
+    def flush() -> None:
+        if day is None:
+            return
+        fields: dict = {}
+        _put(fields, "sleep_score", raw.get("score"))
+        _put(fields, "sleep_awake_count", raw.get("awake_count"))
+        _put(fields, "nap_duration", raw.get("nap_h"))
+        _put_text(fields, "sleep_start", raw.get("start"))
+        _put_text(fields, "sleep_end", raw.get("end"))
+        main_h = raw.get("main_h")
+        # 0 h Hauptschlaf heißt "Uhr nicht getragen", nicht "null Stunden
+        # geschlafen" — daraus abgeleitete Phasen wären erfundene Nullen.
+        if main_h:
+            _put(fields, "sleep_duration", main_h)
+            _put(fields, "sleep_awake", raw.get("awake_h"))
+            for label, col in _STAGE_RATIOS.items():
+                pct = raw.get(label)
+                if pct is not None:
+                    _put(fields, col, round(main_h * pct) / 100)
+        if fields:
+            out[day] = fields
+
     for line in text.splitlines():
         stripped = line.strip()
         m = _ISO_DAY_RE.match(stripped)
         if m:
+            flush()
             saw_day_marker = True
             day = m.group(1)
+            raw = {}
             continue
-        if day and stripped.startswith("Sleep Score:"):
-            fields: dict = {}
-            _put(fields, "sleep_score", parse_int(stripped.split(":", 1)[1]))
-            if fields:
-                out[day] = fields
+        if not day or ":" not in stripped:
+            continue
+        label, value = (p.strip() for p in stripped.split(":", 1))
+        if label == "Sleep Score":
+            raw["score"] = parse_int(value)
+        elif label == "Main Sleep":
+            raw["main_h"] = parse_duration_h(value)
+        elif label == "Awake Time":
+            raw["awake_h"] = parse_duration_h(value)
+        elif label == "Naps Total":
+            raw["nap_h"] = parse_duration_h(value)
+        elif label.startswith("Awake Count"):
+            raw["awake_count"] = parse_int(value)
+        elif label == "Main Sleep Window":
+            # "2026-08-09 22:35 - 2026-08-10 05:58" → Einschlaf- und Aufwachzeit.
+            # Nur die Uhrzeiten; das Datum steckt schon im Tagesmarker.
+            if w := _WINDOW_RE.search(stripped):
+                raw["start"], raw["end"] = w.group(1), w.group(2)
+        elif label in _STAGE_RATIOS:
+            raw[label] = parse_int(value)
+    flush()
+
     if not saw_day_marker:
         raise CorosFormatError(
             "parse_sleep: keine Tagesmarker (JJJJ-MM-TT) gefunden — Format vermutlich geändert"
@@ -377,11 +494,17 @@ def parse_training_load(text: str) -> dict[str, dict]:
             continue
         if not day:
             continue
-        for label, col in (("Short-Term Load", "training_load_short"),
-                           ("Long-Term Load", "training_load_long")):
+        for label, col, conv in (("Short-Term Load", "training_load_short", parse_int),
+                                 ("Long-Term Load", "training_load_long", parse_int),
+                                 ("Load Ratio", "training_load_ratio", parse_float),
+                                 ("Comment", "training_load_trend", _text)):
             if stripped.startswith(label + ":"):
                 fields = out.setdefault(day, {})
-                _put(fields, col, parse_int(stripped.split(":", 1)[1]))
+                value = conv(stripped.split(":", 1)[1].strip())
+                if isinstance(value, str):
+                    _put_text(fields, col, value)
+                else:
+                    _put(fields, col, value)
     if not saw_day_marker:
         raise CorosFormatError(
             "parse_training_load: keine Tagesmarker (JJJJ-MM-TT) gefunden — Format vermutlich geändert"
@@ -389,32 +512,107 @@ def parse_training_load(text: str) -> dict[str, dict]:
     return {d: f for d, f in out.items() if f}
 
 
-def _parse_flat(text: str, label: str, col: str, name: str) -> dict:
-    """Ein einzelnes 'Label: Wert' aus einer tageslosen Antwort.
+def _parse_flat(text: str, specs, anchor: str, name: str) -> dict:
+    """Mehrere 'Label: Wert' aus einer tageslosen Antwort.
 
-    Die Strukturprüfung fragt "wurde das Label gesehen", nicht "wurde ein Wert
-    extrahiert" — 'Recovery: No data' hat das Label, nur der Wert fehlt (Fall 1,
-    legitim). Fehlt das Label komplett, hat sich das Format vermutlich geändert.
+    specs ist eine Folge von (Label, Spalte, Konverter). Liefert der Konverter
+    einen String, geht der Wert über _put_text (keine numerische Grenze), sonst
+    über _put.
+
+    Die Strukturprüfung fragt "wurde das Anker-Label gesehen", nicht "wurde ein
+    Wert extrahiert" — 'Recovery: No data' hat das Label, nur der Wert fehlt
+    (Fall 1, legitim). Fehlt es komplett, hat sich das Format vermutlich geändert.
     """
     check_response(text)
     fields: dict = {}
-    seen_label = False
+    seen_anchor = False
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.startswith(label + ":"):
-            seen_label = True
-            _put(fields, col, parse_int(stripped.split(":", 1)[1]))
-            break            # nur der erste Treffer, sonst gewinnt eine spätere Zeile
-    if not seen_label:
-        raise CorosFormatError(f"{name}: Label '{label}' nicht gefunden — Format vermutlich geändert")
+        for label, col, conv in specs:
+            # Nur der erste Treffer je Spalte, sonst gewinnt eine spätere Zeile.
+            if col in fields or not stripped.startswith(label + ":"):
+                continue
+            if label == anchor:
+                seen_anchor = True
+            # .strip(): parse_duration_h würde bei ' 4h' am führenden Leerzeichen
+            # einen Leer-Match liefern und None zurückgeben.
+            value = conv(stripped.split(":", 1)[1].strip())
+            if isinstance(value, str):
+                _put_text(fields, col, value)
+            else:
+                _put(fields, col, value)
+    if not seen_anchor:
+        raise CorosFormatError(
+            f"{name}: Label '{anchor}' nicht gefunden — Format vermutlich geändert"
+        )
     return fields
 
 
+def _text(raw: str) -> str:
+    return raw.strip()
+
+
+_FITNESS_SPECS = (
+    ("VO2max", "vo2max", parse_int),
+    ("Running Level", "running_level", parse_int),
+    ("Threshold Pace", "threshold_pace_sec", parse_clock_sec),
+    ("5 km Prediction", "race_5k_sec", parse_clock_sec),
+    ("10 km Prediction", "race_10k_sec", parse_clock_sec),
+    ("Half Marathon Prediction", "race_half_sec", parse_clock_sec),
+    ("Marathon Prediction", "race_marathon_sec", parse_clock_sec),
+)
+
+_RECOVERY_SPECS = (
+    ("Recovery", "recovery_pct", parse_int),
+    ("Level", "recovery_level", _text),
+    ("Estimated Full Recovery", "recovery_full_h", parse_duration_h),
+)
+
+_USER_SPECS = (
+    ("Weight", "weight", parse_float),
+    ("Height", "height_cm", parse_int),
+    ("Birthday", "birthday", _iso_date),
+    ("Gender", "gender", _text),
+    ("Nickname", "nickname", _text),
+)
+
+
 def parse_fitness_overview(text: str) -> dict:
-    """queryFitnessAssessmentOverview → {'vo2max': 47}. Ohne Tagesbezug."""
-    return _parse_flat(text, "VO2max", "vo2max", "parse_fitness_overview")
+    """queryFitnessAssessmentOverview → VO2max, Laufniveau, Schwellentempo und
+    die vier Renn-Prognosen. Ohne Tagesbezug — ein Momentanwert.
+
+    Tempo und Prognosen stehen als Uhrzeit ('4:31 /km', '1:40:24') und werden in
+    Sekunden abgelegt: vergleichbar, rechenbar, kein Parsen beim Auslesen.
+    """
+    return _parse_flat(text, _FITNESS_SPECS, "VO2max", "parse_fitness_overview")
 
 
 def parse_recovery(text: str) -> dict:
-    """queryRecoveryStatus → {'recovery_pct': 82}. Ohne Tagesbezug."""
-    return _parse_flat(text, "Recovery", "recovery_pct", "parse_recovery")
+    """queryRecoveryStatus → Erholung in %, COROS' Einschätzung als Text und die
+    geschätzte Restzeit bis zur vollen Erholung. Ohne Tagesbezug."""
+    return _parse_flat(text, _RECOVERY_SPECS, "Recovery", "parse_recovery")
+
+
+def parse_user_info(text: str) -> dict:
+    """queryUserInfo → Gewicht plus die konstanten Profildaten.
+
+    Der Importer trennt sie: `weight` ist ein Tageswert und geht nach health_data,
+    der Rest ändert sich nicht täglich und landet in der settings-Tabelle.
+    """
+    return _parse_flat(text, _USER_SPECS, "Weight", "parse_user_info")
+
+
+def parse_daily_header(text: str) -> dict:
+    """Kopfzeile von queryDailyHealthData → {'hrv_baseline': 50}.
+
+    Die Zeile 'Daily Health Data — Last N days | Resting HR: … | HRV Baseline: …'
+    gilt für den gesamten Abruf, nicht für einen Tag — deshalb ein eigener Parser
+    mit Ziel health_assessment. 'Resting HR' wird hier nicht übernommen:
+    queryRestingHeartRate liefert denselben Wert mit Tagesbezug.
+    """
+    check_response(text)
+    fields: dict = {}
+    head = text.splitlines()[0] if text.strip() else ""
+    if m := re.search(r"HRV Baseline:\s*([\d.,]+)", head):
+        _put(fields, "hrv_baseline", parse_float(m.group(1)))
+    return fields
