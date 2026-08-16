@@ -614,11 +614,10 @@ Parität, Memory-Overhaul+Wissensgraph, Health-Overview). Umbrella-Scope:
 (Recovery/Sleep/Activity/Body) + Metrik-Graphen + Mantis-Klartext, transparent
 aufschlüsselbar, Ring-Hero-Layout. Spec: `2026-07-13-health-overview-scores-design.md`.
 
-- [ ] **BodyOS-Health-Sync reparieren** — HRV/Ruhepuls/Schlafphasen/Kalorien fließen
-      aktuell nicht (nur 3/14 Tage, Kernmetriken leer, COROS Pace 4). Ursache untersuchen:
-      BodyOS-HealthKit-Background-Delivery, COROS→Apple-Health-Freigaben, `/api/health/push`,
-      DB. **Kein Blocker für SP4** (Overview wird mit Graceful-Degradation gebaut) — aber
-      nötig, damit die Scores echte Werte zeigen.
+- [x] **BodyOS-Health-Sync reparieren** — behoben: der lossy Push-Pfad (COROS →
+      Apple Health → BodyOS → `/api/health/push`) ist ersetzt durch einen direkten
+      COROS-MCP-Sync (`domains/coros/`), der `health_data` befüllt. Recovery/Sleep/
+      Activity melden jetzt `status=ok, coverage=1.0`.
 - [ ] SP1 App-Shell & Navigation (Overlay-Framework generalisieren)
 - [ ] SP2 Feature-Parität (goals/journal/insights/fitness/globe … als Widgets/Overlays)
 - [ ] SP3 Memory-Overhaul (Obsidian/Zettelkasten) + Wissensgraph-Overlay
