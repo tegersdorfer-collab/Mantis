@@ -158,18 +158,28 @@ def upsert_day(day: str, fields: dict) -> bool:
     erzeugt hat, ist nicht die Sache dieser Domäne.
 
     Idempotent über ON CONFLICT; leere Feld-Dicts werden nicht geschrieben.
+
+    Gibt zurück, ob sich dabei etwas geändert hat — nicht ob geschrieben wurde.
+    Eine neue Zeile zählt als Änderung; ein Update, das exakt dieselben Werte
+    noch einmal schreibt, nicht. Die WHERE-Klausel im ON CONFLICT vergleicht
+    jede geschriebene Spalte per IS DISTINCT FROM gegen den Bestand — matcht
+    keine, überspringt Postgres das UPDATE komplett und rowcount bleibt 0.
+    Ohne das würde jeder 30-Minuten-Tick als 'neue Daten' durchgehen, selbst
+    wenn COROS denselben Tag unverändert zurückliefert.
     """
     if not day or not fields:
         return False
     cols = list(fields.keys())
     updates = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols)
+    changed = " OR ".join(f"health_data.{c} IS DISTINCT FROM EXCLUDED.{c}" for c in cols)
     sql = (
         f"INSERT INTO health_data (date, {', '.join(cols)}, updated_at) "
         f"VALUES (%s, {', '.join(['%s'] * len(cols))}, NOW()) "
-        f"ON CONFLICT (date) DO UPDATE SET {updates}, updated_at=NOW()"
+        f"ON CONFLICT (date) DO UPDATE SET {updates}, updated_at=NOW() "
+        f"WHERE {changed}"
     )
-    db.execute(sql, tuple([day] + [fields[c] for c in cols]))
-    return True
+    rowcount = db.execute(sql, tuple([day] + [fields[c] for c in cols]))
+    return rowcount > 0
 
 
 def import_health() -> int:
