@@ -8,6 +8,15 @@ Leitlinie ist Strenge. Ein fehlender Wert ist harmlos — health_scores meldet d
 ehrlich "zu wenig Daten". Ein falsch geparster Wert sieht aus wie eine Messung und
 verschiebt die Baselines dauerhaft. Deshalb: exakte Muster, Plausibilitätsgrenzen,
 und im Zweifel nichts.
+
+Fehlererkennung läuft zweistufig. Zuerst `check_response`, eine Denyliste
+bekannter Fehlertexte (`_ERROR_MARKERS`) — die erklärt einen Fehler mit einer
+präzisen Meldung, kann aber naturgemäß nur Formulierungen kennen, die schon
+einmal aufgetreten sind. Als Netz darunter prüft jeder Parser strukturell, ob
+er überhaupt erkennbare Struktur gesehen hat (mindestens ein Tagesmarker bei
+den tagesbezogenen Parsern, das erwartete Label bei den tageslosen). Fehlt
+beides, ist ein leeres Ergebnis keine ehrliche "keine Daten"-Aussage mehr,
+sondern ein unerkanntes Format — dann `CorosFormatError` statt stillem `{}`.
 """
 import logging
 import re
@@ -33,7 +42,12 @@ _ERROR_MARKERS = (
 
 
 def check_response(text: str) -> str:
-    """Text durchreichen — oder CorosFormatError, wenn es gar keine Daten sind."""
+    """Text durchreichen — oder CorosFormatError bei einer der bekannten Fehlerformulierungen.
+
+    Das ist die erste, präzise Stufe der Fehlererkennung (siehe Moduldocstring).
+    Was hier nicht matcht, aber trotzdem kein verwertbares Format ist, fängt die
+    zweite Stufe ab: die Strukturprüfung in den einzelnen Parsern weiter unten.
+    """
     if not text or not text.strip():
         raise CorosFormatError("Leere Antwort vom COROS-MCP")
     low = text.lower()
@@ -44,19 +58,20 @@ def check_response(text: str) -> str:
 
 
 def parse_int(raw: str) -> int | None:
-    """'12,500' → 12500. 'No data', Leerstring und Unsinn → None.
+    """'12,500' → 12500. '12500' → 12500. 'No data', Leerstring und Unsinn → None.
 
-    Verlangt wohlgeformte Dreiergruppen nach jedem Komma. Ein abgeschnittener
-    Stream (SSE-Antwort bricht mitten in der Zahl ab) darf nicht als Zahl mit
-    weniger Stellen durchgehen — '1,0' ist keine 10 und keine 1, sondern gar
-    nichts. Die Lookbehind/Lookahead-Guards verhindern, dass die Regex bei einem
-    fehlgeschlagenen Dreiergruppen-Match einfach auf das führende Fragment
-    zurückfällt (z.B. '1' aus '1,0') oder ein Fragment nach dem Komma als eigene
-    Zahl aufgreift (z.B. '0' aus '1,0').
+    Zwei Formen sind erlaubt: eine Zahl ganz ohne Komma (beliebig viele Stellen),
+    oder eine mit Komma, dann aber nur mit wohlgeformten Dreiergruppen. Ein
+    abgeschnittener Stream (SSE-Antwort bricht mitten in der Zahl ab) darf nicht
+    als Zahl mit weniger Stellen durchgehen — '1,0' ist keine 10 und keine 1,
+    sondern gar nichts. Die Lookbehind/Lookahead-Guards verhindern, dass die
+    Regex bei einem fehlgeschlagenen Dreiergruppen-Match einfach auf das
+    führende Fragment zurückfällt (z.B. '1' aus '1,0') oder ein Fragment nach
+    dem Komma als eigene Zahl aufgreift (z.B. '0' aus '1,0').
     """
     if raw is None:
         return None
-    m = re.search(r"(?<![\d,])-?\d{1,3}(?:,\d{3})*(?![\d,])", raw)
+    m = re.search(r"(?<![\d,])-?(?:\d{1,3}(?:,\d{3})+|\d+)(?![\d,])", raw)
     if not m:
         return None
     return int(m.group(0).replace(",", ""))
@@ -137,16 +152,21 @@ def parse_daily_health(text: str) -> dict[str, dict]:
 
     'Sleep HR' wird bewusst NICHT auf hr_avg/hr_min/hr_max abgebildet — das ist der
     Puls im Schlaf, nicht der des Tages. Die Tageswerte kommen aus queryAvgHeartRate.
+
+    Fehlt jeder Tagesmarker ('--- JJJJMMTT ---'), wird das nicht als leeres
+    Ergebnis gewertet, sondern als CorosFormatError — siehe Moduldocstring.
     """
     check_response(text)
     out: dict[str, dict] = {}
     day: str | None = None
+    saw_day_marker = False
 
     for line in text.splitlines():
         stripped = line.strip()
 
         m = _DAY_RE.match(stripped)
         if m:
+            saw_day_marker = True
             raw = m.group(1)
             day = f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
             out.setdefault(day, {})
@@ -173,6 +193,12 @@ def parse_daily_health(text: str) -> dict[str, dict]:
                 if mm:
                     _put(fields, col, parse_duration_h(mm.group(1)))
 
+    if not saw_day_marker:
+        raise CorosFormatError(
+            "parse_daily_health: keine Tagesmarker ('--- JJJJMMTT ---') gefunden "
+            "— Format vermutlich geändert"
+        )
+
     # Tage ohne einen einzigen erkannten Wert wieder rauswerfen — sonst schreibt der
     # Importer leere Zeilen und die Scores halten den Tag für erfasst.
     return {d: f for d, f in out.items() if f}
@@ -187,14 +213,19 @@ def parse_sleep(text: str) -> dict[str, dict]:
     Nur der Sleep Score. Die Phasen liefert dieses Tool bloß als Prozentanteile;
     absolute Stunden kommen aus parse_daily_health, und zwei Quellen für dieselbe
     Spalte wären eine Fehlerquelle ohne Gewinn.
+
+    Fehlt jeder Tagesmarker (JJJJ-MM-TT), wird das nicht als leeres Ergebnis
+    gewertet, sondern als CorosFormatError — siehe Moduldocstring.
     """
     check_response(text)
     out: dict[str, dict] = {}
     day: str | None = None
+    saw_day_marker = False
     for line in text.splitlines():
         stripped = line.strip()
         m = _ISO_DAY_RE.match(stripped)
         if m:
+            saw_day_marker = True
             day = m.group(1)
             continue
         if day and stripped.startswith("Sleep Score:"):
@@ -202,6 +233,10 @@ def parse_sleep(text: str) -> dict[str, dict]:
             _put(fields, "sleep_score", parse_int(stripped.split(":", 1)[1]))
             if fields:
                 out[day] = fields
+    if not saw_day_marker:
+        raise CorosFormatError(
+            "parse_sleep: keine Tagesmarker (JJJJ-MM-TT) gefunden — Format vermutlich geändert"
+        )
     return out
 
 
@@ -210,10 +245,14 @@ def parse_sleep_hrv(text: str) -> dict[str, dict]:
 
     Liest nur den Tagesabschnitt. Danach folgt eine Rohzeitreihe mit zehntausenden
     'timestamp=… hrv=…'-Zeilen; die wird übersprungen, weil sie keine Tagesmarker hat.
+
+    Fehlt jeder Tagesmarker (JJJJ-MM-TT), wird das nicht als leeres Ergebnis
+    gewertet, sondern als CorosFormatError — siehe Moduldocstring.
     """
     check_response(text)
     out: dict[str, dict] = {}
     day: str | None = None
+    saw_day_marker = False
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("timestamp="):
@@ -221,6 +260,7 @@ def parse_sleep_hrv(text: str) -> dict[str, dict]:
             continue
         m = _ISO_DAY_RE.match(stripped)
         if m:
+            saw_day_marker = True
             day = m.group(1)
             continue
         if day and stripped.startswith("HRV Avg:"):
@@ -229,20 +269,45 @@ def parse_sleep_hrv(text: str) -> dict[str, dict]:
             if fields:
                 out[day] = fields
             day = None            # 'Baseline:' darunter darf den Wert nicht ersetzen
+    if not saw_day_marker:
+        raise CorosFormatError(
+            "parse_sleep_hrv: keine Tagesmarker (JJJJ-MM-TT) gefunden — Format vermutlich geändert"
+        )
     return out
 
 
-def _parse_day_value_lines(text: str, pattern: re.Pattern, build) -> dict[str, dict]:
-    """Gemeinsame Form für 'YYYY-MM-DD: …'-Zeilen: je Treffer ein Tag."""
+_ANY_DAY_LINE = re.compile(r"^\d{4}-\d{2}-\d{2}:")
+
+
+def _parse_day_value_lines(text: str, pattern: re.Pattern, build, name: str) -> dict[str, dict]:
+    """Gemeinsame Form für 'YYYY-MM-DD: …'-Zeilen: je Treffer ein Tag.
+
+    Die Strukturprüfung läuft bewusst über `_ANY_DAY_LINE`, ein permissives
+    'beginnt mit Datum und Doppelpunkt' — NICHT über `pattern`. `pattern`
+    verlangt zusätzlich einen Wert (z.B. 'NN bpm', anchored per Vorgängerfix)
+    und matcht darum eine Zeile wie '2026-08-10: No data' gar nicht. Würde die
+    Strukturprüfung `pattern` selbst benutzen, sähe eine Woche voller
+    'No data'-Tage wie gar keine Struktur aus und würde fälschlich einen
+    CorosFormatError auslösen, obwohl Fall 1 (Tag erkannt, keine Messung)
+    vorliegt.
+    """
     check_response(text)
     out: dict[str, dict] = {}
+    saw_day_marker = False
     for line in text.splitlines():
-        m = pattern.match(line.strip())
+        stripped = line.strip()
+        if _ANY_DAY_LINE.match(stripped):
+            saw_day_marker = True
+        m = pattern.match(stripped)
         if not m:
             continue
         fields = build(m)
         if fields:
             out[m.group(1)] = fields
+    if not saw_day_marker:
+        raise CorosFormatError(
+            f"{name}: keine Tagesmarker (JJJJ-MM-TT:) gefunden — Format vermutlich geändert"
+        )
     return out
 
 
@@ -261,7 +326,7 @@ def parse_resting_hr(text: str) -> dict[str, dict]:
         fields: dict = {}
         _put(fields, "resting_hr", parse_int(m.group(2)))
         return fields
-    return _parse_day_value_lines(text, _RHR_LINE, build)
+    return _parse_day_value_lines(text, _RHR_LINE, build, "parse_resting_hr")
 
 
 _AVG_HR_LINE = re.compile(
@@ -284,7 +349,7 @@ def parse_avg_hr(text: str) -> dict[str, dict]:
         _put(fields, "hr_min", parse_int(m.group(3) or ""))
         _put(fields, "hr_max", parse_int(m.group(4) or ""))
         return fields
-    return _parse_day_value_lines(text, _AVG_HR_LINE, build)
+    return _parse_day_value_lines(text, _AVG_HR_LINE, build, "parse_avg_hr")
 
 
 _PLAIN_DAY = re.compile(r"^(\d{4}-\d{2}-\d{2})$")
@@ -295,14 +360,19 @@ def parse_training_load(text: str) -> dict[str, dict]:
 
     Load Ratio und Comment werden bewusst nicht übernommen: das Ratio ist aus den
     beiden Lasten ableitbar, der Comment ist Fließtext ohne Spalte.
+
+    Fehlt jeder Tagesmarker (JJJJ-MM-TT), wird das nicht als leeres Ergebnis
+    gewertet, sondern als CorosFormatError — siehe Moduldocstring.
     """
     check_response(text)
     out: dict[str, dict] = {}
     day: str | None = None
+    saw_day_marker = False
     for line in text.splitlines():
         stripped = line.strip()
         m = _PLAIN_DAY.match(stripped)
         if m:
+            saw_day_marker = True
             day = m.group(1)
             continue
         if not day:
@@ -312,26 +382,39 @@ def parse_training_load(text: str) -> dict[str, dict]:
             if stripped.startswith(label + ":"):
                 fields = out.setdefault(day, {})
                 _put(fields, col, parse_int(stripped.split(":", 1)[1]))
+    if not saw_day_marker:
+        raise CorosFormatError(
+            "parse_training_load: keine Tagesmarker (JJJJ-MM-TT) gefunden — Format vermutlich geändert"
+        )
     return {d: f for d, f in out.items() if f}
 
 
-def _parse_flat(text: str, label: str, col: str) -> dict:
-    """Ein einzelnes 'Label: Wert' aus einer tageslosen Antwort."""
+def _parse_flat(text: str, label: str, col: str, name: str) -> dict:
+    """Ein einzelnes 'Label: Wert' aus einer tageslosen Antwort.
+
+    Die Strukturprüfung fragt "wurde das Label gesehen", nicht "wurde ein Wert
+    extrahiert" — 'Recovery: No data' hat das Label, nur der Wert fehlt (Fall 1,
+    legitim). Fehlt das Label komplett, hat sich das Format vermutlich geändert.
+    """
     check_response(text)
     fields: dict = {}
+    seen_label = False
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith(label + ":"):
+            seen_label = True
             _put(fields, col, parse_int(stripped.split(":", 1)[1]))
             break            # nur der erste Treffer, sonst gewinnt eine spätere Zeile
+    if not seen_label:
+        raise CorosFormatError(f"{name}: Label '{label}' nicht gefunden — Format vermutlich geändert")
     return fields
 
 
 def parse_fitness_overview(text: str) -> dict:
     """queryFitnessAssessmentOverview → {'vo2max': 47}. Ohne Tagesbezug."""
-    return _parse_flat(text, "VO2max", "vo2max")
+    return _parse_flat(text, "VO2max", "vo2max", "parse_fitness_overview")
 
 
 def parse_recovery(text: str) -> dict:
     """queryRecoveryStatus → {'recovery_pct': 82}. Ohne Tagesbezug."""
-    return _parse_flat(text, "Recovery", "recovery_pct")
+    return _parse_flat(text, "Recovery", "recovery_pct", "parse_recovery")

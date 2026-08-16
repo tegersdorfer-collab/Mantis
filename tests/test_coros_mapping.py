@@ -78,6 +78,20 @@ def test_parse_int_truncated_thousands_group_is_none():
     assert mapping.parse_int("1,0") is None
 
 
+def test_parse_int_truncated_two_digit_group_is_none():
+    assert mapping.parse_int("1,04") is None
+
+
+def test_parse_int_plain_four_digit_without_separator():
+    # Wohlgeformte Zahl ohne Tausendertrennzeichen — kein abgebrochener Stream,
+    # darf also nicht an der Dreiergruppen-Regel scheitern.
+    assert mapping.parse_int("12500") == 12500
+
+
+def test_parse_int_negative():
+    assert mapping.parse_int("-5") == -5
+
+
 # ── parse_duration_h ────────────────────────────────────────────────────────
 
 def test_duration_hours_and_minutes():
@@ -170,9 +184,11 @@ def test_daily_health_rejects_error_text():
         mapping.parse_daily_health(_fix("error_anomalies.txt"))
 
 
-def test_daily_health_unrecognisable_text_yields_nothing():
-    # Kein Tagesmarker → leeres Ergebnis, keine Ausnahme: der Tag fehlt eben.
-    assert mapping.parse_daily_health("Daily Health Data\n====\n\nNichts hier.") == {}
+def test_daily_health_unrecognisable_text_raises_when_no_day_markers():
+    # Kein einziger Tagesmarker → das ist keine leere Antwort, sondern ein
+    # unerkanntes Format (z.B. ein durchgerutschter Fehlertext ohne Marker-Wort).
+    with pytest.raises(mapping.CorosFormatError):
+        mapping.parse_daily_health("Daily Health Data\n====\n\nNichts hier.")
 
 
 def test_daily_health_truncated_stream_yields_no_steps_value():
@@ -229,6 +245,11 @@ def test_sleep_rejects_error_text():
         mapping.parse_sleep(_fix("error_anomalies.txt"))
 
 
+def test_sleep_unrecognisable_text_raises_when_no_day_markers():
+    with pytest.raises(mapping.CorosFormatError):
+        mapping.parse_sleep("Sleep Data\n====\n\nNichts hier.")
+
+
 # ── parse_sleep_hrv ─────────────────────────────────────────────────────────
 
 def test_hrv_reads_daily_average():
@@ -257,6 +278,11 @@ def test_hrv_rejects_error_text():
         mapping.parse_sleep_hrv(_fix("error_anomalies.txt"))
 
 
+def test_hrv_unrecognisable_text_raises_when_no_day_markers():
+    with pytest.raises(mapping.CorosFormatError):
+        mapping.parse_sleep_hrv("Sleep HRV\n====\n\nNichts hier.")
+
+
 # ── parse_resting_hr / parse_avg_hr ─────────────────────────────────────────
 
 def test_resting_hr_per_day():
@@ -277,6 +303,19 @@ def test_resting_hr_ignores_stale_value_mentioned_in_no_data_line():
     assert "2026-08-10" not in days
 
 
+def test_resting_hr_unrecognisable_text_raises_when_no_day_markers():
+    with pytest.raises(mapping.CorosFormatError):
+        mapping.parse_resting_hr("Resting Heart Rate\n====\n\nNichts hier.")
+
+
+def test_resting_hr_all_no_data_returns_empty_without_raising():
+    # Die Falle: _RHR_LINE verlangt 'NN bpm' und matcht 'No data' nicht — die
+    # Strukturprüfung darf sich darum nicht auf dieses Muster stützen, sonst
+    # würde eine Woche voller 'No data'-Tage fälschlich als Formatbruch gelten.
+    days = mapping.parse_resting_hr("2026-08-12: No data\n2026-08-11: No data")
+    assert days == {}
+
+
 def test_avg_hr_reads_avg_min_max():
     day = mapping.parse_avg_hr(_fix("avg_hr.txt"))["2026-08-11"]
     assert day == {"hr_avg": 85, "hr_min": 52, "hr_max": 140}
@@ -293,6 +332,17 @@ def test_avg_hr_ignores_stale_value_mentioned_in_no_data_line():
     assert "2026-08-11" not in days
 
 
+def test_avg_hr_unrecognisable_text_raises_when_no_day_markers():
+    with pytest.raises(mapping.CorosFormatError):
+        mapping.parse_avg_hr("Average Heart Rate\n====\n\nNichts hier.")
+
+
+def test_avg_hr_all_no_data_returns_empty_without_raising():
+    # Dieselbe Falle wie bei parse_resting_hr: _AVG_HR_LINE verlangt 'NN bpm'.
+    days = mapping.parse_avg_hr("2026-08-12: No data\n2026-08-11: No data")
+    assert days == {}
+
+
 # ── parse_training_load ─────────────────────────────────────────────────────
 
 def test_training_load_per_day():
@@ -303,6 +353,11 @@ def test_training_load_per_day():
 def test_training_load_ignores_ratio_and_comment():
     day = mapping.parse_training_load(_fix("training_load.txt"))["2026-08-11"]
     assert set(day) == {"training_load_short", "training_load_long"}
+
+
+def test_training_load_unrecognisable_text_raises_when_no_day_markers():
+    with pytest.raises(mapping.CorosFormatError):
+        mapping.parse_training_load("Training Load Assessment\n====\n\nNichts hier.")
 
 
 # ── tageslose Parser ────────────────────────────────────────────────────────
@@ -320,8 +375,17 @@ def test_recovery_reads_percentage():
     assert mapping.parse_recovery(_fix("recovery.txt")) == {"recovery_pct": 82}
 
 
-def test_flat_parsers_return_empty_dict_when_field_absent():
-    assert mapping.parse_recovery("Recovery Status\n====\n\nLevel: unbekannt") == {}
+def test_recovery_no_data_returns_empty_without_raising():
+    # Das Label war da, nur der Wert fehlt — das ist Fall 1 (legitim), kein
+    # Formatbruch. Muss von "Label gar nicht vorhanden" unterscheidbar bleiben.
+    assert mapping.parse_recovery("Recovery Status\n====\n\nRecovery: No data") == {}
+
+
+def test_flat_parsers_raise_when_label_absent():
+    # Fehlt das Label ganz, ist das kein leeres Ergebnis mehr, sondern ein
+    # unerkanntes Format — der Aufrufer soll das nicht als "keine Daten" lesen.
+    with pytest.raises(mapping.CorosFormatError):
+        mapping.parse_recovery("Recovery Status\n====\n\nLevel: unbekannt")
 
 
 def test_flat_parsers_reject_error_text():
