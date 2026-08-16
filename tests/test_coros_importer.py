@@ -116,6 +116,34 @@ def test_error_text_from_a_tool_is_treated_as_failure(monkeypatch):
     assert days["2026-08-11"]["steps"] == 12500
 
 
+def test_collect_logs_day_count_per_source(caplog):
+    with caplog.at_level("INFO", logger="mantis.coros"):
+        importer.collect(FakeClient(), days=14)
+    lines = [r.message for r in caplog.records if "queryDailyHealthData" in r.message]
+    assert len(lines) == 1
+    assert "4" in lines[0]      # daily_health.txt hat 4 Tage
+
+
+def test_collect_logs_zero_days_when_a_source_yields_nothing(caplog):
+    # Der Produktionsfall, der drei Metriken lautlos verschwinden ließ: eine
+    # Quelle liefert erkennbare Struktur, aber keinen einzigen Tag mit Werten —
+    # bisher stand davon gar nichts im Log, nur die DB blieb leer.
+    c = FakeClient()
+    real = c.call_tool
+
+    def call(name, arguments):
+        if name == "querySleepData":
+            return {"content": [{"type": "text", "text": "2026-08-10\nSleep Score: No data\n"}]}
+        return real(name, arguments)
+
+    c.call_tool = call
+    with caplog.at_level("INFO", logger="mantis.coros"):
+        importer.collect(c, days=14)
+    lines = [r.message for r in caplog.records if "querySleepData" in r.message]
+    assert len(lines) == 1
+    assert "0" in lines[0]
+
+
 def test_flat_metrics_land_on_the_most_recent_day():
     days = importer.collect(FakeClient(), days=14)
     newest = max(days)

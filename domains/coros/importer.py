@@ -70,8 +70,13 @@ def collect(client, days: int) -> dict[str, dict]:
     for tool, parse, needs_range in _DAY_SOURCES:
         try:
             text = payload(client.call_tool(tool, _args(days, needs_range)))
-            for day, fields in parse(str(text)).items():
+            parsed = parse(str(text))
+            for day, fields in parsed.items():
                 merged.setdefault(day, {}).update(fields)
+            # Eine Zeile je Quelle, auch bei 0 Tagen — sonst ist ein degradierter
+            # Sync (Struktur erkannt, aber nichts extrahiert) nur an der leeren
+            # DB ablesbar, nicht am Log.
+            log.info(f"COROS: {tool} lieferte {len(parsed)} Tage")
         except Exception as e:
             log.warning(f"COROS: {tool} übersprungen ({type(e).__name__}: {e})")
 
@@ -83,7 +88,9 @@ def collect(client, days: int) -> dict[str, dict]:
     for tool, parse in _FLAT_SOURCES:
         try:
             text = payload(client.call_tool(tool, {}))
-            merged[newest].update(parse(str(text)))
+            fields = parse(str(text))
+            merged[newest].update(fields)
+            log.info(f"COROS: {tool} lieferte {len(fields)} Felder")
         except Exception as e:
             log.warning(f"COROS: {tool} übersprungen ({type(e).__name__}: {e})")
 
