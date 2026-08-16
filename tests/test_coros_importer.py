@@ -34,6 +34,7 @@ class FakeClient:
     def __init__(self, broken: set[str] | None = None):
         self.broken = broken or set()
         self.calls: list[tuple[str, dict]] = []
+        self.closed = False
 
     def call_tool(self, name, arguments):
         self.calls.append((name, arguments))
@@ -41,6 +42,9 @@ class FakeClient:
             raise RuntimeError(f"{name} kaputt")
         text = (FIX / RESPONSES[name]).read_text(encoding="utf-8")
         return {"content": [{"type": "text", "text": text}]}
+
+    def close(self):
+        self.closed = True
 
 
 @pytest.fixture
@@ -148,7 +152,11 @@ def test_sync_survives_total_network_failure(monkeypatch, written):
 
 
 def test_sync_returns_partial_count_when_writing_dies(monkeypatch):
-    """Eine sterbende DB darf den Hintergrund-Tick nicht sprengen."""
+    """Eine sterbende DB darf den Hintergrund-Tick nicht sprengen.
+
+    Jeder Tag wird einzeln gefangen (Finding 7): die ersten zwei Tage schreiben
+    erfolgreich, alle folgenden schlagen fehl (calls['n'] bleibt > 2) — macht 2.
+    """
     calls = {"n": 0}
 
     def exploding_upsert(day, fields):
@@ -159,6 +167,32 @@ def test_sync_returns_partial_count_when_writing_dies(monkeypatch):
 
     monkeypatch.setattr(importer.health, "upsert_day", exploding_upsert)
     assert importer.sync(days=14, client=FakeClient()) == 2
+
+
+def test_sync_logs_write_failures_once_not_per_day(monkeypatch, caplog):
+    """Eine tote DB darf nicht eine Warnung je Tag erzeugen (94 Zeilen im Log)."""
+    def exploding_upsert(day, fields):
+        raise RuntimeError("DB weg")
+
+    monkeypatch.setattr(importer.health, "upsert_day", exploding_upsert)
+    with caplog.at_level("WARNING", logger="mantis.coros"):
+        n = importer.sync(days=14, client=FakeClient())
+    assert n == 0
+    write_failure_lines = [r for r in caplog.records if "nicht geschrieben" in r.message]
+    assert len(write_failure_lines) == 1
+
+
+def test_sync_closes_a_client_it_built_itself(monkeypatch, written):
+    fake = FakeClient()
+    monkeypatch.setattr(importer, "_build_client", lambda: fake)
+    importer.sync(days=14)
+    assert fake.closed is True
+
+
+def test_sync_does_not_close_an_injected_client(written):
+    fake = FakeClient()
+    importer.sync(days=14, client=fake)
+    assert fake.closed is False
 
 
 def test_dashboard_refresh_health_calls_the_coros_importer(monkeypatch):

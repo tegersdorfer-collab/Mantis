@@ -97,6 +97,7 @@ def sync(days: int = 14, client=None) -> int:
     ergeben je eine Logzeile und einen Rückgabewert, nie eine Ausnahme — der
     Aufrufer ist ein Hintergrund-Tick.
     """
+    owns_client = client is None
     try:
         c = client or _build_client()
     except oauth.CorosNotAuthorized as e:
@@ -111,18 +112,30 @@ def sync(days: int = 14, client=None) -> int:
     except Exception as e:
         log.warning(f"COROS-Sync fehlgeschlagen: {e}")
         return 0
+    finally:
+        # Nur schließen, was sync() selbst gebaut hat — ein injizierter Client
+        # (Tests, manuelle Läufe) gehört dem Aufrufer.
+        if owns_client:
+            c.close()
 
+    # Pro Tag einzeln fangen statt die gesamte Schleife in ein try zu packen:
+    # ein einzelner kaputter Tag darf nicht alle folgenden mitreißen (dieselbe
+    # Leitlinie wie in collect()). Der Fehlerzähler landet in einer Logzeile,
+    # nicht in einer je Tag — eine tote DB darf nicht 94 Warnungen erzeugen.
     written = 0
-    try:
-        for day, fields in sorted(days_data.items()):
+    failed = 0
+    last_error: Exception | None = None
+    for day, fields in sorted(days_data.items()):
+        try:
             if health.upsert_day(day, fields):
                 written += 1
-    except Exception as e:
-        # Realistischer Fall ist eine nicht erreichbare DB, also alles-oder-nichts:
-        # einmal loggen und mit dem zurückgeben, was schon durch ist, statt den
-        # Hintergrund-Tick zu sprengen.
-        log.warning(f"COROS-Sync: Schreiben nach {written} Tagen abgebrochen ({e})")
+        except Exception as e:
+            failed += 1
+            last_error = e
 
+    if failed:
+        log.warning(f"COROS-Sync: {failed} von {len(days_data)} Tagen nicht geschrieben "
+                    f"(zuletzt: {last_error})")
     if written:
         log.info(f"🩺 COROS: {written} Tage geschrieben")
     return written
