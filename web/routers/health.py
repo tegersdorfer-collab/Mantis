@@ -7,7 +7,6 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
 
 from core import db
 from domains.health_scores import compute_body_trend, health_narrative, score_history
@@ -48,22 +47,14 @@ def build_router(orch=None) -> APIRouter:
 
     @router.post("/api/health/import")
     async def health_import():
-        import domains.health as _h
-        _h._last_updated = None  # Cache-Bypass: manueller Import soll immer schreiben
-        n = await asyncio.to_thread(_h.import_health)
+        """Manueller Sync-Button in der PWA. Zieht COROS-Daten direkt (kein
+        HealthKit-Push mehr)."""
+        # Import steht bewusst in der Funktion: domains/coros/importer.py zieht
+        # client.py und damit config nach, und dieses Modul importiert Router
+        # bereits an anderer Stelle deferred (siehe body-Endpoints unten).
+        from domains.coros import importer
+        n = await asyncio.to_thread(importer.sync)
         return {"ok": True, "days": n}
-
-    @router.post("/api/health/push")
-    async def health_push(req: Request):
-        """Swift-App pusht HealthKit-Daten direkt (keine Pull-Abhängigkeit mehr)."""
-        import domains.health as _h
-        try:
-            data = await req.json()
-        except Exception:
-            return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
-        _h._last_updated = None  # Push überschreibt immer (neueste Daten vom Gerät)
-        n = await asyncio.to_thread(_h.process_health_data, data)
-        return {"ok": True, "written": n == 1}
 
     @router.post("/api/health/manual")
     async def health_manual(req: Request):

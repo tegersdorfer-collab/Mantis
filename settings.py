@@ -79,7 +79,6 @@ class MantisSettings(BaseSettings):
     OWNER_TIMEZONE: str = "Europe/Berlin"
 
     # ── Datenquellen ─────────────────────────────────────────────────────────
-    HEALTH_API_URL: str = ""
     CALENDAR_ICS_URLS: str = ""
 
     # ── COROS ────────────────────────────────────────────────────────────────

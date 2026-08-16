@@ -35,7 +35,6 @@ OWNER_NAME               = cfg.OWNER_NAME
 OWNER_EMAIL              = cfg.OWNER_EMAIL
 OWNER_TIMEZONE           = cfg.OWNER_TIMEZONE
 
-HEALTH_API_URL           = cfg.HEALTH_API_URL
 CALENDAR_ICS_URLS        = cfg.CALENDAR_ICS_URLS
 COROS_MCP_URL            = cfg.COROS_MCP_URL
 
