@@ -6,12 +6,18 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import json
+import subprocess
 
 import pytest
 
 from forge import models as m
 from forge import pipeline as pl
 from forge.runner import RunResult
+
+# Die echte gitctl.run, festgehalten BEVOR die stubs-Fixture sie ersetzt.
+# Tests, die gegen ein echtes temporäres Repo laufen, holen sie sich damit
+# zurück (siehe TestC3GegenEchtesGit).
+_echtes_gitctl = pl.gitctl.run
 
 
 @pytest.fixture
@@ -270,13 +276,22 @@ class TestDiffArtefakt:
             kaputt.chmod(0o700)
 
     def test_fix_stufe_braucht_keinen_diff(self, monkeypatch, stubs, tmp_path):
-        # Die Fix-Stufe hat Bash und kann sich selbst behelfen — nur die
-        # eigentliche Review-Stufe ist darauf angewiesen, dass die Pipeline
-        # vorbaut.
+        # Nur die eigentliche Review-Stufe braucht den vorgebauten Diff: sie
+        # bekommt ihn vom Runner in den Prompt gelegt. Die Fix-Stufe arbeitet
+        # gegen das Verdikt und braucht ihn nicht.
         _verdikt(tmp_path, "fail", [{"severity": "critical", "what": "x"}])
 
-        def _explodierendes_gitctl(*a, **kw):
-            raise AssertionError("gitctl.run haette hier nicht aufgerufen werden duerfen")
+        def _explodierendes_gitctl(*args, cwd=None, timeout=300):
+            if args and args[0] == "diff":
+                raise AssertionError("git diff haette hier nicht aufgerufen werden duerfen")
+
+            # status/add/commit gehören seit C3 zur Fix-Stufe dazu: sie hat
+            # kein Bash und kann ihre Arbeit nicht selbst committen.
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _R()
 
         monkeypatch.setattr(pl.gitctl, "run", _explodierendes_gitctl)
         monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="x")))
@@ -790,29 +805,203 @@ class TestFund3ArtefaktWirdCommittet:
         # eine Stufe als abgeschlossen, deren Artefakt gar nicht sichtbar ist.
         assert stubs["states"] == []
 
-    def test_implement_und_fix_committen_nichts_zusaetzliches(self, monkeypatch, stubs, tmp_path):
+    def test_implement_bekommt_kein_dokument_artefakt(self, monkeypatch, stubs, tmp_path):
         # implement/fix versprechen kein Artefakt-Dokument (siehe
-        # _ARTEFAKT_FELD_JE_STUFE) — der Commit-Schritt gilt ausdrücklich nur
-        # für spec/plan, sonst würde hier ein bereits vom Agenten selbst
-        # committeter Diff ein zweites Mal (und diesmal fälschlich pauschal)
-        # committet.
-        aufrufe = []
-
-        def _gitctl(*args, cwd=None, timeout=300):
-            aufrufe.append(args)
-
-            class _R:
-                returncode = 0
-                stdout = ""
-                stderr = ""
-            return _R()
-
-        monkeypatch.setattr(pl.gitctl, "run", _gitctl)
+        # _ARTEFAKT_FELD_JE_STUFE) — der Dokument-Commit-Pfad
+        # (_committe_artefakt, "docs(forge): Artefakt der Stufe ...") gilt
+        # ausdrücklich nur für spec/plan. Ihre Arbeit wird stattdessen über
+        # _committe_stufenarbeit committet, siehe TestC3StufenarbeitCommit.
+        aufrufe = _gitctl_aufzeichnend(monkeypatch)
         monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
         ergebnis = pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path)
 
         assert ergebnis == "weiter"
-        assert aufrufe == []
+        assert stubs["artefakte"] == []
+        assert not any("Artefakt der Stufe" in str(a) for a in aufrufe)
+
+
+def _gitctl_aufzeichnend(monkeypatch, status_stdout="", returncodes=None):
+    """Zeichnet alle gitctl-Aufrufe auf und beantwortet `git status` mit
+    `status_stdout` (NUL-getrennt, wie `--porcelain -z` es liefert).
+    `returncodes` kann je git-Unterbefehl einen abweichenden Rückgabewert
+    setzen, z.B. {"commit": 1}."""
+    aufrufe: list[tuple] = []
+    codes = returncodes or {}
+
+    def _gitctl(*args, cwd=None, timeout=300):
+        aufrufe.append(args)
+
+        class _R:
+            returncode = codes.get(args[0] if args else "", 0)
+            stdout = status_stdout if args and args[0] == "status" else ""
+            stderr = "kaputt"
+        return _R()
+
+    monkeypatch.setattr(pl.gitctl, "run", _gitctl)
+    return aufrufe
+
+
+class TestC3StufenarbeitCommit:
+    """Kritischer Fund C3 (Abschluss-Review 2026-09-09): implement/fix haben
+    unter opencode `bash: deny` und damit kein git. Ihr Prompt verlangte
+    trotzdem einen Commit, und die Pipeline committete nur Stufen mit
+    Dokument-Artefakt. Ergebnis: die Arbeit blieb unkommittet, `git diff
+    main...HEAD` war leer, das Review urteilte über nichts und das Gate sah
+    'keine Änderungen im Branch'. Die Pipeline committet jetzt selbst."""
+
+    def _lauf_implement(self, monkeypatch, stubs, tmp_path, status_stdout="", returncodes=None):
+        aufrufe = _gitctl_aufzeichnend(monkeypatch, status_stdout, returncodes)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        return aufrufe, pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path)
+
+    def test_arbeit_wird_mit_expliziten_pfaden_committet(self, monkeypatch, stubs, tmp_path):
+        aufrufe, ergebnis = self._lauf_implement(
+            monkeypatch, stubs, tmp_path, "?? forge/neu.py\0 M forge/alt.py\0")
+        assert ergebnis == "weiter"
+        add = next(a for a in aufrufe if a[0] == "add")
+        commit = next(a for a in aufrufe if a[0] == "commit")
+        assert set(add[2:]) == {"forge/neu.py", "forge/alt.py"}
+        assert set(commit[4:]) == {"forge/neu.py", "forge/alt.py"}
+        # Niemals pauschal — der Worktree kann Fremdes enthalten.
+        assert "-A" not in add and "--all" not in add
+
+    def test_pipeline_interne_dateien_werden_nicht_mitcommittet(self, monkeypatch, stubs, tmp_path):
+        # .forge/ ist Zwischenstand zwischen zwei Stufen. Ein mitcommittetes
+        # altes review.json stünde im Diff, den das nächste Review beurteilt.
+        aufrufe, _ = self._lauf_implement(
+            monkeypatch, stubs, tmp_path,
+            "?? .forge/review.json\0?? .forge/diff.patch\0?? forge/neu.py\0")
+        add = next(a for a in aufrufe if a[0] == "add")
+        assert list(add[2:]) == ["forge/neu.py"]
+
+    def test_leerer_worktree_erzeugt_keinen_commit(self, monkeypatch, stubs, tmp_path):
+        # Eine Stufe, die nichts hinterlassen hat, ist kein Pipeline-Fehler —
+        # darüber urteilen Review und Gate, nicht der Commit.
+        aufrufe, ergebnis = self._lauf_implement(monkeypatch, stubs, tmp_path, "")
+        assert ergebnis == "weiter"
+        assert not any(a[0] in ("add", "commit") for a in aufrufe)
+
+    def test_fehlgeschlagener_commit_parkt(self, monkeypatch, stubs, tmp_path):
+        _, ergebnis = self._lauf_implement(
+            monkeypatch, stubs, tmp_path, "?? forge/neu.py\0", returncodes={"commit": 1})
+        assert ergebnis == "geparkt"
+        assert "Commit der Stufenarbeit" in stubs["parks"][-1][1]
+        assert stubs["states"] == []
+
+    def test_auch_die_fix_stufe_committet(self, monkeypatch, stubs, tmp_path):
+        _verdikt(tmp_path, "fail", [{"severity": "critical", "what": "x"}])
+        aufrufe = _gitctl_aufzeichnend(monkeypatch, "?? forge/repariert.py\0")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        assert pl.eine_stufe(_task(m.REVIEWING), tmp_path) == "weiter"
+        commit = next(a for a in aufrufe if a[0] == "commit")
+        assert "forge/repariert.py" in commit
+
+    def test_umbenennung_nimmt_den_quellpfad_mit(self, monkeypatch, stubs, tmp_path):
+        # `--porcelain -z` hängt bei R/C den Quellpfad als eigenen Eintrag an.
+        # Ohne ihn bliebe die Löschung der Quelle uncommittet zurück.
+        aufrufe, _ = self._lauf_implement(
+            monkeypatch, stubs, tmp_path, "R  forge/neu.py\0forge/alt.py\0")
+        add = next(a for a in aufrufe if a[0] == "add")
+        assert set(add[2:]) == {"forge/neu.py", "forge/alt.py"}
+
+    def test_zeitueberschreitung_mit_unkommittierter_arbeit_gilt_als_geliefert(
+            self, monkeypatch, stubs, tmp_path):
+        # _timeout_produkt zählte nur Commits. Seit implement/fix gar nicht
+        # mehr selbst committen können, wäre damit JEDE zeitüberschrittene
+        # Arbeitsstufe leer — genau die bezahlte Arbeit, die dieser Zweig
+        # retten soll, ginge verloren.
+        aufrufe = _gitctl_aufzeichnend(monkeypatch, "?? forge/halbfertig.py\0")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(
+            stubs, RunResult(ok=False, error="Zeitüberschreitung nach 5400s")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path) == "weiter"
+        assert stubs["parks"] == []
+        commit = next(a for a in aufrufe if a[0] == "commit")
+        assert "forge/halbfertig.py" in commit
+
+    def test_zeitueberschreitung_ohne_jede_arbeit_parkt_weiterhin(self, monkeypatch, stubs, tmp_path):
+        _gitctl_aufzeichnend(monkeypatch, "")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(
+            stubs, RunResult(ok=False, error="Zeitüberschreitung nach 5400s")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path) == "geparkt"
+
+
+class TestC3GegenEchtesGit:
+    """Dieselbe Naht wie oben, aber gegen ein echtes `git` statt gegen einen
+    Stub. Genau diese Abdeckung fehlte: sämtliche Unit-Tests der Welle mockten
+    subprocess, und drei Fehler, die zusammen keinen einzigen Task durchlaufen
+    liessen, waren deshalb grün. Hier läuft `git status --porcelain -z` echt,
+    und der Diff, den Review und Gate sehen, wird tatsächlich nachgesehen."""
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        ort = tmp_path / "repo"
+        ort.mkdir()
+
+        def g(*args):
+            subprocess.run(["git", *args], cwd=str(ort), check=True, capture_output=True)
+        g("init", "-b", "main")
+        g("config", "user.email", "test@example.com")
+        g("config", "user.name", "Test")
+        (ort / "README.md").write_text("hallo\n")
+        g("add", "README.md")
+        g("commit", "-m", "erster Commit")
+        # Wie im Betrieb: der Task arbeitet auf einem eigenen Branch, und
+        # `git diff main...HEAD` (die Sicht von Review und Gate) ist genau die
+        # Differenz zu main.
+        g("checkout", "-b", "forge/task-5")
+        return ort
+
+    def test_arbeit_landet_wirklich_im_diff_den_review_und_gate_sehen(
+            self, monkeypatch, stubs, repo):
+        monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
+        # Was eine implement-Stufe ohne Shell hinterlässt: Dateien im Worktree,
+        # nichts committet. Dazu pipeline-interner Zwischenstand.
+        (repo / "forge").mkdir()
+        (repo / "forge" / "neu.py").write_text("# neu\n")
+        (repo / "README.md").write_text("hallo\nund tschuess\n")
+        (repo / ".forge").mkdir()
+        (repo / ".forge" / "review.json").write_text("{}")
+
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), repo) == "weiter"
+
+        diff = subprocess.run(["git", "diff", "main...HEAD"], cwd=str(repo),
+                              capture_output=True, text=True).stdout
+        assert "forge/neu.py" in diff
+        assert "und tschuess" in diff
+        # Der pipeline-interne Zwischenstand darf NICHT im Diff stehen.
+        assert ".forge/review.json" not in diff
+        assert (repo / ".forge" / "review.json").is_file()
+
+    def test_geloeschte_datei_wird_mitcommittet(self, monkeypatch, stubs, repo):
+        monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
+        (repo / "README.md").unlink()
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), repo) == "weiter"
+        diff = subprocess.run(["git", "diff", "--name-status", "main...HEAD"], cwd=str(repo),
+                              capture_output=True, text=True).stdout
+        assert diff.startswith("D\tREADME.md")
+
+    def test_pfad_mit_leerzeichen_und_umlaut_ueberlebt(self, monkeypatch, stubs, repo):
+        # `-z` liefert unquotierte Pfade. Ohne das käme hier git-eigene
+        # C-Quotierung ("\303\244...") zurück und `git add` liefe ins Leere.
+        monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
+        (repo / "ein Pfad mit Ümlaut.md").write_text("inhalt\n")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), repo) == "weiter"
+        # Auch hier `-z`: `git diff --name-only` quotiert den Pfad sonst auf
+        # der Ausgabeseite genauso ("ein Pfad mit \303\234mlaut.md").
+        dateien = subprocess.run(["git", "diff", "--name-only", "-z", "main...HEAD"], cwd=str(repo),
+                                 capture_output=True, text=True).stdout.split("\0")
+        assert "ein Pfad mit Ümlaut.md" in dateien
+
+    def test_ohne_aenderung_kein_leerer_commit(self, monkeypatch, stubs, repo):
+        monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), repo) == "weiter"
+        anzahl = subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=str(repo),
+                                capture_output=True, text=True).stdout.strip()
+        assert anzahl == "1"
 
 
 class TestBackendAufruf:

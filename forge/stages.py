@@ -4,7 +4,19 @@ Jede Stufe ist ein eigener headless Lauf mit frischem Kontext. Die Übergabe
 läuft über Artefakte im Worktree, nie über Gesprächsverlauf — deshalb steht in
 jedem Prompt, wo das Ergebnis der Vorstufe liegt, statt es mitzuschicken.
 
-Die Rechteprofile sind die einzige Schranke zwischen einem unbeaufsichtigten
+ACHTUNG, seit der Umstellung auf die Gratis-Backends (Plan 1, 2026-09-09):
+die `profile`-Felder unten gelten NUR für das Claude-Code-Backend in
+forge/runner.py. Die Pipeline ruft dieses Backend derzeit nicht auf — sie geht
+über forge/backends.hole(), und dort kommen die Rechte aus
+forge.backends.OpencodePermission, für ALLE Stufen gleich (`bash`, `task`,
+`webfetch`, `websearch`, `external_directory` verboten; lesen und schreiben
+erlaubt). Die Profile hier sind damit produktiv wirkungslos; sie bleiben
+stehen, weil sie bei der Stage-Konstruktion weiterhin die gemessenen
+Claude-Code-Schranken erzwingen (siehe Ruling Task 7 im SDD-Ledger). Der
+folgende Absatz beschreibt entsprechend den Claude-Code-Fall, nicht den
+laufenden Betrieb.
+
+Die Rechteprofile waren die erste Schranke zwischen einem unbeaufsichtigten
 Agenten und dem Dateisystem. Sie sind absichtlich eng: nur `implement` und
 `fix` dürfen editieren und Befehle ausführen (`Edit`, `Bash`). `spec`, `plan`
 und `review` bekommen `Write`, aber NICHT bepfadet. Diese drei Stufen könnten
@@ -127,10 +139,11 @@ def _implement_prompt(task: dict, kontext: dict) -> str:
         f"Spec: {kontext.get('spec_path', '(unbekannt)')}\n"
         f"Plan: {kontext.get('plan_path', '(unbekannt)')}\n"
         "Arbeite den Plan testgetrieben ab: erst der fehlschlagende Test, dann "
-        "die Implementierung, dann committen. Halte dich an die Konventionen der "
+        "die Implementierung. Halte dich an die Konventionen der "
         "Codebase (Kommentare auf Deutsch, ruff select F+E9, line-length 120).\n"
         "Fasse NICHT an: .env, data/, forge/gate.py, forge/runner.py.\n"
-        "Committe deine Arbeit mit expliziten Pfaden, niemals mit 'git add -A'."
+        "Du hast keine Shell: keine Befehle, kein git, keine Testläufe. Lass "
+        "deine Arbeit einfach im Worktree stehen — die Pipeline committet sie."
     )
 
 
@@ -154,9 +167,10 @@ def _fix_prompt(task: dict, kontext: dict) -> str:
         _kopf(task) + "\n\n"
         f"Ein Review hat Mängel gefunden. Sie stehen in {VERDIKT_DATEI}.\n"
         "Behebe ausschließlich die dort als critical oder important markierten "
-        "Befunde. Baue nichts darüber hinaus. Lass die Tests danach laufen und "
-        "committe mit expliziten Pfaden.\n"
-        "Fasse NICHT an: .env, data/, forge/gate.py, forge/runner.py."
+        "Befunde. Baue nichts darüber hinaus.\n"
+        "Fasse NICHT an: .env, data/, forge/gate.py, forge/runner.py.\n"
+        "Du hast keine Shell: keine Befehle, kein git, keine Testläufe. Lass "
+        "deine Arbeit einfach im Worktree stehen — die Pipeline committet sie."
     )
 
 

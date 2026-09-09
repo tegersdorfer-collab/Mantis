@@ -40,6 +40,17 @@ BASIS_BRANCH = "main"
 # für die drei gibt es hier bewusst keinen Eintrag.
 _ARTEFAKT_FELD_JE_STUFE = {"spec": "spec_path", "plan": "plan_path"}
 
+# Die beiden Stufen, deren Produkt Code im Worktree ist statt eines Dokuments.
+# Sie haben unter opencode `bash: deny` und können deshalb NICHT selbst
+# committen — die Pipeline tut es für sie (Kritischer Fund C3).
+_ARBEITSSTUFEN = ("implement", "fix")
+
+# Pipeline-interne Ablage im Worktree (diff.patch, review.json). Sie gehört
+# NIE in einen Commit: sie ist Zwischenstand zwischen zwei Stufen, wird nach
+# einer Fix-Runde wieder gelöscht (_verwirf_review_artefakte), und ein
+# mitcommittetes altes Verdikt stünde im Diff, den das nächste Review beurteilt.
+_INTERNES_VERZEICHNIS = ".forge"
+
 
 def _artefakt_vorhanden(worktree: Path, pfad: str) -> bool:
     """Existiert das von der Stufe versprochene Artefakt im Worktree?"""
@@ -81,6 +92,78 @@ def _hat_neuen_commit(worktree: Path) -> bool:
         return False
 
 
+def _ist_intern(pfad: str) -> bool:
+    """Gehört dieser Pfad der Pipeline selbst (.forge/) statt der Stufe?"""
+    return pfad == _INTERNES_VERZEICHNIS or pfad.startswith(_INTERNES_VERZEICHNIS + "/")
+
+
+def _stufenarbeit_pfade(worktree: Path) -> list[str]:
+    """Alle unkommittierten Pfade im Worktree, ohne die pipeline-internen.
+
+    `--untracked-files=all` ist wesentlich: ohne das fasst git ein komplett
+    neues Verzeichnis zu EINEM Eintrag zusammen ("?? .forge/"), und dann
+    griffe die Filterung auf Dateiebene nicht mehr. `-z` liefert die Pfade
+    NUL-getrennt und unquotiert — sonst käme ein Pfad mit Umlaut oder
+    Leerzeichen in git-eigener C-Quotierung zurück und ginge als Argument an
+    `git add` ins Leere.
+    """
+    ergebnis = gitctl.run("status", "--porcelain", "-z", "--untracked-files=all", cwd=worktree)
+    if ergebnis.returncode != 0:
+        log.warning(f"Forge-Pipeline: git status fehlgeschlagen (returncode {ergebnis.returncode}): "
+                    f"{(ergebnis.stderr or '').strip()[:300]}")
+        return []
+    eintraege = (ergebnis.stdout or "").split("\0")
+    pfade: list[str] = []
+    i = 0
+    while i < len(eintraege):
+        eintrag = eintraege[i]
+        i += 1
+        # Format je Eintrag: zwei Statuszeichen, ein Leerzeichen, dann der Pfad.
+        if len(eintrag) < 4:
+            continue
+        status, pfad = eintrag[:2], eintrag[3:]
+        if status[0] in ("R", "C"):
+            # Bei Umbenennung/Kopie folgt der Quellpfad als eigener Eintrag.
+            # Ohne ihn bliebe die Löschung der Quelle uncommittet zurück.
+            if i < len(eintraege) and eintraege[i]:
+                quelle = eintraege[i]
+                i += 1
+                if not _ist_intern(quelle):
+                    pfade.append(quelle)
+        if not _ist_intern(pfad):
+            pfade.append(pfad)
+    return sorted(set(pfade))
+
+
+def _committe_stufenarbeit(worktree: Path, stufe_name: str, task_id: int) -> str | None:
+    """Kritischer Fund C3: committet, was implement/fix im Worktree hinterlassen
+    haben. Gibt bei Erfolg None zurück, sonst eine Fehlermeldung.
+
+    Unter opencode haben beide Stufen `bash: deny` und damit kein git. Ohne
+    diesen Commit sähe `git diff main...HEAD` nur committete Arbeit — also
+    nichts: _schreibe_diff schriebe einen LEEREN Diff, das Review urteilte über
+    nichts, und das Gate fände "keine Änderungen im Branch".
+
+    Wie _committe_artefakt: explizite Pfade, nie `git add -A`. Die Pfade kommen
+    aus `git status`, .forge/ ist herausgefiltert. Ein leerer Worktree ist KEIN
+    Fehler — die Stufe hat dann eben nichts geliefert, und das entscheiden
+    Review und Gate, nicht dieser Commit.
+    """
+    pfade = _stufenarbeit_pfade(worktree)
+    if not pfade:
+        return None
+    hinzugefuegt = gitctl.run("add", "--", *pfade, cwd=worktree)
+    if hinzugefuegt.returncode != 0:
+        return (f"git add fehlgeschlagen (returncode {hinzugefuegt.returncode}): "
+                f"{(hinzugefuegt.stderr or '').strip()[:300]}")
+    nachricht = f"feat(forge): Arbeit der Stufe '{stufe_name}' für Task {task_id}"
+    committet = gitctl.run("commit", "-m", nachricht, "--", *pfade, cwd=worktree)
+    if committet.returncode != 0:
+        return (f"git commit fehlgeschlagen (returncode {committet.returncode}): "
+                f"{(committet.stderr or '').strip()[:300]}")
+    return None
+
+
 def _verdikt_lesbar(worktree: Path) -> bool:
     """Liegt VERDIKT_DATEI vor und lässt sie sich als JSON parsen? Das ist das
     Produkt der review-Stufe — ob das Urteil selbst 'pass' oder 'fail' ist,
@@ -104,7 +187,15 @@ def _timeout_produkt(stufe: stages.Stage, task: dict, worktree: Path, start: flo
 
     Definition 'Produkt' je Stufe (siehe Aufgabenstellung):
       spec/plan   — das Artefakt-Dokument existiert
-      implement/fix — mindestens ein neuer Commit auf dem Task-Branch
+      implement/fix — geleistete Arbeit im Worktree: ein neuer Commit auf dem
+                    Task-Branch ODER unkommittierte Änderungen. Der zweite
+                    Fall ist seit C3 der Normalfall und nicht die Ausnahme:
+                    beide Stufen haben `bash: deny` und können gar nicht
+                    selbst committen — die Pipeline committet nach dieser
+                    Prüfung für sie (_committe_stufenarbeit). Bliebe es beim
+                    reinen Commit-Zähler, gälte jede zeitüberschrittene
+                    implement-Stufe als leer, und exakt die bezahlte Arbeit,
+                    die dieser Zweig retten soll, ginge verloren.
       review      — VERDIKT_DATEI existiert und lässt sich parsen
     """
     if stufe.name in _ARTEFAKT_FELD_JE_STUFE:
@@ -117,8 +208,8 @@ def _timeout_produkt(stufe: stages.Stage, task: dict, worktree: Path, start: flo
         if neuestes is None:
             return False, None
         return True, str(neuestes.relative_to(worktree))
-    if stufe.name in ("implement", "fix"):
-        return _hat_neuen_commit(worktree), None
+    if stufe.name in _ARBEITSSTUFEN:
+        return _hat_neuen_commit(worktree) or bool(_stufenarbeit_pfade(worktree)), None
     if stufe.name == "review":
         return _verdikt_lesbar(worktree), None
     return False, None
@@ -483,6 +574,18 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
     if not ergebnis.ok and not zeitueberschreitung_geliefert:
         _park(task_id, state, f"Stufe '{stufe.name}' fehlgeschlagen: {ergebnis.error} (Task {task_id})")
         return "geparkt"
+
+    if stufe.name in _ARBEITSSTUFEN:
+        # Kritischer Fund C3: implement/fix haben `bash: deny` und damit kein
+        # git. Ohne diesen Commit bliebe ihre Arbeit unkommittet, und
+        # `git diff main...HEAD` — die einzige Sicht von Review UND Gate —
+        # wäre leer, obwohl die Stufe geliefert hat.
+        commit_fehler = _committe_stufenarbeit(worktree, stufe.name, task_id)
+        if commit_fehler is not None:
+            _park(task_id, state,
+                  f"Commit der Stufenarbeit fehlgeschlagen (Stufe '{stufe.name}'): {commit_fehler} "
+                  f"(Task {task_id})")
+            return "geparkt"
 
     try:
         if zeitueberschreitung_geliefert and stufe.name in _ARTEFAKT_FELD_JE_STUFE:
