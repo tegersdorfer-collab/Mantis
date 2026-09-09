@@ -150,16 +150,28 @@ class TestPrompts:
         text = s.fuer_state(m.SPECCING).baue_prompt(self._task(), kontext={})
         assert "Annahme" in text
 
-    def test_review_prompt_verlangt_das_verdikt_als_datei(self):
+    def test_review_prompt_verlangt_das_verdikt_auf_stdout(self):
+        # I7 (Abschluss-Review): der Prompt wies den Reviewer an, das Verdikt
+        # selbst nach .forge/review.json zu schreiben — das kann er nicht, und
+        # forge/runner_agy.py hängt zusätzlich eine widersprechende Anweisung
+        # an. Der Prompt muss dasselbe sagen wie der Runner: Urteil auf stdout,
+        # die Datei legt der Runner an.
         text = s.fuer_state(m.REVIEWING).baue_prompt(self._task(), kontext={})
-        assert ".forge/review.json" in text
+        assert "Standardausgabe" in text
+        assert "Schreibe keine Datei" in text
+        # Der Dateiname darf vorkommen (als Erklärung, wer sie anlegt), aber
+        # niemals als Auftrag an das Modell.
+        assert "Runner" in text
 
-    def test_review_prompt_verweist_auf_die_diff_datei(self):
-        # review hat kein Bash und kann sich also keinen eigenen Diff erzeugen
-        # (kein `git diff`) — der Prompt muss stattdessen auf die Datei
-        # verweisen, die die Pipeline (Task 6) vorher schreibt.
+    def test_review_prompt_schickt_das_modell_nicht_zur_diff_datei(self):
+        # Der Diff wird vom Runner in den Prompt eingebettet
+        # (forge/runner_agy.run). Ein Prompt, der das Modell stattdessen zu
+        # einer Datei schickt, verlangt einen Lesezugriff, auf den sich die
+        # Stufe nicht verlassen kann — und widerspricht dem, was der Runner
+        # anhängt.
         text = s.fuer_state(m.REVIEWING).baue_prompt(self._task(), kontext={})
-        assert s.DIFF_DATEI in text
+        assert s.DIFF_DATEI not in text
+        assert "weiter unten in diesem Prompt" in text
 
     def test_kein_prompt_interpoliert_rohe_taskfelder_direkt(self):
         # Ein manipulierter Titel darf nirgends unzensiert im Prompt landen —
@@ -196,3 +208,33 @@ class TestPrompts:
         for stufe in s.ALLE_STUFEN:
             text = stufe.baue_prompt(self._task(), kontext={})
             assert isinstance(text, str) and text
+
+
+from forge import backends
+from forge.stages import ALLE_STUFEN, STAGES
+
+
+class TestBackendZuordnung:
+    def test_jede_stufe_hat_backend_und_modell(self):
+        for stufe in ALLE_STUFEN:
+            assert stufe.backend, f"{stufe.name} ohne Backend"
+            assert stufe.model, f"{stufe.name} ohne Modell"
+
+    def test_jedes_backend_ist_aufloesbar(self):
+        for stufe in ALLE_STUFEN:
+            assert callable(backends.hole(stufe.backend))
+
+    def test_review_laeuft_auf_agy(self):
+        review = next(s for s in STAGES if s.name == "review")
+        assert review.backend == "agy"
+        assert review.model == "claude-opus-4-6-thinking"
+
+    def test_reviewer_ist_nicht_das_implementierer_modell(self):
+        review = next(s for s in STAGES if s.name == "review")
+        implement = next(s for s in STAGES if s.name == "implement")
+        assert review.model != implement.model
+
+    def test_unbekanntes_backend_wirft(self):
+        import pytest
+        with pytest.raises(KeyError, match="unbekanntes Backend"):
+            backends.hole("gibtsnicht")

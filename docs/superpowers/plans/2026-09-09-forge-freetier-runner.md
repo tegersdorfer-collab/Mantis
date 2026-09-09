@@ -30,9 +30,10 @@ Keine neuen Abhängigkeiten.
 - Die Rechtekonfiguration für opencode ist **exakt** die in
   `tests/fixtures/permission_probe_opencode.md` Probe (j) belegte. Jede
   Abweichung Richtung mehr Rechte ist ein Fehler, kein Feature.
-- Nach jedem Task: `python3.14 -m pytest tests/ -q` muss grün sein bis auf die
-  zwei vorbestehenden Fehlschläge in `tests/test_api_auth.py`
-  (WebSocket-Subprotokoll, unabhängig von diesem Plan).
+- Nach jedem Task: `python3.14 -m pytest tests/ -q` muss **vollständig grün**
+  sein. Gemessene Grundlinie im Arbeits-Worktree am 2026-09-09:
+  **1201 passed, 0 failed**. Jeder Fehlschlag ist eine Regression aus diesem
+  Plan, es gibt keine geduldeten Vorbestände.
 
 ## Dateistruktur
 
@@ -811,7 +812,14 @@ def _finde_json(text: str) -> dict | None:
 
 
 def run(prompt: str, cwd: Path, timeout: int, agent: str, model: str) -> RunResult:
-    """Führt einen werkzeuglosen agy-Lauf aus und schreibt das Verdikt."""
+    """Führt einen werkzeuglosen agy-Lauf aus und schreibt das Verdikt.
+
+    `agent` wird hier nicht benutzt und ist trotzdem Teil der Signatur: alle
+    Backends werden über forge.backends.hole() einheitlich aufgerufen, und die
+    Pipeline reicht den Stufennamen an jedes durch. Eine abweichende Signatur
+    würde die Registry zu einer Sonderfallbehandlung zwingen.
+    """
+    del agent  # bewusst ungenutzt, siehe Docstring
     if AGY_BIN is None:
         return RunResult(ok=False, error="agy-Binary nicht im PATH gefunden")
 
@@ -930,8 +938,16 @@ from typing import Callable
 
 
 def hole(name: str) -> Callable:
-    """Die run-Funktion eines Backends. Import erst hier, um Zyklen zu vermeiden
-    (runner_agy importiert forge.stages, stages importiert forge.backends)."""
+    """Die run-Funktion eines Backends.
+
+    Der Import steht bewusst in der Funktion, nicht am Modulkopf: `runner_agy`
+    importiert `forge.stages` (für DIFF_DATEI und VERDIKT_DATEI). Ein
+    Modulimport hier hiesse, dass jeder Import von `forge.backends` die
+    gesamte Stufen- und Prompt-Kette mitzieht — auch dort, wo nur die
+    Rechteschranke gebraucht wird, etwa in tests/test_forge_backends.py.
+    Heute gibt es keinen Zyklus; sobald `stages` je `backends` braucht,
+    entstünde einer, und dieser Import verhindert ihn schon jetzt.
+    """
     from forge import runner_agy, runner_opencode
     tabelle = {
         "opencode": runner_opencode.run,
@@ -1101,8 +1117,7 @@ Und Zeile 439 ersetzen:
 - [ ] **Schritt 4: Tests laufen lassen und Erfolg prüfen**
 
 Run: `python3.14 -m pytest tests/ -q`
-Erwartet: PASS bis auf die zwei vorbestehenden Fehlschläge in
-`tests/test_api_auth.py`
+Erwartet: vollständig grün, mindestens 1201 passed, 0 failed
 
 - [ ] **Schritt 5: Committen**
 

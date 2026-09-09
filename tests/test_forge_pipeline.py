@@ -6,6 +6,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import json
+import subprocess
 
 import pytest
 
@@ -13,11 +14,18 @@ from forge import models as m
 from forge import pipeline as pl
 from forge.runner import RunResult
 
+# Die echte gitctl.run, festgehalten BEVOR die stubs-Fixture sie ersetzt.
+# Tests, die gegen ein echtes temporäres Repo laufen, holen sie sich damit
+# zurück (siehe TestC3GegenEchtesGit).
+_echtes_gitctl = pl.gitctl.run
+
 
 @pytest.fixture
 def stubs(monkeypatch):
     """Sammelt alle Seiteneffekte, statt sie auszuführen."""
-    aufz = {"states": [], "parks": [], "journal": [], "artefakte": [], "profile": [], "fixrunden": 0,
+    # "profile" ist mit der Backend-Registry entfallen — die Pipeline reicht
+    # kein PermissionProfile mehr durch, sondern den Stufennamen als "agenten".
+    aufz = {"states": [], "parks": [], "journal": [], "artefakte": [], "agenten": [], "fixrunden": 0,
             "gitctl": [], "fehlschlaege": [], "zuruecksetzungen": []}
 
     monkeypatch.setattr(pl.queue, "set_state",
@@ -59,9 +67,12 @@ def stubs(monkeypatch):
 
 
 def _lauf(aufz, ergebnis):
-    """Ersetzt runner.run und merkt sich das übergebene Rechteprofil."""
-    def _run(prompt, cwd, timeout=1800, profile=None):
-        aufz["profile"].append(profile)
+    """Ersetzt die von backends.hole(...) gelieferte run-Funktion und merkt
+    sich den übergebenen Agent-Namen (die stufenspezifische Identität, mit
+    der das Backend seine Rechte je Lauf konfiguriert — siehe
+    forge/runner_opencode.baue_config)."""
+    def _run(prompt, cwd, timeout=1800, agent=None, model=None):
+        aufz["agenten"].append(agent)
         return ergebnis
     return _run
 
@@ -80,13 +91,13 @@ def _verdikt(worktree, verdict, findings=()):
 
 class TestErfolgreicheStufe:
     def test_geht_in_den_naechsten_zustand(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="egal")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="egal")))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         assert pl.eine_stufe(_task(m.PLANNING), tmp_path) == "weiter"
         assert stubs["states"][-1] == (5, m.IMPLEMENTING)
 
     def test_journalt_stage_done(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="egal")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="egal")))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.PLANNING), tmp_path)
         assert any("stage_done" in str(e) for e in stubs["journal"])
@@ -111,31 +122,34 @@ class TestErfolgreicheStufe:
             return _R()
 
         monkeypatch.setattr(pl.gitctl, "run", _fake_gitctl)
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="egal")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="egal")))
         assert pl.eine_stufe(_task(m.REVIEWING), tmp_path) == "fertig"
 
-    def test_rechteprofil_wird_durchgereicht(self, monkeypatch, stubs, tmp_path):
-        # Ohne das liefe jede Stufe mit geerbten Rechten — der Kern des
-        # Sicherheitsmodells aus Task 1 und 3 wäre wirkungslos.
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="x")))
+    def test_stufenname_wird_als_agent_durchgereicht(self, monkeypatch, stubs, tmp_path):
+        # Seit Task 7 reicht die Pipeline kein Rechteprofil (forge/runner.py,
+        # Claude-Code-Backend) mehr an den Aufruf durch — das war der frühere
+        # Sicherheitsmechanismus aus Task 1/3. Die Rechte kommen jetzt aus dem
+        # Backend selbst (forge/runner_opencode.baue_config); was die Pipeline
+        # weiterreichen MUSS, ist die Stufenidentität (agent=stufe.name), denn
+        # ohne sie liefe jede Stufe unter derselben austauschbaren Rolle.
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="x")))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
-        assert stubs["profile"][-1] is not None
-        assert "Edit" not in " ".join(stubs["profile"][-1].allowed)
+        assert stubs["agenten"][-1] == "spec"
 
 
 class TestArtefaktPflicht:
     def test_fehlendes_artefakt_ist_ein_fehlschlag(self, monkeypatch, stubs, tmp_path):
         # Der Kern dieser Klasse: ein Modell, das "fertig" sagt, ohne die Datei
         # geschrieben zu haben, darf nicht durchkommen.
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="docs/specs/x-design.md")))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: False)
         assert pl.eine_stufe(_task(m.SPECCING), tmp_path) == "geparkt"
         assert stubs["parks"]
 
     def test_spec_pfad_wird_hinterlegt(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="docs/specs/x-design.md")))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
@@ -144,14 +158,14 @@ class TestArtefaktPflicht:
 
 class TestFehlschlag:
     def test_fehlgeschlagener_lauf_parkt(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=False, error="kaputt")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=False, error="kaputt")))
         assert pl.eine_stufe(_task(m.PLANNING), tmp_path) == "geparkt"
         assert "kaputt" in stubs["parks"][-1][1]
 
     def test_ratelimit_parkt_nicht(self, monkeypatch, stubs, tmp_path):
         # Plan 3 hängt hier seine Pause ein. Würde ein Rate-Limit parken, wäre
         # jede Kontingentgrenze ein verlorener Task statt einer Wartezeit.
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=False, error="usage limit", rate_limited=True)))
         assert pl.eine_stufe(_task(m.PLANNING), tmp_path) == "fehler"
         assert stubs["parks"] == []
@@ -161,15 +175,16 @@ class TestFehlschlag:
 class TestFixRunden:
     def test_negatives_verdikt_geht_in_die_fix_stufe(self, monkeypatch, stubs, tmp_path):
         _verdikt(tmp_path, "fail", [{"severity": "important", "what": "x"}])
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="gefixt")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="gefixt")))
         ergebnis = pl.eine_stufe(_task(m.REVIEWING), tmp_path)
         assert ergebnis == "weiter"
-        # Die Fix-Stufe darf editieren — daran ist sie erkennbar.
-        assert "Edit" in " ".join(stubs["profile"][-1].allowed)
+        # Die Fix-Stufe ist an ihrem Agent-Namen 'fix' erkennbar (kein
+        # Rechteprofil mehr, siehe test_stufenname_wird_als_agent_durchgereicht).
+        assert stubs["agenten"][-1] == "fix"
 
     def test_nach_max_fixrunden_wird_geparkt(self, monkeypatch, stubs, tmp_path):
         _verdikt(tmp_path, "fail", [{"severity": "critical", "what": "x"}])
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="x")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="x")))
         stubs["fixrunden"] = pl.MAX_FIXRUNDEN
         assert pl.eine_stufe(_task(m.REVIEWING), tmp_path) == "geparkt"
 
@@ -195,7 +210,7 @@ class TestVerweigerteWerkzeuge:
     einmal ohne denials — die Park-Gründe müssen sich unterscheiden."""
 
     def test_denials_parken_mit_anderem_grund_als_fehlendes_artefakt(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="docs/specs/x-design.md",
                                                     denials=[{"tool_name": "Write"}])))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: False)
@@ -205,7 +220,7 @@ class TestVerweigerteWerkzeuge:
         assert "Write" in grund_mit_denial
 
         stubs["parks"].clear()
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="docs/specs/x-design.md")))
         ergebnis2 = pl.eine_stufe(_task(m.SPECCING), tmp_path)
         assert ergebnis2 == "geparkt"
@@ -214,8 +229,20 @@ class TestVerweigerteWerkzeuge:
         assert grund_mit_denial != grund_ohne_denial
         assert "Write" not in grund_ohne_denial
 
+    def test_park_grund_nennt_auch_den_fehlertext(self, monkeypatch, stubs, tmp_path):
+        # I5 (Abschluss-Review): ergebnis.error wurde auf diesem Pfad nirgends
+        # ausgegeben. Wer morgens den geparkten Task ansieht, erfuhr weder,
+        # welches Werkzeug fehlte, noch woran der Anbieter sich gestört hat.
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(
+            stubs, RunResult(ok=False, error="Tool call validation failed: apply_patch",
+                             denials=[{"tool_name": "apply_patch", "message": "..."}])))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path) == "geparkt"
+        grund = stubs["parks"][-1][1]
+        assert "apply_patch" in grund
+        assert "Tool call validation failed" in grund
+
     def test_mehrere_verweigerte_werkzeuge_werden_alle_genannt(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="x",
                                                     denials=[{"tool_name": "Bash"}, {"tool_name": "Edit"}])))
         pl.eine_stufe(_task(m.PLANNING), tmp_path)
@@ -242,7 +269,7 @@ class TestDiffArtefakt:
             return _R()
 
         monkeypatch.setattr(pl.gitctl, "run", _fake_gitctl)
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="egal")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="egal")))
         pl.eine_stufe(_task(m.REVIEWING), tmp_path)
 
         diff_datei = tmp_path / pl.stages.DIFF_DATEI
@@ -251,7 +278,7 @@ class TestDiffArtefakt:
         assert aufgezeichnet["cwd"] == tmp_path
         # Der Diff wird VOR dem Lauf geschrieben — die Stufe muss ihn schon
         # vorfinden können.
-        assert len(stubs["profile"]) == 1
+        assert len(stubs["agenten"]) == 1
 
     def test_diff_schreiben_schlaegt_fehl_dann_kein_review_lauf(self, monkeypatch, stubs, tmp_path):
         # Ein Worktree ohne Schreibrecht simuliert einen fehlschlagenden
@@ -260,27 +287,36 @@ class TestDiffArtefakt:
         kaputt.mkdir()
         kaputt.chmod(0o500)
         try:
-            monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="egal")))
+            monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="egal")))
             ergebnis = pl.eine_stufe(_task(m.REVIEWING), kaputt)
             assert ergebnis == "geparkt"
             # Review darf gar nicht erst gelaufen sein — sonst prüfte es einen
             # veralteten oder fehlenden Diff.
-            assert stubs["profile"] == []
+            assert stubs["agenten"] == []
             assert stubs["parks"]
         finally:
             kaputt.chmod(0o700)
 
     def test_fix_stufe_braucht_keinen_diff(self, monkeypatch, stubs, tmp_path):
-        # Die Fix-Stufe hat Bash und kann sich selbst behelfen — nur die
-        # eigentliche Review-Stufe ist darauf angewiesen, dass die Pipeline
-        # vorbaut.
+        # Nur die eigentliche Review-Stufe braucht den vorgebauten Diff: sie
+        # bekommt ihn vom Runner in den Prompt gelegt. Die Fix-Stufe arbeitet
+        # gegen das Verdikt und braucht ihn nicht.
         _verdikt(tmp_path, "fail", [{"severity": "critical", "what": "x"}])
 
-        def _explodierendes_gitctl(*a, **kw):
-            raise AssertionError("gitctl.run haette hier nicht aufgerufen werden duerfen")
+        def _explodierendes_gitctl(*args, cwd=None, timeout=300):
+            if args and args[0] == "diff":
+                raise AssertionError("git diff haette hier nicht aufgerufen werden duerfen")
+
+            # status/add/commit gehören seit C3 zur Fix-Stufe dazu: sie hat
+            # kein Bash und kann ihre Arbeit nicht selbst committen.
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _R()
 
         monkeypatch.setattr(pl.gitctl, "run", _explodierendes_gitctl)
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="x")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="x")))
         ergebnis = pl.eine_stufe(_task(m.REVIEWING), tmp_path)
         assert ergebnis == "weiter"
 
@@ -289,7 +325,7 @@ class TestRatelimitZustandBleibtUnveraendert:
     def test_kein_journal_fuer_denials_bei_ratelimit_noetig_aber_kein_park(self, monkeypatch, stubs, tmp_path):
         # Ergänzt den Brief-Test: auch wenn ein rate-limitierter Lauf
         # (theoretisch) denials trüge, darf er niemals parken.
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=False, error="usage limit",
                                                     rate_limited=True, denials=[{"tool_name": "Write"}])))
         assert pl.eine_stufe(_task(m.PLANNING), tmp_path) == "fehler"
@@ -302,7 +338,7 @@ class TestTokenWeiterleitung:
         # Gemessen: ein Lauf hatte 3 Input- und 5 Output-Token. Kleine Werte
         # werden in Kürzungen oder Defaults leicht verschluckt oder vertauscht
         # — Plan 3 rechnet mit genau diesen Feldern das Budget.
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="x", tokens_in=3, tokens_out=5)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
@@ -313,7 +349,7 @@ class TestTokenWeiterleitung:
         # Gemessen (tests/fixtures/claude_stream_success.jsonl): 10102 cache_read
         # und 8779 cache_creation gegen nur 3/5 tokens_in/out — Plan 3s
         # Budget-Reserve rechnet mit den Cache-Feldern, nicht nur mit tokens_in/out.
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="x", cache_read=10102, cache_creation=8779)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
@@ -337,11 +373,11 @@ class TestFehlgeschlagenerGitDiffParkt:
             return _R()
 
         monkeypatch.setattr(pl.gitctl, "run", _kaputtes_gitctl)
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="egal")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="egal")))
         ergebnis = pl.eine_stufe(_task(m.REVIEWING), tmp_path)
         assert ergebnis == "geparkt"
         # Review darf gar nicht erst gelaufen sein.
-        assert stubs["profile"] == []
+        assert stubs["agenten"] == []
         grund = stubs["parks"][-1][1]
         assert "git diff" in grund
         assert "128" in grund
@@ -371,7 +407,7 @@ class TestKritisch1FixRundeErzwingtErneutesReview:
             return _R()
 
         monkeypatch.setattr(pl.gitctl, "run", _fake_gitctl)
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="gefixt")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="gefixt")))
         # Artefakt-Pflicht ist hier nicht der Prüfgegenstand — implement/fix
         # versprechen ohnehin kein Artefakt (siehe _ARTEFAKT_FELD_JE_STUFE),
         # nur die Review-Stufe (VERDIKT_DATEI) tut es in Tick 3.
@@ -383,8 +419,8 @@ class TestKritisch1FixRundeErzwingtErneutesReview:
         ergebnis1 = pl.eine_stufe(task, tmp_path)
         assert ergebnis1 == "weiter"
         assert stubs["states"][-1] == (5, m.IMPLEMENTING)
-        # Die Fix-Stufe ist an ihrem Rechteprofil erkennbar (Edit erlaubt).
-        assert "Edit" in " ".join(stubs["profile"][-1].allowed)
+        # Die Fix-Stufe ist an ihrem Agent-Namen 'fix' erkennbar.
+        assert stubs["agenten"][-1] == "fix"
         # Kritischer Fund 1: das Vor-Fix-Urteil muss jetzt weg sein.
         assert not (tmp_path / pl.stages.VERDIKT_DATEI).is_file()
         task["state"] = m.IMPLEMENTING
@@ -400,8 +436,8 @@ class TestKritisch1FixRundeErzwingtErneutesReview:
         stubs["journal"].clear()
         ergebnis3 = pl.eine_stufe(task, tmp_path)
 
-        # Die Review-Stufe hat KEIN Edit im Profil — die Fix-Stufe hätte es.
-        assert "Edit" not in " ".join(stubs["profile"][-1].allowed)
+        # Der Agent-Name ist jetzt 'review', nicht mehr 'fix'.
+        assert stubs["agenten"][-1] == "review"
         # Der stage_start-Journaleintrag muss 'review' nennen, nicht 'fix'.
         stage_start = next(e for e in stubs["journal"] if e[0][1] == "stage_start")
         meldung = stage_start[0][2]
@@ -424,7 +460,7 @@ class TestUnerwarteteAusnahme:
     den Task nicht aktiv und spurlos hängen lassen."""
 
     def test_ausnahme_in_set_state_wird_geloggt_und_parkt(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="x")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="x")))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
 
         def _explodiert(*a, **kw):
@@ -444,7 +480,7 @@ class TestCompareAndSwapVerweigert:
     melden, obwohl der Task tatsächlich noch im alten Zustand feststeckt."""
 
     def test_gescheiterter_zustandswechsel_parkt_statt_weiter_zu_melden(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="egal")))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="egal")))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         monkeypatch.setattr(pl.queue, "set_state", lambda tid, target, current: False)
         ergebnis = pl.eine_stufe(_task(m.PLANNING), tmp_path)
@@ -458,7 +494,7 @@ class TestPfadExtraktion:
         # abschließenden Pfad — .text.strip() allein würde diese Zeilen mit
         # in den vermeintlichen Pfad ziehen.
         text = "Annahme: es gibt kein bestehendes Modul dafür.\ndocs/specs/y-design.md"
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=text)))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text=text)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
         assert ("spec_path", "docs/specs/y-design.md") in stubs["artefakte"]
@@ -478,14 +514,14 @@ class TestPfadNormalisierung:
         # Die WÖRTLICHE Modellantwort aus dem Journal-Eintrag des Laufs, der
         # den Bug aufgedeckt hat — keine Nacherzählung, sondern das Original.
         text = f"`{self.ECHTER_PFAD}`"
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=text)))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text=text)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
         assert ergebnis == "weiter"
         assert ("spec_path", self.ECHTER_PFAD) in stubs["artefakte"]
 
     def test_backticks_werden_entfernt(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="`docs/specs/x-design.md`")))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
@@ -495,7 +531,7 @@ class TestPfadNormalisierung:
 
     def test_umschliessender_codezaun_wird_entfernt(self, monkeypatch, stubs, tmp_path):
         text = "Hier ist die Spec:\n\n```\ndocs/specs/x-design.md\n```"
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=text)))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text=text)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
         # Ohne Zaun-Erkennung wäre die 'letzte nicht-leere Zeile' die
@@ -503,7 +539,7 @@ class TestPfadNormalisierung:
         assert ("spec_path", "docs/specs/x-design.md") in stubs["artefakte"]
 
     def test_anfuehrungszeichen_werden_entfernt(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text='"docs/specs/x-design.md"')))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
@@ -511,7 +547,7 @@ class TestPfadNormalisierung:
 
     def test_markdown_link_form_wird_aufgeloest(self, monkeypatch, stubs, tmp_path):
         text = "[Design-Spec](docs/specs/x-design.md)"
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=text)))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text=text)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
         # Ohne Auflösung landete die komplette Link-Syntax im Feld statt
@@ -520,7 +556,7 @@ class TestPfadNormalisierung:
 
     def test_umgebende_leerzeichen_und_abschliessender_punkt_werden_entfernt(self, monkeypatch, stubs, tmp_path):
         text = "   docs/specs/x-design.md.   "
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=text)))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text=text)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
         # Ohne die Bereinigung bliebe entweder der Satzpunkt am Pfad kleben,
@@ -528,7 +564,7 @@ class TestPfadNormalisierung:
         assert ("spec_path", "docs/specs/x-design.md") in stubs["artefakte"]
 
     def test_fuehrendes_punkt_slash_wird_entfernt(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="./docs/specs/x-design.md")))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
@@ -538,7 +574,7 @@ class TestPfadNormalisierung:
         # Ein absoluter Pfad lässt sich nicht sinnvoll unter dem Worktree
         # einordnen — das darf niemals als 'Artefakt fehlt' durchgehen,
         # sondern muss als eigene, diagnostizierbare Park-Ursache auffallen.
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="/etc/passwd")))
         ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
         assert ergebnis == "geparkt"
@@ -547,7 +583,7 @@ class TestPfadNormalisierung:
         assert stubs["artefakte"] == []
 
     def test_pfad_mit_elternverzeichnis_wird_abgelehnt(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="docs/../../../etc/passwd")))
         ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
         assert ergebnis == "geparkt"
@@ -560,7 +596,7 @@ class TestPfadNormalisierung:
         # unvorhergesehene Formatierung trifft, ist der ROHE Text das Einzige,
         # was den Fund noch diagnostizierbar macht.
         roh = "  `/absolute/pfad.md`  "
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=roh)))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text=roh)))
         ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
         assert ergebnis == "geparkt"
         grund = stubs["parks"][-1][1]
@@ -578,7 +614,7 @@ class TestFund2StufenspezifischesTimeout:
     def test_timeout_wird_je_stufe_durchgereicht(self, monkeypatch, stubs, tmp_path):
         aufgezeichnete_timeouts = []
 
-        def _run(prompt, cwd, timeout=1800, profile=None):
+        def _run(prompt, cwd, timeout=1800, agent=None, model=None):
             aufgezeichnete_timeouts.append(timeout)
             return RunResult(ok=True, text="x")
 
@@ -589,7 +625,7 @@ class TestFund2StufenspezifischesTimeout:
                 stderr = ""
             return _R()
 
-        monkeypatch.setattr(pl.runner, "run", _run)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
         monkeypatch.setattr(pl.gitctl, "run", _gitctl_erfolg)  # review braucht _schreibe_diff
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
 
@@ -641,7 +677,7 @@ class TestFund1ZeitueberschreitungLiefertTrotzdem:
             return _R()
 
         monkeypatch.setattr(pl.gitctl, "run", _gitctl)
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=False, error=_ZEITUEBERSCHREITUNG)))
         ergebnis = pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path)
 
@@ -662,7 +698,7 @@ class TestFund1ZeitueberschreitungLiefertTrotzdem:
             return _R()
 
         monkeypatch.setattr(pl.gitctl, "run", _gitctl)
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=False, error=_ZEITUEBERSCHREITUNG)))
         ergebnis = pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path)
 
@@ -680,7 +716,7 @@ class TestFund1ZeitueberschreitungLiefertTrotzdem:
         ziel.parent.mkdir(parents=True)
         ziel.write_text("# Spec")
 
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=False, error=_ZEITUEBERSCHREITUNG)))
         ergebnis = pl.eine_stufe(_task(m.SPECCING, spec_path=pfad), tmp_path)
 
@@ -704,7 +740,7 @@ class TestFund1ZeitueberschreitungLiefertTrotzdem:
         neu.write_text("# Neu")
         os.utime(neu, (fester_start + 5, fester_start + 5))
 
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=False, error=_ZEITUEBERSCHREITUNG)))
         ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
 
@@ -717,7 +753,7 @@ class TestFund1ZeitueberschreitungLiefertTrotzdem:
         # jedes Produkt (leeres Verzeichnis, kein Commit) — muss weiterhin
         # parken. Ohne diesen Test könnte die Erkennung 'jeder Timeout ist
         # ein Erfolg' geworden sein, ohne dass ein Test das auffängt.
-        monkeypatch.setattr(pl.runner, "run",
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=False, error=_ZEITUEBERSCHREITUNG)))
         ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
         assert ergebnis == "geparkt"
@@ -747,7 +783,7 @@ class TestFund3ArtefaktWirdCommittet:
             return _R()
 
         monkeypatch.setattr(pl.gitctl, "run", _gitctl)
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=pfad)))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text=pfad)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
 
         ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
@@ -762,7 +798,7 @@ class TestFund3ArtefaktWirdCommittet:
 
     def test_commit_wird_journalt(self, monkeypatch, stubs, tmp_path):
         pfad = "docs/superpowers/specs/2026-08-15-x-design.md"
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=pfad)))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text=pfad)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
 
         pl.eine_stufe(_task(m.SPECCING), tmp_path)
@@ -780,7 +816,7 @@ class TestFund3ArtefaktWirdCommittet:
             return _R()
 
         monkeypatch.setattr(pl.gitctl, "run", _kaputtes_gitctl)
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text=pfad)))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text=pfad)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
 
         ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
@@ -791,26 +827,240 @@ class TestFund3ArtefaktWirdCommittet:
         # eine Stufe als abgeschlossen, deren Artefakt gar nicht sichtbar ist.
         assert stubs["states"] == []
 
-    def test_implement_und_fix_committen_nichts_zusaetzliches(self, monkeypatch, stubs, tmp_path):
+    def test_implement_bekommt_kein_dokument_artefakt(self, monkeypatch, stubs, tmp_path):
         # implement/fix versprechen kein Artefakt-Dokument (siehe
-        # _ARTEFAKT_FELD_JE_STUFE) — der Commit-Schritt gilt ausdrücklich nur
-        # für spec/plan, sonst würde hier ein bereits vom Agenten selbst
-        # committeter Diff ein zweites Mal (und diesmal fälschlich pauschal)
-        # committet.
-        aufrufe = []
-
-        def _gitctl(*args, cwd=None, timeout=300):
-            aufrufe.append(args)
-
-            class _R:
-                returncode = 0
-                stdout = ""
-                stderr = ""
-            return _R()
-
-        monkeypatch.setattr(pl.gitctl, "run", _gitctl)
-        monkeypatch.setattr(pl.runner, "run", _lauf(stubs, RunResult(ok=True, text="fertig")))
+        # _ARTEFAKT_FELD_JE_STUFE) — der Dokument-Commit-Pfad
+        # (_committe_artefakt, "docs(forge): Artefakt der Stufe ...") gilt
+        # ausdrücklich nur für spec/plan. Ihre Arbeit wird stattdessen über
+        # _committe_stufenarbeit committet, siehe TestC3StufenarbeitCommit.
+        aufrufe = _gitctl_aufzeichnend(monkeypatch)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
         ergebnis = pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path)
 
         assert ergebnis == "weiter"
-        assert aufrufe == []
+        assert stubs["artefakte"] == []
+        assert not any("Artefakt der Stufe" in str(a) for a in aufrufe)
+
+
+def _gitctl_aufzeichnend(monkeypatch, status_stdout="", returncodes=None):
+    """Zeichnet alle gitctl-Aufrufe auf und beantwortet `git status` mit
+    `status_stdout` (NUL-getrennt, wie `--porcelain -z` es liefert).
+    `returncodes` kann je git-Unterbefehl einen abweichenden Rückgabewert
+    setzen, z.B. {"commit": 1}."""
+    aufrufe: list[tuple] = []
+    codes = returncodes or {}
+
+    def _gitctl(*args, cwd=None, timeout=300):
+        aufrufe.append(args)
+
+        class _R:
+            returncode = codes.get(args[0] if args else "", 0)
+            stdout = status_stdout if args and args[0] == "status" else ""
+            stderr = "kaputt"
+        return _R()
+
+    monkeypatch.setattr(pl.gitctl, "run", _gitctl)
+    return aufrufe
+
+
+class TestC3StufenarbeitCommit:
+    """Kritischer Fund C3 (Abschluss-Review 2026-09-09): implement/fix haben
+    unter opencode `bash: deny` und damit kein git. Ihr Prompt verlangte
+    trotzdem einen Commit, und die Pipeline committete nur Stufen mit
+    Dokument-Artefakt. Ergebnis: die Arbeit blieb unkommittet, `git diff
+    main...HEAD` war leer, das Review urteilte über nichts und das Gate sah
+    'keine Änderungen im Branch'. Die Pipeline committet jetzt selbst."""
+
+    def _lauf_implement(self, monkeypatch, stubs, tmp_path, status_stdout="", returncodes=None):
+        aufrufe = _gitctl_aufzeichnend(monkeypatch, status_stdout, returncodes)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        return aufrufe, pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path)
+
+    def test_arbeit_wird_mit_expliziten_pfaden_committet(self, monkeypatch, stubs, tmp_path):
+        aufrufe, ergebnis = self._lauf_implement(
+            monkeypatch, stubs, tmp_path, "?? forge/neu.py\0 M forge/alt.py\0")
+        assert ergebnis == "weiter"
+        add = next(a for a in aufrufe if a[0] == "add")
+        commit = next(a for a in aufrufe if a[0] == "commit")
+        assert set(add[2:]) == {"forge/neu.py", "forge/alt.py"}
+        assert set(commit[4:]) == {"forge/neu.py", "forge/alt.py"}
+        # Niemals pauschal — der Worktree kann Fremdes enthalten.
+        assert "-A" not in add and "--all" not in add
+
+    def test_pipeline_interne_dateien_werden_nicht_mitcommittet(self, monkeypatch, stubs, tmp_path):
+        # .forge/ ist Zwischenstand zwischen zwei Stufen. Ein mitcommittetes
+        # altes review.json stünde im Diff, den das nächste Review beurteilt.
+        aufrufe, _ = self._lauf_implement(
+            monkeypatch, stubs, tmp_path,
+            "?? .forge/review.json\0?? .forge/diff.patch\0?? forge/neu.py\0")
+        add = next(a for a in aufrufe if a[0] == "add")
+        assert list(add[2:]) == ["forge/neu.py"]
+
+    def test_leerer_worktree_erzeugt_keinen_commit(self, monkeypatch, stubs, tmp_path):
+        # Eine Stufe, die nichts hinterlassen hat, ist kein Pipeline-Fehler —
+        # darüber urteilen Review und Gate, nicht der Commit.
+        aufrufe, ergebnis = self._lauf_implement(monkeypatch, stubs, tmp_path, "")
+        assert ergebnis == "weiter"
+        assert not any(a[0] in ("add", "commit") for a in aufrufe)
+
+    def test_fehlgeschlagener_commit_parkt(self, monkeypatch, stubs, tmp_path):
+        _, ergebnis = self._lauf_implement(
+            monkeypatch, stubs, tmp_path, "?? forge/neu.py\0", returncodes={"commit": 1})
+        assert ergebnis == "geparkt"
+        assert "Commit der Stufenarbeit" in stubs["parks"][-1][1]
+        assert stubs["states"] == []
+
+    def test_auch_die_fix_stufe_committet(self, monkeypatch, stubs, tmp_path):
+        _verdikt(tmp_path, "fail", [{"severity": "critical", "what": "x"}])
+        aufrufe = _gitctl_aufzeichnend(monkeypatch, "?? forge/repariert.py\0")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        assert pl.eine_stufe(_task(m.REVIEWING), tmp_path) == "weiter"
+        commit = next(a for a in aufrufe if a[0] == "commit")
+        assert "forge/repariert.py" in commit
+
+    def test_umbenennung_nimmt_den_quellpfad_mit(self, monkeypatch, stubs, tmp_path):
+        # `--porcelain -z` hängt bei R/C den Quellpfad als eigenen Eintrag an.
+        # Ohne ihn bliebe die Löschung der Quelle uncommittet zurück.
+        aufrufe, _ = self._lauf_implement(
+            monkeypatch, stubs, tmp_path, "R  forge/neu.py\0forge/alt.py\0")
+        add = next(a for a in aufrufe if a[0] == "add")
+        assert set(add[2:]) == {"forge/neu.py", "forge/alt.py"}
+
+    def test_zeitueberschreitung_mit_unkommittierter_arbeit_gilt_als_geliefert(
+            self, monkeypatch, stubs, tmp_path):
+        # _timeout_produkt zählte nur Commits. Seit implement/fix gar nicht
+        # mehr selbst committen können, wäre damit JEDE zeitüberschrittene
+        # Arbeitsstufe leer — genau die bezahlte Arbeit, die dieser Zweig
+        # retten soll, ginge verloren.
+        aufrufe = _gitctl_aufzeichnend(monkeypatch, "?? forge/halbfertig.py\0")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(
+            stubs, RunResult(ok=False, error="Zeitüberschreitung nach 5400s")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path) == "weiter"
+        assert stubs["parks"] == []
+        commit = next(a for a in aufrufe if a[0] == "commit")
+        assert "forge/halbfertig.py" in commit
+
+    def test_zeitueberschreitung_ohne_jede_arbeit_parkt_weiterhin(self, monkeypatch, stubs, tmp_path):
+        _gitctl_aufzeichnend(monkeypatch, "")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(
+            stubs, RunResult(ok=False, error="Zeitüberschreitung nach 5400s")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path) == "geparkt"
+
+
+class TestC3GegenEchtesGit:
+    """Dieselbe Naht wie oben, aber gegen ein echtes `git` statt gegen einen
+    Stub. Genau diese Abdeckung fehlte: sämtliche Unit-Tests der Welle mockten
+    subprocess, und drei Fehler, die zusammen keinen einzigen Task durchlaufen
+    liessen, waren deshalb grün. Hier läuft `git status --porcelain -z` echt,
+    und der Diff, den Review und Gate sehen, wird tatsächlich nachgesehen."""
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        ort = tmp_path / "repo"
+        ort.mkdir()
+
+        def g(*args):
+            subprocess.run(["git", *args], cwd=str(ort), check=True, capture_output=True)
+        g("init", "-b", "main")
+        g("config", "user.email", "test@example.com")
+        g("config", "user.name", "Test")
+        (ort / "README.md").write_text("hallo\n")
+        g("add", "README.md")
+        g("commit", "-m", "erster Commit")
+        # Wie im Betrieb: der Task arbeitet auf einem eigenen Branch, und
+        # `git diff main...HEAD` (die Sicht von Review und Gate) ist genau die
+        # Differenz zu main.
+        g("checkout", "-b", "forge/task-5")
+        return ort
+
+    def test_arbeit_landet_wirklich_im_diff_den_review_und_gate_sehen(
+            self, monkeypatch, stubs, repo):
+        monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
+        # Was eine implement-Stufe ohne Shell hinterlässt: Dateien im Worktree,
+        # nichts committet. Dazu pipeline-interner Zwischenstand.
+        (repo / "forge").mkdir()
+        (repo / "forge" / "neu.py").write_text("# neu\n")
+        (repo / "README.md").write_text("hallo\nund tschuess\n")
+        (repo / ".forge").mkdir()
+        (repo / ".forge" / "review.json").write_text("{}")
+
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), repo) == "weiter"
+
+        diff = subprocess.run(["git", "diff", "main...HEAD"], cwd=str(repo),
+                              capture_output=True, text=True).stdout
+        assert "forge/neu.py" in diff
+        assert "und tschuess" in diff
+        # Der pipeline-interne Zwischenstand darf NICHT im Diff stehen.
+        assert ".forge/review.json" not in diff
+        assert (repo / ".forge" / "review.json").is_file()
+
+    def test_geloeschte_datei_wird_mitcommittet(self, monkeypatch, stubs, repo):
+        monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
+        (repo / "README.md").unlink()
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), repo) == "weiter"
+        diff = subprocess.run(["git", "diff", "--name-status", "main...HEAD"], cwd=str(repo),
+                              capture_output=True, text=True).stdout
+        assert diff.startswith("D\tREADME.md")
+
+    def test_pfad_mit_leerzeichen_und_umlaut_ueberlebt(self, monkeypatch, stubs, repo):
+        # `-z` liefert unquotierte Pfade. Ohne das käme hier git-eigene
+        # C-Quotierung ("\303\244...") zurück und `git add` liefe ins Leere.
+        monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
+        (repo / "ein Pfad mit Ümlaut.md").write_text("inhalt\n")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), repo) == "weiter"
+        # Auch hier `-z`: `git diff --name-only` quotiert den Pfad sonst auf
+        # der Ausgabeseite genauso ("ein Pfad mit \303\234mlaut.md").
+        dateien = subprocess.run(["git", "diff", "--name-only", "-z", "main...HEAD"], cwd=str(repo),
+                                 capture_output=True, text=True).stdout.split("\0")
+        assert "ein Pfad mit Ümlaut.md" in dateien
+
+    def test_ohne_aenderung_kein_leerer_commit(self, monkeypatch, stubs, repo):
+        monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), repo) == "weiter"
+        anzahl = subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=str(repo),
+                                capture_output=True, text=True).stdout.strip()
+        assert anzahl == "1"
+
+
+class TestBackendAufruf:
+    def test_spec_stufe_laeuft_ueber_opencode(self, monkeypatch, stubs, tmp_path):
+        """Die Pipeline darf runner.run nicht mehr fest verdrahtet aufrufen."""
+        gesehen = {}
+
+        def _fake_hole(name):
+            def _run(prompt, cwd, timeout, agent, model):
+                gesehen["backend"] = name
+                gesehen["agent"] = agent
+                gesehen["model"] = model
+                return RunResult(ok=True, text="egal")
+            return _run
+
+        monkeypatch.setattr(pl.backends, "hole", _fake_hole)
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+
+        assert gesehen["backend"] == "opencode"
+        assert gesehen["agent"] == "spec"
+        assert gesehen["model"] == "google/gemini-3.6-flash"
+
+    def test_review_stufe_laeuft_ueber_agy(self, monkeypatch, stubs, tmp_path):
+        gesehen = {}
+
+        def _fake_hole(name):
+            def _run(prompt, cwd, timeout, agent, model):
+                gesehen["backend"] = name
+                gesehen["model"] = model
+                return RunResult(ok=True, text="egal")
+            return _run
+
+        monkeypatch.setattr(pl.backends, "hole", _fake_hole)
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        monkeypatch.setattr(pl, "_schreibe_diff", lambda w: None)
+        pl._eine_stufe_intern({"id": 1}, 1, m.REVIEWING, tmp_path)
+
+        assert gesehen["backend"] == "agy"
+        assert gesehen["model"] == "claude-opus-4-6-thinking"

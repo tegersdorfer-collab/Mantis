@@ -4,7 +4,19 @@ Jede Stufe ist ein eigener headless Lauf mit frischem Kontext. Die Übergabe
 läuft über Artefakte im Worktree, nie über Gesprächsverlauf — deshalb steht in
 jedem Prompt, wo das Ergebnis der Vorstufe liegt, statt es mitzuschicken.
 
-Die Rechteprofile sind die einzige Schranke zwischen einem unbeaufsichtigten
+ACHTUNG, seit der Umstellung auf die Gratis-Backends (Plan 1, 2026-09-09):
+die `profile`-Felder unten gelten NUR für das Claude-Code-Backend in
+forge/runner.py. Die Pipeline ruft dieses Backend derzeit nicht auf — sie geht
+über forge/backends.hole(), und dort kommen die Rechte aus
+forge.backends.OpencodePermission, für ALLE Stufen gleich (`bash`, `task`,
+`webfetch`, `websearch`, `external_directory` verboten; lesen und schreiben
+erlaubt). Die Profile hier sind damit produktiv wirkungslos; sie bleiben
+stehen, weil sie bei der Stage-Konstruktion weiterhin die gemessenen
+Claude-Code-Schranken erzwingen (siehe Ruling Task 7 im SDD-Ledger). Der
+folgende Absatz beschreibt entsprechend den Claude-Code-Fall, nicht den
+laufenden Betrieb.
+
+Die Rechteprofile waren die erste Schranke zwischen einem unbeaufsichtigten
 Agenten und dem Dateisystem. Sie sind absichtlich eng: nur `implement` und
 `fix` dürfen editieren und Befehle ausführen (`Edit`, `Bash`). `spec`, `plan`
 und `review` bekommen `Write`, aber NICHT bepfadet. Diese drei Stufen könnten
@@ -44,11 +56,13 @@ SPEC_VERZEICHNIS = "docs/superpowers/specs"
 PLAN_VERZEICHNIS = "docs/superpowers/plans"
 VERDIKT_DATEI = ".forge/review.json"
 
-# Die Review-Stufe hat absichtlich kein Bash und kann sich also KEINEN eigenen
-# Diff erzeugen (kein `git diff`, kein sonstiger Befehl) — sonst könnte sie
+# Die Review-Stufe soll sich KEINEN eigenen Diff erzeugen — sonst könnte sie
 # sich eine ihr genehme Sicht auf die Änderung zusammenbauen, statt die
-# tatsächliche zu prüfen. Stattdessen liest sie den Diff aus dieser Datei.
-# WICHTIG: forge/pipeline.py (Task 6) MUSS diese Datei schreiben, BEVOR die
+# tatsächliche zu prüfen. Deshalb der Umweg über diese Datei: forge/pipeline.py
+# schreibt sie, und forge/runner_agy.py liest sie und legt ihren Inhalt dem
+# Modell in den Prompt. Das Modell selbst wird nie auf diesen Pfad verwiesen
+# (I7) — es bekommt den Diff fertig eingebettet.
+# WICHTIG: forge/pipeline.py MUSS diese Datei schreiben, BEVOR die
 # Review-Stufe läuft — ohne sie prüft review eine Spec ohne jede Sicht auf
 # das, was tatsächlich geändert wurde, und das Gate-Urteil stünde auf nichts.
 DIFF_DATEI = ".forge/diff.patch"
@@ -81,6 +95,11 @@ class Stage:
     baue_prompt: Callable[[dict, dict], str]
     artefakt: Callable[[dict], str | None]
     timeout: int = STANDARD_TIMEOUT_SEKUNDEN
+    # Welche CLI diese Stufe ausführt und mit welchem Modell. `profile` bleibt
+    # erhalten und gilt weiterhin für das Claude-Code-Backend; die opencode-
+    # Rechte kommen aus forge/backends.OpencodePermission.
+    backend: str = "opencode"
+    model: str = ""
 
 
 def _kopf(task: dict) -> str:
@@ -122,10 +141,11 @@ def _implement_prompt(task: dict, kontext: dict) -> str:
         f"Spec: {kontext.get('spec_path', '(unbekannt)')}\n"
         f"Plan: {kontext.get('plan_path', '(unbekannt)')}\n"
         "Arbeite den Plan testgetrieben ab: erst der fehlschlagende Test, dann "
-        "die Implementierung, dann committen. Halte dich an die Konventionen der "
+        "die Implementierung. Halte dich an die Konventionen der "
         "Codebase (Kommentare auf Deutsch, ruff select F+E9, line-length 120).\n"
         "Fasse NICHT an: .env, data/, forge/gate.py, forge/runner.py.\n"
-        "Committe deine Arbeit mit expliziten Pfaden, niemals mit 'git add -A'."
+        "Du hast keine Shell: keine Befehle, kein git, keine Testläufe. Lass "
+        "deine Arbeit einfach im Worktree stehen — die Pipeline committet sie."
     )
 
 
@@ -133,15 +153,14 @@ def _review_prompt(task: dict, kontext: dict) -> str:
     return (
         _kopf(task) + "\n\n"
         f"Die Spec liegt unter: {kontext.get('spec_path', '(unbekannt)')}\n"
-        f"Der Diff dieses Branches gegen die Spec liegt unter: {DIFF_DATEI}. Das "
-        "ist deine einzige verlässliche Sicht auf die Änderung — lies diese "
-        "Datei, statt einen eigenen Diff zu erzeugen. Du hast den "
+        "Der Diff dieses Branches steht weiter unten in diesem Prompt — er ist "
+        "deine einzige verlässliche Sicht auf die Änderung. Erzeuge keinen "
+        "eigenen Diff und suche keine Datei danach ab. Du hast den "
         "Entstehungsverlauf NICHT gesehen und sollst ihm auch nicht vertrauen.\n"
-        f"Schreibe dein Urteil als JSON nach {VERDIKT_DATEI}:\n"
-        '{"verdict": "pass" oder "fail", "findings": [{"severity": "critical|important|minor", '
-        '"file": "...", "what": "..."}]}\n'
-        "verdict ist 'fail', sobald mindestens ein Befund critical oder important ist.\n"
-        "Ändere ausschließlich diese eine Datei."
+        "Gib dein Urteil als JSON auf der Standardausgabe aus. Schreibe keine "
+        f"Datei — {VERDIKT_DATEI} legt der Runner aus deiner Antwort an.\n"
+        "Das exakte Schema hängt der Runner unten an den Prompt an; halte dich "
+        "wörtlich daran."
     )
 
 
@@ -150,9 +169,10 @@ def _fix_prompt(task: dict, kontext: dict) -> str:
         _kopf(task) + "\n\n"
         f"Ein Review hat Mängel gefunden. Sie stehen in {VERDIKT_DATEI}.\n"
         "Behebe ausschließlich die dort als critical oder important markierten "
-        "Befunde. Baue nichts darüber hinaus. Lass die Tests danach laufen und "
-        "committe mit expliziten Pfaden.\n"
-        "Fasse NICHT an: .env, data/, forge/gate.py, forge/runner.py."
+        "Befunde. Baue nichts darüber hinaus.\n"
+        "Fasse NICHT an: .env, data/, forge/gate.py, forge/runner.py.\n"
+        "Du hast keine Shell: keine Befehle, kein git, keine Testläufe. Lass "
+        "deine Arbeit einfach im Worktree stehen — die Pipeline committet sie."
     )
 
 
@@ -160,17 +180,21 @@ def _fix_prompt(task: dict, kontext: dict) -> str:
 STAGES: tuple[Stage, ...] = (
     Stage("spec", m.SPECCING, m.PLANNING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
-          _spec_prompt, lambda t: t.get("spec_path")),
+          _spec_prompt, lambda t: t.get("spec_path"),
+          backend="opencode", model="google/gemini-3.6-flash"),
     Stage("plan", m.PLANNING, m.IMPLEMENTING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
-          _plan_prompt, lambda t: t.get("plan_path")),
+          _plan_prompt, lambda t: t.get("plan_path"),
+          backend="opencode", model="nvidia/moonshotai/kimi-k3"),
     Stage("implement", m.IMPLEMENTING, m.REVIEWING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                             mode="dontAsk"),
-          _implement_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN),
+          _implement_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN,
+          backend="opencode", model="nvidia/minimaxai/minimax-m3"),
     Stage("review", m.REVIEWING, m.GATING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
-          _review_prompt, lambda t: VERDIKT_DATEI),
+          _review_prompt, lambda t: VERDIKT_DATEI,
+          backend="agy", model="claude-opus-4-6-thinking"),
 )
 
 # Die Fix-Stufe steht bewusst NEBEN der Kette, nicht darin: sie teilt sich den
@@ -182,6 +206,7 @@ FIX_STAGE = Stage(
     PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                       mode="dontAsk"),
     _fix_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN,
+    backend="opencode", model="nvidia/minimaxai/minimax-m3",
 )
 
 ALLE_STUFEN: tuple[Stage, ...] = STAGES + (FIX_STAGE,)
