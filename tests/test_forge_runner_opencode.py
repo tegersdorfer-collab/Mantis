@@ -64,3 +64,22 @@ class TestEreignisse:
         r = parse_events([])
         assert r.ok is False
         assert "keine Ereignisse" in (r.error or "")
+
+    def test_cache_wird_ueber_alle_schritte_summiert(self):
+        """Cache-Lese- und Schreibzähler werden über mehrere step_finish-Ereignisse summiert.
+
+        Mit zwei step_finish-Ereignissen:
+        - Ereignis 1: cache.read=100, cache.write=50
+        - Ereignis 2: cache.read=200, cache.write=75
+        Erwartet: cache_read=300, cache_creation=125
+        """
+        zeilen = [
+            '{"type":"step_start"}',
+            '{"type":"step_finish","part":{"tokens":{"input":1000,"output":100,"cache":{"read":100,"write":50}}}}',
+            '{"type":"step_start"}',
+            '{"type":"step_finish","part":{"tokens":{"input":2000,"output":200,"cache":{"read":200,"write":75}}}}',
+        ]
+        r = parse_events(zeilen)
+        assert r.ok is True
+        assert r.cache_read == 300
+        assert r.cache_creation == 125
