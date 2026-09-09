@@ -45,3 +45,9 @@ mlx_models/
 # bewusst ein Geschwisterverzeichnis AUSSERHALB dieses Repos, nicht darunter.
 # Ein .gitignore-Eintrag dafür kann hier nie greifen; das ist beabsichtigt und
 # kein vergessenes Aufräumen.
+
+# Benchmark-Rohdaten (bench/nanbeige42): Aufgaben, Blindmappen und Rohlaeufe
+# enthalten echte COROS-Messwerte (Puls, Distanz, Datum). Dieses Repo ist
+# oeffentlich — die Unterlagen bleiben lokal. Auswertung und Modellwahl stehen
+# in den Commit-Nachrichten, nicht hier.
+bench/nanbeige42/
