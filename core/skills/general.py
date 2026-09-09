@@ -97,7 +97,7 @@ def _refresh_tools() -> str:
     n = len(tools)
     return (
         f"{n} Tools aktuell verfügbar. "
-        "Falls ein benötigtes Tool fehlt: create_skill nutzen um es selbst zu bauen."
+        "Falls ein Tool fehlt: create_skill speichert einen inaktiven Entwurf zur manuellen Prüfung; keine automatische Aktivierung."
     )
 
 @T.register(

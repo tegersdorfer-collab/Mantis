@@ -60,6 +60,11 @@ def echo_tool():
     toolreg.REGISTRY.update(saved)
 
 
+@pytest.fixture(autouse=True)
+def no_production_event_log(monkeypatch):
+    monkeypatch.setattr("core.agent.log_event", lambda *args, **kwargs: None)
+
+
 def test_plain_answer_no_tools(echo_tool):
     be = FakeBackend([("Hallo Timo!", [])])
     text, trace = asyncio.run(Agent(be).run([{"role": "user", "content": "hi"}], system="s"))
@@ -138,3 +143,40 @@ def test_dry_run_does_not_execute(echo_tool):
     _, trace = asyncio.run(Agent(be).run(
         [{"role": "user", "content": "x"}], system="s", dry_run_tools=True))
     assert "Dry-Run" in trace[0]["result"]  # nicht wirklich ausgeführt
+
+
+@pytest.mark.parametrize("permissions", [
+    {"allowed_tools": ["calculate"]},
+    {"allowed_tools": []},
+    {"use_tools": False},
+    {"use_tools": False, "allowed_tools": ["echo"]},
+])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_backend_cannot_execute_unpermitted_tools(echo_tool, monkeypatch, permissions, dry_run):
+    executed = []
+
+    async def write(text=""):
+        executed.append(text)
+        return "written"
+
+    monkeypatch.setattr(toolreg.REGISTRY["echo"], "handler", write)
+    be = FakeBackend([("", [_tc("echo", {"text": "unauthorized"})]), ("Done", [])])
+    _, trace = asyncio.run(Agent(be).run([], system="s", dry_run_tools=dry_run, **permissions))
+    assert executed == []
+    assert "FEHLER" in trace[0]["result"]
+    assert "Dry-Run" not in trace[0]["result"]
+    assert be.calls[1]["messages"][-1]["content"] == trace[0]["result"]
+
+
+def test_math_guard_does_not_request_disallowed_calculate(echo_tool):
+    be = FakeBackend([("Durchschnitt ~ 73", [])])
+    text, trace = asyncio.run(Agent(be).run([], system="s", allowed_tools=["echo"]))
+    assert text == "Durchschnitt ~ 73"
+    assert trace == []
+    assert len(be.calls) == 1
+
+
+def test_unknown_tool_is_rejected_in_dry_run(echo_tool):
+    be = FakeBackend([("", [_tc("nonexistent")]), ("Done", [])])
+    _, trace = asyncio.run(Agent(be).run([], system="s", dry_run_tools=True))
+    assert "FEHLER" in trace[0]["result"]

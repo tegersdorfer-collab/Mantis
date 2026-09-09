@@ -1,22 +1,14 @@
-"""
-Skill-Factory: Mantis kann zur Laufzeit neue Tools für sich selbst erschaffen,
-wenn ihm für eine Anfrage kein passendes Tool zur Verfügung steht – statt zu
-sagen "das kann ich nicht", baut er sich die Fähigkeit.
+"""Generate review artifacts; never execute generated Python.
 
-Sicherheitsmodell:
-- Statische AST-Prüfung vor jeder Aktivierung: nur Imports aus einer festen
-  Whitelist, keine eval/exec/compile/__import__/os/subprocess/socket etc.
-- Genau eine async-Funktion pro Skill, dekoriert mit @T.register(...).
-- Neue Skills landen in domains/dynamic_skills/<name>.py, werden per Git
-  committed (Nachvollziehbarkeit + Rollback per `git revert`) und sofort per
-  importlib in die laufende Tool-Registry geladen – kein Neustart nötig.
-- Tages-Limit gegen Fehler-Spiralen (wiederholt fehlschlagende Skill-Erzeugung).
+AST checks are lint, not a sandbox. Python imports and introspection can recover
+host capabilities, and a plain subprocess would still inherit host permissions.
+Until an OS-enforced sandbox is available, creation saves .py.pending files and
+startup refuses to import even legacy .py skills. Review and integration must
+happen outside this automatic workflow. No runtime opt-in bypass is provided.
 """
 import ast
-import importlib
 import logging
 import re
-import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -64,7 +56,7 @@ def _check_import_root(root: str) -> None:
 
 
 def validate_source(source: str, expected_name: str) -> None:
-    """Wirft SkillValidationError wenn der generierte Code unsicher/unpassend ist."""
+    """Lint source structure; acceptance never authorizes execution."""
     try:
         tree = ast.parse(source)
     except SyntaxError as e:
@@ -110,20 +102,6 @@ def _record_attempt() -> None:
     db.set_setting("skill_factory_log", log_)
 
 
-def _git_commit(message: str) -> str:
-    try:
-        subprocess.run(["git", "add", "-A", "domains/dynamic_skills"],
-                       cwd=MANTIS_DIR, capture_output=True, check=True)
-        subprocess.run(["git", "commit", "-m", message, "--no-gpg-sign", "--allow-empty"],
-                       cwd=MANTIS_DIR, capture_output=True, text=True)
-        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=MANTIS_DIR,
-                             capture_output=True, text=True)
-        return out.stdout.strip()
-    except Exception as e:
-        log.warning(f"Skill-Factory: Git-Commit fehlgeschlagen: {e}")
-        return ""
-
-
 _PROMPT_INJECTION_PATTERNS = re.compile(
     r"(ignore (previous|above|all)|system\s*prompt|you are now|jailbreak|"
     r"disregard|override|<\s*/?system|<\s*/?instruction|\[INST\]|###\s*system)",
@@ -141,7 +119,7 @@ def _sanitize_text(text: str, field: str, max_len: int = 200) -> str:
 
 def create_skill(skill_name: str, description: str, source_code: str) -> dict:
     """
-    Erstellt, validiert und aktiviert ein neues Tool zur Laufzeit.
+    Erstellt einen inaktiven Code-Entwurf zur manuellen Prüfung.
     Gibt {'ok': bool, 'message': str} zurück.
     """
     if _today_count() >= MAX_SKILLS_PER_DAY:
@@ -150,7 +128,7 @@ def create_skill(skill_name: str, description: str, source_code: str) -> dict:
             "Erstmal bestehende Skills nutzen/reparieren statt neue zu bauen."
         )}
 
-    if not re.fullmatch(r"[a-z][a-z0-9_]{2,40}", skill_name):
+    if not re.fullmatch(r"[a-z][a-z0-9_]{2,39}", skill_name):
         return {"ok": False, "message": "skill_name muss snake_case sein, 3-40 Zeichen, nur a-z/0-9/_."}
 
     try:
@@ -160,8 +138,8 @@ def create_skill(skill_name: str, description: str, source_code: str) -> dict:
     if skill_name in T.REGISTRY:
         return {"ok": False, "message": f"Tool '{skill_name}' existiert bereits."}
 
-    file_path = SKILLS_DIR / f"{skill_name}.py"
-    if file_path.exists():
+    file_path = SKILLS_DIR / f"{skill_name}.py.pending"
+    if file_path.exists() or (SKILLS_DIR / f"{skill_name}.py").exists():
         return {"ok": False, "message": f"Datei '{file_path.name}' existiert bereits."}
 
     _record_attempt()
@@ -171,72 +149,63 @@ def create_skill(skill_name: str, description: str, source_code: str) -> dict:
     except SkillValidationError as e:
         return {"ok": False, "message": f"Validierung fehlgeschlagen: {e}"}
 
-    header = (
-        f'"""Automatisch von Mantis erstelltes Skill: {description}\n'
-        f'Erstellt: {datetime.now().isoformat(timespec="seconds")}\n"""\n'
-        "from core import tools as T\n\n\n"
-    )
+    # Comment each metadata line: user text must never become executable source.
+    header = "# INACTIVE: generated draft; manual review required.\n"
+    header += "".join(f"# {line}\n" for line in description.splitlines())
+    header += f"# Created: {datetime.now().isoformat(timespec='seconds')}\n"
+    header += "from core import tools as T\n\n"
     full_source = header + source_code.strip() + "\n"
 
     try:
-        file_path.write_text(full_source, encoding="utf-8")
+        # Exclusive creation also prevents following a pre-existing symlink.
+        with file_path.open("x", encoding="utf-8") as artifact:
+            artifact.write(full_source)
     except Exception as e:
         return {"ok": False, "message": f"Schreiben fehlgeschlagen: {e}"}
 
-    # Sofort live laden (kein Neustart nötig) – Fehler hier → Datei wieder entfernen
-    try:
-        mod_name = f"domains.dynamic_skills.{skill_name}"
-        if mod_name in __import__("sys").modules:
-            importlib.reload(__import__("sys").modules[mod_name])
-        else:
-            importlib.import_module(mod_name)
-    except Exception as e:
-        file_path.unlink(missing_ok=True)
-        return {"ok": False, "message": f"Laden fehlgeschlagen, Skill verworfen: {e}"}
-
-    if skill_name not in T.REGISTRY:
-        file_path.unlink(missing_ok=True)
-        return {"ok": False, "message": "Skill geladen, aber nicht in der Registry erschienen (Decorator fehlt?)."}
-
-    commit = _git_commit(f"skill: {skill_name} ({description[:60]})")
-    from domains.self_modify import _log_change
-    _log_change("skill_create", f"domains/dynamic_skills/{skill_name}.py", description,
-               "", full_source, commit)
-    log.info(f"🛠️  Neues Skill erstellt und aktiviert: {skill_name}")
+    log.info("Skill-Entwurf zur Prüfung gespeichert (inaktiv): %s", skill_name)
     return {
         "ok": True,
-        "message": f"Skill '{skill_name}' erstellt und sofort aktiv. Commit: {commit[:8] if commit else 'n/a'}",
+        "active": False,
+        "status": "pending_review",
+        "path": str(file_path),
+        "message": (
+            f"Skill '{skill_name}' als inaktiver Entwurf gespeichert: {file_path.name}. "
+            "Manuelle Prüfung und Integration erforderlich; automatische Ausführung "
+            "ist ohne isolierte Sandbox deaktiviert."
+        ),
     }
 
 
 def delete_skill(skill_name: str) -> dict:
-    """Entfernt ein per create_skill erzeugtes Tool wieder (Datei + Registry)."""
-    file_path = SKILLS_DIR / f"{skill_name}.py"
-    if not file_path.exists():
+    """Remove a draft or legacy generated file, without executing its contents."""
+    if not re.fullmatch(r"[a-z][a-z0-9_]{2,39}", skill_name):
+        return {"ok": False, "message": "Ungültiger Skill-Name."}
+    paths = [SKILLS_DIR / f"{skill_name}.py.pending", SKILLS_DIR / f"{skill_name}.py"]
+    found = False
+    for path in paths:
+        if path.exists() or path.is_symlink():
+            path.unlink()
+            found = True
+    if not found:
         return {"ok": False, "message": f"'{skill_name}' ist kein dynamisch erstelltes Skill."}
-    old_content = file_path.read_text(encoding="utf-8")
-    file_path.unlink()
     T.REGISTRY.pop(skill_name, None)
-    commit = _git_commit(f"skill entfernt: {skill_name}")
-    from domains.self_modify import _log_change
-    _log_change("skill_delete", f"domains/dynamic_skills/{skill_name}.py",
-               f"Skill '{skill_name}' entfernt", old_content, "", commit)
     return {"ok": True, "message": f"Skill '{skill_name}' entfernt."}
 
 
 def list_dynamic_skills() -> list[str]:
-    return sorted(p.stem for p in SKILLS_DIR.glob("*.py") if p.stem != "__init__")
+    """List inactive drafts and legacy files; presence does not mean activation."""
+    names = {p.stem for p in SKILLS_DIR.glob("*.py") if p.stem != "__init__"}
+    names.update(p.name.removesuffix(".py.pending") for p in SKILLS_DIR.glob("*.py.pending"))
+    return sorted(names)
 
 
 def load_all_on_startup() -> int:
-    """Lädt alle bereits existierenden dynamischen Skills beim Start (Persistenz über Neustarts)."""
-    count = 0
-    for name in list_dynamic_skills():
-        try:
-            importlib.import_module(f"domains.dynamic_skills.{name}")
-            count += 1
-        except Exception as e:
-            log.error(f"Dynamisches Skill '{name}' konnte nicht geladen werden: {e}")
-    if count:
-        log.info(f"🛠️  {count} dynamisch erstellte Skill(s) geladen")
-    return count
+    """Fail closed: never import generated Python, including legacy artifacts."""
+    names = list_dynamic_skills()
+    if names:
+        log.warning(
+            "%d dynamische Skill-Dateien bleiben inaktiv: isolierte Sandbox fehlt; "
+            "manuelle Prüfung und Integration erforderlich.", len(names)
+        )
+    return 0

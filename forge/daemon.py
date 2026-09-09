@@ -54,6 +54,11 @@ def _park(task_id: int, current: str, reason: str) -> None:
     park()-Aufruf darf nicht spurlos bleiben, sonst hält ein Task, den nichts
     mehr bewegen kann, die Queue fest, ohne dass irgendwo sichtbar wird warum."""
     journal.log(task_id, "stage_failed", reason)
+    if queue.zaehle_fehlschlag(task_id, current=current):
+        # Schwelle bereits erreicht — queue.zaehle_fehlschlag hat den Task
+        # automatisch geparkt. Ein zweiter park()-Aufruf mit dem spezifischeren
+        # Grund würde nur noch am inzwischen falschen Ausgangszustand scheitern.
+        return
     if not queue.park(task_id, current=current, reason=reason):
         journal.log(task_id, "stage_failed",
                      f"park() hat Task {task_id} nicht angenommen (Zustand '{current}')")
@@ -77,6 +82,9 @@ def _gate_und_abschliessen(task_id: int, baum: Path) -> str:
             _park(task_id, m.GATING,
                   f"Zustandswechsel {m.GATING} -> {m.AWAITING_RESTART} schlug fehl (Task {task_id})")
             return "geparkt"
+        # Grünes Gate ist der Abschluss der Kette — der Fehlschlag-Zähler
+        # beginnt neu (siehe forge/queue.py: versuche_zuruecksetzen).
+        queue.versuche_zuruecksetzen(task_id)
         return "fertig"
 
     gruende = "; ".join(ergebnis.gruende)
@@ -134,6 +142,12 @@ def tick() -> str:
         return ergebnis
     except Exception as exc:
         journal.log(task_id, "stage_failed", f"Tick-Absturz bei Task {task_id}: {exc}")
+        try:
+            # Buchführung für den Fehlschlag-Zähler — best effort, darf den
+            # eigentlichen Park-Versuch gleich danach nicht verhindern.
+            queue.zaehle_fehlschlag(task_id, current=state)
+        except Exception:
+            log.exception(f"Forge: Fehlschlag-Zählung für Task {task_id} selbst gescheitert")
         try:
             geparkt = queue.park(task_id, current=state, reason=f"Tick-Absturz: {exc}")
             if not geparkt:

@@ -116,6 +116,11 @@ class TestGateAnschluss:
         monkeypatch.setattr(d.queue, "claim_next", lambda: _task(task_id, ausgangszustand))
         monkeypatch.setattr(d.worktree, "create", lambda tid, **kw: tmp_path)
         monkeypatch.setattr(d.pipeline, "eine_stufe", lambda task, baum: "fertig")
+        # DB gestubbt: forge/daemon.py ruft bei Erfolg/Fehlschlag jetzt die
+        # echten queue.py-Funktionen zaehle_fehlschlag/versuche_zuruecksetzen
+        # auf — ungestubbt würden die gegen die echte Postgres-Verbindung laufen.
+        monkeypatch.setattr(d.queue, "zaehle_fehlschlag", lambda tid, current: False)
+        monkeypatch.setattr(d.queue, "versuche_zuruecksetzen", lambda tid: None)
 
     def test_gruenes_gate_geht_in_awaiting_restart(self, monkeypatch, frei, tmp_path):
         self._vorbereitet(monkeypatch, tmp_path)
@@ -243,6 +248,9 @@ class TestTickUeberlebtAbsturz:
 
         monkeypatch.setattr(d.worktree, "create", _explodiert)
         monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
+        # DB gestubbt: tick()s Absturzpfad ruft jetzt zaehle_fehlschlag zur
+        # Buchführung auf, bevor der eigentliche park()-Aufruf erfolgt.
+        monkeypatch.setattr(d.queue, "zaehle_fehlschlag", lambda tid, current: False)
 
         geparkt = {}
         monkeypatch.setattr(d.queue, "park",
@@ -294,6 +302,7 @@ class TestTickUeberlebtAbsturz:
         # C2: tick() parkt jetzt real (echtes Modul, kein Stub für tick selbst) —
         # ohne diesen Stub würde queue.park() gegen die echte (nicht verbundene) DB laufen.
         monkeypatch.setattr(d.queue, "park", lambda *a, **kw: True)
+        monkeypatch.setattr(d.queue, "zaehle_fehlschlag", lambda tid, current: False)
 
         def _worktree_explodiert(tid, **kw):
             raise RuntimeError("Worktree-Erstellung abgestürzt")

@@ -1,7 +1,7 @@
 """Tests für den Sicherheits-Validator der Skill-Factory (core/skill_factory.py).
 
-validate_source ist die Sandbox für von Mantis SELBST generierten Code — sie muss
-gefährliche Imports/Namen zuverlässig ablehnen. Bisher komplett ungetestet.
+validate_source ist ein Linter, keine Sandbox. Diese Tests prüfen einzelne
+Strukturregeln; die Ausführungsgrenze testen die Factory-Isolationstests.
 """
 
 import os

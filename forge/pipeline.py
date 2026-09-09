@@ -366,6 +366,13 @@ def _ist_gueltiger_relativer_pfad(pfad: str) -> bool:
 
 def _park(task_id: int, state: str, grund: str) -> None:
     journal.log(task_id, "stage_failed", grund)
+    if queue.zaehle_fehlschlag(task_id, current=state):
+        # Die Schwelle war bereits erreicht (siehe forge/queue.py) — der Task
+        # ist jetzt automatisch geparkt. Der oben schon journalte, spezifische
+        # Grund bleibt sichtbar; ein zweiter park()-Aufruf hier würde nur noch
+        # an dem inzwischen falschen Ausgangszustand scheitern (CAS) und einen
+        # irreführenden 'nicht angenommen'-Eintrag erzeugen.
+        return
     # Wie forge.daemon.tick(): ein verworfener park()-Aufruf darf nicht
     # spurlos bleiben, sonst hält ein Task, den weder set_state noch park
     # bewegen konnten, die Queue fest, ohne dass irgendwo sichtbar wird warum.
@@ -526,6 +533,11 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
         _park(task_id, state,
               f"Zustandswechsel {state} -> {ziel} schlug fehl (Task {task_id})")
         return "geparkt"
+    # Die Stufe hat sauber abgeschlossen — der Fehlschlag-Zähler beginnt neu
+    # (forge/queue.py: zaehle_fehlschlag/versuche_zuruecksetzen). Sonst würde
+    # ein länger zurückliegender Fehlschlag einen inzwischen gesunden Task
+    # weiter Richtung Park-Schwelle mitzählen.
+    queue.versuche_zuruecksetzen(task_id)
     if ist_fix:
         # Kritischer Fund 1: das Vor-Fix-Urteil (und der Diff, den es beurteilt
         # hat) sind jetzt veraltet — ohne diesen Schnitt läse die nächste

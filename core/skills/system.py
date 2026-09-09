@@ -48,16 +48,13 @@ async def _write_own_code(path: str, content: str, description: str):
     return f"❌ {result['message']}"
 
 @T.register("create_skill",
-    "Erstellt UND AKTIVIERT SOFORT ein komplett neues Tool für dich selbst, wenn für eine "
-    "Anfrage kein passendes Tool existiert. NUTZE DIES bevor du sagst 'das kann ich nicht' "
-    "oder 'dafür habe ich keine Funktion' – baue dir die Fähigkeit stattdessen selbst. "
-    "Schreibe EINE einzige 'async def <skill_name>(...)'-Funktion, dekoriert mit "
-    "@T.register(name, beschreibung, parameter_schema, required, kategorie) – exakt im "
-    "selben Stil wie die anderen Tools in core/skills.py. Erlaubte Imports: asyncio, json, "
-    "re, math, statistics, datetime, time, uuid, httpx, config, core.* (z.B. core.db), "
-    "domains.* (bestehende Domain-Funktionen wiederverwenden!), llm.*, memory.*, tools.*. "
-    "KEIN os/subprocess/socket/eval/exec/open – wird automatisch geprüft und sonst abgelehnt. "
-    "Die Funktion muss einen String zurückgeben (wie alle anderen Tools).",
+    "Speichert einen INAKTIVEN Python-Skill-Entwurf zur manuellen Prüfung, wenn ein Tool fehlt. "
+    "Der Entwurf wird NICHT ausgeführt oder aktiviert, auch nicht nach einem Neustart. "
+    "Automatische Ausführung ist ohne isolierte Sandbox deaktiviert. "
+    "Schreibe eine async def <skill_name>(...)-Funktion mit "
+    "@T.register(name, beschreibung, parameter_schema, required, kategorie). "
+    "Statische Prüfungen sind nur Lint und keine Sicherheitsfreigabe. "
+    "Die Funktion soll einen String zurückgeben.",
     {
         "skill_name": {"type": "string", "description": "snake_case Tool-Name, z.B. 'convert_currency'"},
         "description": {"type": "string", "description": "Kurze Beschreibung wofür das Skill gut ist"},
@@ -70,13 +67,13 @@ async def _create_skill(skill_name: str, description: str, source_code: str):
     if result["ok"]:
         if CTX.channel:
             try:
-                await CTX.channel.send(f"🛠️ Neues Skill erstellt: **{skill_name}**\n_{description}_")
+                await CTX.channel.send(f"🛠️ Inaktiver Skill-Entwurf gespeichert: **{skill_name}**\n_{description}_")
             except Exception:
                 pass
         try:
             from core import push
             import asyncio as _asyncio
-            await _asyncio.to_thread(push.send_push, "🛠️ Neues Skill", f"{skill_name}: {description}", "/?view=settings")
+            await _asyncio.to_thread(push.send_push, "🛠️ Skill-Entwurf (inaktiv)", f"{skill_name}: {description}", "/?view=settings")
         except Exception:
             pass
     return f"✅ {result['message']}" if result["ok"] else f"❌ {result['message']}"
@@ -92,12 +89,12 @@ async def _delete_skill(skill_name: str):
     return f"✅ {result['message']}" if result["ok"] else f"❌ {result['message']}"
 
 @T.register("list_dynamic_skills",
-    "Listet alle Skills auf, die du dir selbst zur Laufzeit erstellt hast.",
+    "Listet gespeicherte Skill-Entwürfe und alte Skill-Dateien; diese werden nicht automatisch aktiviert.",
     {}, [], "system")
 async def _list_dynamic_skills():
     from core.skill_factory import list_dynamic_skills
     names = list_dynamic_skills()
-    return "\n".join(names) if names else "Noch keine selbst erstellten Skills."
+    return "Inaktive Skill-Dateien (manuelle Prüfung erforderlich):\n" + "\n".join(names) if names else "Noch keine selbst erstellten Skills."
 
 @T.register("api_costs",
     "Zeigt Token-Verbrauch und API-Kosten deiner LLM-Calls (Claude API kostet Geld, "

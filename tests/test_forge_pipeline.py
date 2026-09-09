@@ -18,7 +18,7 @@ from forge.runner import RunResult
 def stubs(monkeypatch):
     """Sammelt alle Seiteneffekte, statt sie auszuführen."""
     aufz = {"states": [], "parks": [], "journal": [], "artefakte": [], "profile": [], "fixrunden": 0,
-            "gitctl": []}
+            "gitctl": [], "fehlschlaege": [], "zuruecksetzungen": []}
 
     monkeypatch.setattr(pl.queue, "set_state",
                         lambda tid, target, current: aufz["states"].append((tid, target)) or True)
@@ -28,6 +28,14 @@ def stubs(monkeypatch):
                         lambda tid, feld, pfad: aufz["artefakte"].append((feld, pfad)))
     monkeypatch.setattr(pl.journal, "log",
                         lambda *a, **kw: aufz["journal"].append((a, kw)))
+    # DB gestubbt (siehe Moduldocstring): ohne diese beiden Stubs riefe
+    # forge/pipeline.py bei jedem Erfolg/Fehlschlag die ECHTEN queue.py-
+    # Funktionen auf, die wiederum die reale Postgres-Verbindung öffnen —
+    # nicht bloß crashen, sondern echte forge_tasks-Zeilen mutieren.
+    monkeypatch.setattr(pl.queue, "zaehle_fehlschlag",
+                        lambda tid, current: aufz["fehlschlaege"].append((tid, current)) or False)
+    monkeypatch.setattr(pl.queue, "versuche_zuruecksetzen",
+                        lambda tid: aufz["zuruecksetzungen"].append(tid))
 
     def _fixrunde(tid):
         aufz["fixrunden"] += 1

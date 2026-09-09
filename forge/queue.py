@@ -13,11 +13,22 @@ from forge import models as m
 
 log = logging.getLogger(__name__)
 
-# Ab diesem Versuchszähler wird ein Task automatisch geparkt, egal was als
+# Ab diesem Fehlschlag-Zähler wird ein Task automatisch geparkt, egal was als
 # Nächstes passiert — muss mit forge.daemon.MAX_CONSECUTIVE_FAILURES
 # übereinstimmen. Sonst hält ein Task, der bei jedem Versuch abstürzt (und
 # dessen park()-Aufruf selbst aus irgendeinem Grund nicht durchkommt), die
 # Spitze der Queue für immer, auch wenn der Daemon selbst längst bremst.
+#
+# WICHTIG: `attempts` zählt seit Plan 2 KONSEKUTIVE FEHLSCHLÄGE, nicht mehr
+# Claims. Plan 1 kannte nur einen Tick pro Task (ein Tick = die ganze
+# Aufgabe) — dort war "viermal geclaimt, nie fertig" gleichbedeutend mit
+# "vergiftet". Plan 2s Pipeline (forge/pipeline.py) bringt einen Task pro
+# Tick genau eine Stufe weiter; ein gesunder Task braucht mindestens fünf
+# Ticks (spec, plan, implement, review, gate) und würde die alte, an
+# claim_next() hängende Zählung allein durch normalen Fortschritt reißen —
+# belegt durch den Akzeptanzlauf vom 2026-08-15 (Task 5: drei erfolgreiche
+# Stufen, dann automatisch geparkt mit "4 Versuche ohne Erfolg"). Siehe
+# `zaehle_fehlschlag` und `versuche_zuruecksetzen`.
 AUTO_PARK_AFTER_ATTEMPTS = 3
 
 
@@ -49,12 +60,18 @@ def claim_next() -> dict | None:
     """Der Task, an dem als Nächstes gearbeitet wird.
 
     Zuerst ein bereits laufender (Wiederaufsetzen nach Absturz), sonst der
-    oberste aus der Queue — der wird dabei auf die erste Stufe gesetzt. Jeder
-    zurückgegebene Task zählt als ein Versuch (siehe `_versuch_zaehlen`).
+    oberste aus der Queue — der wird dabei auf die erste Stufe gesetzt.
+
+    Rührt den Fehlschlag-Zähler (`attempts`) NICHT an: ein Claim allein ist
+    kein Fehlschlag, sonst würde eine gesunde, mehrstufige Pipeline sich
+    selbst Richtung Auto-Park zählen, nur weil sie mehrfach geclaimt wird
+    (siehe AUTO_PARK_AFTER_ATTEMPTS). Wer einen Fehlschlag zählen will, ruft
+    `zaehle_fehlschlag` auf; ein erfolgreicher Stufen-Abschluss ruft
+    `versuche_zuruecksetzen`.
     """
     laufend = active()
     if laufend is not None:
-        return _versuch_zaehlen(laufend)
+        return laufend
 
     rows = db.query(
         "SELECT * FROM forge_tasks "
@@ -69,26 +86,42 @@ def claim_next() -> dict | None:
     if not set_state(task["id"], m.SPECCING, current=m.QUEUED):
         return None
     task["state"] = m.SPECCING
-    return _versuch_zaehlen(task)
-
-
-def _versuch_zaehlen(task: dict) -> dict | None:
-    """Zählt einen Bearbeitungsversuch am Task. Übersteigt er die Schwelle,
-    wird der Task automatisch geparkt und None zurückgegeben, statt an den
-    Aufrufer weiterzureichen — sonst könnte ein Task, der bei jedem Anlauf
-    abstürzt, ohne dass tick() selbst zum Parken kommt, die Queue für immer
-    blockieren."""
-    versuche = (task.get("attempts") or 0) + 1
-    if versuche > AUTO_PARK_AFTER_ATTEMPTS:
-        park(task["id"], current=task["state"],
-             reason=f"Automatisch geparkt: {versuche} Versuche ohne Erfolg")
-        return None
-    db.execute(
-        "UPDATE forge_tasks SET attempts=%s, updated_at=NOW() WHERE id=%s",
-        (versuche, task["id"]),
-    )
-    task["attempts"] = versuche
     return task
+
+
+def zaehle_fehlschlag(task_id: int, current: str) -> bool:
+    """Zählt einen gescheiterten Bearbeitungsversuch am Task. Übersteigt der
+    Zähler die Schwelle, wird der Task automatisch geparkt (Rückgabe True) —
+    sonst nur hochgezählt (Rückgabe False).
+
+    Ersetzt den früheren, an claim_next() hängenden Zähler: jetzt zählt nur
+    ein tatsächlicher Fehlschlag, nicht jede Beanspruchung. In der Praxis
+    parkt fast jeder Fehlschlag den Task ohnehin schon direkt mit einem
+    spezifischeren Grund (siehe forge/pipeline.py und forge/daemon.py,
+    Funktion `_park`); diese Funktion ist das Sicherheitsnetz für den Fall,
+    dass genau dieser gezielte park()-Aufruf selbst wiederholt scheitert
+    (CAS verloren) — ohne sie könnte ein solcher Task die Spitze der Queue
+    für immer blockieren.
+    """
+    zeile = db.query_one(
+        "UPDATE forge_tasks SET attempts=attempts+1, updated_at=NOW() WHERE id=%s RETURNING attempts",
+        (task_id,),
+    )
+    versuche = int(zeile["attempts"]) if zeile else 0
+    if versuche > AUTO_PARK_AFTER_ATTEMPTS:
+        park(task_id, current=current,
+             reason=f"Automatisch geparkt: {versuche} Fehlschläge in Folge")
+        return True
+    return False
+
+
+def versuche_zuruecksetzen(task_id: int) -> None:
+    """Setzt den Fehlschlag-Zähler zurück, nachdem eine Stufe sauber
+    abgeschlossen hat. Das macht `attempts` zu einem 'hängt fest'-Detektor
+    statt einem 'dauert lange'-Detektor: ein einzelner alter Fehlschlag darf
+    einen inzwischen gesunden Task nicht weiter Richtung Park-Schwelle
+    mitzählen, nur weil zwischendurch nie wieder auf 0 zurückgesetzt wurde."""
+    db.execute("UPDATE forge_tasks SET attempts=0, updated_at=NOW() WHERE id=%s", (task_id,))
 
 
 def set_state(task_id: int, target: str, current: str) -> bool:
