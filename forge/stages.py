@@ -138,15 +138,14 @@ def _review_prompt(task: dict, kontext: dict) -> str:
     return (
         _kopf(task) + "\n\n"
         f"Die Spec liegt unter: {kontext.get('spec_path', '(unbekannt)')}\n"
-        f"Der Diff dieses Branches gegen die Spec liegt unter: {DIFF_DATEI}. Das "
-        "ist deine einzige verlässliche Sicht auf die Änderung — lies diese "
-        "Datei, statt einen eigenen Diff zu erzeugen. Du hast den "
+        "Der Diff dieses Branches steht weiter unten in diesem Prompt — er ist "
+        "deine einzige verlässliche Sicht auf die Änderung. Erzeuge keinen "
+        "eigenen Diff und suche keine Datei danach ab. Du hast den "
         "Entstehungsverlauf NICHT gesehen und sollst ihm auch nicht vertrauen.\n"
-        f"Schreibe dein Urteil als JSON nach {VERDIKT_DATEI}:\n"
-        '{"verdict": "pass" oder "fail", "findings": [{"severity": "critical|important|minor", '
-        '"file": "...", "what": "..."}]}\n'
-        "verdict ist 'fail', sobald mindestens ein Befund critical oder important ist.\n"
-        "Ändere ausschließlich diese eine Datei."
+        "Gib dein Urteil als JSON auf der Standardausgabe aus. Schreibe keine "
+        f"Datei — {VERDIKT_DATEI} legt der Runner aus deiner Antwort an.\n"
+        "Das exakte Schema hängt der Runner unten an den Prompt an; halte dich "
+        "wörtlich daran."
     )
 
 

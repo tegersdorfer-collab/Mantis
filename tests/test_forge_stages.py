@@ -150,16 +150,28 @@ class TestPrompts:
         text = s.fuer_state(m.SPECCING).baue_prompt(self._task(), kontext={})
         assert "Annahme" in text
 
-    def test_review_prompt_verlangt_das_verdikt_als_datei(self):
+    def test_review_prompt_verlangt_das_verdikt_auf_stdout(self):
+        # I7 (Abschluss-Review): der Prompt wies den Reviewer an, das Verdikt
+        # selbst nach .forge/review.json zu schreiben — das kann er nicht, und
+        # forge/runner_agy.py hängt zusätzlich eine widersprechende Anweisung
+        # an. Der Prompt muss dasselbe sagen wie der Runner: Urteil auf stdout,
+        # die Datei legt der Runner an.
         text = s.fuer_state(m.REVIEWING).baue_prompt(self._task(), kontext={})
-        assert ".forge/review.json" in text
+        assert "Standardausgabe" in text
+        assert "Schreibe keine Datei" in text
+        # Der Dateiname darf vorkommen (als Erklärung, wer sie anlegt), aber
+        # niemals als Auftrag an das Modell.
+        assert "Runner" in text
 
-    def test_review_prompt_verweist_auf_die_diff_datei(self):
-        # review hat kein Bash und kann sich also keinen eigenen Diff erzeugen
-        # (kein `git diff`) — der Prompt muss stattdessen auf die Datei
-        # verweisen, die die Pipeline (Task 6) vorher schreibt.
+    def test_review_prompt_schickt_das_modell_nicht_zur_diff_datei(self):
+        # Der Diff wird vom Runner in den Prompt eingebettet
+        # (forge/runner_agy.run). Ein Prompt, der das Modell stattdessen zu
+        # einer Datei schickt, verlangt einen Lesezugriff, auf den sich die
+        # Stufe nicht verlassen kann — und widerspricht dem, was der Runner
+        # anhängt.
         text = s.fuer_state(m.REVIEWING).baue_prompt(self._task(), kontext={})
-        assert s.DIFF_DATEI in text
+        assert s.DIFF_DATEI not in text
+        assert "weiter unten in diesem Prompt" in text
 
     def test_kein_prompt_interpoliert_rohe_taskfelder_direkt(self):
         # Ein manipulierter Titel darf nirgends unzensiert im Prompt landen —
