@@ -117,9 +117,25 @@ Neu:
   --format json < /dev/null` mit einer je Lauf geschriebenen temporären Config
   über `OPENCODE_CONFIG`. Parst die JSON-Events zu `RunResult`, inklusive
   Token-Zählung für das Budget.
-- `forge/runner_agy.py` — ruft `agy -p <prompt> --model <modell>`. **Ohne
-  Werkzeuge**: der Reviewer bekommt den Diff im Prompt. `agy`s Rechtemodell ist
-  ungemessen; solange das so ist, bekommt es keinen Dateizugriff.
+- `forge/runner_agy.py` — ruft `agy -p <prompt> --model <modell> --print-timeout`
+  mit `cwd` auf den Worktree. Der Reviewer **braucht** keine Werkzeuge: er
+  bekommt den Diff im Prompt und gibt sein Urteil auf stdout zurück.
+
+  **Korrektur vom 2026-09-09, nach der Umsetzung:** Die erste Fassung dieses
+  Abschnitts behauptete, der Reviewer laufe „ohne Werkzeuge" und bekomme
+  „keinen Dateizugriff". Das ist **nicht erzwingbar** — `agy` hat keine Flagge,
+  die Werkzeuge abschaltet (`--sandbox` und
+  `--dangerously-skip-permissions` regeln etwas anderes), und sein Rechtemodell
+  ist nach wie vor ungemessen. Tatsächlich läuft der Reviewer mit vollem,
+  ungemessenem Werkzeugzugriff **innerhalb des Task-Worktrees**, seit
+  `cwd=<worktree>` gesetzt ist (davor lief er im Arbeitsverzeichnis des
+  Daemons, also im echten Haupt-Checkout — schlimmer).
+
+  Die Eingrenzung ist damit der Worktree, nicht das Rechtemodell. Konkrete
+  Folge: Dateien, die der Reviewer schreibt, sammelt der Commit-Pfad der
+  nächsten Fix-Stufe mit ein. Eine Aufnahme von `agy`s Rechteverhalten nach
+  dem Muster von `permission_probe_opencode.md` ist Vorbedingung dafür, hier
+  wieder eine Schranke zu behaupten.
 
 **Daraus folgt eine Änderung an der Review-Stufe.** Heute weist `_review_prompt`
 den Agenten an, sein Urteil selbst nach `.forge/review.json` zu schreiben, und
@@ -316,6 +332,35 @@ kann bei einem opencode-Update ungültig werden. Deshalb:
 
 Ein erneuter Lauf der Rechte-Aufnahme gehört vor jedes opencode-Update, das in
 den Nachtbetrieb geht. Das ist eine Betriebsregel, kein Test.
+
+## Offene Vorbedingungen für Plan 2
+
+Aus der Umsetzung von Plan 1 (Abschluss-Review am 2026-09-09). Alle drei müssen
+stehen, **bevor** zum ersten Mal etwas unbeaufsichtigt über Nacht läuft.
+
+1. **Erlaubnisliste ins Gate.** `forge/gate.py` hat heute nur die Verbotsliste
+   `SPERRZONEN` mit sechs Präfixen. Die in „Getroffene Entscheidungen"
+   beschlossenen erlaubten Pfade (`tests/`, `docs/`, `scripts/`, `tools/`,
+   `core/skills/`) existieren nirgends als Prüfung. Solange das so ist, können
+   die Stufen mit `edit: allow` Dateien ausserhalb der gedachten Zonen ändern —
+   die Begründung, mit der `edit: allow` akzeptiert wurde, trägt erst mit
+   dieser Liste.
+
+2. **Fehlgeschlagenes `git status` darf nicht als „nichts zu tun" durchgehen.**
+   `_stufenarbeit_pfade` in `forge/pipeline.py` gibt bei nicht-null returncode
+   eine leere Liste zurück; `_committe_stufenarbeit` liest das als Erfolg und
+   lässt die Stufe mit uncommitteter Arbeit weiterrücken. `_schreibe_diff`
+   behandelt denselben Fehlerfall zwei Funktionen weiter richtig, nämlich mit
+   Parken.
+
+3. **Gestagter Rename bricht `git add` ab.** Steht nach einem fehlgeschlagenen
+   Commit ein Rename im Index, matcht der Quellpfad auf nichts mehr, und ein
+   einziger schlechter Pathspec bricht das gesamte `git add` ab (returncode
+   128). Der Task hängt dann dauerhaft und braucht ein manuelles `git reset`.
+   Behebung: bei Status `R`/`C` den Quellpfad weglassen.
+
+Dazu die Aufnahme von `agy`s Rechteverhalten (siehe oben), falls die
+Review-Stufe je wieder als eingegrenzt gelten soll.
 
 ## Bewusst nicht enthalten
 
