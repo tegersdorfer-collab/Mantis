@@ -11,6 +11,13 @@ from forge.runner_opencode import baue_config, parse_events
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
+# Ein vollständig durchgelaufener opencode-Lauf endet mit einem step_finish,
+# dessen reason "stop" ist — belegt in fixtures/opencode_stream_success.jsonl.
+# Tests, die den Aufruf selbst prüfen (nicht den Abbruchfall), brauchen diesen
+# Abschluss, sonst wertet parse_events den Strom zu Recht als abgeschnitten.
+_ABSCHLUSS = ('{"type":"text","part":{"text":"ok"}}\n'
+              '{"type":"step_finish","part":{"reason":"stop"}}')
+
 
 class TestConfig:
     def test_agent_und_modell_stehen_drin(self):
@@ -125,6 +132,18 @@ class TestAufruf:
         assert "OPENCODE_CONFIG" in auf["kwargs"]["env"]
         assert inhalt["agent"]["plan"]["model"] == "nvidia/moonshotai/kimi-k3"
         assert inhalt["agent"]["plan"]["permission"]["bash"] == "deny"
+
+    def test_projekt_configs_sind_abgeschaltet(self, monkeypatch, tmp_path):
+        """C2 (Abschluss-Review): opencode sucht Projekt-Configs von --dir
+        aufwärts, und die schlagen OPENCODE_CONFIG. Eine Stufe mit
+        `edit: allow` könnte sich damit ein <worktree>/opencode.json mit
+        `bash: allow` schreiben und ihre eigene Einhegung aufheben — laut
+        Probe (d) ist eine Shell der vollständige Ausbruch."""
+        auf = {}
+        monkeypatch.setattr(ro, "OPENCODE_BIN", "/usr/local/bin/opencode")
+        monkeypatch.setattr(subprocess, "run", self._fake_run(auf, _ABSCHLUSS))
+        ro.run("x", cwd=tmp_path, timeout=60, agent="implement", model="m")
+        assert auf["kwargs"]["env"][ro.PROJEKT_CONFIG_AUS] == "1"
 
     def test_temporaere_config_wird_hinterher_entfernt(self, monkeypatch, tmp_path):
         pfade = {}

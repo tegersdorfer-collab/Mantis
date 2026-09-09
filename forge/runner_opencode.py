@@ -3,12 +3,33 @@
 Ein Lauf pro Stufe, frischer Kontext, Übergabe über Dateien im Worktree —
 dieselbe Bauart wie forge/runner.py, nur mit anderer CLI.
 
-Die Rechte kommen ausschliesslich aus forge/backends.OpencodePermission und
-werden je Lauf in eine temporäre Config geschrieben, die über die
-Umgebungsvariable OPENCODE_CONFIG gesetzt wird. Die globale Config des
-Benutzers (~/.config/opencode/opencode.json) wird damit NICHT verwendet — ein
-unbeaufsichtigter Lauf darf nicht davon abhängen, was Timo dort gerade
-eingestellt hat.
+Die Rechte kommen aus forge/backends.OpencodePermission und werden je Lauf in
+eine temporäre Config geschrieben, die über die Umgebungsvariable
+OPENCODE_CONFIG gesetzt wird.
+
+Wie opencode 1.18.20 Configs tatsächlich schichtet (C2, Abschluss-Review
+2026-09-09 — die frühere Behauptung "die globale Config wird damit NICHT
+verwendet" war in beiden Hälften falsch):
+
+    globale Config (~/.config/opencode/opencode.json)
+      → OPENCODE_CONFIG (unsere Lauf-Config)
+      → Projekt-Configs, von --dir aufwärts gesucht  ← gewinnen
+      → OPENCODE_CONFIG_CONTENT
+
+Zwei Folgen:
+
+1. Die globale Config des Benutzers wird sehr wohl gemergt. Unsere Lauf-Config
+   überschreibt sie in allem, was sie selbst setzt (Modell, Agent, Rechte),
+   aber die Modell-Deklarationen (limit, tool_call) der NVIDIA-Modelle stehen
+   heute NUR dort. Ein Lauf hängt insoweit weiterhin an Timos globaler Config.
+2. Projekt-Configs schlagen unsere. Eine implement-Stufe hat `edit: allow` in
+   ihrem Worktree und könnte dort ein `opencode.json` mit
+   {"agent":{"implement":{"permission":{"bash":"allow"}}}} anlegen — der
+   nächste Lauf im selben Worktree hätte damit eine Shell, und Probe (d) in
+   tests/fixtures/permission_probe_opencode.md zeigt, dass eine Shell der
+   vollständige Ausbruch bis ~/.config/ai-keys.env ist. Der confined Agent
+   könnte also seine eigene Einhegung aufheben. Dagegen setzt run()
+   OPENCODE_DISABLE_PROJECT_CONFIG=1 in die Laufumgebung.
 """
 import json
 import logging
@@ -29,6 +50,11 @@ log = logging.getLogger(__name__)
 # und ein fehlendes Binary soll als klare Meldung auftauchen, nicht als
 # generischer OSError aus subprocess.
 OPENCODE_BIN = shutil.which("opencode")
+
+# Schaltet die Projekt-Config-Suche ab, die sonst unsere Lauf-Config schlagen
+# würde (siehe Modul-Docstring). Im Binary von opencode 1.18.20 nachgewiesen —
+# keine erfundene Variable.
+PROJEKT_CONFIG_AUS = "OPENCODE_DISABLE_PROJECT_CONFIG"
 
 # Welche Provider in der Lauf-Config stehen. Die Schlüssel selbst stehen nie
 # in der Datei, nur der Verweis auf die Umgebungsvariable — die Config landet
@@ -146,6 +172,10 @@ def run(prompt: str, cwd: Path, timeout: int, agent: str, model: str) -> RunResu
 
         umgebung = dict(os.environ)
         umgebung["OPENCODE_CONFIG"] = datei.name
+        # C2: ohne das schlägt ein <worktree>/opencode.json unsere Lauf-Config
+        # (siehe Modul-Docstring) — eine Stufe mit `edit: allow` könnte sich
+        # damit selbst `bash: allow` erteilen und wäre nicht mehr eingehegt.
+        umgebung[PROJEKT_CONFIG_AUS] = "1"
 
         try:
             ergebnis = subprocess.run(
