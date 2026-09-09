@@ -60,9 +60,29 @@ class MantisSettings(BaseSettings):
     # Benchmark 2026-07-09: qwen3.5:9b (8.4/10 @ 7s) schlug deepseek-r1:14b sowohl
     # ohne (6.6 @ 70s) als auch MIT Thinking (7.2 @ 37s) — bei 4-5× weniger Latenz.
     BG_REASONING_MODEL: str = "qwen3.5:9b"
-    # Code-Spezialist für create_skill / Skill-Factory. Benchmark 2026-07-09:
-    # ornith:9b war der beste Coder im Feld (8.7/10) und schneller als qwen3.5.
-    BG_CODE_MODEL: str = "ornith:9b"
+    # Code-Spezialist des Background-LLM. Benchmark 2026-07-09: ornith:9b war
+    # der beste Coder im Feld (8.7/10) und schneller als qwen3.5.
+    # ACHTUNG, der frühere Kommentar "für create_skill / Skill-Factory" war
+    # falsch (geprüft am 09.09.2026 am laufenden System): create_skill bekommt
+    # `source_code` als Tool-Argument vom CHAT-Agenten (AGENT_MODEL_STRONG), und
+    # die Forge fährt über die claude-CLI. Dieses Modell greift ausschließlich
+    # dort, wo ein Background-Prompt die _CODE_KEYWORDS in llm/routed.py trifft
+    # (background_review, Konsolidierung, idle_loop) — nicht in der Skill-Factory.
+    # Ersetzt 2026-09-09 durch Ornith-1.5 (Benchmark-Lauf bench/nanbeige42,
+    # n=12 — die Unterlagen liegen nur lokal und bewusst nicht im Repo, weil
+    # die COROS-Aufgabe echte Messwerte enthaelt):
+    # gleiche Code-Trefferquote (11/12), aber halbe Latenz (Median 6.3s statt
+    # 14.3s im Code-Block). NICHT das nackte ornith-1.5:9b eintragen — dessen
+    # Modelfile bringt weder SYSTEM noch Sampling-Parameter mit, was allein
+    # 11/12 auf 8/12 drückt. Der lokale Tag ornith-1.5:9b-sys backt beides aus
+    # ornith:9b ein und ist damit ein echter Drop-in (verifiziert, 11/12).
+    # Neu bauen: siehe ORNITH-1.5.md §8 in den lokalen Unterlagen.
+    BG_CODE_MODEL: str = "ornith-1.5:9b-sys"
+    # Sampling-Temperatur für die Code-Route. Der Ollama-Pfad sendet temperature
+    # immer explizit und überschreibt damit den Wert aus dem Modelfile — ohne
+    # diese Einstellung liefe der Coder auf dem generischen 0.7-Default.
+    # Messung 09.09.2026 (Code-Aufgabe des Benchmarks): 0.6 → 8/8, 0.7 → 7/8.
+    BG_CODE_TEMPERATURE: float = 0.6
     # Vision-Modell für Foto-Analyse (Mahlzeiten)
     VISION_MODEL: str = "qwen3-vl:8b"
 
