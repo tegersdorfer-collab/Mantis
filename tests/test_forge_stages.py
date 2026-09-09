@@ -196,3 +196,33 @@ class TestPrompts:
         for stufe in s.ALLE_STUFEN:
             text = stufe.baue_prompt(self._task(), kontext={})
             assert isinstance(text, str) and text
+
+
+from forge import backends
+from forge.stages import ALLE_STUFEN, STAGES
+
+
+class TestBackendZuordnung:
+    def test_jede_stufe_hat_backend_und_modell(self):
+        for stufe in ALLE_STUFEN:
+            assert stufe.backend, f"{stufe.name} ohne Backend"
+            assert stufe.model, f"{stufe.name} ohne Modell"
+
+    def test_jedes_backend_ist_aufloesbar(self):
+        for stufe in ALLE_STUFEN:
+            assert callable(backends.hole(stufe.backend))
+
+    def test_review_laeuft_auf_agy(self):
+        review = next(s for s in STAGES if s.name == "review")
+        assert review.backend == "agy"
+        assert review.model == "claude-opus-4-6-thinking"
+
+    def test_reviewer_ist_nicht_das_implementierer_modell(self):
+        review = next(s for s in STAGES if s.name == "review")
+        implement = next(s for s in STAGES if s.name == "implement")
+        assert review.model != implement.model
+
+    def test_unbekanntes_backend_wirft(self):
+        import pytest
+        with pytest.raises(KeyError, match="unbekanntes Backend"):
+            backends.hole("gibtsnicht")

@@ -5,6 +5,7 @@ ergänzt Backends für `opencode` und `agy` und die Schranke, die deren Rechte
 festnagelt.
 """
 from dataclasses import dataclass
+from typing import Callable
 
 # Werte, die opencode für eine Rechte-Kategorie akzeptiert.
 _AKTIONEN = frozenset({"allow", "ask", "deny"})
@@ -74,3 +75,24 @@ class OpencodePermission:
             "webfetch": self.webfetch, "websearch": self.websearch,
             "external_directory": self.external_directory,
         }
+
+
+def hole(name: str) -> Callable:
+    """Die run-Funktion eines Backends.
+
+    Der Import steht bewusst in der Funktion, nicht am Modulkopf: `runner_agy`
+    importiert `forge.stages` (für DIFF_DATEI und VERDIKT_DATEI). Ein
+    Modulimport hier hiesse, dass jeder Import von `forge.backends` die
+    gesamte Stufen- und Prompt-Kette mitzieht — auch dort, wo nur die
+    Rechteschranke gebraucht wird, etwa in tests/test_forge_backends.py.
+    Heute gibt es keinen Zyklus; sobald `stages` je `backends` braucht,
+    entstünde einer, und dieser Import verhindert ihn schon jetzt.
+    """
+    from forge import runner_agy, runner_opencode
+    tabelle = {
+        "opencode": runner_opencode.run,
+        "agy": runner_agy.run,
+    }
+    if name not in tabelle:
+        raise KeyError(f"unbekanntes Backend: {name!r}")
+    return tabelle[name]

@@ -81,6 +81,11 @@ class Stage:
     baue_prompt: Callable[[dict, dict], str]
     artefakt: Callable[[dict], str | None]
     timeout: int = STANDARD_TIMEOUT_SEKUNDEN
+    # Welche CLI diese Stufe ausführt und mit welchem Modell. `profile` bleibt
+    # erhalten und gilt weiterhin für das Claude-Code-Backend; die opencode-
+    # Rechte kommen aus forge/backends.OpencodePermission.
+    backend: str = "opencode"
+    model: str = ""
 
 
 def _kopf(task: dict) -> str:
@@ -160,17 +165,21 @@ def _fix_prompt(task: dict, kontext: dict) -> str:
 STAGES: tuple[Stage, ...] = (
     Stage("spec", m.SPECCING, m.PLANNING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
-          _spec_prompt, lambda t: t.get("spec_path")),
+          _spec_prompt, lambda t: t.get("spec_path"),
+          backend="opencode", model="google/gemini-3.6-flash"),
     Stage("plan", m.PLANNING, m.IMPLEMENTING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
-          _plan_prompt, lambda t: t.get("plan_path")),
+          _plan_prompt, lambda t: t.get("plan_path"),
+          backend="opencode", model="nvidia/moonshotai/kimi-k3"),
     Stage("implement", m.IMPLEMENTING, m.REVIEWING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                             mode="dontAsk"),
-          _implement_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN),
+          _implement_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN,
+          backend="opencode", model="nvidia/minimaxai/minimax-m3"),
     Stage("review", m.REVIEWING, m.GATING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
-          _review_prompt, lambda t: VERDIKT_DATEI),
+          _review_prompt, lambda t: VERDIKT_DATEI,
+          backend="agy", model="claude-opus-4-6-thinking"),
 )
 
 # Die Fix-Stufe steht bewusst NEBEN der Kette, nicht darin: sie teilt sich den
@@ -182,6 +191,7 @@ FIX_STAGE = Stage(
     PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                       mode="dontAsk"),
     _fix_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN,
+    backend="opencode", model="nvidia/minimaxai/minimax-m3",
 )
 
 ALLE_STUFEN: tuple[Stage, ...] = STAGES + (FIX_STAGE,)
