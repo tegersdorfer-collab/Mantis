@@ -2,7 +2,11 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pathlib
+import json
+import subprocess
+from pathlib import Path
 
+from forge import runner_opencode as ro
 from forge.runner_opencode import baue_config, parse_events
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
@@ -83,3 +87,68 @@ class TestEreignisse:
         assert r.ok is True
         assert r.cache_read == 300
         assert r.cache_creation == 125
+
+
+class TestAufruf:
+    def _fake_run(self, aufzeichnung, stdout="", rc=0):
+        def _run(cmd, **kwargs):
+            aufzeichnung["cmd"] = cmd
+            aufzeichnung["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, rc, stdout, "")
+        return _run
+
+    def test_kommando_setzt_agent_dir_und_format(self, monkeypatch, tmp_path):
+        auf = {}
+        monkeypatch.setattr(ro, "OPENCODE_BIN", "/usr/local/bin/opencode")
+        monkeypatch.setattr(subprocess, "run", self._fake_run(auf, '{"type":"text","part":{"text":"ok"}}'))
+        ro.run("mach was", cwd=tmp_path, timeout=60, agent="spec", model="google/gemini-3.6-flash")
+        assert "--agent" in auf["cmd"] and "spec" in auf["cmd"]
+        assert "--format" in auf["cmd"] and "json" in auf["cmd"]
+        assert "--dir" in auf["cmd"] and str(tmp_path) in auf["cmd"]
+
+    def test_config_wird_ueber_umgebung_gesetzt_und_enthaelt_das_modell(self, monkeypatch, tmp_path):
+        """Der Lauf darf nicht von ~/.config/opencode/opencode.json abhängen."""
+        auf = {}
+        inhalt = {}
+
+        def _run(cmd, **kwargs):
+            # Während des Laufs muss die Datei existieren — danach wird sie
+            # entfernt, deshalb hier lesen und nicht hinterher.
+            inhalt.update(json.loads(Path(kwargs["env"]["OPENCODE_CONFIG"]).read_text()))
+            auf["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, 0, '{"type":"text","part":{"text":"ok"}}', "")
+
+        monkeypatch.setattr(ro, "OPENCODE_BIN", "/usr/local/bin/opencode")
+        monkeypatch.setattr(subprocess, "run", _run)
+        ro.run("x", cwd=tmp_path, timeout=60, agent="plan", model="nvidia/moonshotai/kimi-k3")
+
+        assert "OPENCODE_CONFIG" in auf["kwargs"]["env"]
+        assert inhalt["agent"]["plan"]["model"] == "nvidia/moonshotai/kimi-k3"
+        assert inhalt["agent"]["plan"]["permission"]["bash"] == "deny"
+
+    def test_temporaere_config_wird_hinterher_entfernt(self, monkeypatch, tmp_path):
+        pfade = {}
+
+        def _run(cmd, **kwargs):
+            pfade["config"] = kwargs["env"]["OPENCODE_CONFIG"]
+            return subprocess.CompletedProcess(cmd, 0, '{"type":"text","part":{"text":"ok"}}', "")
+
+        monkeypatch.setattr(ro, "OPENCODE_BIN", "/usr/local/bin/opencode")
+        monkeypatch.setattr(subprocess, "run", _run)
+        ro.run("x", cwd=tmp_path, timeout=60, agent="spec", model="m")
+        assert not Path(pfade["config"]).exists()
+
+    def test_fehlendes_binary_ist_kein_absturz(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(ro, "OPENCODE_BIN", None)
+        r = ro.run("x", cwd=tmp_path, timeout=60, agent="spec", model="m")
+        assert r.ok is False
+        assert "opencode" in (r.error or "")
+
+    def test_zeitueberschreitung_wird_als_fehler_gemeldet(self, monkeypatch, tmp_path):
+        def _timeout(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 60)
+        monkeypatch.setattr(ro, "OPENCODE_BIN", "/usr/local/bin/opencode")
+        monkeypatch.setattr(subprocess, "run", _timeout)
+        r = ro.run("x", cwd=tmp_path, timeout=60, agent="spec", model="m")
+        assert r.ok is False
+        assert "Zeitüberschreitung" in (r.error or "")

@@ -12,12 +12,23 @@ eingestellt hat.
 """
 import json
 import logging
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Iterable
 
 from forge.backends import OpencodePermission
 from forge.runner import RunResult
 
 log = logging.getLogger(__name__)
+
+# Einmal beim Import aufgelöst, nicht je Lauf — dieselbe Begründung wie
+# CLAUDE_BIN in forge/runner.py: ein launchd-Agent hat einen minimalen PATH,
+# und ein fehlendes Binary soll als klare Meldung auftauchen, nicht als
+# generischer OSError aus subprocess.
+OPENCODE_BIN = shutil.which("opencode")
 
 # Welche Provider in der Lauf-Config stehen. Die Schlüssel selbst stehen nie
 # in der Datei, nur der Verweis auf die Umgebungsvariable — die Config landet
@@ -116,3 +127,43 @@ def parse_events(lines: Iterable[str]) -> RunResult:
         cache_creation=ccreate,
         raw=ereignisse,
     )
+
+
+def run(prompt: str, cwd: Path, timeout: int, agent: str, model: str) -> RunResult:
+    """Führt eine Stufe über opencode im angegebenen Worktree aus."""
+    if OPENCODE_BIN is None:
+        fehler = f"opencode-Binary nicht im PATH gefunden (PATH={os.environ.get('PATH', '')})"
+        log.warning(f"Forge-Runner: {fehler}")
+        return RunResult(ok=False, error=fehler)
+
+    config = baue_config(agent, model)
+    datei = tempfile.NamedTemporaryFile(
+        "w", suffix=".json", prefix="forge-oc-", delete=False, encoding="utf-8"
+    )
+    try:
+        json.dump(config, datei)
+        datei.close()
+
+        umgebung = dict(os.environ)
+        umgebung["OPENCODE_CONFIG"] = datei.name
+
+        try:
+            ergebnis = subprocess.run(
+                [OPENCODE_BIN, "run", "--agent", agent, "--dir", str(cwd),
+                 "--format", "json", prompt],
+                capture_output=True, text=True, timeout=timeout,
+                env=umgebung, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            return RunResult(ok=False, error=f"Zeitüberschreitung nach {timeout}s")
+        except OSError as exc:
+            return RunResult(ok=False, error=f"Aufruf fehlgeschlagen: {exc}")
+
+        return parse_events((ergebnis.stdout or "").splitlines())
+    finally:
+        # Die Config enthält keine Schlüssel, nur Verweise — trotzdem nicht
+        # in /tmp liegen lassen.
+        try:
+            os.unlink(datei.name)
+        except OSError:
+            pass
