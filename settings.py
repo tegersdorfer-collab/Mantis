@@ -62,12 +62,12 @@ class MantisSettings(BaseSettings):
     BG_REASONING_MODEL: str = "qwen3.5:9b"
     # Code-Spezialist des Background-LLM. Benchmark 2026-07-09: ornith:9b war
     # der beste Coder im Feld (8.7/10) und schneller als qwen3.5.
-    # ACHTUNG, der frühere Kommentar "für create_skill / Skill-Factory" war
-    # falsch (geprüft am 09.09.2026 am laufenden System): create_skill bekommt
-    # `source_code` als Tool-Argument vom CHAT-Agenten (AGENT_MODEL_STRONG), und
-    # die Forge fährt über die claude-CLI. Dieses Modell greift ausschließlich
-    # dort, wo ein Background-Prompt die _CODE_KEYWORDS in llm/routed.py trifft
-    # (background_review, Konsolidierung, idle_loop) — nicht in der Skill-Factory.
+    # Erreicht wird dieses Modell über die _CODE_KEYWORDS in llm/routed.py:
+    # Background-Review, Konsolidierung, idle_loop — und seit dem Fast-Path in
+    # core/skill_request.py auch die Skill-Factory. Vorher stimmte das NICHT:
+    # `create_skill` bekam `source_code` als Tool-Argument vom CHAT-Agenten
+    # (AGENT_MODEL_STRONG), der dabei reproduzierbar `skill_name` verschluckte.
+    # Die Forge läuft weiterhin über die claude-CLI, nicht über Ollama.
     # Ersetzt 2026-09-09 durch Ornith-1.5 (Benchmark-Lauf bench/nanbeige42,
     # n=12 — die Unterlagen liegen nur lokal und bewusst nicht im Repo, weil
     # die COROS-Aufgabe echte Messwerte enthaelt):
