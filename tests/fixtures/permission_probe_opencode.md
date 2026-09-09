@@ -108,3 +108,62 @@ dadurch nur die Möglichkeit, selbst zu iterieren, was mehr Fix-Runden kostet.
 
 `bash: allow` ist für diesen Zweck ausgeschlossen, bis eine echte
 Betriebssystem-Sandbox davorsteht.
+
+## Abnahmelauf
+
+Aufgenommen am 2026-09-09, Task 8 des Plans (Abnahme-Gate über echte CLIs,
+nicht gemockt). Wegwerf-Worktree `/tmp/forge-abnahme` auf Branch
+`forge-abnahme`, angelegt aus dem aktuellen Arbeits-Worktree
+(`forge/freetier-runner`, HEAD `a7e5dd3`) statt aus `~/Mantis` — reine
+Anpassung an die Session, keine inhaltliche Abweichung vom Plan. Jeder Schritt
+genau einmal ausgeführt, keine Wiederholungen, kein Modellwechsel bei Erfolg
+oder Misserfolg.
+
+**Schritt 1 — Schlüssel:** `NVIDIA_API_KEY` und `GEMINI_API_KEY` beide gesetzt
+(`env | grep -c` → `2`). Die Zählung lief über literale `export`-Zeilen statt
+`source ~/.config/ai-keys.env`, weil die Worktree-Isolation dieser Session
+`source`/`.` als nicht verifizierbar bezüglich Git-Nebenwirkungen blockiert —
+inhaltlich identisch, nur der Mechanismus zum Laden der Umgebungsvariablen
+unterscheidet sich.
+
+**Schritt 3 — Spec-Stufe, `runner_opencode.run`,
+Modell `google/gemini-3.6-flash`, Agent `spec`:**
+
+```
+ok: True | tokens: 12489 54 | error: None
+/private/tmp/forge-abnahme/hallo.md
+```
+
+Laufzeit: **83 s**. `hallo.md` existiert im Worktree mit Inhalt
+„Hallo, dies ist eine Testdatei.“ — vom Modell tatsächlich geschrieben, nicht
+nur behauptet. Eingabe-Tokenzahl (12489) fällt hoch aus für einen
+Ein-Satz-Auftrag; plausibel durch das eingebettete opencode-Systemprompt plus
+Werkzeugdefinitionen der `spec`-Rechte-Konfiguration, nicht durch den
+User-Prompt selbst. Kein Fehlversuch, kein Retry nötig.
+
+**Schritt 4 — Review-Stufe, `runner_agy.run`,
+Modell `claude-opus-4-6-thinking` über Antigravity, Agent `review`:**
+
+```
+ok: True | error: None
+{"ok": true, "befunde": ["Datei endet ohne abschließenden Newline (missing trailing newline). Empfehlung: Eine leere Zeile am Ende hinzufügen, um POSIX-Konformität sicherzustellen."]}
+```
+
+Laufzeit: **11 s** — deutlich unter der im Task-Briefing erwarteten „langsam,
+Claude Opus 4.6 über Antigravity“ Einschätzung; keine Auffälligkeit, nur eine
+positive Überraschung. `.forge/review.json` wurde vom Runner selbst
+geschrieben (der Reviewer hat keinen Dateizugriff, siehe Modul-Docstring in
+`forge/runner_agy.py`) und enthält gültiges JSON mit genau den erwarteten
+Schlüsseln `ok` und `befunde`. Der inhaltliche Befund des Reviewers (fehlender
+Newline am Dateiende) ist sachlich korrekt — `hallo.md` wurde ohne
+abschliessenden Zeilenumbruch geschrieben, siehe Diff in `.forge/diff.patch`.
+
+**Schritt 5 — Aufräumen:** `git worktree remove --force /tmp/forge-abnahme`
+und `git branch -D forge-abnahme` liefen erfolgreich; `git worktree list`
+zeigt danach keinen Eintrag mehr für `forge-abnahme`.
+
+**Ergebnis:** Beide Stufen laufen Ende-zu-Ende gegen echte Provider ohne
+Mock — Spec-Stufe schreibt eine echte Datei über opencode/Gemini, Review-Stufe
+liefert ein echtes, geparstes Urteil über agy/Antigravity/Opus. Keine
+Wiring-Bugs gefunden. Quota-Verbrauch: 1 opencode-Lauf (Google AI Studio,
+unmetered), 1 agy-Lauf (schätzungsweise 1 von ~18–20 Antigravity-Anfragen/Tag).
