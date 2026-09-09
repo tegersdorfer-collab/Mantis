@@ -219,6 +219,18 @@ class TestVerweigerteWerkzeuge:
         assert grund_mit_denial != grund_ohne_denial
         assert "Write" not in grund_ohne_denial
 
+    def test_park_grund_nennt_auch_den_fehlertext(self, monkeypatch, stubs, tmp_path):
+        # I5 (Abschluss-Review): ergebnis.error wurde auf diesem Pfad nirgends
+        # ausgegeben. Wer morgens den geparkten Task ansieht, erfuhr weder,
+        # welches Werkzeug fehlte, noch woran der Anbieter sich gestört hat.
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(
+            stubs, RunResult(ok=False, error="Tool call validation failed: apply_patch",
+                             denials=[{"tool_name": "apply_patch", "message": "..."}])))
+        assert pl.eine_stufe(_task(m.IMPLEMENTING), tmp_path) == "geparkt"
+        grund = stubs["parks"][-1][1]
+        assert "apply_patch" in grund
+        assert "Tool call validation failed" in grund
+
     def test_mehrere_verweigerte_werkzeuge_werden_alle_genannt(self, monkeypatch, stubs, tmp_path):
         monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="x",

@@ -566,9 +566,15 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
         return "fehler"
 
     if ergebnis.denials:
-        _park(task_id, state,
-              f"Verweigerte Werkzeuge in Stufe '{stufe.name}': {_denial_namen(ergebnis.denials)} "
-              f"(Task {task_id}) — Rechteprofil vermutlich zu eng")
+        # I5: der Fehlertext des Laufs stand auf diesem Pfad nirgends — der
+        # Park-Grund nannte weder das Werkzeug (das war "?") noch, woran der
+        # Anbieter sich gestört hat. Für eine Nachschau am Morgen ist beides
+        # nötig.
+        grund = (f"Verweigerte Werkzeuge in Stufe '{stufe.name}': {_denial_namen(ergebnis.denials)} "
+                 f"(Task {task_id}) — Rechteprofil vermutlich zu eng")
+        if ergebnis.error:
+            grund += f" | Fehlertext: {ergebnis.error[:300]}"
+        _park(task_id, state, grund)
         return "geparkt"
 
     if not ergebnis.ok and not zeitueberschreitung_geliefert:

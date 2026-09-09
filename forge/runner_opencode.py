@@ -34,12 +34,14 @@ Zwei Folgen:
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Iterable
 
+from forge import runner
 from forge.backends import OpencodePermission
 from forge.runner import RunResult
 
@@ -97,6 +99,18 @@ def baue_config(agent: str, model: str) -> dict:
 # trotzdem, und der Anbieter lehnt mit dieser Meldung ab.
 _DENIAL_MARKER = "was not in request.tools"
 
+# Der Werkzeugname aus genau dieser Meldung. forge/pipeline.py liest ihn als
+# `tool_name`; ohne ihn nannte der Park-Grund das verweigerte Werkzeug als "?"
+# und war damit für eine nächtliche Nachschau wertlos (I5).
+_DENIAL_WERKZEUG = re.compile(r"tool '([^']+)' which was not in request\.tools")
+
+# Der `reason` des letzten step_finish eines regulär beendeten Laufs. Belegt in
+# tests/fixtures/opencode_stream_success.jsonl. Ohne diese Prüfung meldete ein
+# abgeschnittener Strom (OOM-Kill, Signal, Output-Limit) ok=True mit halb
+# geschriebenem Code — parse_events verlangte bisher kein Abschlussereignis,
+# anders als forge/runner.py:parse_stream, das ohne Result-Event ablehnt (I3).
+_ABSCHLUSS_GRUND = "stop"
+
 
 def parse_events(lines: Iterable[str]) -> RunResult:
     """Wertet den `--format json`-Strom von opencode aus.
@@ -121,6 +135,7 @@ def parse_events(lines: Iterable[str]) -> RunResult:
 
     texte: list[str] = []
     denials: list[dict] = []
+    abschluss_gruende: list[str | None] = []
     fehler: str | None = None
     tin = tout = cread = ccreate = 0
 
@@ -130,6 +145,8 @@ def parse_events(lines: Iterable[str]) -> RunResult:
         if art == "text":
             texte.append(teil.get("text", ""))
         elif art == "step_finish":
+            grund = teil.get("reason")
+            abschluss_gruende.append(grund if isinstance(grund, str) else None)
             tok = teil.get("tokens") or {}
             tin += int(tok.get("input") or 0)
             tout += int(tok.get("output") or 0)
@@ -139,15 +156,34 @@ def parse_events(lines: Iterable[str]) -> RunResult:
         elif art == "error":
             meldung = json.dumps(e.get("error") or {})
             if _DENIAL_MARKER in meldung:
-                denials.append({"message": meldung})
+                eintrag: dict = {"message": meldung}
+                treffer = _DENIAL_WERKZEUG.search(meldung)
+                if treffer:
+                    eintrag["tool_name"] = treffer.group(1)
+                denials.append(eintrag)
             fehler = meldung
 
+    if fehler is None and (not abschluss_gruende or abschluss_gruende[-1] != _ABSCHLUSS_GRUND):
+        # Kein Abschlussereignis (Prozess gestorben) oder ein anderer Grund als
+        # "stop" (z.B. "length" = Ausgabe abgeschnitten, "tool-calls" = der Lauf
+        # war mitten in einer Werkzeugrunde). In allen Fällen liegt halbe Arbeit
+        # vor, und die darf nicht als Erfolg durchgehen.
+        letzter = abschluss_gruende[-1] if abschluss_gruende else "(kein step_finish)"
+        fehler = (f"opencode-Strom endet nicht regulär (letzter step_finish: {letzter!r}) — "
+                  f"abgebrochener oder abgeschnittener Lauf")
+        log.warning(f"Forge-Runner: {fehler}")
+
+    text = "".join(texte).strip()
     return RunResult(
         ok=fehler is None,
-        text="".join(texte).strip(),
+        text=text,
         tokens_in=tin,
         tokens_out=tout,
         error=fehler,
+        # Kontingentgrenzen sind bei Gratis-Anbietern der Normalfall. Ohne
+        # dieses Flag parkt forge/pipeline.py den Task, statt den Zustand
+        # stehen zu lassen und es später erneut zu versuchen (I2).
+        rate_limited=fehler is not None and runner._ist_rate_limit(f"{fehler}\n{text}"),
         denials=denials,
         cache_read=cread,
         cache_creation=ccreate,
@@ -189,7 +225,22 @@ def run(prompt: str, cwd: Path, timeout: int, agent: str, model: str) -> RunResu
         except OSError as exc:
             return RunResult(ok=False, error=f"Aufruf fehlgeschlagen: {exc}")
 
-        return parse_events((ergebnis.stdout or "").splitlines())
+        resultat = parse_events((ergebnis.stdout or "").splitlines())
+        # I3: returncode und stderr wurden bisher verworfen. Ein Strom kann
+        # vollständig aussehen und der Prozess trotzdem unsauber gestorben
+        # sein — und die Kontingentmeldung eines Anbieters steht oft nur auf
+        # stderr, nie im Ereignisstrom.
+        if ergebnis.returncode != 0:
+            fehlerstrom = (ergebnis.stderr or "").strip()
+            if resultat.ok:
+                resultat.ok = False
+                resultat.error = (f"opencode endete mit returncode {ergebnis.returncode}: "
+                                  f"{fehlerstrom[:300] or 'ohne stderr'}")
+            elif fehlerstrom:
+                resultat.error = (f"{resultat.error} (returncode {ergebnis.returncode}: "
+                                  f"{fehlerstrom[:300]})")
+            resultat.rate_limited = resultat.rate_limited or runner._ist_rate_limit(fehlerstrom)
+        return resultat
     finally:
         # Die Config enthält keine Schlüssel, nur Verweise — trotzdem nicht
         # in /tmp liegen lassen.
