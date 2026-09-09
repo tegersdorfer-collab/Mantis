@@ -9,15 +9,20 @@
 //   cp mantis-bridge.js ~/.config/spicetify/Extensions/
 //   spicetify config extensions mantis-bridge.js
 //   spicetify apply
+//   Spotify-Profilmenü → Mantis-Verbindung → Server-Adresse + DASHBOARD_TOKEN.
+//   Server: DASHBOARD_ALLOWED_ORIGINS muss https://xpui.app.spotify.com enthalten.
 //
-// (Läuft im Spotify-Client; verbindet nur nach 127.0.0.1, keine externen Hosts.)
+// (Läuft im Spotify-Client; Server-Adresse standardmäßig 127.0.0.1.)
 
 (function MantisBridge() {
-  const URL = "ws://127.0.0.1:7779/spicetify/ws";
+  const DEFAULT_SERVER = "http://127.0.0.1:7779";
+  const SERVER_KEY = "mantis.backendUrl";
   const RECONNECT_MS = 5000;
+  const TOKEN_PREFIX = "mantis.dashboardToken:";
 
   // Warten bis Spicetify bereit ist.
-  if (!window.Spicetify || !Spicetify.Player || !Spicetify.CosmosAsync) {
+  if (!window.Spicetify || !Spicetify.Player || !Spicetify.CosmosAsync ||
+      !Spicetify.Menu || !Spicetify.PopupModal) {
     setTimeout(MantisBridge, 500);
     return;
   }
@@ -185,9 +190,86 @@
   }
 
   let ws;
+  let reconnectTimer;
+
+  function serverOrigin(value) {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password ||
+        url.search || url.hash || url.pathname !== "/") {
+      throw new Error("Ungültige Server-Adresse");
+    }
+    return url.origin;
+  }
+
+  function configure() {
+    const form = document.createElement("form");
+    const serverLabel = document.createElement("label");
+    serverLabel.textContent = "Mantis-Server (http:// oder https://)";
+    const serverInput = document.createElement("input");
+    serverInput.type = "url";
+    serverInput.required = true;
+    serverInput.value = localStorage.getItem(SERVER_KEY) || DEFAULT_SERVER;
+    serverInput.style.width = "100%";
+    serverLabel.append(serverInput);
+    const label = document.createElement("label");
+    label.textContent = "Mantis-Zugangstoken (DASHBOARD_TOKEN)";
+    const input = document.createElement("input");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.value = localStorage.getItem(TOKEN_PREFIX + serverInput.value) || "";
+    input.style.width = "100%";
+    label.append(input);
+    serverInput.addEventListener("input", () => { input.value = ""; });
+    const hint = document.createElement("p");
+    hint.textContent = "Wird lokal in Spotify gespeichert. Leer speichern trennt die Verbindung.";
+    const save = document.createElement("button");
+    save.type = "submit";
+    save.textContent = "Speichern";
+    form.append(serverLabel, label, hint, save);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      let server;
+      try {
+        server = serverOrigin(serverInput.value.trim());
+      } catch (_) {
+        Spicetify.showNotification("Server-Adresse muss HTTP(S) ohne Zugangsdaten, Pfad, Query oder Fragment sein.", true);
+        return;
+      }
+      const token = input.value.trim();
+      // WebSocket subprotocols must be valid HTTP tokens.
+      if (token && !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(token)) {
+        Spicetify.showNotification("Ungültiges Token: keine Leerzeichen oder Sonderzeichen wie / verwenden.", true);
+        return;
+      }
+      if (token) localStorage.setItem(TOKEN_PREFIX + server, token);
+      else localStorage.removeItem(TOKEN_PREFIX + server);
+      localStorage.setItem(SERVER_KEY, server);
+      clearTimeout(reconnectTimer);
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+      }
+      Spicetify.PopupModal.hide();
+      connect();
+    });
+    Spicetify.PopupModal.display({ title: "Mantis-Verbindung", content: form });
+    input.focus();
+  }
+
   function connect() {
-    ws = new WebSocket(URL);
-    ws.onmessage = async (ev) => {
+    let server;
+    try {
+      server = serverOrigin(localStorage.getItem(SERVER_KEY) || DEFAULT_SERVER);
+    } catch (_) {
+      return;
+    }
+    const token = localStorage.getItem(TOKEN_PREFIX + server);
+    if (!token) return;
+    const url = new URL("/spicetify/ws", server);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(url.href, ["bearer." + token]);
+    ws = socket;
+    socket.onmessage = async (ev) => {
       let msg;
       try {
         msg = JSON.parse(ev.data);
@@ -196,13 +278,14 @@
       }
       try {
         const result = await handle(msg.method, msg.params || {});
-        ws.send(JSON.stringify({ id: msg.id, result }));
+        socket.send(JSON.stringify({ id: msg.id, result }));
       } catch (e) {
-        ws.send(JSON.stringify({ id: msg.id, error: String(e && e.message ? e.message : e) }));
+        socket.send(JSON.stringify({ id: msg.id, error: String(e && e.message ? e.message : e) }));
       }
     };
-    ws.onclose = () => setTimeout(connect, RECONNECT_MS);
-    ws.onerror = () => ws.close();
+    socket.onclose = () => { reconnectTimer = setTimeout(connect, RECONNECT_MS); };
+    socket.onerror = () => socket.close();
   }
+  new Spicetify.Menu.Item("Mantis-Verbindung", false, configure).register();
   connect();
 })();
