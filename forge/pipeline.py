@@ -21,7 +21,7 @@ import re
 import time
 from pathlib import Path
 
-from forge import gate, gitctl, journal, models as m, queue, runner, stages
+from forge import backends, gate, gitctl, journal, models as m, queue, runner, stages
 
 log = logging.getLogger(__name__)
 
@@ -429,7 +429,12 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
     # Fund 2 (Akzeptanzlauf 2026-08-15): implement/fix bekommen ein größeres
     # Zeitbudget als die drei Lese-Stufen — siehe forge/stages.py.
     start = time.time()
-    ergebnis = runner.run(prompt, cwd=worktree, profile=stufe.profile, timeout=stufe.timeout)
+    # Vorher: ergebnis = runner.run(prompt, cwd=worktree, profile=stufe.profile,
+    #                               timeout=stufe.timeout)
+    ergebnis = backends.hole(stufe.backend)(
+        prompt, cwd=worktree, timeout=stufe.timeout,
+        agent=stufe.name, model=stufe.model,
+    )
 
     # Fund 1 (Akzeptanzlauf 2026-08-15): ein Timeout ist nicht automatisch ein
     # Fehlschlag. Der Lauf kann sein Produkt bereits geliefert (implement/fix
