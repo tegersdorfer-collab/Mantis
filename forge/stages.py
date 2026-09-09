@@ -56,11 +56,13 @@ SPEC_VERZEICHNIS = "docs/superpowers/specs"
 PLAN_VERZEICHNIS = "docs/superpowers/plans"
 VERDIKT_DATEI = ".forge/review.json"
 
-# Die Review-Stufe hat absichtlich kein Bash und kann sich also KEINEN eigenen
-# Diff erzeugen (kein `git diff`, kein sonstiger Befehl) — sonst könnte sie
+# Die Review-Stufe soll sich KEINEN eigenen Diff erzeugen — sonst könnte sie
 # sich eine ihr genehme Sicht auf die Änderung zusammenbauen, statt die
-# tatsächliche zu prüfen. Stattdessen liest sie den Diff aus dieser Datei.
-# WICHTIG: forge/pipeline.py (Task 6) MUSS diese Datei schreiben, BEVOR die
+# tatsächliche zu prüfen. Deshalb der Umweg über diese Datei: forge/pipeline.py
+# schreibt sie, und forge/runner_agy.py liest sie und legt ihren Inhalt dem
+# Modell in den Prompt. Das Modell selbst wird nie auf diesen Pfad verwiesen
+# (I7) — es bekommt den Diff fertig eingebettet.
+# WICHTIG: forge/pipeline.py MUSS diese Datei schreiben, BEVOR die
 # Review-Stufe läuft — ohne sie prüft review eine Spec ohne jede Sicht auf
 # das, was tatsächlich geändert wurde, und das Gate-Urteil stünde auf nichts.
 DIFF_DATEI = ".forge/diff.patch"

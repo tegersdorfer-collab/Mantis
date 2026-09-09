@@ -109,6 +109,13 @@ _DENIAL_WERKZEUG = re.compile(r"tool '([^']+)' which was not in request\.tools")
 # abgeschnittener Strom (OOM-Kill, Signal, Output-Limit) ok=True mit halb
 # geschriebenem Code — parse_events verlangte bisher kein Abschlussereignis,
 # anders als forge/runner.py:parse_stream, das ohne Result-Event ablehnt (I3).
+#
+# Die Prüfung ist bewusst strikt (nur "stop" gilt), nach derselben Regel wie
+# das fehlende is_error in forge/runner.py:parse_stream: für einen
+# unbeaufsichtigten, geldkostenden Prozess muss UNBEKANNT als Fehlschlag
+# gelten. Belegt ist bislang nur diese eine Aufnahme; taucht im Betrieb ein
+# weiterer regulärer Abschlussgrund auf, gehört er hierher — mit Aufnahme,
+# nicht auf Verdacht.
 _ABSCHLUSS_GRUND = "stop"
 
 
