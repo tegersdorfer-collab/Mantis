@@ -1,3 +1,4 @@
+import { authenticatedEventSource } from './api-auth';
 export type StatusEvent = {
   type: string;
   text: string;
@@ -11,7 +12,7 @@ export type EventSourceLike = {
 };
 
 function defaultEsFactory(url: string): EventSourceLike {
-  return new EventSource(url) as unknown as EventSourceLike;
+  return authenticatedEventSource(url);
 }
 
 export function subscribeStatus(

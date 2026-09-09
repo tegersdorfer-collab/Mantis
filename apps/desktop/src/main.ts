@@ -1,3 +1,4 @@
+import { authenticatedFetch } from './api-auth';
 import { getBaseUrl } from './config';
 import { checkBackendHealth } from './backend';
 import { deriveHudState } from './hud-state';
@@ -410,7 +411,7 @@ export async function initVoiceCapture(
   onSegment: (r: VoiceSegmentResult) => void,
 ): Promise<() => void> {
   try {
-    const res = await fetch(`${baseUrl}/api/voice/stream-mode`);
+    const res = await authenticatedFetch(`${baseUrl}/api/voice/stream-mode`);
     const { mode } = await res.json();
     return mode === 'websocket'
       ? startVoiceCaptureStream(baseUrl, onSegment)

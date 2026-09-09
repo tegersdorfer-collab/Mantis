@@ -255,14 +255,13 @@ class IdleLoop:
 
     async def monitoring_loop(self) -> None:
         import httpx as _httpx
-        import config
         _failures = 0
         await asyncio.sleep(60)
         while True:
             try:
                 async with _httpx.AsyncClient(timeout=5) as c:
-                    port = getattr(config, "DASHBOARD_PORT", 7779)
-                    r = await c.get(f"http://127.0.0.1:{port}/health")
+                    from web.client_auth import dashboard_url, dashboard_headers
+                    r = await c.get(f"{dashboard_url()}/health", headers=dashboard_headers())
                 checks = r.json() if r.status_code == 200 else {}
                 unhealthy = [k for k, v in checks.items() if str(v).startswith("error")]
                 if unhealthy:

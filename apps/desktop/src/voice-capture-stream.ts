@@ -1,3 +1,4 @@
+import { authenticatedWebSocket } from './api-auth';
 import type { VoiceSegmentResult } from './voice-capture';
 
 function wsUrlFor(baseUrl: string): string {
@@ -7,7 +8,7 @@ function wsUrlFor(baseUrl: string): string {
 export function startVoiceCaptureStream(
   baseUrl: string,
   onSegment: (result: VoiceSegmentResult) => void,
-  wsFactory: (url: string) => WebSocket = (url) => new WebSocket(url),
+  wsFactory: (url: string) => WebSocket = authenticatedWebSocket,
 ): () => void {
   let stopped = false;
   let stream: MediaStream | null = null;

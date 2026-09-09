@@ -77,37 +77,38 @@ MCP_TOOLS = [
 
 def _handle_mcp_call(tool: str, args: dict) -> str:
     """Führt einen MCP-Tool-Call aus. Synchron, für stdio-Modus."""
-    import httpx, config
-    port = getattr(config, "DASHBOARD_PORT", 7779)
-    base = f"http://127.0.0.1:{port}"
+    import httpx
+    from web.client_auth import dashboard_url, dashboard_headers
+    base = dashboard_url()
+    headers = dashboard_headers()
 
     try:
         if tool == "mantis_chat":
-            r = httpx.post(f"{base}/api/chat", json={"message": args["message"]}, timeout=30)
+            r = httpx.post(f"{base}/api/chat", headers=headers, json={"message": args["message"]}, timeout=30)
             return r.json().get("response", r.text)
 
         elif tool == "mantis_memory_search":
-            r = httpx.get(f"{base}/api/memory/search",
+            r = httpx.get(f"{base}/api/memory/search", headers=headers,
                           params={"q": args["query"]}, timeout=10)
             items = r.json() if r.status_code == 200 else []
             return "\n".join(f"- {m.get('content','')}" for m in items[:5]) or "Nichts gefunden."
 
         elif tool == "mantis_brain_search":
-            r = httpx.get(f"{base}/api/brain/search",
+            r = httpx.get(f"{base}/api/brain/search", headers=headers,
                           params={"q": args["query"], "limit": 5}, timeout=10)
             items = r.json() if r.status_code == 200 else []
             return "\n".join(f"- [{n.get('title')}] {n.get('content','')[:120]}" for n in items) or "Nichts gefunden."
 
         elif tool == "mantis_get_tasks":
             status = args.get("status", "open")
-            r = httpx.get(f"{base}/api/tasks", params={"status": status}, timeout=10)
+            r = httpx.get(f"{base}/api/tasks", headers=headers, params={"status": status}, timeout=10)
             tasks = r.json() if r.status_code == 200 else []
             if isinstance(tasks, list):
                 return "\n".join(f"- [{t.get('priority','?')}] {t.get('title')}" for t in tasks[:10])
             return str(tasks)
 
         elif tool == "mantis_get_health":
-            r = httpx.get(f"{base}/api/health-data", timeout=10)
+            r = httpx.get(f"{base}/api/health-data", headers=headers, timeout=10)
             d = r.json() if r.status_code == 200 else {}
             if isinstance(d, list) and d:
                 d = d[0]

@@ -20,7 +20,9 @@ class MantisSettings(BaseSettings):
     )
 
     # ── Dashboard ────────────────────────────────────────────────────────────
-    DASHBOARD_HOST: str = "0.0.0.0"
+    DASHBOARD_HOST: str = "127.0.0.1"
+    DASHBOARD_TOKEN: str = ""
+    DASHBOARD_ALLOWED_ORIGINS: str = "http://localhost:1420,tauri://localhost,http://tauri.localhost,https://tauri.localhost"
     DASHBOARD_PORT: int = 7779
 
     # ── LLM ──────────────────────────────────────────────────────────────────

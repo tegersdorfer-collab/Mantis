@@ -1,3 +1,4 @@
+import { authenticatedFetch } from './api-auth';
 // Wissensgraph-Overlay — Vollbild-Ansicht des vereinten Graphen (Notizen +
 // Entitäten + Fakten). Holt /api/knowledge/graph, rendert ein Knoten-Kanten-Bild
 // mit Kind-Filter + Klick-Detail. Öffnen per Cmd/Ctrl+K-Kachel "Wissen" oder
@@ -139,7 +140,7 @@ function detailHtml(nodeId: string, view: Graph): string {
     <div style="font-size:11px;color:#9fb2ba">Verbindungen</div><ul style="margin:6px 0;padding-left:16px;font-size:12px;line-height:1.6">${neigh}</ul>`;
 }
 
-export function initKnowledgeGraphOverlay(baseUrl: string, fetchImpl: typeof fetch = fetch): { open: () => void } {
+export function initKnowledgeGraphOverlay(baseUrl: string, fetchImpl: typeof fetch = authenticatedFetch): { open: () => void } {
   let data: Graph = { nodes: [], edges: [] };
   const active = new Set<string>(KINDS);
 

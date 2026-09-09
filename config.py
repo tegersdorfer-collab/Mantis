@@ -6,6 +6,8 @@ kommen jetzt aber aus dem typisierten `settings.cfg` (Pydantic BaseSettings).
 from settings import cfg
 
 DASHBOARD_HOST           = cfg.DASHBOARD_HOST
+DASHBOARD_TOKEN          = cfg.DASHBOARD_TOKEN
+DASHBOARD_ALLOWED_ORIGINS = cfg.DASHBOARD_ALLOWED_ORIGINS
 DASHBOARD_PORT           = cfg.DASHBOARD_PORT
 
 OLLAMA_MODEL             = cfg.OLLAMA_MODEL

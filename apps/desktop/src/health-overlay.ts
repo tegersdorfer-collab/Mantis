@@ -1,3 +1,4 @@
+import { authenticatedFetch } from './api-auth';
 // Health-Overlay — Vollbild-Ansicht (Ring-Hero + Drilldown), holt sich die
 // Domain-Scores selbst von /api/health/scores. Geöffnet per Cmd/Ctrl+K-Kachel
 // "Health" oder dem CustomEvent 'open-health' (z.B. aus einem Voice-Intent).
@@ -93,7 +94,7 @@ export function drilldownHtml(key: string, dom: Domain, _days: any[]): string {
     <div class="ho-why">Woraus sich ${Math.round(dom.score)} ergibt</div>${rows}</div>`;
 }
 
-export function initHealthOverlay(baseUrl: string, fetchImpl: typeof fetch = fetch): { open: () => void } {
+export function initHealthOverlay(baseUrl: string, fetchImpl: typeof fetch = authenticatedFetch): { open: () => void } {
   let data: ScoresData | null = null;
   const { el, open } = createOverlay({
     id: 'health-overlay',

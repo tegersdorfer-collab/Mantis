@@ -8,7 +8,7 @@ und wird unten via `app.include_router(...)` eingebunden.
 """
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -21,18 +21,27 @@ log = logging.getLogger("mantis.api")
 def create_app(orch=None) -> FastAPI:
     app = FastAPI(title="Mantis Dashboard", docs_url=None, redoc_url=None)
 
-    # Kein App-Token: main.py bindet den Server nur ins Tailnet, das Netzwerk
-    # selbst ist die Zugriffskontrolle. Macht PWA-Homescreen-start_url "/" möglich.
-
-    # Der Tauri-Desktop-Client läuft auf einem anderen Origin (localhost:1420 im
-    # Dev-Modus, tauri:// im Bundle) als das Backend — ohne CORS blockt der
-    # Webview jeden fetch()/EventSource()-Aufruf trotz erreichbarem Server.
+    from web.auth import DashboardAuth, origins, COOKIE, SESSION_SECONDS, session_value
+    app.add_middleware(DashboardAuth)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=origins(),
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Mantis-Token"],
     )
+
+    @app.post("/auth/session")
+    async def login(request: Request):
+        response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+        response.set_cookie(COOKIE, session_value(), max_age=SESSION_SECONDS,
+                            httponly=True, secure=request.url.scheme == "https", samesite="strict")
+        return response
+
+    @app.delete("/auth/session")
+    async def logout():
+        response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+        response.delete_cookie(COOKIE)
+        return response
 
     # ── System Health-Check ──────────────────────────────────────────────────
     @app.get("/health")

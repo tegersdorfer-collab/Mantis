@@ -305,7 +305,7 @@ body::after {
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
-#settings-base-url {
+#settings-base-url, #settings-api-token {
   background: rgba(0, 229, 255, 0.06);
   border: 1px solid rgba(0, 229, 255, 0.2);
   border-radius: 4px;
@@ -316,7 +316,8 @@ body::after {
   outline: none;
   transition: border-color 150ms ease-out;
 }
-#settings-base-url:focus { border-color: rgba(0, 229, 255, 0.53); box-shadow: var(--glow-idle); }
+#settings-base-url:focus, #settings-api-token:focus { border-color: rgba(0, 229, 255, 0.53); box-shadow: var(--glow-idle); }
+#settings-form button { padding: 9px 16px; border: 1px solid var(--c-idle); border-radius: 6px; background: transparent; color: var(--c-idle); cursor: pointer; }
 .settings-hint {
   font-size: var(--fs-micro);
   color: rgba(0, 229, 255, 0.4);

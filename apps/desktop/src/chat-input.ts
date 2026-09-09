@@ -1,3 +1,4 @@
+import { authenticatedFetch } from './api-auth';
 export function initChatInput(
   baseUrl: string,
   onReply: (reply: string, userText: string) => void,
@@ -17,11 +18,16 @@ export function initChatInput(
     input.value = '';
     input.disabled = true;
     try {
-      const res = await fetch(`${baseUrl}/api/chat`, {
+      const res = await authenticatedFetch(`${baseUrl}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
       });
+      if (res.status === 401 || res.status === 403) {
+        onReply('Zugangsschlüssel prüfen: Einstellungen mit Cmd/Ctrl+, öffnen.', text);
+        return;
+      }
+      if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       onReply(data.response ?? '', text);
     } catch {

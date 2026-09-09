@@ -1,3 +1,4 @@
+import { authenticatedFetch } from './api-auth';
 import { applyPanelChrome } from './fx/panel-chrome';
 import { staggerIn } from './motion';
 import { getOverlays } from './overlay';
@@ -44,13 +45,13 @@ export function initNavOverlay(baseUrl: string): void {
       }
       const widgetType = tile.dataset.widgetType;
       if (widgetType) {
-        fetch(`${baseUrl}/api/ui/select`, {
+        authenticatedFetch(`${baseUrl}/api/ui/select`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ widget_type: widgetType }),
         }).catch(() => {});
       } else {
-        fetch(`${baseUrl}/api/ui/clear`, { method: 'POST' }).catch(() => {});
+        authenticatedFetch(`${baseUrl}/api/ui/clear`, { method: 'POST' }).catch(() => {});
       }
       close();
     });

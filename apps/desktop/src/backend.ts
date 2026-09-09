@@ -1,3 +1,4 @@
+import { authenticatedFetch } from './api-auth';
 export type HealthStatus = { ok: boolean; checks?: Record<string, string> };
 
 function delay(ms: number): Promise<void> {
@@ -18,7 +19,7 @@ async function tryFetchHealth(
 
 export async function checkBackendHealth(
   baseUrl: string,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl: typeof fetch = authenticatedFetch,
 ): Promise<HealthStatus> {
   try {
     return await tryFetchHealth(baseUrl, fetchImpl);

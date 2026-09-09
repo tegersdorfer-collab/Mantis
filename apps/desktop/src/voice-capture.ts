@@ -1,3 +1,4 @@
+import { authenticatedFetch } from './api-auth';
 export type VoiceSegmentResult = {
   text: string;
   addressed: boolean;
@@ -76,7 +77,7 @@ export function startVoiceCapture(
     try {
       const form = new FormData();
       form.append('audio', blob, `segment.${extensionFor(mimeType)}`);
-      const res = await fetch(`${baseUrl}/api/voice/segment`, { method: 'POST', body: form });
+      const res = await authenticatedFetch(`${baseUrl}/api/voice/segment`, { method: 'POST', body: form });
       const data = (await res.json()) as VoiceSegmentResult;
       if (data.audio_b64) playReplyAudio(data.audio_b64);
       onSegment(data);
