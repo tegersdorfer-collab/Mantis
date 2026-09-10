@@ -27,6 +27,37 @@ SPERRZONEN = (
     "scripts/fix_bluetooth.sh",
 )
 
+# Pfad-Präfixe, in denen die Agenten überhaupt arbeiten dürfen. Bewusst eine
+# ERLAUBNIS-, keine Verbotsliste: bei einer Verbotsliste wäre jeder neu
+# angelegte Ordner automatisch offen. SPERRZONEN bleibt zusätzlich bestehen —
+# eine Datei muss beide Prüfungen bestehen.
+#
+# `core/skills/` ist die einzige Ausnahme innerhalb von `core/`: dort entstehen
+# neue Mantis-Fähigkeiten, und genau diese Arbeit soll der Nachtbetrieb machen.
+ERLAUBTE_ZONEN = (
+    "tests/",
+    "docs/",
+    "scripts/",
+    "tools/",
+    "core/skills/",
+)
+
+
+def ausserhalb_erlaubter_zonen(dateien: list[str]) -> list[str]:
+    """Welche der Dateien liegen ausserhalb jeder erlaubten Zone?
+
+    Alle Zonen enden auf "/" und matchen als Präfix. Dass sie auf "/" enden,
+    ist die Prüfung gegen Treffer über die Verzeichnisgrenze hinweg:
+    "testsuite.py" beginnt mit "tests", aber nicht mit "tests/".
+    """
+    treffer = []
+    for datei in dateien:
+        pfad = _normalisiere_pfad(datei)
+        if not any(pfad.startswith(zone) for zone in ERLAUBTE_ZONEN):
+            treffer.append(datei)
+    return treffer
+
+
 # Darüber ist es kein Task mehr, sondern ein Projekt — dann soll ein Mensch schauen.
 MAX_DIFF_ZEILEN = 800
 
@@ -199,6 +230,10 @@ def pruefe(worktree: Path, basis: str = "main") -> GateErgebnis:
     verboten = beruehrt_sperrzone(dateien)
     if verboten:
         gruende.append(f"Sperrzone berührt: {', '.join(verboten)}")
+
+    draussen = ausserhalb_erlaubter_zonen(dateien)
+    if draussen:
+        gruende.append(f"ausserhalb der erlaubten Zonen: {', '.join(draussen)}")
 
     groesse, binaere = _diff_groesse(baum, basis)
     if groesse > MAX_DIFF_ZEILEN:

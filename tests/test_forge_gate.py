@@ -181,7 +181,7 @@ class TestPruefe:
     """Deckt pruefe() selbst ab: subprocess.run und gitctl.run werden gestubbt,
     damit hier nie die echte Suite oder echtes ruff läuft (das würde rekursieren)."""
 
-    def _stub_sauberer_git(self, monkeypatch, dateien="core/foo.py\n", numstat="10\t2\tcore/foo.py\n"):
+    def _stub_sauberer_git(self, monkeypatch, dateien="tests/foo.py\n", numstat="10\t2\ttests/foo.py\n"):
         def fake_gitctl_run(*args, cwd=None, timeout=300):
             if "--name-only" in args:
                 return subprocess.CompletedProcess(args=args, returncode=0, stdout=dateien, stderr="")
@@ -237,10 +237,14 @@ class TestPruefe:
     def test_drei_gleichzeitige_verstoesse_ergeben_drei_gruende(self, tmp_path, monkeypatch):
         # Ein Gate, das nur den ersten Grund meldet, führt zu einer Fix-Runde,
         # die den Rest erst danach entdeckt — teuer bei jedem einzelnen Fund.
+        # "scripts/fix_bluetooth.sh" liegt in der erlaubten Zone "scripts/",
+        # ist aber trotzdem eine Sperrzone (exakter Dateiname in SPERRZONEN) —
+        # so löst die Datei Sperrzone aus, ohne zusätzlich (und am eigentlichen
+        # Testzweck vorbei) die neue Zonen-Prüfung zu triggern.
         self._stub_sauberer_git(
             monkeypatch,
-            dateien="forge/gate.py\ncore/foo.py\n",
-            numstat="500\t0\tforge/gate.py\n400\t0\tcore/foo.py\n",
+            dateien="scripts/fix_bluetooth.sh\ntests/foo.py\n",
+            numstat="500\t0\tscripts/fix_bluetooth.sh\n400\t0\ttests/foo.py\n",
         )
         self._stub_subprocess(monkeypatch, pytest_rc=1, pytest_stdout="1 failed")
         self._schreibe_pass_verdikt(tmp_path)
@@ -312,7 +316,7 @@ class TestPruefe:
         # Grenzwerttest: exakt MAX_DIFF_ZEILEN darf noch durchgehen (">" nicht
         # ">="). Ohne diesen Test würde ein künftiges Vertippen von ">" zu ">="
         # unbemerkt bleiben.
-        self._stub_sauberer_git(monkeypatch, numstat=f"{gate.MAX_DIFF_ZEILEN}\t0\tcore/foo.py\n")
+        self._stub_sauberer_git(monkeypatch, numstat=f"{gate.MAX_DIFF_ZEILEN}\t0\ttests/foo.py\n")
         self._stub_subprocess(monkeypatch)
         self._schreibe_pass_verdikt(tmp_path)
         ergebnis = gate.pruefe(tmp_path)
@@ -320,7 +324,7 @@ class TestPruefe:
         assert not any("Diff zu groß" in g for g in ergebnis.gruende)
 
     def test_diff_ein_ueber_der_grenze_ist_nicht_ok(self, tmp_path, monkeypatch):
-        self._stub_sauberer_git(monkeypatch, numstat=f"{gate.MAX_DIFF_ZEILEN + 1}\t0\tcore/foo.py\n")
+        self._stub_sauberer_git(monkeypatch, numstat=f"{gate.MAX_DIFF_ZEILEN + 1}\t0\ttests/foo.py\n")
         self._stub_subprocess(monkeypatch)
         self._schreibe_pass_verdikt(tmp_path)
         ergebnis = gate.pruefe(tmp_path)
@@ -349,3 +353,40 @@ class TestPruefe:
         self._schreibe_pass_verdikt(tmp_path)
         ergebnis = gate.pruefe(tmp_path)
         assert not any("Diff zu groß" in g for g in ergebnis.gruende)
+
+
+from forge.gate import ausserhalb_erlaubter_zonen
+
+
+class TestErlaubteZonen:
+    def test_erlaubte_pfade_gehen_durch(self):
+        erlaubt = [
+            "tests/test_neu.py",
+            "docs/superpowers/specs/2026-01-01-x-design.md",
+            "scripts/hilfe.sh",
+            "tools/spotify/x.py",
+            "core/skills/neu.py",
+        ]
+        assert ausserhalb_erlaubter_zonen(erlaubt) == []
+
+    def test_kern_und_web_sind_draussen(self):
+        assert ausserhalb_erlaubter_zonen(["core/db.py"]) == ["core/db.py"]
+        assert ausserhalb_erlaubter_zonen(["web/api.py"]) == ["web/api.py"]
+
+    def test_forge_darf_sich_nicht_selbst_umbauen(self):
+        assert ausserhalb_erlaubter_zonen(["forge/pipeline.py"]) == ["forge/pipeline.py"]
+
+    def test_core_skills_ist_die_ausnahme_in_core(self):
+        gemischt = ["core/skills/gut.py", "core/agent.py"]
+        assert ausserhalb_erlaubter_zonen(gemischt) == ["core/agent.py"]
+
+    def test_praefix_matcht_nicht_ueber_die_verzeichnisgrenze(self):
+        """'tests/' darf nicht 'testsuite.py' im Wurzelverzeichnis erlauben."""
+        assert ausserhalb_erlaubter_zonen(["testsuite.py"]) == ["testsuite.py"]
+        assert ausserhalb_erlaubter_zonen(["core/skillsammlung.py"]) == ["core/skillsammlung.py"]
+
+    def test_fuehrendes_punktslash_wird_normalisiert(self):
+        assert ausserhalb_erlaubter_zonen(["./tests/x.py"]) == []
+
+    def test_wurzeldateien_sind_draussen(self):
+        assert ausserhalb_erlaubter_zonen(["main.py", "README.md"]) == ["main.py", "README.md"]
