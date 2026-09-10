@@ -21,7 +21,7 @@ import re
 import time
 from pathlib import Path
 
-from forge import backends, budget, gate, gitctl, journal, models as m, queue, runner, stages
+from forge import backends, budget, gate, gitctl, journal, ketten, models as m, queue, runner, stages
 
 log = logging.getLogger(__name__)
 
@@ -564,16 +564,35 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
     start = time.time()
     # Vorher: ergebnis = runner.run(prompt, cwd=worktree, profile=stufe.profile,
     #                               timeout=stufe.timeout)
-    ergebnis = backends.hole(stufe.backend)(
+
+    # Die Review-Stufe darf nicht auf dem Modell laufen, das implementiert hat.
+    verboten = frozenset()
+    if stufe.name == "review":
+        vorher = task.get("implement_model")
+        if vorher:
+            verboten = frozenset({vorher})
+
+    wahl = ketten.waehle(stufe.name, verboten=verboten)
+    if wahl is None:
+        _park(task_id, state,
+              f"Kette für Stufe '{stufe.name}' erschöpft — kein nutzbares Modell "
+              f"übrig (Task {task_id})")
+        return "geparkt"
+    backend_name, modell = wahl
+
+    ergebnis = backends.hole(backend_name)(
         prompt, cwd=worktree, timeout=stufe.timeout,
-        agent=stufe.name, model=stufe.model,
+        agent=stufe.name, model=modell,
     )
 
     # Verbrauch buchen, bevor irgendein Zweig zurückspringt — auch ein
     # gescheiterter Lauf hat Kontingent gekostet.
-    budget.buche(stufe.model, ergebnis.tokens_in, ergebnis.tokens_out)
+    budget.buche(modell, ergebnis.tokens_in, ergebnis.tokens_out)
     if ergebnis.rate_limited:
-        budget.markiere_erschoepft(stufe.model, (ergebnis.error or "Rate-Limit")[:200])
+        budget.markiere_erschoepft(modell, (ergebnis.error or "Rate-Limit")[:200])
+
+    if stufe.name in ("implement", "fix"):
+        queue.merke_implement_modell(task_id, modell)
 
     # Fund 1 (Akzeptanzlauf 2026-08-15): ein Timeout ist nicht automatisch ein
     # Fehlschlag. Der Lauf kann sein Produkt bereits geliefert (implement/fix

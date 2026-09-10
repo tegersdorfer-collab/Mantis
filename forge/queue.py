@@ -180,6 +180,11 @@ def setze_artefakt(task_id: int, feld: str, pfad: str) -> None:
     db.execute(f"UPDATE forge_tasks SET {feld}=%s, updated_at=NOW() WHERE id=%s", (pfad, task_id))
 
 
+def merke_implement_modell(task_id: int, model: str) -> None:
+    """Womit implementiert wurde — die Review-Stufe darf nicht dasselbe nehmen."""
+    db.execute("UPDATE forge_tasks SET implement_model=%s WHERE id=%s", (model, task_id))
+
+
 def zaehle_fixrunde(task_id: int) -> int:
     """Erhöht den Fix-Runden-Zähler und gibt den neuen Stand zurück."""
     zeile = db.query_one(

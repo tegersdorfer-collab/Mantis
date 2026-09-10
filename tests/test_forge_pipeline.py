@@ -34,6 +34,11 @@ def stubs(monkeypatch):
                         lambda tid, current, reason: aufz["parks"].append((tid, reason)) or True)
     monkeypatch.setattr(pl.queue, "setze_artefakt",
                         lambda tid, feld, pfad: aufz["artefakte"].append((feld, pfad)))
+    # merke_implement_modell() (Task 8) würde sonst bei implement/fix ebenfalls
+    # die echte Postgres-Verbindung öffnen. Tests, die das Verhalten selbst
+    # prüfen, überschreiben diesen Stub lokal (siehe TestKettenwahl).
+    monkeypatch.setattr(pl.queue, "merke_implement_modell",
+                        lambda tid, model: aufz.setdefault("implement_modelle", []).append((tid, model)))
     monkeypatch.setattr(pl.journal, "log",
                         lambda *a, **kw: aufz["journal"].append((a, kw)))
     # DB gestubbt (siehe Moduldocstring): ohne diese beiden Stubs riefe
@@ -49,6 +54,15 @@ def stubs(monkeypatch):
     # das Budget-Verhalten selbst prüfen, überschreiben diese Stubs lokal
     # (siehe TestBudgetMeldung._budget_stub).
     monkeypatch.setattr(pl.budget, "buche", lambda model, tokens_in, tokens_out: None)
+    # ketten.waehle() (Task 8) würde ohne Stub bei jedem Lauf über
+    # budget.ist_erschoepft() ebenfalls die echte Postgres-Verbindung öffnen.
+    # Default hier: dasselbe Glied, das vor der Kette fest in forge/stages.py
+    # stand — so bleiben alle Tests, denen die Kettenwahl selbst egal ist,
+    # unverändert gültig. Tests, die die Kette prüfen, überschreiben diesen
+    # Stub lokal (siehe TestKettenwahl).
+    _stufe_ketten_default = {s.name: (s.backend, s.model) for s in pl.stages.ALLE_STUFEN}
+    monkeypatch.setattr(pl.ketten, "waehle",
+                        lambda name, verboten=frozenset(): _stufe_ketten_default.get(name))
     monkeypatch.setattr(pl.budget, "markiere_erschoepft", lambda model, grund: None)
 
     def _fixrunde(tid):
@@ -1038,9 +1052,19 @@ class TestC3GegenEchtesGit:
 
 
 class TestBackendAufruf:
-    def test_spec_stufe_laeuft_ueber_opencode(self, monkeypatch, stubs, tmp_path):
+    """Seit Task 8 kommt das Backend/Modell-Paar aus `ketten.waehle`, nicht
+    mehr aus `stufe.backend`/`stufe.model` (Vorher-Zustand aus Plan 1). Die
+    Werte hier sind bewusst fiktiv und tauchen weder in forge/stages.py noch
+    in forge/ketten.py auf — nur so zeigt ein bestehender Test, dass die
+    Pipeline wirklich die Kette befragt und nicht zufällig denselben Wert
+    liefert, der auch in der Stage-Definition steht."""
+
+    def test_spec_stufe_laeuft_mit_dem_glied_aus_der_kette(self, monkeypatch, stubs, tmp_path):
         """Die Pipeline darf runner.run nicht mehr fest verdrahtet aufrufen."""
         gesehen = {}
+
+        monkeypatch.setattr(pl.ketten, "waehle",
+                            lambda name, verboten=frozenset(): ("fiktiv-backend-spec", "fiktiv/spec-modell-9000"))
 
         def _fake_hole(name):
             def _run(prompt, cwd, timeout, agent, model):
@@ -1054,12 +1078,15 @@ class TestBackendAufruf:
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
 
-        assert gesehen["backend"] == "opencode"
+        assert gesehen["backend"] == "fiktiv-backend-spec"
         assert gesehen["agent"] == "spec"
-        assert gesehen["model"] == "google/gemini-3.6-flash"
+        assert gesehen["model"] == "fiktiv/spec-modell-9000"
 
-    def test_review_stufe_laeuft_ueber_agy(self, monkeypatch, stubs, tmp_path):
+    def test_review_stufe_laeuft_mit_dem_glied_aus_der_kette(self, monkeypatch, stubs, tmp_path):
         gesehen = {}
+
+        monkeypatch.setattr(pl.ketten, "waehle",
+                            lambda name, verboten=frozenset(): ("fiktiv-backend-review", "fiktiv/review-modell-7000"))
 
         def _fake_hole(name):
             def _run(prompt, cwd, timeout, agent, model):
@@ -1073,8 +1100,8 @@ class TestBackendAufruf:
         monkeypatch.setattr(pl, "_schreibe_diff", lambda w: None)
         pl._eine_stufe_intern({"id": 1}, 1, m.REVIEWING, tmp_path)
 
-        assert gesehen["backend"] == "agy"
-        assert gesehen["model"] == "claude-opus-4-6-thinking"
+        assert gesehen["backend"] == "fiktiv-backend-review"
+        assert gesehen["model"] == "fiktiv/review-modell-7000"
 
 
 class TestGitStatusFehlschlag:
@@ -1243,3 +1270,52 @@ class TestBudgetMeldung:
         assert gebucht and gebucht[-1][0] == self.SPEC_MODELL, \
             "Gewoehnlicher Fehlschlag wurde nicht gebucht"
         assert erschoepft == []
+
+
+class TestKettenwahl:
+    def test_stufe_laeuft_mit_dem_glied_aus_der_kette(self, monkeypatch, stubs, tmp_path):
+        gesehen = {}
+        monkeypatch.setattr(pl.ketten, "waehle",
+                            lambda name, verboten=frozenset(): ("opencode", "test/modell-x"))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: (
+                gesehen.update(backend=name, model=model) or RunResult(ok=True, text="egal"))))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert gesehen["backend"] == "opencode"
+        assert gesehen["model"] == "test/modell-x"
+
+    def test_leere_kette_parkt_statt_zu_scheitern(self, monkeypatch, stubs, tmp_path):
+        monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
+        ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert ergebnis == "geparkt"
+        assert stubs["parks"], "kein Park-Eintrag geschrieben"
+
+    def test_review_bekommt_das_implementierer_modell_als_verboten(self, monkeypatch, stubs, tmp_path):
+        gesehen = {}
+
+        def _waehle(name, verboten=frozenset()):
+            gesehen[name] = verboten
+            return ("agy", "claude-opus-4-6-thinking")
+
+        monkeypatch.setattr(pl.ketten, "waehle", _waehle)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: RunResult(ok=True, text="egal")))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        monkeypatch.setattr(pl, "_schreibe_diff", lambda w: None)
+        pl._eine_stufe_intern({"id": 1, "implement_model": "nvidia/minimaxai/minimax-m3"},
+                              1, m.REVIEWING, tmp_path)
+        assert "nvidia/minimaxai/minimax-m3" in gesehen["review"]
+
+    def test_implement_merkt_sich_sein_modell_am_task(self, monkeypatch, stubs, tmp_path):
+        gemerkt = []
+        monkeypatch.setattr(pl.queue, "merke_implement_modell",
+                            lambda task_id, model: gemerkt.append((task_id, model)))
+        monkeypatch.setattr(pl.ketten, "waehle",
+                            lambda name, verboten=frozenset(): ("opencode", "test/impl"))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: RunResult(ok=True, text="egal")))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        monkeypatch.setattr(pl, "_committe_stufenarbeit", lambda *a: None)
+        pl._eine_stufe_intern({"id": 1}, 1, m.IMPLEMENTING, tmp_path)
+        assert gemerkt == [(1, "test/impl")]
