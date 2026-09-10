@@ -21,7 +21,7 @@ import re
 import time
 from pathlib import Path
 
-from forge import backends, gate, gitctl, journal, models as m, queue, runner, stages
+from forge import backends, budget, gate, gitctl, journal, models as m, queue, runner, stages
 
 log = logging.getLogger(__name__)
 
@@ -568,6 +568,12 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
         prompt, cwd=worktree, timeout=stufe.timeout,
         agent=stufe.name, model=stufe.model,
     )
+
+    # Verbrauch buchen, bevor irgendein Zweig zurückspringt — auch ein
+    # gescheiterter Lauf hat Kontingent gekostet.
+    budget.buche(stufe.model, ergebnis.tokens_in, ergebnis.tokens_out)
+    if ergebnis.rate_limited:
+        budget.markiere_erschoepft(stufe.model, (ergebnis.error or "Rate-Limit")[:200])
 
     # Fund 1 (Akzeptanzlauf 2026-08-15): ein Timeout ist nicht automatisch ein
     # Fehlschlag. Der Lauf kann sein Produkt bereits geliefert (implement/fix

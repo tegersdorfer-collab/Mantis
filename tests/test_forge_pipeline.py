@@ -44,6 +44,12 @@ def stubs(monkeypatch):
                         lambda tid, current: aufz["fehlschlaege"].append((tid, current)) or False)
     monkeypatch.setattr(pl.queue, "versuche_zuruecksetzen",
                         lambda tid: aufz["zuruecksetzungen"].append(tid))
+    # Budget ebenso gestubbt: buche()/markiere_erschoepft() (Task 7) würden
+    # sonst bei jedem Lauf die echte Postgres-Verbindung öffnen. Tests, die
+    # das Budget-Verhalten selbst prüfen, überschreiben diese Stubs lokal
+    # (siehe TestBudgetMeldung._budget_stub).
+    monkeypatch.setattr(pl.budget, "buche", lambda model, ti, to: None)
+    monkeypatch.setattr(pl.budget, "markiere_erschoepft", lambda model, grund: None)
 
     def _fixrunde(tid):
         aufz["fixrunden"] += 1
@@ -1181,3 +1187,38 @@ class TestGestagterRenameGegenEchtesGit:
                                    capture_output=True, text=True).stdout.split()
         assert "neu.py" in vorhanden
         assert "alt.py" not in vorhanden
+
+
+class TestBudgetMeldung:
+    def _budget_stub(self, monkeypatch):
+        gebucht, erschoepft = [], []
+        monkeypatch.setattr(pl.budget, "buche",
+                            lambda m, ti, to: gebucht.append((m, ti, to)))
+        monkeypatch.setattr(pl.budget, "markiere_erschoepft",
+                            lambda m, g: erschoepft.append((m, g)))
+        return gebucht, erschoepft
+
+    def test_erfolgreicher_lauf_wird_gebucht(self, monkeypatch, stubs, tmp_path):
+        gebucht, _ = self._budget_stub(monkeypatch)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: RunResult(
+                ok=True, text="egal", tokens_in=1200, tokens_out=80)))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert gebucht and gebucht[-1][1:] == (1200, 80)
+
+    def test_rate_limit_markiert_den_anbieter_als_erschoepft(self, monkeypatch, stubs, tmp_path):
+        _, erschoepft = self._budget_stub(monkeypatch)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: RunResult(
+                ok=False, error="rate limit", rate_limited=True)))
+        pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert erschoepft, "Rate-Limit wurde nicht ans Budget gemeldet"
+
+    def test_gewoehnlicher_fehler_erschoepft_nichts(self, monkeypatch, stubs, tmp_path):
+        _, erschoepft = self._budget_stub(monkeypatch)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: RunResult(
+                ok=False, error="irgendwas anderes")))
+        pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert erschoepft == []
