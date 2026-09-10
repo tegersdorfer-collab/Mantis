@@ -227,9 +227,16 @@ Fehlerfall.
 **Interfaces:**
 - Consumes: `gitctl.run(*args, cwd) -> CompletedProcess`-ähnliches Objekt mit
   `returncode`, `stdout`, `stderr`
-- Produces: `_stufenarbeit_pfade(worktree) -> tuple[list[str], str | None]`
-  — Pfade und, im Fehlerfall, eine Meldung. **Signaturänderung**: alle drei
+- Produces:
+  `_stufenarbeit_pfade(worktree) -> tuple[list[str], list[str], str | None]`
+  — `(zum_hinzufuegen, zum_committen, fehler)`. **Signaturänderung**: alle drei
   Aufrufstellen müssen mit.
+
+**Warum zwei Listen statt einer.** `git add` und `git commit` brauchen
+unterschiedliche Pfadmengen, sobald eine Umbenennung im Spiel ist — am
+2026-09-10 gegen echtes git gemessen. In diesem Task sind beide Listen noch
+identisch; Task 3 nutzt die Trennung. Die Aufteilung gehört hierher, damit
+Task 3 nur noch Semantik ändert und nicht erneut die Signatur.
 
 - [ ] **Schritt 1: Den fehlschlagenden Test schreiben**
 
@@ -247,10 +254,22 @@ class TestGitStatusFehlschlag:
 
     def test_pfade_melden_den_fehler_statt_leerer_liste(self, monkeypatch, tmp_path):
         self._kaputtes_gitctl(monkeypatch)
-        pfade, fehler = pl._stufenarbeit_pfade(tmp_path)
-        assert pfade == []
+        zum_hinzufuegen, zum_committen, fehler = pl._stufenarbeit_pfade(tmp_path)
+        assert zum_hinzufuegen == []
+        assert zum_committen == []
         assert fehler is not None
         assert "128" in fehler
+
+    def test_beide_listen_sind_ohne_umbenennung_gleich(self, monkeypatch, tmp_path):
+        class _Zwei:
+            returncode = 0
+            stdout = " M a.py\0?? b.py\0"
+            stderr = ""
+
+        monkeypatch.setattr(pl.gitctl, "run", lambda *a, **k: _Zwei())
+        zum_hinzufuegen, zum_committen, fehler = pl._stufenarbeit_pfade(tmp_path)
+        assert fehler is None
+        assert zum_hinzufuegen == zum_committen == ["a.py", "b.py"]
 
     def test_committe_gibt_den_fehler_weiter_statt_erfolg(self, monkeypatch, tmp_path):
         """Der stille C3-Fehlermodus: Erfolg melden, obwohl nichts committet ist."""
@@ -272,6 +291,7 @@ class TestGitStatusFehlschlag:
     def test_timeout_produkt_meldet_kein_produkt_bei_kaputtem_status(self, monkeypatch, tmp_path):
         """Signatur ist _timeout_produkt(stufe, task, worktree, start)."""
         self._kaputtes_gitctl(monkeypatch)
+        monkeypatch.setattr(pl, "_hat_neuen_commit", lambda w: False)
         implement = next(s for s in pl.stages.ALLE_STUFEN if s.name == "implement")
         hat_produkt, pfad = pl._timeout_produkt(implement, {"id": 1}, tmp_path, 0.0)
         assert hat_produkt is False
@@ -290,35 +310,43 @@ In `_stufenarbeit_pfade` den Docstring um einen Absatz ergänzen und die
 Rückgaben ändern:
 
 ```python
-    Rückgabe ist ein Tupel (pfade, fehler). Ein fehlgeschlagenes `git status`
-    darf NICHT als leere Liste zurückkommen: der Aufrufer läse das als "nichts
-    zu committen" und liesse die Stufe mit uncommitteter Arbeit weiterrücken —
-    genau der Fehlermodus, gegen den _committe_stufenarbeit gebaut wurde, nur
-    still. `_schreibe_diff` behandelt denselben Fall ebenso als Fehler.
+    Rückgabe ist (zum_hinzufuegen, zum_committen, fehler). Zwei Listen, weil
+    `git add` und `git commit` bei Umbenennungen unterschiedliche Pfadmengen
+    brauchen — hier sind sie noch identisch, Task 3 trennt sie inhaltlich.
+
+    Ein fehlgeschlagenes `git status` darf NICHT als leere Liste zurückkommen:
+    der Aufrufer läse das als "nichts zu committen" und liesse die Stufe mit
+    uncommitteter Arbeit weiterrücken — genau der Fehlermodus, gegen den
+    _committe_stufenarbeit gebaut wurde, nur still. `_schreibe_diff` behandelt
+    denselben Fall ebenso als Fehler.
     """
     ergebnis = gitctl.run("status", "--porcelain", "-z", "--untracked-files=all", cwd=worktree)
     if ergebnis.returncode != 0:
         fehler = (f"git status fehlgeschlagen (returncode {ergebnis.returncode}): "
                   f"{(ergebnis.stderr or '').strip()[:300]}")
         log.warning(f"Forge-Pipeline: {fehler}")
-        return [], fehler
+        return [], [], fehler
 ```
 
 und am Ende der Funktion:
 
 ```python
-    return sorted(set(pfade)), None
+    geordnet = sorted(set(pfade))
+    return geordnet, list(geordnet), None
 ```
 
-In `_committe_stufenarbeit` die Aufrufstelle:
+In `_committe_stufenarbeit` die Aufrufstelle und die beiden git-Aufrufe:
 
 ```python
-    pfade, fehler = _stufenarbeit_pfade(worktree)
+    zum_hinzufuegen, zum_committen, fehler = _stufenarbeit_pfade(worktree)
     if fehler is not None:
         return fehler
-    if not pfade:
+    if not zum_committen:
         return None
+    hinzugefuegt = gitctl.run("add", "--", *zum_hinzufuegen, cwd=worktree)
 ```
+
+und weiter unten der commit-Aufruf entsprechend mit `*zum_committen`.
 
 In `_timeout_produkt` (Zeile 212). **Achtung:** das zweite Tupel-Element ist
 ein Artefaktpfad für spec/plan, kein Fehlertext — dort gehört auch im
@@ -326,12 +354,12 @@ Fehlerfall `None` hin, nicht die Meldung:
 
 ```python
     if stufe.name in _ARBEITSSTUFEN:
-        pfade, fehler = _stufenarbeit_pfade(worktree)
+        _, zum_committen, fehler = _stufenarbeit_pfade(worktree)
         if fehler is not None:
             # Kein Produkt nachweisbar, wenn git nicht antwortet. Der Fehler
             # wird eine Ebene höher beim Commit-Versuch erneut sichtbar.
             return False, None
-        return _hat_neuen_commit(worktree) or bool(pfade), None
+        return _hat_neuen_commit(worktree) or bool(zum_committen), None
 ```
 
 - [ ] **Schritt 4: Test laufen lassen und Erfolg prüfen**
@@ -364,17 +392,33 @@ Pathspec komplett ab (returncode 128) — es wird gar nichts committet, der Task
 parkt, und jeder Neuversuch scheitert erneut. Ohne manuelles `git reset` kommt
 die Arbeit nie in einen Commit.
 
-Der Quellpfad wird nur gebraucht, wenn der Rename **nicht** schon im Index
-steht. Im Porcelain-Format ist `status[0]` der Index-Status — `R` oder `C` dort
-heisst bereits gestagt.
+**Am 2026-09-10 gegen echtes git gemessen, das Ergebnis widerlegt die
+naheliegende Lösung.** Nach `git mv alt.py neu.py` meldet
+`git status --porcelain -z --untracked-files=all` genau `R  neu.py\0alt.py\0`.
+
+- Quellpfad **auch** an `git add`: `fatal: pathspec 'alt.py' did not match any
+  files`, returncode 128, und weil ein einziger schlechter Pathspec das ganze
+  `add` abbricht, wird gar nichts committet.
+- Quellpfad **weder** an `add` **noch** an `commit`: `git add -- neu.py` läuft,
+  `git commit -- neu.py` läuft — aber danach steht `D  alt.py` weiterhin
+  gestagt und uncommittet im Baum. Die Löschung der Quelle bleibt liegen, und
+  der nächste Durchlauf scheitert erneut an genau diesem Pfad.
+- Quellpfad **nur an `commit`**, nicht an `add`: `git status --porcelain` ist
+  danach leer, `git show --stat` zeigt `alt.py => neu.py`. Das ist die richtige
+  Form.
+
+Deshalb die zwei Listen aus Task 2: `zum_hinzufuegen` ohne die Rename-Quelle,
+`zum_committen` mit ihr.
 
 **Files:**
 - Modify: `forge/pipeline.py:100-135` (`_stufenarbeit_pfade`, Rename-Zweig)
 - Test: `tests/test_forge_pipeline.py`
 
 **Interfaces:**
-- Consumes: `_stufenarbeit_pfade(worktree) -> tuple[list[str], str | None]` aus Task 2
-- Produces: keine neuen
+- Consumes:
+  `_stufenarbeit_pfade(worktree) -> tuple[list[str], list[str], str | None]`
+  aus Task 2
+- Produces: keine neuen (nur geänderte Semantik der beiden Listen)
 
 - [ ] **Schritt 1: Den fehlschlagenden Test gegen echtes git schreiben**
 
@@ -401,21 +445,24 @@ class TestGestagterRenameGegenEchtesGit:
         g("commit", "-qm", "start")
         return g
 
-    def test_gestagter_rename_laesst_add_nicht_scheitern(self, tmp_path):
-        """Der Quellpfad eines bereits gestagten Renames matcht auf nichts mehr.
-        Ein einziger schlechter Pathspec bricht das ganze `git add` ab."""
+    def test_quelle_geht_an_commit_aber_nicht_an_add(self, tmp_path):
+        """Gemessen am 2026-09-10: der Quellpfad eines gestagten Renames matcht
+        bei `git add` auf nichts (returncode 128, bricht das ganze add ab),
+        wird bei `git commit` aber gebraucht — sonst bleibt die Loeschung
+        der Quelle gestagt und uncommittet liegen."""
         g = self._repo(tmp_path)
         g("mv", "alt.py", "neu.py")          # legt den Rename in den Index
         (tmp_path / "dazu.py").write_text("x\n")
 
-        pfade, fehler = pl._stufenarbeit_pfade(tmp_path)
+        zum_hinzufuegen, zum_committen, fehler = pl._stufenarbeit_pfade(tmp_path)
         assert fehler is None
-        assert "alt.py" not in pfade, "Quellpfad eines gestagten Renames gehoert nicht in die Pathspecs"
-        assert "neu.py" in pfade
-        assert "dazu.py" in pfade
+        assert "alt.py" not in zum_hinzufuegen, "Quelle gehoert nicht an git add"
+        assert "alt.py" in zum_committen, "Quelle wird bei git commit gebraucht"
+        assert "neu.py" in zum_hinzufuegen and "neu.py" in zum_committen
+        assert "dazu.py" in zum_hinzufuegen and "dazu.py" in zum_committen
 
         # Der eigentliche Beweis: git add muss die Pfade annehmen.
-        ergebnis = subprocess.run(["git", "add", "--", *pfade], cwd=tmp_path,
+        ergebnis = subprocess.run(["git", "add", "--", *zum_hinzufuegen], cwd=tmp_path,
                                   capture_output=True, text=True)
         assert ergebnis.returncode == 0, ergebnis.stderr
 
@@ -439,31 +486,49 @@ class TestGestagterRenameGegenEchtesGit:
 - [ ] **Schritt 2: Test laufen lassen und Fehlschlag prüfen**
 
 Run: `python3.14 -m pytest tests/test_forge_pipeline.py::TestGestagterRenameGegenEchtesGit -q`
-Erwartet: FAIL — `assert "alt.py" not in pfade` schlägt fehl, weil der
-Quellpfad noch mitgenommen wird. Wenn stattdessen der `git add`-Aufruf mit
-returncode 128 und `fatal: pathspec 'alt.py' did not match any files` scheitert,
-ist das derselbe Befund von der anderen Seite — beides ist ein gültiger RED.
+Erwartet: FAIL bei `assert "alt.py" not in zum_hinzufuegen` — nach Task 2 sind
+beide Listen noch identisch, die Quelle steht also auch in `zum_hinzufuegen`.
 
 - [ ] **Schritt 3: Implementierung**
 
-In `_stufenarbeit_pfade` den Rename-Zweig ersetzen:
+In `_stufenarbeit_pfade` zwei Listen führen statt einer. Die Sammelschleife:
 
 ```python
+    nur_commit: list[str] = []
+    pfade: list[str] = []
+    i = 0
+    while i < len(eintraege):
+        eintrag = eintraege[i]
+        i += 1
+        # Format je Eintrag: zwei Statuszeichen, ein Leerzeichen, dann der Pfad.
+        if len(eintrag) < 4:
+            continue
         status, pfad = eintrag[:2], eintrag[3:]
         if status[0] in ("R", "C"):
             # Bei Umbenennung/Kopie folgt der Quellpfad als eigener Eintrag.
             # status[0] ist der INDEX-Status: 'R'/'C' dort heisst, der Rename
-            # steht bereits im Index, die Quelle existiert im Arbeitsbaum nicht
-            # mehr, und ein Pathspec darauf matcht auf nichts. `git add` bricht
-            # bei einem einzigen schlechten Pathspec komplett ab (returncode
-            # 128) — dann wird gar nichts committet und jeder Neuversuch
-            # scheitert erneut. Der Eintrag wird deshalb übersprungen, nicht
-            # übernommen; die Löschung der Quelle steckt bereits im Index.
+            # steht bereits im Index und die Quelle existiert im Arbeitsbaum
+            # nicht mehr. Am 2026-09-10 gegen echtes git gemessen:
+            #   - Quelle an `git add`  → returncode 128, und weil ein einziger
+            #     schlechter Pathspec das ganze add abbricht, wird NICHTS
+            #     committet; der Task haengt danach dauerhaft.
+            #   - Quelle nirgends      → `D <quelle>` bleibt gestagt und
+            #     uncommittet liegen, der naechste Durchlauf scheitert erneut.
+            #   - Quelle nur an commit → sauber, `git show --stat` zeigt die
+            #     Umbenennung, der Baum ist danach leer.
             if i < len(eintraege) and eintraege[i]:
+                quelle = eintraege[i]
                 i += 1
+                if not _ist_intern(quelle):
+                    nur_commit.append(quelle)
         if not _ist_intern(pfad):
             pfade.append(pfad)
+    zum_hinzufuegen = sorted(set(pfade))
+    zum_committen = sorted(set(pfade) | set(nur_commit))
+    return zum_hinzufuegen, zum_committen, None
 ```
+
+Der `return`-Zweig für den `git status`-Fehler aus Task 2 bleibt unverändert.
 
 - [ ] **Schritt 4: Test laufen lassen und Erfolg prüfen**
 
