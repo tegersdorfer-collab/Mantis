@@ -167,3 +167,128 @@ Mock — Spec-Stufe schreibt eine echte Datei über opencode/Gemini, Review-Stuf
 liefert ein echtes, geparstes Urteil über agy/Antigravity/Opus. Keine
 Wiring-Bugs gefunden. Quota-Verbrauch: 1 opencode-Lauf (Google AI Studio,
 unmetered), 1 agy-Lauf (schätzungsweise 1 von ~18–20 Antigravity-Anfragen/Tag).
+
+## Abnahmelauf Budget und Ketten
+
+Aufgenommen am 2026-09-10, Task 9 des Plans „forge-budget-ketten" (Abnahme-Gate
+für Budget-Buchführung und Ausweich-Ketten gegen die echte PostgreSQL-Tabelle,
+nicht gegen `core.db`-Mocks wie in den Unit-Tests aus Task 1–8). Ausgeführt im
+Worktree `/Users/timoegersdorfer/Mantis/.worktrees/forge-budget-ketten` (nicht
+`~/Mantis` — das Briefing nennt `~/Mantis`, aber der Code aus diesem Plan liegt
+nur auf diesem Branch/Worktree; das ist der einzige Abweichung von den
+wörtlichen Befehlen im Task-Brief). **Kein LLM-Provider wurde aufgerufen**,
+weder `opencode` noch `agy` — die Erschöpfung wurde ausschliesslich über
+`forge.budget` herbeigeführt.
+
+**Schritt 1 — Datenbank erreichbar, Migrationen:**
+
+```
+$ python3.14 -c "
+from core import db
+db.init_pool(); db.run_migrations()
+print('Migrationen gelaufen')
+print(db.query('SELECT * FROM forge_budget LIMIT 1'))
+"
+```
+```
+⚠️  OWNER_NAME nicht in .env gesetzt – bitte eintragen
+Migrationen gelaufen
+[]
+```
+Erwartung erfüllt: „Migrationen gelaufen" und leere Liste. Die `OWNER_NAME`-
+Warnung ist unabhängiges Konfigurations-Rauschen, kein Fehler — `forge_budget`
+existierte vor diesem Lauf nicht und wurde durch `run_migrations()` neu
+angelegt.
+
+**Schritt 2 — Buchführung gegen die echte Tabelle:**
+
+```
+$ python3.14 -c "
+from core import db
+from forge import budget
+db.init_pool()
+budget.buche('nvidia/moonshotai/kimi-k3', 1000, 50)
+budget.buche('nvidia/minimaxai/minimax-m3', 500, 25)
+print('Stand:', budget.stand())
+print('erschoepft?', budget.ist_erschoepft('nvidia/moonshotai/kimi-k3'))
+"
+```
+```
+Stand: [{'nacht': datetime.date(2026, 9, 10), 'provider': 'nvidia', 'laeufe': 2, 'tokens_in': 1500, 'tokens_out': 75, 'erschoepft_seit': None, 'grund': None}]
+erschoepft? False
+```
+Erwartung erfüllt exakt: eine Zeile für `nvidia` mit `laeufe=2`,
+`tokens_in=1500`, `tokens_out=75`, `erschoepft_seit=None`; `erschoepft?` liefert
+`False`. Der `ON CONFLICT`-Upsert aggregiert über zwei Aufrufe korrekt gegen
+echtes Postgres — das hatte bislang nur die Fake-Datenbank in den Unit-Tests
+bestätigt.
+
+**Schritt 3 — Erschöpfung und Ausweichen:**
+
+```
+$ python3.14 -c "
+from core import db
+from forge import budget, ketten
+db.init_pool()
+print('vorher :', ketten.waehle('implement'))
+budget.markiere_erschoepft('nvidia/minimaxai/minimax-m3', 'Abnahmelauf')
+print('nachher:', ketten.waehle('implement'))
+print('review mit verbotenem Modell:',
+      ketten.waehle('review', verboten=frozenset({'claude-opus-4-6-thinking'})))
+"
+```
+```
+Forge-Budget: nvidia erschöpft — Abnahmelauf
+vorher : ('opencode', 'nvidia/minimaxai/minimax-m3')
+nachher: ('opencode', 'google/gemini-3.6-flash')
+review mit verbotenem Modell: ('agy', 'gemini-3.1-pro-high')
+```
+Erwartung erfüllt exakt: `vorher` nennt ein NVIDIA-Modell
+(`nvidia/minimaxai/minimax-m3`). Nach `markiere_erschoepft()` auf ein
+NVIDIA-Modell nennt `nachher` **kein** weiteres NVIDIA-Modell, sondern
+`('opencode', 'google/gemini-3.6-flash')` — das anbieterfremde letzte Glied der
+`implement`-Kette. Das belegt: Erschöpfung wird korrekt anbieterweit
+getrackt, nicht je Modell (der erste mögliche Defekt aus dem Brief trat nicht
+ein), und das anbieterfremde Fallback-Glied wird tatsächlich erreicht statt
+`None` zu liefern (der zweite mögliche Defekt trat ebenfalls nicht ein).
+`review` mit `claude-opus-4-6-thinking` verboten weicht wie erwartet auf
+`('agy', 'gemini-3.1-pro-high')` aus.
+
+**Schritt 4 — Aufräumen:**
+
+```
+$ python3.14 -c "
+from core import db
+from forge import budget
+db.init_pool()
+db.execute('DELETE FROM forge_budget WHERE nacht = %s', (budget.nacht_id(),))
+print('Testzeilen entfernt:', budget.stand())
+"
+```
+```
+Testzeilen entfernt: []
+```
+Erwartung erfüllt: leere Liste. Zusätzlich geprüft mit
+`SELECT * FROM forge_budget` (ohne `WHERE`-Filter): ebenfalls `[]` — die
+Tabelle war vor diesem Abnahmelauf leer und ist es danach wieder; keine
+fremden Nächte betroffen, die Tabelle selbst wurde nicht gelöscht.
+
+**Verifikation der Nebenbedingungen:**
+
+```
+$ python3.14 -m pytest tests/ -q
+```
+`1414 passed, 6 warnings in 5.59s` (die Warnungen sind eine vorbestehende
+`feedparser`-Deprecation in `tests/test_news_feeds.py`, unabhängig von diesem
+Task).
+
+```
+$ ruff check .
+```
+`All checks passed!`
+
+**Ergebnis:** Alle vier Abnahmeschritte liefen wie im Brief erwartet, keine
+der beiden beschriebenen Defekt-Beobachtungen trat ein. Die
+Upsert-Aggregation, die Erschöpfungs-Markierung und die anbieterweite
+Ausweichlogik in `forge/ketten.py` funktionieren im Zusammenspiel gegen echtes
+PostgreSQL — nicht nur gegen den `core.db`-Mock der Unit-Tests aus Task 1–8.
