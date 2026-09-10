@@ -38,6 +38,18 @@ BLOCKED_SLEEP_SECONDS = 300
 # weitere Ticks, ohne jede Bremse — bis zu drei Vollpreis-Claude-Läufe in
 # Sekunden, bevor die Fehler-Spirale überhaupt greift.
 FAILURE_SLEEP_SECONDS = 30
+# Backoff nach einem geparkten Task. Ein Park ist kein Fortschritt, und er kann
+# entstehen, ohne dass ein einziger LLM-Lauf stattfand (Reviewer-Kollision,
+# fehlendes Artefakt, kaputter Worktree). Ohne Bremse zieht der nächste Tick
+# sofort den nächsten Task, legt Worktree und Branch an, parkt ihn und macht
+# weiter — ein ganzer Backlog ist so in Sekunden verbrannt. Kürzer als
+# FAILURE_SLEEP_SECONDS, weil ein Park den Task aus der Queue nimmt und der
+# nächste durchaus echte Arbeit sein kann.
+#
+# Der Kontingent-Fall braucht hier KEINEN eigenen Zweig: eine erschöpfte Kette
+# meldet seit dem Abschluss-Review C2 "fehler" statt "geparkt"
+# (forge/pipeline.py) und bekommt damit FAILURE_SLEEP_SECONDS.
+PARK_SLEEP_SECONDS = 10
 
 
 def should_run(failures: int) -> tuple[bool, str]:
@@ -198,6 +210,8 @@ def main() -> None:
             time.sleep(IDLE_SLEEP_SECONDS)
         elif ergebnis == "fehler":
             time.sleep(FAILURE_SLEEP_SECONDS)
+        elif ergebnis == "geparkt":
+            time.sleep(PARK_SLEEP_SECONDS)
 
 
 if __name__ == "__main__":

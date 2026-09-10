@@ -557,9 +557,27 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
 
     wahl = ketten.waehle(stufe.name, verboten=verboten)
     if wahl is None:
+        # Zwei Ursachen, zwei Ausgänge (Abschluss-Review C2, 2026-09-10). Vorher
+        # parkte hier beides — und weil der Daemon bei "geparkt" nicht schläft,
+        # verwandelte eine trockene Kette binnen Sekunden den kompletten Backlog
+        # in geparkte Tasks mit je einem Worktree und Branch, ohne einen
+        # einzigen LLM-Aufruf.
+        if ketten.kette_erschoepft(stufe.name):
+            # Kontingent, nicht Fehlverhalten: Zustand bewusst unverändert
+            # lassen (wie der Rate-Limit-Pfad weiter unten), damit der Task
+            # weiterläuft, sobald die Anbieter wieder da sind. Spec Zeile 264:
+            # "Erst wenn jede Kette trocken ist, endet die Nacht."
+            grund = (f"Kette für Stufe '{stufe.name}' erschöpft — jeder Anbieter ist für diese "
+                     f"Nacht raus; Task {task_id} bleibt liegen (kein Park)")
+            log.warning(f"Forge-Pipeline: {grund}")
+            journal.log(task_id, "stage_failed", grund)
+            return "fehler"
+        # Reviewer-Kollision: übrig bliebe nur das Modell, das implementiert
+        # hat. Hier verlangt die Spec (Zeile 183) ausdrücklich Parken — ein
+        # Modell, das seinen eigenen Code abnimmt, sieht nur aus wie ein Review.
         _park(task_id, state,
-              f"Kette für Stufe '{stufe.name}' erschöpft — kein nutzbares Modell "
-              f"übrig (Task {task_id})")
+              f"Kette für Stufe '{stufe.name}' erschöpft — übrig bliebe nur das Modell, "
+              f"das implementiert hat (Task {task_id})")
         return "geparkt"
     backend_name, modell = wahl
 

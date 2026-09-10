@@ -232,6 +232,37 @@ class TestFailureBackoff:
         d.main()
         assert d.FAILURE_SLEEP_SECONDS in schlaefe
 
+    def test_geparkter_task_bekommt_backoff_sleep(self, monkeypatch, tmp_path):
+        # Abschluss-Review C2 (2026-09-10): main() schlief nur bei "leerlauf"
+        # und "fehler". Ein Park ist aber kein Fortschritt und kann ganz ohne
+        # LLM-Lauf entstehen — ohne Bremse zog der nächste Tick sofort den
+        # nächsten Task, legte Worktree und Branch an, parkte ihn, und so
+        # weiter durch den kompletten Backlog, in Sekunden.
+        class _Abbruch(BaseException):
+            """BaseException, damit main()s `except Exception` sie NICHT fängt —
+            sonst liefe die Schleife weiter."""
+
+        stop = tmp_path / "stop"
+        monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
+        monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
+
+        ergebnisse = iter(["geparkt"])
+
+        def _tick():
+            for wert in ergebnisse:
+                return wert
+            raise _Abbruch
+
+        monkeypatch.setattr(d, "tick", _tick)
+        schlaefe = []
+        monkeypatch.setattr(d.time, "sleep", lambda s: schlaefe.append(s))
+        with pytest.raises(_Abbruch):
+            d.main()
+        assert d.PARK_SLEEP_SECONDS in schlaefe, \
+            f"kein Backoff nach einem Park: {schlaefe}"
+
 
 
 class TestTickUeberlebtAbsturz:

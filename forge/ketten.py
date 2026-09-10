@@ -41,10 +41,20 @@ KETTEN: dict[str, tuple[tuple[str, str], ...]] = {
         ("opencode", "nvidia/moonshotai/kimi-k3"),
         ("opencode", "google/gemini-3.6-flash"),
     ),
+    # Review ist bewusst Antigravity-only, und die Kette ist deshalb kürzer als
+    # die anderen. Die Review-Stufe hat ein PROTOKOLL: der Diff wird aus
+    # .forge/diff.patch gelesen und in den Prompt eingebettet, das Urteil kommt
+    # auf stdout, und der Runner schreibt daraus .forge/review.json. Nur
+    # forge/runner_agy.py kann das; forge/runner_opencode.py kennt weder die
+    # eine noch die andere Datei. Ein opencode-Glied hier bekäme einen Prompt,
+    # der "der Diff steht unten" behauptet (er steht nicht da) und "schreib
+    # keine Datei, das macht der Runner" (er macht es nicht) — ein voller Lauf
+    # für nichts, und schlimmstenfalls schriebe das Modell (edit: allow) sich
+    # selbst ein "pass", ohne den Diff je gesehen zu haben. Zwei Glieder sind
+    # die ehrliche Kettenlänge, solange nur ein Backend das Protokoll kann.
     "review": (
         ("agy", "claude-opus-4-6-thinking"),
         ("agy", "gemini-3.1-pro-high"),
-        ("opencode", "nvidia/moonshotai/kimi-k3"),
     ),
 }
 
@@ -64,3 +74,28 @@ def waehle(stufe_name: str, verboten: frozenset[str] = frozenset()) -> tuple[str
             continue
         return backend, model
     return None
+
+
+def kette_erschoepft(stufe_name: str) -> bool:
+    """Ist die Kette wirklich trocken — unabhängig von der Reviewer-Regel?
+
+    `waehle` liefert None aus zwei Gründen, die NICHT denselben Handler haben
+    dürfen:
+
+    * **Reviewer-Kollision** — es bliebe nur noch das Modell übrig, das
+      implementiert hat. Die Spec verlangt hier Parken (Zeile 183: "geparkt
+      statt reviewt").
+    * **Kontingent-Erschöpfung** — jeder Anbieter der Kette ist für diese
+      Nacht raus. Die Spec sagt hier etwas anderes (Zeile 264: "Erst wenn jede
+      Kette trocken ist, endet die Nacht") — der Task bleibt liegen und läuft
+      weiter, sobald das Kontingent zurück ist.
+
+    Unterschieden wird durch einen zweiten Anlauf OHNE `verboten`: bleibt auch
+    dann nichts übrig, lag es nicht an der Reviewer-Regel. Diesen Weg statt
+    eines zusätzlichen Rückgabewerts von `waehle`, weil `waehle` genau einen
+    Zweck hat (welches Glied läuft?) und ein Tupel aus Wahl und Grund jeden
+    Aufrufer zwänge, den Grund auch dort auszupacken, wo er ihn nicht braucht.
+    Der Preis ist ein zweiter Durchlauf der Kette — er passiert nur im
+    None-Fall, also nie im Normalbetrieb.
+    """
+    return waehle(stufe_name) is None

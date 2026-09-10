@@ -1285,9 +1285,15 @@ class TestKettenwahl:
         assert gesehen["backend"] == "opencode"
         assert gesehen["model"] == "test/modell-x"
 
-    def test_leere_kette_parkt_statt_zu_scheitern(self, monkeypatch, stubs, tmp_path):
-        monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
-        ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+    def test_reviewer_kollision_parkt(self, monkeypatch, stubs, tmp_path):
+        """Bleibt nur noch das Implementierer-Modell übrig, wird geparkt —
+        Spec Zeile 183, "geparkt statt reviewt"."""
+        # Ohne `verboten` liefert die Kette noch ein Glied: die Kette ist also
+        # nicht trocken, es scheitert allein an der Reviewer-Regel.
+        monkeypatch.setattr(pl.ketten, "waehle",
+                            lambda name, verboten=frozenset(): None if verboten else ("agy", "irgendwas"))
+        ergebnis = pl._eine_stufe_intern({"id": 1, "implement_model": "agy-modell"},
+                                         1, m.REVIEWING, tmp_path)
         assert ergebnis == "geparkt"
         assert stubs["parks"], "kein Park-Eintrag geschrieben"
         # Review-Finding (Minor, 2026-09-09): "nicht leer" genügt nicht — ein
@@ -1296,6 +1302,32 @@ class TestKettenwahl:
         # tatsächlich nennen.
         assert "Kette" in stubs["parks"][-1][1], \
             f"Park-Grund nennt die erschöpfte Kette nicht: {stubs['parks'][-1][1]!r}"
+
+    def test_erschoepfte_kette_parkt_nicht_und_verbraucht_den_task_nicht(
+            self, monkeypatch, stubs, tmp_path):
+        """Abschluss-Review C2 (2026-09-10): Kontingent-Erschöpfung ist kein
+        Park-Grund. Spec Zeile 264: "Erst wenn jede Kette trocken ist, endet die
+        Nacht" — der Task bleibt unangetastet liegen und läuft weiter, sobald
+        das Kontingent zurück ist. Vorher parkte dieser Pfad, und weil der
+        Daemon bei "geparkt" nicht schlief, war ein ganzer Backlog in Sekunden
+        geparkt, mit je einem Worktree und Branch."""
+        monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
+        ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert ergebnis == "fehler", "erschöpfte Kette darf nicht als Park gemeldet werden"
+        assert stubs["parks"] == [], f"Task wurde trotzdem geparkt: {stubs['parks']}"
+        assert stubs["states"] == [], f"Zustand wurde verändert: {stubs['states']}"
+        assert stubs["fehlschlaege"] == [], "Fehlschlag-Zähler darf nicht anspringen"
+        # Die Nacht endet still, wenn niemand sie protokolliert — der Grund muss
+        # morgens im Journal stehen.
+        assert any("erschöpft" in str(eintrag[0]) for eintrag in stubs["journal"]), \
+            f"kein Journal-Eintrag zur erschöpften Kette: {stubs['journal']}"
+
+    def test_erschoepfte_kette_ruft_kein_backend_auf(self, monkeypatch, stubs, tmp_path):
+        """Kein Glied heißt kein Lauf — die Erschöpfung darf kein Kontingent kosten."""
+        monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda *a, **kw: pytest.fail("Backend trotz erschöpfter Kette aufgerufen")))
+        assert pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path) == "fehler"
 
     def test_review_bekommt_das_implementierer_modell_als_verboten(self, monkeypatch, stubs, tmp_path):
         gesehen = {}
@@ -1373,17 +1405,20 @@ class TestKettenwahl:
             f"budget.markiere_erschoepft bekam nicht das Kettenmodell: {erschoepft}"
 
     def test_erschoepfte_kette_auf_fix_stufe_verbraucht_keine_fixrunde(self, monkeypatch, stubs, tmp_path):
-        """Review-Finding 3 (2026-09-09): die Kettenwahl (und ihr
-        Park-auf-None) muss VOR der Fixrunden-Zählung stehen. Stünde sie
-        danach, würde jeder Versuch gegen eine erschöpfte Kette eine
-        Fixrunde verbrauchen, obwohl nie ein Fix-Lauf stattfand — nach
-        MAX_FIXRUNDEN stünde der Task mit dem irreführenden Grund
-        'Fix-Runden-Grenze erreicht' geparkt, obwohl in Wirklichkeit kein
-        Anbieter mehr verfügbar war."""
+        """Review-Finding 3 (2026-09-09): die Kettenwahl muss VOR der
+        Fixrunden-Zählung stehen. Stünde sie danach, würde jeder Versuch gegen
+        eine erschöpfte Kette eine Fixrunde verbrauchen, obwohl nie ein
+        Fix-Lauf stattfand — nach MAX_FIXRUNDEN stünde der Task mit dem
+        irreführenden Grund 'Fix-Runden-Grenze erreicht' geparkt, obwohl in
+        Wirklichkeit kein Anbieter mehr verfügbar war.
+
+        Seit Abschluss-Review C2 (2026-09-10) meldet dieser Pfad "fehler"
+        statt zu parken (Kontingent ist kein Fehlverhalten) — die Zusicherung
+        dieses Tests bleibt davon unberührt: gezählt wird nichts."""
         _verdikt(tmp_path, "fail", [{"severity": "important", "what": "x"}])
         monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
         ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.REVIEWING, tmp_path)
-        assert ergebnis == "geparkt"
+        assert ergebnis == "fehler"
         assert stubs["fixrunden"] == 0, \
             "eine erschöpfte Kette hat trotzdem eine Fixrunde verbraucht"
-        assert "Kette" in stubs["parks"][-1][1]
+        assert stubs["parks"] == [], "Kontingent-Erschöpfung darf nicht parken"
