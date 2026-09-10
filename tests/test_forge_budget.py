@@ -30,3 +30,104 @@ class TestMigrationen:
                 assert "IF NOT EXISTS" in gross, m[:80]
             if gross.strip().startswith("ALTER TABLE") and "ADD COLUMN" in gross:
                 assert "IF NOT EXISTS" in gross, m[:80]
+
+
+from datetime import date, datetime
+
+import pytest
+
+from forge import budget
+
+
+class TestProviderAusModell:
+    def test_opencode_modelle_tragen_den_provider_vorn(self):
+        assert budget.provider_von_modell("nvidia/moonshotai/kimi-k3") == "nvidia"
+        assert budget.provider_von_modell("google/gemini-3.6-flash") == "google"
+        assert budget.provider_von_modell("groq/openai/gpt-oss-120b") == "groq"
+
+    def test_agy_modelle_haben_keinen_praefix(self):
+        assert budget.provider_von_modell("claude-opus-4-6-thinking") == "antigravity"
+        assert budget.provider_von_modell("gemini-3.1-pro-high") == "antigravity"
+
+
+class TestNachtSchluessel:
+    def test_abend_gehoert_zum_selben_tag(self):
+        assert budget.nacht_id(datetime(2026, 9, 9, 23, 30)) == date(2026, 9, 9)
+
+    def test_nach_mitternacht_gehoert_zur_vorherigen_nacht(self):
+        """Ein Lauf um 02:00 gehört zur Nacht, die am Vorabend begann."""
+        assert budget.nacht_id(datetime(2026, 9, 10, 2, 0)) == date(2026, 9, 9)
+
+    def test_nachmittag_gehoert_zum_selben_tag(self):
+        assert budget.nacht_id(datetime(2026, 9, 10, 13, 0)) == date(2026, 9, 10)
+
+
+class TestBuchfuehrung:
+    @pytest.fixture
+    def db_stub(self, monkeypatch):
+        zeilen = {}
+
+        def _execute(sql, params=()):
+            if "erschoepft_seit" in sql and "UPDATE" in sql.upper():
+                zeilen[(params[-2], params[-1])] = dict(
+                    zeilen.get((params[-2], params[-1]), {}), erschoepft_seit="jetzt", grund=params[0])
+                return 1
+            schluessel = (params[0], params[1])
+            eintrag = zeilen.setdefault(
+                schluessel, {"nacht": params[0], "provider": params[1],
+                             "laeufe": 0, "tokens_in": 0, "tokens_out": 0,
+                             "erschoepft_seit": None, "grund": None})
+            eintrag["laeufe"] += 1
+            eintrag["tokens_in"] += params[2]
+            eintrag["tokens_out"] += params[3]
+            return 1
+
+        def _query_one(sql, params=()):
+            return zeilen.get((params[0], params[1]))
+
+        def _query(sql, params=()):
+            return list(zeilen.values())
+
+        monkeypatch.setattr(budget.db, "execute", _execute)
+        monkeypatch.setattr(budget.db, "query_one", _query_one)
+        monkeypatch.setattr(budget.db, "query", _query)
+        return zeilen
+
+    def test_buchen_summiert(self, db_stub):
+        budget.buche("nvidia/moonshotai/kimi-k3", 100, 10)
+        budget.buche("nvidia/minimaxai/minimax-m3", 200, 20)
+        eintrag = db_stub[(budget.nacht_id(), "nvidia")]
+        assert eintrag["laeufe"] == 2
+        assert eintrag["tokens_in"] == 300
+        assert eintrag["tokens_out"] == 30
+
+    def test_provider_werden_getrennt_gefuehrt(self, db_stub):
+        budget.buche("nvidia/moonshotai/kimi-k3", 100, 10)
+        budget.buche("google/gemini-3.6-flash", 50, 5)
+        assert db_stub[(budget.nacht_id(), "nvidia")]["tokens_in"] == 100
+        assert db_stub[(budget.nacht_id(), "google")]["tokens_in"] == 50
+
+    def test_frischer_provider_ist_nicht_erschoepft(self, db_stub):
+        assert budget.ist_erschoepft("nvidia/moonshotai/kimi-k3") is False
+
+    def test_markierte_erschoepfung_gilt(self, db_stub):
+        budget.buche("claude-opus-4-6-thinking", 10, 1)
+        budget.markiere_erschoepft("claude-opus-4-6-thinking", "Kontingent leer")
+        assert budget.ist_erschoepft("claude-opus-4-6-thinking") is True
+
+    def test_erschoepfung_gilt_fuer_den_ganzen_provider(self, db_stub):
+        """Nicht nur für das Modell, das die Meldung ausgelöst hat."""
+        budget.buche("nvidia/moonshotai/kimi-k3", 10, 1)
+        budget.markiere_erschoepft("nvidia/moonshotai/kimi-k3", "leer")
+        assert budget.ist_erschoepft("nvidia/minimaxai/minimax-m3") is True
+
+    def test_obergrenze_erschoepft_vorsorglich(self, db_stub, monkeypatch):
+        monkeypatch.setitem(budget.OBERGRENZEN, "antigravity", 2)
+        budget.buche("claude-opus-4-6-thinking", 1, 1)
+        assert budget.ist_erschoepft("claude-opus-4-6-thinking") is False
+        budget.buche("claude-opus-4-6-thinking", 1, 1)
+        assert budget.ist_erschoepft("claude-opus-4-6-thinking") is True
+
+    def test_antigravity_grenze_liegt_unter_der_berichteten(self):
+        """18 statt der berichteten 20 — die Zahl ist eine Community-Angabe."""
+        assert budget.OBERGRENZEN["antigravity"] == 18
