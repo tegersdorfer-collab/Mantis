@@ -74,13 +74,24 @@ def buche(model: str, tokens_in: int, tokens_out: int) -> None:
 
 
 def markiere_erschoepft(model: str, grund: str) -> None:
-    """Der Anbieter ist für den Rest der Nacht raus."""
+    """Der Anbieter ist für den Rest der Nacht raus.
+
+    Upsert statt reinem UPDATE: ohne vorherige `buche()`-Zeile für
+    (nacht, provider) würde ein reines UPDATE 0 Zeilen betreffen und die
+    Erschöpfungsmeldung verpuffte stillschweigend — das System liefe bis zum
+    Morgen unbeobachtet gegen einen Anbieter, der schon abgewiesen hat. Eine
+    dabei neu angelegte Zeile trägt Nullzähler: ehrlich, denn wir haben in
+    dieser Nacht noch keinen erfolgreichen Lauf mit diesem Anbieter gehabt.
+    """
     provider = provider_von_modell(model)
     log.warning(f"Forge-Budget: {provider} erschöpft — {grund}")
     db.execute(
-        "UPDATE forge_budget SET erschoepft_seit = NOW(), grund = %s "
-        "WHERE nacht = %s AND provider = %s",
-        (grund, nacht_id(), provider),
+        "INSERT INTO forge_budget "
+        "(nacht, provider, laeufe, tokens_in, tokens_out, erschoepft_seit, grund) "
+        "VALUES (%s, %s, 0, 0, 0, NOW(), %s) "
+        "ON CONFLICT (nacht, provider) DO UPDATE SET "
+        "erschoepft_seit = NOW(), grund = EXCLUDED.grund",
+        (nacht_id(), provider, grund),
     )
 
 

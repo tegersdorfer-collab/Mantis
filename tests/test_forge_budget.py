@@ -68,11 +68,23 @@ class TestBuchfuehrung:
         zeilen = {}
 
         def _execute(sql, params=()):
-            if "erschoepft_seit" in sql and "UPDATE" in sql.upper():
-                zeilen[(params[-2], params[-1])] = dict(
-                    zeilen.get((params[-2], params[-1]), {}), erschoepft_seit="jetzt", grund=params[0])
-                return 1
             schluessel = (params[0], params[1])
+            if "erschoepft_seit" in sql:
+                # markiere_erschoepft: INSERT ... ON CONFLICT DO UPDATE.
+                # Legt bei fehlendem Schluessel eine Zeile mit Nullzaehlern
+                # an (wie das echte INSERT es täte) statt wie ein reines
+                # UPDATE folgenlos zu verpuffen; bei vorhandener Zeile werden
+                # nur erschoepft_seit/grund aktualisiert, die Zähler bleiben
+                # unangetastet.
+                grund = params[2]
+                eintrag = zeilen.setdefault(
+                    schluessel, {"nacht": params[0], "provider": params[1],
+                                 "laeufe": 0, "tokens_in": 0, "tokens_out": 0,
+                                 "erschoepft_seit": None, "grund": None})
+                eintrag["erschoepft_seit"] = "jetzt"
+                eintrag["grund"] = grund
+                return 1
+            # buche: INSERT ... ON CONFLICT DO UPDATE, summiert Laeufe/Tokens.
             eintrag = zeilen.setdefault(
                 schluessel, {"nacht": params[0], "provider": params[1],
                              "laeufe": 0, "tokens_in": 0, "tokens_out": 0,
@@ -131,3 +143,12 @@ class TestBuchfuehrung:
     def test_antigravity_grenze_liegt_unter_der_berichteten(self):
         """18 statt der berichteten 20 — die Zahl ist eine Community-Angabe."""
         assert budget.OBERGRENZEN["antigravity"] == 18
+
+    def test_erschoepfung_gilt_auch_ohne_vorherige_buchung(self, db_stub):
+        """markiere_erschoepft() muss auch dann wirken, wenn buche() für
+        diesen Anbieter in dieser Nacht noch nie lief — sonst existiert noch
+        keine Zeile für (nacht, provider), und ein reines UPDATE verpufft
+        folgenlos. Das System würde dann bis zum Morgen weiter gegen einen
+        Anbieter laufen, der schon abgewiesen hat."""
+        budget.markiere_erschoepft("nvidia/moonshotai/kimi-k3", "leer, ohne vorherige Buchung")
+        assert budget.ist_erschoepft("nvidia/moonshotai/kimi-k3") is True
