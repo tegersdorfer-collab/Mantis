@@ -918,13 +918,18 @@ class TestC3StufenarbeitCommit:
         commit = next(a for a in aufrufe if a[0] == "commit")
         assert "forge/repariert.py" in commit
 
-    def test_umbenennung_nimmt_den_quellpfad_mit(self, monkeypatch, stubs, tmp_path):
+    def test_umbenennung_nimmt_den_quellpfad_nur_beim_commit_mit(self, monkeypatch, stubs, tmp_path):
         # `--porcelain -z` hängt bei R/C den Quellpfad als eigenen Eintrag an.
-        # Ohne ihn bliebe die Löschung der Quelle uncommittet zurück.
+        # Task 3, gemessen gegen echtes git: die Quelle existiert im
+        # Arbeitsbaum nicht mehr und darf NICHT an `git add` (dort matcht sie
+        # auf nichts, returncode 128, bricht das ganze add ab), muss aber an
+        # `git commit`, sonst bleibt ihre Löschung uncommittet liegen.
         aufrufe, _ = self._lauf_implement(
             monkeypatch, stubs, tmp_path, "R  forge/neu.py\0forge/alt.py\0")
         add = next(a for a in aufrufe if a[0] == "add")
-        assert set(add[2:]) == {"forge/neu.py", "forge/alt.py"}
+        commit = next(a for a in aufrufe if a[0] == "commit")
+        assert set(add[2:]) == {"forge/neu.py"}
+        assert set(commit[4:]) == {"forge/neu.py", "forge/alt.py"}
 
     def test_zeitueberschreitung_mit_unkommittierter_arbeit_gilt_als_geliefert(
             self, monkeypatch, stubs, tmp_path):
@@ -1119,3 +1124,60 @@ class TestGitStatusFehlschlag:
         hat_produkt, pfad = pl._timeout_produkt(implement, {"id": 1}, tmp_path, 0.0)
         assert hat_produkt is False
         assert pfad is None
+
+
+class TestGestagterRenameGegenEchtesGit:
+    """Gemessen am 2026-09-10 gegen echtes git (siehe Task-Brief): der
+    Quellpfad eines bereits im Index stehenden Renames matcht bei `git add`
+    auf nichts mehr (returncode 128, bricht das ganze add ab), wird aber bei
+    `git commit` gebraucht, sonst bleibt die Löschung der Quelle gestagt und
+    uncommittet liegen. Deshalb zwei unterschiedlich befüllte Listen."""
+
+    def _repo(self, tmp_path):
+        def g(*args):
+            return subprocess.run(["git", *args], cwd=tmp_path,
+                                  capture_output=True, text=True)
+        g("init", "-q")
+        g("config", "user.email", "p@p")
+        g("config", "user.name", "p")
+        (tmp_path / "alt.py").write_text("inhalt\n")
+        g("add", "-A")
+        g("commit", "-qm", "start")
+        return g
+
+    def test_quelle_geht_an_commit_aber_nicht_an_add(self, tmp_path):
+        """Gemessen am 2026-09-10: der Quellpfad eines gestagten Renames matcht
+        bei `git add` auf nichts (returncode 128, bricht das ganze add ab),
+        wird bei `git commit` aber gebraucht — sonst bleibt die Loeschung
+        der Quelle gestagt und uncommittet liegen."""
+        g = self._repo(tmp_path)
+        g("mv", "alt.py", "neu.py")          # legt den Rename in den Index
+        (tmp_path / "dazu.py").write_text("x\n")
+
+        zum_hinzufuegen, zum_committen, fehler = pl._stufenarbeit_pfade(tmp_path)
+        assert fehler is None
+        assert "alt.py" not in zum_hinzufuegen, "Quelle gehoert nicht an git add"
+        assert "alt.py" in zum_committen, "Quelle wird bei git commit gebraucht"
+        assert "neu.py" in zum_hinzufuegen and "neu.py" in zum_committen
+        assert "dazu.py" in zum_hinzufuegen and "dazu.py" in zum_committen
+
+        # Der eigentliche Beweis: git add muss die Pfade annehmen.
+        ergebnis = subprocess.run(["git", "add", "--", *zum_hinzufuegen], cwd=tmp_path,
+                                  capture_output=True, text=True)
+        assert ergebnis.returncode == 0, ergebnis.stderr
+
+    def test_rename_landet_trotzdem_vollstaendig_im_commit(self, tmp_path):
+        """Ohne den Quellpfad darf die Loeschung der Quelle nicht zurueckbleiben."""
+        g = self._repo(tmp_path)
+        g("mv", "alt.py", "neu.py")
+
+        fehler = pl._committe_stufenarbeit(tmp_path, "implement", 1)
+        assert fehler is None
+
+        offen = subprocess.run(["git", "status", "--porcelain"], cwd=tmp_path,
+                               capture_output=True, text=True).stdout.strip()
+        assert offen == "", f"nach dem Commit blieb offen: {offen!r}"
+        vorhanden = subprocess.run(["git", "ls-files"], cwd=tmp_path,
+                                   capture_output=True, text=True).stdout.split()
+        assert "neu.py" in vorhanden
+        assert "alt.py" not in vorhanden

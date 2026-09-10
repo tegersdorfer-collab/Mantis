@@ -109,7 +109,9 @@ def _stufenarbeit_pfade(worktree: Path) -> tuple[list[str], list[str], str | Non
 
     Rückgabe ist (zum_hinzufuegen, zum_committen, fehler). Zwei Listen, weil
     `git add` und `git commit` bei Umbenennungen unterschiedliche Pfadmengen
-    brauchen — hier sind sie noch identisch, Task 3 trennt sie inhaltlich.
+    brauchen: der Quellpfad eines bereits im Index stehenden Renames existiert
+    im Arbeitsbaum nicht mehr und geht nur an `git commit`, nicht an
+    `git add` (siehe Rename-Zweig unten und das Task-3-Brief).
 
     Ein fehlgeschlagenes `git status` darf NICHT als leere Liste zurückkommen:
     der Aufrufer läse das als "nichts zu committen" und liesse die Stufe mit
@@ -124,6 +126,7 @@ def _stufenarbeit_pfade(worktree: Path) -> tuple[list[str], list[str], str | Non
         log.warning(f"Forge-Pipeline: {fehler}")
         return [], [], fehler
     eintraege = (ergebnis.stdout or "").split("\0")
+    nur_commit: list[str] = []
     pfade: list[str] = []
     i = 0
     while i < len(eintraege):
@@ -135,16 +138,26 @@ def _stufenarbeit_pfade(worktree: Path) -> tuple[list[str], list[str], str | Non
         status, pfad = eintrag[:2], eintrag[3:]
         if status[0] in ("R", "C"):
             # Bei Umbenennung/Kopie folgt der Quellpfad als eigener Eintrag.
-            # Ohne ihn bliebe die Löschung der Quelle uncommittet zurück.
+            # status[0] ist der INDEX-Status: 'R'/'C' dort heisst, der Rename
+            # steht bereits im Index und die Quelle existiert im Arbeitsbaum
+            # nicht mehr. Am 2026-09-10 gegen echtes git gemessen:
+            #   - Quelle an `git add`  → returncode 128, und weil ein einziger
+            #     schlechter Pathspec das ganze add abbricht, wird NICHTS
+            #     committet; der Task haengt danach dauerhaft.
+            #   - Quelle nirgends      → `D <quelle>` bleibt gestagt und
+            #     uncommittet liegen, der naechste Durchlauf scheitert erneut.
+            #   - Quelle nur an commit → sauber, `git show --stat` zeigt die
+            #     Umbenennung, der Baum ist danach leer.
             if i < len(eintraege) and eintraege[i]:
                 quelle = eintraege[i]
                 i += 1
                 if not _ist_intern(quelle):
-                    pfade.append(quelle)
+                    nur_commit.append(quelle)
         if not _ist_intern(pfad):
             pfade.append(pfad)
-    geordnet = sorted(set(pfade))
-    return geordnet, list(geordnet), None
+    zum_hinzufuegen = sorted(set(pfade))
+    zum_committen = sorted(set(pfade) | set(nur_commit))
+    return zum_hinzufuegen, zum_committen, None
 
 
 def _committe_stufenarbeit(worktree: Path, stufe_name: str, task_id: int) -> str | None:
@@ -225,8 +238,11 @@ def _timeout_produkt(stufe: stages.Stage, task: dict, worktree: Path, start: flo
     if stufe.name in _ARBEITSSTUFEN:
         _, zum_committen, fehler = _stufenarbeit_pfade(worktree)
         if fehler is not None:
-            # Kein Produkt nachweisbar, wenn git nicht antwortet. Der Fehler
-            # wird eine Ebene höher beim Commit-Versuch erneut sichtbar.
+            # Kein Produkt nachweisbar, wenn git nicht antwortet. Bei einem
+            # Timeout parkt der Task hier direkt und erreicht
+            # _committe_stufenarbeit gar nicht erst — sichtbar wird der
+            # Fehler ausschliesslich über das log.warning in
+            # _stufenarbeit_pfade.
             return False, None
         return _hat_neuen_commit(worktree) or bool(zum_committen), None
     if stufe.name == "review":
