@@ -1064,3 +1064,58 @@ class TestBackendAufruf:
 
         assert gesehen["backend"] == "agy"
         assert gesehen["model"] == "claude-opus-4-6-thinking"
+
+
+class TestGitStatusFehlschlag:
+    def _kaputtes_gitctl(self, monkeypatch):
+        class _Ergebnis:
+            returncode = 128
+            stdout = ""
+            stderr = "fatal: not a git repository"
+
+        monkeypatch.setattr(pl.gitctl, "run", lambda *a, **k: _Ergebnis())
+
+    def test_pfade_melden_den_fehler_statt_leerer_liste(self, monkeypatch, tmp_path):
+        self._kaputtes_gitctl(monkeypatch)
+        zum_hinzufuegen, zum_committen, fehler = pl._stufenarbeit_pfade(tmp_path)
+        assert zum_hinzufuegen == []
+        assert zum_committen == []
+        assert fehler is not None
+        assert "128" in fehler
+
+    def test_beide_listen_sind_ohne_umbenennung_gleich(self, monkeypatch, tmp_path):
+        class _Zwei:
+            returncode = 0
+            stdout = " M a.py\0?? b.py\0"
+            stderr = ""
+
+        monkeypatch.setattr(pl.gitctl, "run", lambda *a, **k: _Zwei())
+        zum_hinzufuegen, zum_committen, fehler = pl._stufenarbeit_pfade(tmp_path)
+        assert fehler is None
+        assert zum_hinzufuegen == zum_committen == ["a.py", "b.py"]
+
+    def test_committe_gibt_den_fehler_weiter_statt_erfolg(self, monkeypatch, tmp_path):
+        """Der stille C3-Fehlermodus: Erfolg melden, obwohl nichts committet ist."""
+        self._kaputtes_gitctl(monkeypatch)
+        fehler = pl._committe_stufenarbeit(tmp_path, "implement", 1)
+        assert fehler is not None
+        assert "status" in fehler.lower()
+
+    def test_leerer_worktree_bleibt_ein_erfolg(self, monkeypatch, tmp_path):
+        """Nichts zu committen ist kein Fehler — nur ein Fehlschlag ist einer."""
+        class _Leer:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(pl.gitctl, "run", lambda *a, **k: _Leer())
+        assert pl._committe_stufenarbeit(tmp_path, "implement", 1) is None
+
+    def test_timeout_produkt_meldet_kein_produkt_bei_kaputtem_status(self, monkeypatch, tmp_path):
+        """Signatur ist _timeout_produkt(stufe, task, worktree, start)."""
+        self._kaputtes_gitctl(monkeypatch)
+        monkeypatch.setattr(pl, "_hat_neuen_commit", lambda w: False)
+        implement = next(s for s in pl.stages.ALLE_STUFEN if s.name == "implement")
+        hat_produkt, pfad = pl._timeout_produkt(implement, {"id": 1}, tmp_path, 0.0)
+        assert hat_produkt is False
+        assert pfad is None

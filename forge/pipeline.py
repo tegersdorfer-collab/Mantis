@@ -97,7 +97,7 @@ def _ist_intern(pfad: str) -> bool:
     return pfad == _INTERNES_VERZEICHNIS or pfad.startswith(_INTERNES_VERZEICHNIS + "/")
 
 
-def _stufenarbeit_pfade(worktree: Path) -> list[str]:
+def _stufenarbeit_pfade(worktree: Path) -> tuple[list[str], list[str], str | None]:
     """Alle unkommittierten Pfade im Worktree, ohne die pipeline-internen.
 
     `--untracked-files=all` ist wesentlich: ohne das fasst git ein komplett
@@ -106,12 +106,23 @@ def _stufenarbeit_pfade(worktree: Path) -> list[str]:
     NUL-getrennt und unquotiert — sonst käme ein Pfad mit Umlaut oder
     Leerzeichen in git-eigener C-Quotierung zurück und ginge als Argument an
     `git add` ins Leere.
+
+    Rückgabe ist (zum_hinzufuegen, zum_committen, fehler). Zwei Listen, weil
+    `git add` und `git commit` bei Umbenennungen unterschiedliche Pfadmengen
+    brauchen — hier sind sie noch identisch, Task 3 trennt sie inhaltlich.
+
+    Ein fehlgeschlagenes `git status` darf NICHT als leere Liste zurückkommen:
+    der Aufrufer läse das als "nichts zu committen" und liesse die Stufe mit
+    uncommitteter Arbeit weiterrücken — genau der Fehlermodus, gegen den
+    _committe_stufenarbeit gebaut wurde, nur still. `_schreibe_diff` behandelt
+    denselben Fall ebenso als Fehler.
     """
     ergebnis = gitctl.run("status", "--porcelain", "-z", "--untracked-files=all", cwd=worktree)
     if ergebnis.returncode != 0:
-        log.warning(f"Forge-Pipeline: git status fehlgeschlagen (returncode {ergebnis.returncode}): "
-                    f"{(ergebnis.stderr or '').strip()[:300]}")
-        return []
+        fehler = (f"git status fehlgeschlagen (returncode {ergebnis.returncode}): "
+                  f"{(ergebnis.stderr or '').strip()[:300]}")
+        log.warning(f"Forge-Pipeline: {fehler}")
+        return [], [], fehler
     eintraege = (ergebnis.stdout or "").split("\0")
     pfade: list[str] = []
     i = 0
@@ -132,7 +143,8 @@ def _stufenarbeit_pfade(worktree: Path) -> list[str]:
                     pfade.append(quelle)
         if not _ist_intern(pfad):
             pfade.append(pfad)
-    return sorted(set(pfade))
+    geordnet = sorted(set(pfade))
+    return geordnet, list(geordnet), None
 
 
 def _committe_stufenarbeit(worktree: Path, stufe_name: str, task_id: int) -> str | None:
@@ -149,15 +161,17 @@ def _committe_stufenarbeit(worktree: Path, stufe_name: str, task_id: int) -> str
     Fehler — die Stufe hat dann eben nichts geliefert, und das entscheiden
     Review und Gate, nicht dieser Commit.
     """
-    pfade = _stufenarbeit_pfade(worktree)
-    if not pfade:
+    zum_hinzufuegen, zum_committen, fehler = _stufenarbeit_pfade(worktree)
+    if fehler is not None:
+        return fehler
+    if not zum_committen:
         return None
-    hinzugefuegt = gitctl.run("add", "--", *pfade, cwd=worktree)
+    hinzugefuegt = gitctl.run("add", "--", *zum_hinzufuegen, cwd=worktree)
     if hinzugefuegt.returncode != 0:
         return (f"git add fehlgeschlagen (returncode {hinzugefuegt.returncode}): "
                 f"{(hinzugefuegt.stderr or '').strip()[:300]}")
     nachricht = f"feat(forge): Arbeit der Stufe '{stufe_name}' für Task {task_id}"
-    committet = gitctl.run("commit", "-m", nachricht, "--", *pfade, cwd=worktree)
+    committet = gitctl.run("commit", "-m", nachricht, "--", *zum_committen, cwd=worktree)
     if committet.returncode != 0:
         return (f"git commit fehlgeschlagen (returncode {committet.returncode}): "
                 f"{(committet.stderr or '').strip()[:300]}")
@@ -209,7 +223,12 @@ def _timeout_produkt(stufe: stages.Stage, task: dict, worktree: Path, start: flo
             return False, None
         return True, str(neuestes.relative_to(worktree))
     if stufe.name in _ARBEITSSTUFEN:
-        return _hat_neuen_commit(worktree) or bool(_stufenarbeit_pfade(worktree)), None
+        _, zum_committen, fehler = _stufenarbeit_pfade(worktree)
+        if fehler is not None:
+            # Kein Produkt nachweisbar, wenn git nicht antwortet. Der Fehler
+            # wird eine Ebene höher beim Commit-Versuch erneut sichtbar.
+            return False, None
+        return _hat_neuen_commit(worktree) or bool(zum_committen), None
     if stufe.name == "review":
         return _verdikt_lesbar(worktree), None
     return False, None
