@@ -32,11 +32,31 @@ class TestMigrationen:
                 assert "IF NOT EXISTS" in gross, m[:80]
 
 
-from datetime import date, datetime
+import re
+from datetime import date, datetime, timedelta
 
 import pytest
 
 from forge import budget
+
+
+class _IntegrityErrorStub(Exception):
+    """Simuliert psycopg2.IntegrityError bei einer verletzten
+    PRIMARY KEY-Constraint, ohne psycopg2 zu importieren."""
+
+
+def _leere_zeile(nacht, provider):
+    return {"nacht": nacht, "provider": provider, "laeufe": 0,
+            "tokens_in": 0, "tokens_out": 0, "erschoepft_seit": None, "grund": None}
+
+
+def _spalten_aus_select(sql):
+    """Liefert die im SELECT genannten Spaltennamen, oder None für SELECT *."""
+    treffer = re.search(r"SELECT\s+(.*?)\s+FROM", sql, re.IGNORECASE | re.DOTALL)
+    spalten_text = treffer.group(1).strip()
+    if spalten_text == "*":
+        return None
+    return [s.strip() for s in spalten_text.split(",")]
 
 
 class TestProviderAusModell:
@@ -62,49 +82,90 @@ class TestNachtSchluessel:
         assert budget.nacht_id(datetime(2026, 9, 10, 13, 0)) == date(2026, 9, 10)
 
 
-class TestBuchfuehrung:
-    @pytest.fixture
-    def db_stub(self, monkeypatch):
-        zeilen = {}
+@pytest.fixture
+def db_stub(monkeypatch):
+    """Bildet die reale forge_budget-Tabelle nach — inklusive ihrer
+    PRIMARY KEY (nacht, provider)-Constraint aus der Migration.
 
-        def _execute(sql, params=()):
-            schluessel = (params[0], params[1])
-            if "erschoepft_seit" in sql:
-                # markiere_erschoepft: INSERT ... ON CONFLICT DO UPDATE.
-                # Legt bei fehlendem Schluessel eine Zeile mit Nullzaehlern
-                # an (wie das echte INSERT es täte) statt wie ein reines
-                # UPDATE folgenlos zu verpuffen; bei vorhandener Zeile werden
-                # nur erschoepft_seit/grund aktualisiert, die Zähler bleiben
-                # unangetastet.
-                grund = params[2]
-                eintrag = zeilen.setdefault(
-                    schluessel, {"nacht": params[0], "provider": params[1],
-                                 "laeufe": 0, "tokens_in": 0, "tokens_out": 0,
-                                 "erschoepft_seit": None, "grund": None})
-                eintrag["erschoepft_seit"] = "jetzt"
-                eintrag["grund"] = grund
-                return 1
-            # buche: INSERT ... ON CONFLICT DO UPDATE, summiert Laeufe/Tokens.
-            eintrag = zeilen.setdefault(
-                schluessel, {"nacht": params[0], "provider": params[1],
-                             "laeufe": 0, "tokens_in": 0, "tokens_out": 0,
-                             "erschoepft_seit": None, "grund": None})
-            eintrag["laeufe"] += 1
-            eintrag["tokens_in"] += params[2]
-            eintrag["tokens_out"] += params[3]
+    Der Stub dispatcht nicht mehr blind per Substring auf hart codierte
+    Update-Logik: er prüft zuerst, ob die SQL-Anweisung tatsächlich eine
+    wirksame ON CONFLICT ... DO UPDATE-Klausel enthält. Fehlt sie bei
+    einem INSERT auf einen bereits vorhandenen Schlüssel, wirft er einen
+    Fehler — genau wie Postgres es bei einer verletzten Primary-Key-
+    Constraint täte. Nur wenn die Klausel da ist, wird die (weiterhin
+    handgeschriebene) Update-Logik für buche()/markiere_erschoepft()
+    angewandt. Modul-weite Fixture, damit sie sowohl TestBuchfuehrung als
+    auch TestStand zur Verfügung steht.
+    """
+    zeilen = {}
+
+    def _execute(sql, params=()):
+        sql_gross = sql.upper()
+        ist_insert = sql_gross.strip().startswith("INSERT")
+        hat_on_conflict = "ON CONFLICT" in sql_gross
+        hat_do_update = "DO UPDATE" in sql_gross
+        schluessel = (params[0], params[1])
+        existiert = schluessel in zeilen
+
+        if ist_insert and existiert and not hat_on_conflict:
+            # Das ist der Fall, den ein reines INSERT ohne
+            # ON CONFLICT-Klausel in echtem Postgres nicht überlebt:
+            # doppelter Primary Key.
+            raise _IntegrityErrorStub(
+                "duplicate key value violates unique constraint "
+                f"\"forge_budget_pkey\": Key (nacht, provider)="
+                f"{schluessel} already exists."
+            )
+
+        if ist_insert and existiert and hat_on_conflict and not hat_do_update:
+            # z.B. ON CONFLICT ... DO NOTHING: bewusst keine Änderung.
+            return 0
+
+        if "ERSCHOEPFT_SEIT" in sql_gross:
+            # markiere_erschoepft(): INSERT ... ON CONFLICT DO UPDATE SET
+            # erschoepft_seit = NOW(), grund = EXCLUDED.grund. Zähler
+            # bleiben unangetastet; ein frischer INSERT legt die Zeile
+            # mit Nullzählern an.
+            grund = params[2]
+            eintrag = zeilen.setdefault(schluessel, _leere_zeile(*schluessel))
+            eintrag["erschoepft_seit"] = "jetzt"
+            eintrag["grund"] = grund
             return 1
 
-        def _query_one(sql, params=()):
-            return zeilen.get((params[0], params[1]))
+        # buche(): INSERT ... ON CONFLICT DO UPDATE SET
+        # laeufe = laeufe + 1, tokens_in = ..., tokens_out = ...
+        eintrag = zeilen.setdefault(schluessel, _leere_zeile(*schluessel))
+        eintrag["laeufe"] += 1
+        eintrag["tokens_in"] += params[2]
+        eintrag["tokens_out"] += params[3]
+        return 1
 
-        def _query(sql, params=()):
-            return list(zeilen.values())
+    def _query_one(sql, params=()):
+        zeile = zeilen.get((params[0], params[1]))
+        if zeile is None:
+            return None
+        spalten = _spalten_aus_select(sql)
+        if spalten is None:
+            return dict(zeile)
+        return {spalte: zeile.get(spalte) for spalte in spalten}
 
-        monkeypatch.setattr(budget.db, "execute", _execute)
-        monkeypatch.setattr(budget.db, "query_one", _query_one)
-        monkeypatch.setattr(budget.db, "query", _query)
-        return zeilen
+    def _query(sql, params=()):
+        # Bildet WHERE nacht = %s und ORDER BY provider nach - stand()
+        # darf keine Zeilen anderer Nächte zeigen und muss sortiert sein.
+        nacht = params[0] if params else None
+        treffer = [dict(z) for z in zeilen.values()
+                   if nacht is None or z["nacht"] == nacht]
+        if "ORDER BY PROVIDER" in sql.upper():
+            treffer.sort(key=lambda z: z["provider"])
+        return treffer
 
+    monkeypatch.setattr(budget.db, "execute", _execute)
+    monkeypatch.setattr(budget.db, "query_one", _query_one)
+    monkeypatch.setattr(budget.db, "query", _query)
+    return zeilen
+
+
+class TestBuchfuehrung:
     def test_buchen_summiert(self, db_stub):
         budget.buche("nvidia/moonshotai/kimi-k3", 100, 10)
         budget.buche("nvidia/minimaxai/minimax-m3", 200, 20)
@@ -152,3 +213,27 @@ class TestBuchfuehrung:
         Anbieter laufen, der schon abgewiesen hat."""
         budget.markiere_erschoepft("nvidia/moonshotai/kimi-k3", "leer, ohne vorherige Buchung")
         assert budget.ist_erschoepft("nvidia/moonshotai/kimi-k3") is True
+
+
+class TestStand:
+    def test_stand_zeigt_alle_provider_der_nacht_sortiert(self, db_stub):
+        budget.buche("google/gemini-3.6-flash", 50, 5)
+        budget.buche("nvidia/moonshotai/kimi-k3", 100, 10)
+        ergebnis = budget.stand()
+        assert [zeile["provider"] for zeile in ergebnis] == ["google", "nvidia"]
+        assert ergebnis[0]["tokens_in"] == 50
+        assert ergebnis[1]["tokens_in"] == 100
+
+    def test_stand_zeigt_nur_die_laufende_nacht(self, db_stub):
+        """_query muss nach nacht filtern — eine Zeile aus einer anderen
+        Nacht darf in stand() nicht auftauchen."""
+        alte_nacht = budget.nacht_id() - timedelta(days=1)
+        db_stub[(alte_nacht, "groq")] = {
+            "nacht": alte_nacht, "provider": "groq", "laeufe": 5,
+            "tokens_in": 1, "tokens_out": 1, "erschoepft_seit": None, "grund": None}
+        budget.buche("nvidia/moonshotai/kimi-k3", 100, 10)
+        ergebnis = budget.stand()
+        assert [zeile["provider"] for zeile in ergebnis] == ["nvidia"]
+
+    def test_stand_ohne_buchungen_ist_leer(self, db_stub):
+        assert budget.stand() == []
