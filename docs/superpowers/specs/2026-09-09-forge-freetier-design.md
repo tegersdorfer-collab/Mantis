@@ -164,7 +164,7 @@ Konstruktor, mit Verweis auf Probe (d) und (e) — nach demselben Muster wie
 | spec | Gemini 3.6 Flash (AI Studio) → Kimi K3 → MiniMax M3 |
 | plan | Kimi K3 (NVIDIA) → Gemini 3.6 Flash → MiniMax M3 |
 | implement | MiniMax M3 → Nemotron 3.5 Lightning → Kimi K3 |
-| review | Claude Opus 4.6 (agy) → Gemini 3.1 Pro (agy) → Kimi K3 |
+| review | Claude Opus 4.6 (agy) → Gemini 3.1 Pro (agy) |
 | fix | wie implement |
 | Commit-Text | Mistral `codestral-latest` — siehe Einschränkung unten |
 | Sitzungstitel | Groq `gpt-oss-120b` als opencodes `small_model` |
@@ -333,10 +333,50 @@ kann bei einem opencode-Update ungültig werden. Deshalb:
 Ein erneuter Lauf der Rechte-Aufnahme gehört vor jedes opencode-Update, das in
 den Nachtbetrieb geht. Das ist eine Betriebsregel, kein Test.
 
-## Offene Vorbedingungen für Plan 2
+## Offene Vorbedingungen für Plan 2b
 
-Aus der Umsetzung von Plan 1 (Abschluss-Review am 2026-09-09). Alle drei müssen
-stehen, **bevor** zum ersten Mal etwas unbeaufsichtigt über Nacht läuft.
+Aus der Umsetzung von Plan 2a (Abschluss-Review am 2026-09-10). Beide müssen
+stehen, **bevor** zum ersten Mal etwas unbeaufsichtigt über Nacht läuft. Keine
+kann vorher eintreten, weil vor Plan 2b nichts unbeaufsichtigt läuft.
+
+1. **Erschöpfte Kontingente schalten die Forge dauerhaft ab.** Seit Plan 2a
+   liefert eine erschöpfte Kette `"fehler"` statt zu parken — richtig, denn
+   Parken verlor den Task. Aber `forge/daemon.py` zählt `"fehler"` in
+   `failures`, und nach `MAX_CONSECUTIVE_FAILURES` schreibt es
+   `~/.mantis-forge-stop`. `should_run` verweigert danach jede Arbeit, über
+   Neustarts hinweg, bis die Datei von Hand gelöscht wird. Eine Nacht mit
+   leeren Kontingenten legt die Forge also für alle folgenden Nächte still.
+   Behebung: ein eigener tick()-Ausgang für „Kontingent leer", der schläft,
+   ohne die Fehler-Spirale zu füttern. Ändert den pipeline/tick/main-Vertrag,
+   deshalb nicht mehr in 2a.
+
+2. **Die Fix-Stufe ist in Produktion unerreichbar.** Die Review-Stufe wechselt
+   bedingungslos nach `GATING`, ohne ihr eigenes Verdikt zu lesen, und `GATING`
+   hat keinen Rückweg nach `REVIEWING` oder `IMPLEMENTING`. `MAX_FIXRUNDEN`,
+   `FIX_STAGE`, `_verwirf_review_artefakte` und die gesamte Fix-Runden-Logik
+   regeln damit einen Pfad, der nie läuft: **das erste negative Review parkt
+   den Task dauerhaft.** Vorbestehend, älter als Plan 1. Behebung ist eine
+   Änderung der Zustandsmaschine in `forge/models.py` und braucht eine
+   Entscheidung darüber, wie oft ein Task die Runde drehen darf.
+
+Solange 2 offen ist, ist auch die Regel „Reviewer ≠ Implementierer" nur halb
+wirksam: `implement_model` merkt sich nur den letzten Schreiber, was erst nach
+einer Fix-Runde zum Problem wird — und die gibt es heute nicht.
+
+## Erledigte Vorbedingungen aus Plan 1
+
+Alle drei wurden in Plan 2a geschlossen (Tasks 1-3), zwei davon mit Tests gegen
+echtes git. Hier belassen, weil spätere Pläne darauf verweisen — und weil die
+Begründung zu Punkt 1 auch dann noch gilt, wenn niemand mehr weiss warum.
+
+**Nachtrag zur Review-Kette:** Sie hat nur zwei Glieder, nicht drei. Der
+ursprünglich vorgesehene dritte Link auf `opencode`/Kimi K3 wurde im
+Abschluss-Review von Plan 2a entfernt: nur `forge/runner_agy.py` beherrscht das
+Review-Protokoll (Diff in den Prompt einbetten, Verdikt-Datei schreiben).
+`runner_opencode.py` hätte einen vollen Lauf verbrannt und dann geparkt — und
+weil dieser Agent `edit: allow` hat, hätte er sich im schlimmeren Fall selbst
+ein „pass" geschrieben, ohne den Diff je gesehen zu haben. Solange nur ein
+Backend das Protokoll kann, ist eine zweigliedrige Kette die ehrliche Länge.
 
 1. **Erlaubnisliste ins Gate.** `forge/gate.py` hat heute nur die Verbotsliste
    `SPERRZONEN` mit sechs Präfixen. Die in „Getroffene Entscheidungen"
