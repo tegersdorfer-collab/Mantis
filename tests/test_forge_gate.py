@@ -181,12 +181,15 @@ class TestPruefe:
     """Deckt pruefe() selbst ab: subprocess.run und gitctl.run werden gestubbt,
     damit hier nie die echte Suite oder echtes ruff läuft (das würde rekursieren)."""
 
-    def _stub_sauberer_git(self, monkeypatch, dateien="tests/foo.py\n", numstat="10\t2\ttests/foo.py\n"):
+    def _stub_sauberer_git(self, monkeypatch, dateien="tests/foo.py\n", numstat="10\t2\ttests/foo.py\n",
+                           roh=""):
         def fake_gitctl_run(*args, cwd=None, timeout=300):
             if "--name-only" in args:
                 return subprocess.CompletedProcess(args=args, returncode=0, stdout=dateien, stderr="")
             if "--numstat" in args:
                 return subprocess.CompletedProcess(args=args, returncode=0, stdout=numstat, stderr="")
+            if "--raw" in args:
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout=roh, stderr="")
             return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gate.gitctl, "run", fake_gitctl_run)
@@ -353,6 +356,172 @@ class TestPruefe:
         self._schreibe_pass_verdikt(tmp_path)
         ergebnis = gate.pruefe(tmp_path)
         assert not any("Diff zu groß" in g for g in ergebnis.gruende)
+
+    # --- I4: die Erlaubnisliste, geprüft DURCH pruefe() -------------------
+    # Bis zum Abschluss-Review (2026-09-10) prüfte nur TestErlaubteZonen die
+    # reine Funktion. Ob pruefe() sie überhaupt aufruft, sagte kein Test: der
+    # Reviewer hat die drei Verdrahtungszeilen entfernt und die volle Suite
+    # blieb grün. Eine Prüfung, die nicht verdrahtet ist, ist keine Prüfung.
+
+    def test_datei_ausserhalb_der_erlaubten_zonen_ergibt_gate_grund(self, tmp_path, monkeypatch):
+        self._stub_sauberer_git(monkeypatch, dateien="core/db.py\n",
+                                numstat="10\t2\tcore/db.py\n")
+        self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        ergebnis = gate.pruefe(tmp_path)
+        assert ergebnis.ok is False
+        assert any("ausserhalb der erlaubten Zonen" in g and "core/db.py" in g
+                   for g in ergebnis.gruende), \
+            f"pruefe() ruft die Erlaubnisliste nicht auf: {ergebnis.gruende}"
+
+    def test_beide_listen_laufen_im_selben_aufruf_gegen_dieselben_dateien(self, tmp_path, monkeypatch):
+        """Sperrzonen UND Erlaubnisliste, ein Aufruf, eine Dateiliste.
+
+        `scripts/fix_bluetooth.sh` liegt INNERHALB der erlaubten Zone
+        "scripts/" und steht trotzdem in SPERRZONEN; `core/db.py` ist genau
+        umgekehrt gelagert. Beide Gründe müssen aus demselben pruefe()-Aufruf
+        kommen, und jeder muss seine eigene Datei nennen — ein Gate, das nur
+        eine der beiden Listen verdrahtet hat, fällt hier durch."""
+        self._stub_sauberer_git(
+            monkeypatch,
+            dateien="scripts/fix_bluetooth.sh\ncore/db.py\n",
+            numstat="1\t0\tscripts/fix_bluetooth.sh\n1\t0\tcore/db.py\n",
+        )
+        self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        ergebnis = gate.pruefe(tmp_path)
+        sperr = [g for g in ergebnis.gruende if "Sperrzone" in g]
+        zonen = [g for g in ergebnis.gruende if "ausserhalb der erlaubten Zonen" in g]
+        assert sperr and "scripts/fix_bluetooth.sh" in sperr[0], ergebnis.gruende
+        assert "core/db.py" not in sperr[0], f"Sperrzonen-Grund nennt die falsche Datei: {sperr[0]}"
+        assert zonen and "core/db.py" in zonen[0], ergebnis.gruende
+        assert "fix_bluetooth" not in zonen[0], f"Zonen-Grund nennt die falsche Datei: {zonen[0]}"
+
+    # --- I6: Symlinks -----------------------------------------------------
+
+    def test_symlink_im_diff_ergibt_eigenen_gate_grund(self, tmp_path, monkeypatch):
+        """Ein Symlink besteht beide Pfadlisten und zeigt trotzdem, wohin er will."""
+        self._stub_sauberer_git(
+            monkeypatch,
+            dateien="tests/link\n",
+            numstat="1\t0\ttests/link\n",
+            roh=":000000 120000 0000000 7637430 A\ttests/link\n",
+        )
+        self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        ergebnis = gate.pruefe(tmp_path)
+        assert ergebnis.ok is False
+        assert any("Symlink" in g and "tests/link" in g for g in ergebnis.gruende), \
+            f"kein Symlink-Grund: {ergebnis.gruende}"
+
+    def test_gewoehnliche_datei_ergibt_keinen_symlink_grund(self, tmp_path, monkeypatch):
+        self._stub_sauberer_git(
+            monkeypatch,
+            roh=":000000 100644 0000000 7898192 A\ttests/foo.py\n",
+        )
+        self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        ergebnis = gate.pruefe(tmp_path)
+        assert ergebnis.gruende == []
+
+
+class TestGegenEchtesGit:
+    """I5/I6, gemessen statt geglaubt. Alle anderen Tests dieses Moduls stubben
+    gitctl — genau darin konnten sich Rename-Blindheit und Symlinks verstecken.
+    Hier läuft echtes git in einem Wegwerf-Repo unter tmp_path."""
+
+    @staticmethod
+    def _repo(tmp_path):
+        ort = tmp_path / "repo"
+        ort.mkdir()
+
+        def g(*args):
+            subprocess.run(["git", *args], cwd=str(ort), check=True, capture_output=True)
+
+        g("init", "-b", "main")
+        g("config", "user.email", "test@example.com")
+        g("config", "user.name", "Test")
+        (ort / "core").mkdir()
+        (ort / "core" / "db.py").write_text("x\ny\nz\n")
+        # Muss im ersten Commit liegen, also in `main`: `git diff main...HEAD`
+        # sieht nur, was der Branch gegenüber main ändert. Eine Datei, die es
+        # in main nie gab, kann der Branch auch nicht aus einer Sperrzone
+        # heraustragen.
+        (ort / "data").mkdir()
+        (ort / "data" / "geheim.txt").write_text("wichtig\n")
+        g("add", "-A")
+        g("commit", "-m", "erster Commit")
+        g("checkout", "-b", "forge/task-1")
+        return ort, g
+
+    def test_umbenennung_zeigt_dem_gate_auch_den_quellpfad(self, tmp_path):
+        """core/db.py -> tools/db.py: ohne --no-renames sieht das Gate nur das
+        Ziel in der erlaubten Zone, und der Kern-Pfad taucht nirgends auf."""
+        ort, g = self._repo(tmp_path)
+        (ort / "tools").mkdir()
+        g("mv", "core/db.py", "tools/db.py")
+        g("add", "-A")
+        g("commit", "-m", "verschoben")
+
+        dateien = gate._geaenderte_dateien(ort, "main")
+        assert "core/db.py" in dateien, \
+            f"Quellpfad der Umbenennung fehlt — Gate ist rename-blind: {dateien}"
+        assert "tools/db.py" in dateien
+        assert gate.ausserhalb_erlaubter_zonen(dateien) == ["core/db.py"]
+
+    def test_umbenennung_aus_der_sperrzone_wird_gesehen(self, tmp_path):
+        """Der eigentliche Angriff: eine Sperrzonen-Datei unsichtbar heraustragen."""
+        ort, g = self._repo(tmp_path)
+        (ort / "tools").mkdir()
+        g("mv", "data/geheim.txt", "tools/geheim.txt")
+        g("add", "-A")
+        g("commit", "-m", "raus damit")
+
+        dateien = gate._geaenderte_dateien(ort, "main")
+        assert gate.beruehrt_sperrzone(dateien) == ["data/geheim.txt"], \
+            f"Sperrzonen-Quelle der Umbenennung nicht gesehen: {dateien}"
+
+    def test_umbenennung_zaehlt_ihre_zeilen(self, tmp_path):
+        """Mit Rename-Erkennung meldet --numstat 0 Zeilen — damit liesse sich
+        MAX_DIFF_ZEILEN mit beliebig viel verschobenem Code umgehen."""
+        ort, g = self._repo(tmp_path)
+        (ort / "tools").mkdir()
+        g("mv", "core/db.py", "tools/db.py")
+        g("add", "-A")
+        g("commit", "-m", "verschoben")
+
+        groesse, binaere = gate._diff_groesse(ort, "main")
+        assert groesse == 6, f"Umbenennung zählt {groesse} statt 3 gelöschte + 3 neue Zeilen"
+        assert binaere == []
+
+    def test_symlink_wird_als_symlink_erkannt(self, tmp_path):
+        ort, g = self._repo(tmp_path)
+        os.symlink("../core/db.py", ort / "tests_link")
+        g("add", "-A")
+        g("commit", "-m", "link")
+
+        # Der Pfad selbst ist unauffällig: keine Sperrzone, und er läge in
+        # einer erlaubten Zone. Nur der Dateimodus verrät ihn.
+        assert gate._symlinks_im_diff(ort, "main") == ["tests_link"]
+
+    def test_geloeschter_symlink_ist_kein_befund(self, tmp_path):
+        """Zielmodus 000000 — der Link ist weg, es gibt nichts abzulehnen."""
+        ort, g = self._repo(tmp_path)
+        os.symlink("../core/db.py", ort / "tests_link")
+        g("add", "-A")
+        g("commit", "-m", "link")
+        g("rm", "tests_link")
+        g("commit", "-m", "link weg")
+
+        assert gate._symlinks_im_diff(ort, "main") == []
+
+    def test_gewoehnliche_aenderung_meldet_keinen_symlink(self, tmp_path):
+        ort, g = self._repo(tmp_path)
+        (ort / "core" / "db.py").write_text("x\ny\nz\nneu\n")
+        g("add", "-A")
+        g("commit", "-m", "geaendert")
+
+        assert gate._symlinks_im_diff(ort, "main") == []
 
 
 from forge.gate import ausserhalb_erlaubter_zonen

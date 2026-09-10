@@ -141,10 +141,60 @@ def lies_verdikt(worktree: Path) -> tuple[bool, list[dict]]:
 
 
 def _geaenderte_dateien(worktree: Path, basis: str) -> list[str]:
-    ergebnis = gitctl.run("diff", "--name-only", f"{basis}...HEAD", cwd=worktree)
+    """Alle Pfade, die der Branch anfasst — Quelle UND Ziel einer Umbenennung.
+
+    `--no-renames` ist hier keine Kosmetik, sondern die Prüfung selbst.
+    Rename-Erkennung ist in git standardmässig an, und `--name-only` zeigt dann
+    nur noch das ZIEL. Gemessen am 2026-09-10 an einem echten Repo, ein Commit,
+    der core/db.py nach tools/db.py verschiebt:
+
+        --name-only:              tools/db.py
+        --name-only --no-renames: core/db.py
+                                  tools/db.py
+
+    Ohne die Option sähe das Gate also nur den Zielpfad, in einer erlaubten
+    Zone — und weder Sperrzonen- noch Zonen-Prüfung bekäme die Quelle je zu
+    Gesicht. Damit liesse sich jede Datei unsichtbar aus einer Sperrzone
+    heraustragen.
+    """
+    ergebnis = gitctl.run("diff", "--name-only", "--no-renames", f"{basis}...HEAD", cwd=worktree)
     if ergebnis.returncode != 0:
         return []
     return [z for z in ergebnis.stdout.splitlines() if z.strip()]
+
+
+# git-Dateimodus eines Symlinks. Ein Symlink ist im Baum ein Blob, dessen Inhalt
+# der Zielpfad ist — sichtbar nur im Modus, nie im Pfadnamen.
+_SYMLINK_MODUS = "120000"
+
+
+def _symlinks_im_diff(worktree: Path, basis: str) -> list[str]:
+    """Welche Einträge des Diffs sind am Ende Symlinks?
+
+    Sperrzonen und erlaubte Zonen urteilen über Pfad-ZEICHENKETTEN, nie über
+    das, was an einem Pfad tatsächlich liegt. `tests/link -> ../core/db.py`
+    besteht deshalb beide Listen: der Pfad liegt in einer erlaubten Zone und in
+    keiner Sperrzone — sein Ziel aber im Kern. Da das Gate die letzte Instanz
+    vor einem unbeaufsichtigten Merge ist, wird ein Symlink hier gar nicht erst
+    beurteilt, sondern abgelehnt.
+
+    `git diff --raw` zeigt beide Dateimodi ("`:100644 120000 <sha> <sha> T`");
+    geprüft wird der ZIEL-Modus, also der Zustand nach dem Branch. Ein
+    GELÖSCHTER Symlink hat Zielmodus 000000 und ist damit korrekt kein Befund —
+    er ist ja weg. `--no-renames` aus demselben Grund wie oben.
+    """
+    ergebnis = gitctl.run("diff", "--raw", "--no-renames", f"{basis}...HEAD", cwd=worktree)
+    if ergebnis.returncode != 0:
+        return []
+    treffer = []
+    for zeile in ergebnis.stdout.splitlines():
+        if not zeile.startswith(":") or "\t" not in zeile:
+            continue
+        kopf, _, pfad = zeile.partition("\t")
+        felder = kopf.split()
+        if len(felder) >= 2 and felder[1] == _SYMLINK_MODUS:
+            treffer.append(pfad.strip())
+    return treffer
 
 
 def _diff_groesse(worktree: Path, basis: str) -> tuple[int, list[str]]:
@@ -158,8 +208,15 @@ def _diff_groesse(worktree: Path, basis: str) -> tuple[int, list[str]]:
     Ein großer Blob außerhalb einer Sperrzone dürfte also nie einfach 0 Zeilen
     zählen. Statt ihn zu schätzen (wie viele "Zeilen" hat ein Bild?), bekommt
     er einen eigenen, expliziten Gate-Grund mit Dateinamen.
+
+    `--no-renames` wie in _geaenderte_dateien: mit Rename-Erkennung meldet
+    --numstat eine Verschiebung als "0 0 {core => tools}/db.py". Ein Commit,
+    der beliebig viel Code durch die Gegend trägt, zählte damit 0 Zeilen und
+    liefe an MAX_DIFF_ZEILEN vorbei. Ohne die Option stehen Löschung und
+    Neuanlage mit ihren echten Zeilenzahlen da (gemessen 2026-09-10: 0/3 und
+    3/0 statt 0/0).
     """
-    ergebnis = gitctl.run("diff", "--numstat", f"{basis}...HEAD", cwd=worktree)
+    ergebnis = gitctl.run("diff", "--numstat", "--no-renames", f"{basis}...HEAD", cwd=worktree)
     if ergebnis.returncode != 0:
         return 0, []
     summe = 0
@@ -234,6 +291,13 @@ def pruefe(worktree: Path, basis: str = "main") -> GateErgebnis:
     draussen = ausserhalb_erlaubter_zonen(dateien)
     if draussen:
         gruende.append(f"ausserhalb der erlaubten Zonen: {', '.join(draussen)}")
+
+    # Beide Listen oben urteilen über Pfad-Zeichenketten. Ein Symlink ist genau
+    # die Lücke darin: sein Pfad kann in einer erlaubten Zone liegen, sein Ziel
+    # überall. Deshalb wird er nicht beurteilt, sondern abgelehnt.
+    symlinks = _symlinks_im_diff(baum, basis)
+    if symlinks:
+        gruende.append(f"Symlink im Diff: {', '.join(symlinks)}")
 
     groesse, binaere = _diff_groesse(baum, basis)
     if groesse > MAX_DIFF_ZEILEN:
