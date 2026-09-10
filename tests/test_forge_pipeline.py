@@ -48,7 +48,7 @@ def stubs(monkeypatch):
     # sonst bei jedem Lauf die echte Postgres-Verbindung öffnen. Tests, die
     # das Budget-Verhalten selbst prüfen, überschreiben diese Stubs lokal
     # (siehe TestBudgetMeldung._budget_stub).
-    monkeypatch.setattr(pl.budget, "buche", lambda model, ti, to: None)
+    monkeypatch.setattr(pl.budget, "buche", lambda model, tokens_in, tokens_out: None)
     monkeypatch.setattr(pl.budget, "markiere_erschoepft", lambda model, grund: None)
 
     def _fixrunde(tid):
@@ -1190,12 +1190,21 @@ class TestGestagterRenameGegenEchtesGit:
 
 
 class TestBudgetMeldung:
+    # Modell der Spec-Stufe (SPECCING -> "spec" in forge/stages.py). Fest
+    # verdrahtet statt aus stages.py nachgeschlagen, damit ein Refactor, der
+    # stufe.model durch stufe.name oder ein Stage-/Chain-Objekt ersetzt,
+    # hier eine falsche Zeichenkette produziert und der Test das bemerkt
+    # (siehe Review-Finding 2: mit dem Namen statt Modell landet jeder
+    # provider_von_modell()-Aufruf bei "antigravity" statt beim echten
+    # Anbieter).
+    SPEC_MODELL = "google/gemini-3.6-flash"
+
     def _budget_stub(self, monkeypatch):
         gebucht, erschoepft = [], []
         monkeypatch.setattr(pl.budget, "buche",
-                            lambda m, ti, to: gebucht.append((m, ti, to)))
+                            lambda model, tokens_in, tokens_out: gebucht.append((model, tokens_in, tokens_out)))
         monkeypatch.setattr(pl.budget, "markiere_erschoepft",
-                            lambda m, g: erschoepft.append((m, g)))
+                            lambda model, grund: erschoepft.append((model, grund)))
         return gebucht, erschoepft
 
     def test_erfolgreicher_lauf_wird_gebucht(self, monkeypatch, stubs, tmp_path):
@@ -1205,20 +1214,32 @@ class TestBudgetMeldung:
                 ok=True, text="egal", tokens_in=1200, tokens_out=80)))
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
         pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
-        assert gebucht and gebucht[-1][1:] == (1200, 80)
+        assert gebucht and gebucht[-1] == (self.SPEC_MODELL, 1200, 80)
 
     def test_rate_limit_markiert_den_anbieter_als_erschoepft(self, monkeypatch, stubs, tmp_path):
-        _, erschoepft = self._budget_stub(monkeypatch)
+        gebucht, erschoepft = self._budget_stub(monkeypatch)
         monkeypatch.setattr(pl.backends, "hole", lambda name: (
             lambda prompt, cwd, timeout, agent, model: RunResult(
                 ok=False, error="rate limit", rate_limited=True)))
         pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
-        assert erschoepft, "Rate-Limit wurde nicht ans Budget gemeldet"
+        # Auch ein rate-limiteter Lauf hat Kontingent gekostet und MUSS
+        # gebucht werden — sonst zaehlt er nie gegen OBERGRENZEN, und
+        # ist_erschoepft() bleibt fuer immer False, egal wie oft der
+        # Anbieter ablehnt.
+        assert gebucht and gebucht[-1][0] == self.SPEC_MODELL, \
+            "Rate-limiteter Lauf wurde nicht gebucht"
+        assert erschoepft and erschoepft[-1][0] == self.SPEC_MODELL, \
+            "Rate-Limit wurde nicht (mit dem richtigen Modell) ans Budget gemeldet"
 
     def test_gewoehnlicher_fehler_erschoepft_nichts(self, monkeypatch, stubs, tmp_path):
-        _, erschoepft = self._budget_stub(monkeypatch)
+        gebucht, erschoepft = self._budget_stub(monkeypatch)
         monkeypatch.setattr(pl.backends, "hole", lambda name: (
             lambda prompt, cwd, timeout, agent, model: RunResult(
                 ok=False, error="irgendwas anderes")))
         pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        # Auch ein gewoehnlicher (nicht rate-limiteter) Fehlschlag hat
+        # Kontingent gekostet und muss gebucht werden — nur die
+        # Erschoepfungs-Meldung bleibt aus.
+        assert gebucht and gebucht[-1][0] == self.SPEC_MODELL, \
+            "Gewoehnlicher Fehlschlag wurde nicht gebucht"
         assert erschoepft == []
