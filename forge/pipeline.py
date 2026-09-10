@@ -541,6 +541,28 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
         _park(task_id, state, f"Kein Stufen-Handler für Zustand '{state}' (Task {task_id})")
         return "geparkt"
 
+    # Die Kettenwahl steht VOR der Fixrunden-Zählung (Review-Finding 3,
+    # 2026-09-09): eine erschöpfte Kette parkt, ohne dass dafür je ein Lauf
+    # stattfand. Würde erst gezählt und dann die Kette befragt, verbrauchte
+    # jeder Versuch gegen eine tote Kette eine Fixrunde, ohne dass auch nur
+    # ein einziger Fix-Lauf lief — nach MAX_FIXRUNDEN stünde ein Task mit dem
+    # irreführenden Grund "Fix-Runden-Grenze erreicht" da, obwohl in
+    # Wirklichkeit kein Anbieter mehr verfügbar war.
+    # Die Review-Stufe darf nicht auf dem Modell laufen, das implementiert hat.
+    verboten = frozenset()
+    if stufe.name == "review":
+        vorher = task.get("implement_model")
+        if vorher:
+            verboten = frozenset({vorher})
+
+    wahl = ketten.waehle(stufe.name, verboten=verboten)
+    if wahl is None:
+        _park(task_id, state,
+              f"Kette für Stufe '{stufe.name}' erschöpft — kein nutzbares Modell "
+              f"übrig (Task {task_id})")
+        return "geparkt"
+    backend_name, modell = wahl
+
     if ist_fix:
         runden = queue.zaehle_fixrunde(task_id)
         if runden > MAX_FIXRUNDEN:
@@ -564,21 +586,6 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
     start = time.time()
     # Vorher: ergebnis = runner.run(prompt, cwd=worktree, profile=stufe.profile,
     #                               timeout=stufe.timeout)
-
-    # Die Review-Stufe darf nicht auf dem Modell laufen, das implementiert hat.
-    verboten = frozenset()
-    if stufe.name == "review":
-        vorher = task.get("implement_model")
-        if vorher:
-            verboten = frozenset({vorher})
-
-    wahl = ketten.waehle(stufe.name, verboten=verboten)
-    if wahl is None:
-        _park(task_id, state,
-              f"Kette für Stufe '{stufe.name}' erschöpft — kein nutzbares Modell "
-              f"übrig (Task {task_id})")
-        return "geparkt"
-    backend_name, modell = wahl
 
     ergebnis = backends.hole(backend_name)(
         prompt, cwd=worktree, timeout=stufe.timeout,

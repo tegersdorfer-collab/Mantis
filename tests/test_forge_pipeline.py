@@ -1290,6 +1290,12 @@ class TestKettenwahl:
         ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
         assert ergebnis == "geparkt"
         assert stubs["parks"], "kein Park-Eintrag geschrieben"
+        # Review-Finding (Minor, 2026-09-09): "nicht leer" genügt nicht — ein
+        # beliebiger anderer Park-Zweig (fehlendes Artefakt, Denial, ...)
+        # hätte diese Zusicherung genauso erfüllt. Der Grund muss die Kette
+        # tatsächlich nennen.
+        assert "Kette" in stubs["parks"][-1][1], \
+            f"Park-Grund nennt die erschöpfte Kette nicht: {stubs['parks'][-1][1]!r}"
 
     def test_review_bekommt_das_implementierer_modell_als_verboten(self, monkeypatch, stubs, tmp_path):
         gesehen = {}
@@ -1319,3 +1325,65 @@ class TestKettenwahl:
         monkeypatch.setattr(pl, "_committe_stufenarbeit", lambda *a: None)
         pl._eine_stufe_intern({"id": 1}, 1, m.IMPLEMENTING, tmp_path)
         assert gemerkt == [(1, "test/impl")]
+
+    def test_fix_merkt_sich_sein_modell_am_task(self, monkeypatch, stubs, tmp_path):
+        # Review-Finding 2 (2026-09-09): nur die implement-Hälfte von
+        # `if stufe.name in ("implement", "fix")` war getestet. Eine
+        # Verengung auf ausschließlich "implement" hätte diesen Test nicht
+        # bemerkt — genau der Fehler, der implement_model nach einer
+        # Fix-Runde stehen ließe und die Review-Stufe damit auf das gerade
+        # fixende Modell laufen lassen könnte.
+        _verdikt(tmp_path, "fail", [{"severity": "important", "what": "x"}])
+        gemerkt = []
+        monkeypatch.setattr(pl.queue, "merke_implement_modell",
+                            lambda task_id, model: gemerkt.append((task_id, model)))
+        monkeypatch.setattr(pl.ketten, "waehle",
+                            lambda name, verboten=frozenset(): ("opencode", "test/fix"))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: RunResult(ok=True, text="gefixt")))
+        pl._eine_stufe_intern({"id": 1}, 1, m.REVIEWING, tmp_path)
+        assert gemerkt == [(1, "test/fix")]
+
+    def test_budget_bucht_das_kettenmodell_nicht_das_stufenmodell(self, monkeypatch, stubs, tmp_path):
+        """Regression zum Budget-Pin (Review-Finding 1, 2026-09-09):
+        `TestBudgetMeldung.SPEC_MODELL` pinnt zufällig denselben Wert, den
+        auch der Default-Stub für `ketten.waehle` liefert — beide Pfade
+        (stufe.model UND das Kettenmodell) stimmen für die spec-Stufe
+        überein, sodass diese Zusicherung allein nicht beweist, welcher
+        davon tatsächlich gebucht wird. Hier weicht das Kettenmodell bewusst
+        von stufe.model ab: nur wenn budget.buche/markiere_erschoepft dem
+        Kettenmodell folgen, kann dieser Test bestehen."""
+        gebucht, erschoepft = [], []
+        monkeypatch.setattr(pl.budget, "buche",
+                            lambda model, tokens_in, tokens_out: gebucht.append(model))
+        monkeypatch.setattr(pl.budget, "markiere_erschoepft",
+                            lambda model, grund: erschoepft.append(model))
+        kettenmodell = "test/kette-abweichend-vom-stufenmodell"
+        stufenmodell = next(s.model for s in pl.stages.ALLE_STUFEN if s.name == "spec")
+        assert kettenmodell != stufenmodell, "Testaufbau kaputt: Kette und Stufe stimmen überein"
+        monkeypatch.setattr(pl.ketten, "waehle",
+                            lambda name, verboten=frozenset(): ("opencode", kettenmodell))
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: RunResult(
+                ok=False, error="rate limit", rate_limited=True)))
+        pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert gebucht == [kettenmodell], \
+            f"budget.buche bekam nicht das Kettenmodell: {gebucht}"
+        assert erschoepft == [kettenmodell], \
+            f"budget.markiere_erschoepft bekam nicht das Kettenmodell: {erschoepft}"
+
+    def test_erschoepfte_kette_auf_fix_stufe_verbraucht_keine_fixrunde(self, monkeypatch, stubs, tmp_path):
+        """Review-Finding 3 (2026-09-09): die Kettenwahl (und ihr
+        Park-auf-None) muss VOR der Fixrunden-Zählung stehen. Stünde sie
+        danach, würde jeder Versuch gegen eine erschöpfte Kette eine
+        Fixrunde verbrauchen, obwohl nie ein Fix-Lauf stattfand — nach
+        MAX_FIXRUNDEN stünde der Task mit dem irreführenden Grund
+        'Fix-Runden-Grenze erreicht' geparkt, obwohl in Wirklichkeit kein
+        Anbieter mehr verfügbar war."""
+        _verdikt(tmp_path, "fail", [{"severity": "important", "what": "x"}])
+        monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
+        ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.REVIEWING, tmp_path)
+        assert ergebnis == "geparkt"
+        assert stubs["fixrunden"] == 0, \
+            "eine erschöpfte Kette hat trotzdem eine Fixrunde verbraucht"
+        assert "Kette" in stubs["parks"][-1][1]
