@@ -14,6 +14,8 @@ nicht der Prüfgegenstand.
 import json
 import os
 import sys
+from datetime import datetime, timedelta
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -39,8 +41,36 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def task_id():
-    """Ein echter Task in der echten Tabelle, hinterher restlos entfernt."""
+    """Ein echter Task in der echten Tabelle, hinterher restlos entfernt.
+
+    Fund F1 (Abschluss-Review Plan 2b): dieser Test läuft gegen die ECHTE
+    Queue, aus der ein ECHTER Daemon claimt. Wird pytest zwischen `enqueue`
+    und der Teardown-Zeile SIGKILLed — die Forge's eigenes Gate ruft pytest
+    mit `timeout=1800` und killt beim Überschreiten, dasselbe droht bei
+    Strg-C oder wenn der Laptop einschläft —, läuft die Teardown nie, und der
+    Task bliebe als claimbare Zeile in der Produktionsqueue liegen. Ein
+    Daemon, der in der Zwischenzeit tickt, würde ihn über `active()`
+    claimen und echte, kostenpflichtige LLM-Läufe daran verschwenden.
+    Umgekehrt könnte ein laufender Daemon genau diese Zeile claimen, während
+    der Test selbst noch läuft, und ihr unter den Füßen den Zustand
+    wegziehen.
+
+    Zwei Maßnahmen dagegen:
+      1. `queue.pause` (forge/queue.py:162) hält den Task 3650 Tage lang
+         pausiert. `queue.active()` und `queue.claim_next()` filtern beide
+         auf `paused_until IS NULL OR paused_until <= NOW()`, ein
+         pausierter Task ist für den Daemon also unsichtbar — und
+         `_eine_stufe_intern` liest `paused_until` nirgends, die Tests
+         dieser Datei bleiben davon unberührt.
+      2. Ein Sweep VOR dem `enqueue` räumt Leichen aus früher gekillten
+         Testläufen weg, damit sie sich nicht unbegrenzt ansammeln.
+    """
+    # Sweep zuerst (siehe Docstring, Maßnahme 2): Leichen aus einem früher
+    # gekillten Testlauf dürfen sich nicht unbegrenzt ansammeln.
+    db.execute("DELETE FROM forge_tasks WHERE source='test' AND title='Lebenszyklus-Test'")
     neue_id = queue.enqueue("Lebenszyklus-Test", "wegwerf", source="test", priority=1)
+    queue.pause(neue_id, "Lebenszyklus-Test — nie vom Daemon anfassen",
+                datetime.now() + timedelta(days=3650))
     yield neue_id
     # forge_journal.task_id trägt ON DELETE CASCADE (core/db.py), die
     # Journaleinträge verschwinden also mit dem Task.
@@ -60,9 +90,23 @@ def gemockte_backends(monkeypatch):
     Test würde also je nachdem, ob heute Nacht schon etwas erschöpft ist,
     unterschiedlich ausfallen. Deshalb: dieselbe feste Zuordnung Stufe →
     (Backend, Modell) wie fest in forge/stages.py, keine Budget-Schreibungen.
+
+    Fund F6 (Abschluss-Review Plan 2b): der gemockte Lauf legt für die
+    review-Stufe ein ECHTES positives Urteil ab (Seiteneffekt, genau wie
+    forge/runner_agy.py es in echt tut) statt gar keins. Vorher bestand der
+    Happy-Path-Test nur, weil `_artefakt_vorhanden` pauschal True mockt und
+    nie ein `review.json` existierte — `_hat_negatives_verdikt` liest bei
+    fehlender Datei "nicht negativ" (siehe forge/pipeline.py), das sagt aber
+    nichts darüber aus, ob ein echtes, positives Urteil denselben Weg nimmt.
     """
-    monkeypatch.setattr(backends, "hole", lambda name: (
-        lambda prompt, cwd, timeout, agent, model: RunResult(ok=True, text="egal")))
+    def _lauf(prompt, cwd, timeout, agent, model):
+        if agent == "review":
+            (Path(cwd) / ".forge").mkdir(parents=True, exist_ok=True)
+            (Path(cwd) / stages.VERDIKT_DATEI).write_text(
+                json.dumps({"verdict": "pass", "findings": []}))
+        return RunResult(ok=True, text="egal")
+
+    monkeypatch.setattr(backends, "hole", lambda name: _lauf)
     monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
     monkeypatch.setattr(pl, "_schreibe_diff", lambda w: None)
     monkeypatch.setattr(pl, "_committe_stufenarbeit", lambda *a: None)
@@ -141,6 +185,11 @@ class TestLebenszyklus:
         task = db.query_one("SELECT * FROM forge_tasks WHERE id=%s", (task_id,))
         pl._eine_stufe_intern(task, task_id, m.REVIEWING, tmp_path)
         assert _zustand(task_id) == m.IMPLEMENTING, "Fix-Stufe hat nicht nach IMPLEMENTING gefuehrt"
+        # Fund F7 (Abschluss-Review Plan 2b): das Verwerfen ist hier
+        # tragend für die Schleife — ohne es läse die nächste REVIEWING-Stufe
+        # dasselbe alte "fail" erneut und die Fix-Schleife schlösse sich nie.
+        assert not (tmp_path / stages.VERDIKT_DATEI).is_file(), \
+            "veraltetes Review-Urteil hat die Fix-Runde überlebt"
 
     def test_erschoepfte_kette_laesst_den_zustand_stehen(self, task_id, monkeypatch, tmp_path):
         """Kontingent darf keinen Zustand verbrennen — der Fehler aus Task 1."""
@@ -153,3 +202,14 @@ class TestLebenszyklus:
 
         assert ergebnis == "kontingent"
         assert _zustand(task_id) == m.SPECCING, "Zustand wurde trotz Kontingent veraendert"
+
+
+class TestTaskFixturePausiertSichSelbst:
+    def test_task_id_fixture_pausiert_den_task(self, task_id):
+        """Fund F1 (Abschluss-Review Plan 2b): die Sicherung gegen einen
+        claimbaren Waisen-Task (siehe Docstring der `task_id`-Fixture) hängt
+        an `paused_until` — ein künftiger Refactor, der das Pausieren
+        stillschweigend fallen ließe, muss hier auffallen."""
+        zeile = db.query_one("SELECT paused_until FROM forge_tasks WHERE id=%s", (task_id,))
+        assert zeile["paused_until"] is not None, \
+            "Lebenszyklus-Test-Task ist nicht pausiert — waere fuer einen Daemon claimbar"

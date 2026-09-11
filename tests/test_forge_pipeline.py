@@ -1002,12 +1002,18 @@ class TestC3GegenEchtesGit:
             self, monkeypatch, stubs, repo):
         monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
         # Was eine implement-Stufe ohne Shell hinterlässt: Dateien im Worktree,
-        # nichts committet. Dazu pipeline-interner Zwischenstand.
+        # nichts committet. Dazu pipeline-interner Zwischenstand — bewusst
+        # NICHT review.json/diff.patch (stages.VERDIKT_DATEI/DIFF_DATEI):
+        # seit Fund F3 (Abschluss-Review Plan 2b) räumt genau ein
+        # erfolgreicher Implement-Lauf diese beiden aus (siehe
+        # TestStalesVerdiktNachImplement), ein generischer Dateiname prüft
+        # hier unabhängig davon, dass .forge/ komplett vom Commit
+        # ausgeschlossen bleibt.
         (repo / "forge").mkdir()
         (repo / "forge" / "neu.py").write_text("# neu\n")
         (repo / "README.md").write_text("hallo\nund tschuess\n")
         (repo / ".forge").mkdir()
-        (repo / ".forge" / "review.json").write_text("{}")
+        (repo / ".forge" / "zwischenstand.txt").write_text("pipeline-intern")
 
         monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="fertig")))
         assert pl.eine_stufe(_task(m.IMPLEMENTING), repo) == "weiter"
@@ -1017,8 +1023,8 @@ class TestC3GegenEchtesGit:
         assert "forge/neu.py" in diff
         assert "und tschuess" in diff
         # Der pipeline-interne Zwischenstand darf NICHT im Diff stehen.
-        assert ".forge/review.json" not in diff
-        assert (repo / ".forge" / "review.json").is_file()
+        assert ".forge/zwischenstand.txt" not in diff
+        assert (repo / ".forge" / "zwischenstand.txt").is_file()
 
     def test_geloeschte_datei_wird_mitcommittet(self, monkeypatch, stubs, repo):
         monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
@@ -1314,7 +1320,7 @@ class TestKettenwahl:
 
         Task 1 (2026-09-10): der Ausgang heißt seither "kontingent" statt
         "fehler" — sonst zählte der Daemon eine leere Kette in seine
-        Fehler-Spirale und schrieb nach drei Nächten in Folge die
+        Fehler-Spirale und schrieb nach drei Ticks in Folge die
         Not-Aus-Datei."""
         monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
         ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
@@ -1445,6 +1451,34 @@ class TestKontingentAusgang:
         ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
         assert ergebnis == "geparkt"
 
+    def test_rate_limit_erschoepft_die_kette_liefert_kontingent(self, monkeypatch, stubs, tmp_path):
+        """Fund F2 (Abschluss-Review Plan 2b): ein Rate-Limit, das gerade das
+        letzte Kettenglied verbraucht (budget.markiere_erschoepft ist zu
+        diesem Zeitpunkt bereits gelaufen), ist Kontingent und kein
+        Fehlverhalten — 'fehler' würde sonst weiter in die Fehler-Spirale des
+        Daemons zählen, obwohl kein Anbieter mehr da ist."""
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: RunResult(
+                ok=False, error="rate limit", rate_limited=True)))
+        monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: True)
+        ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert ergebnis == "kontingent"
+        assert stubs["states"] == [], "Zustand wurde trotz Kontingent veraendert"
+        assert stubs["parks"] == [], "Kontingent-Erschöpfung darf nicht parken"
+
+    def test_rate_limit_ohne_erschoepfte_kette_bleibt_fehler(self, monkeypatch, stubs, tmp_path):
+        """Bleibt nach dem Rate-Limit noch ein Kettenglied übrig, ändert sich
+        am bisherigen Verhalten nichts: 'fehler', Plan 3 hängt hier seine
+        Wartezeit ein."""
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: RunResult(
+                ok=False, error="rate limit", rate_limited=True)))
+        monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: False)
+        ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert ergebnis == "fehler"
+        assert stubs["states"] == []
+        assert stubs["parks"] == []
+
 
 class TestFixStufeErreichbar:
     def _review_mit_verdikt(self, monkeypatch, tmp_path, ok: bool):
@@ -1500,3 +1534,35 @@ class TestFixStufeErreichbar:
         stufe, ist_fix = pl._waehle_stufe(m.REVIEWING, tmp_path)
         assert ist_fix is True
         assert stufe.name == "fix"
+
+
+class TestStalesVerdiktNachImplement:
+    """Fund F3 (Abschluss-Review Plan 2b): ein VERALTETES Urteil, das noch von
+    vor dem letzten Absturz oder einem manuell wiedereingereihten Task im
+    Worktree liegt, darf nicht überleben, bis der Task erneut REVIEWING
+    erreicht — sonst schickt _waehle_stufe ihn in eine Fix-Runde, ohne dass
+    der NEUE Code je reviewt wurde."""
+
+    def test_implement_wirft_ein_vorliegendes_altes_verdikt_weg(self, monkeypatch, stubs, tmp_path):
+        # Ein negatives Urteil liegt schon VOR dem Implement-Lauf da — genau
+        # der Fall eines Absturzes zwischen set_state(-> IMPLEMENTING) und dem
+        # bisherigen Aufräumen, oder eines manuell wiedereingereihten Tasks
+        # mit stehendem Worktree.
+        _verdikt(tmp_path, "fail", [{"severity": "critical", "what": "veraltet"}])
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: RunResult(ok=True, text="egal")))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        monkeypatch.setattr(pl, "_committe_stufenarbeit", lambda *a: None)
+
+        ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.IMPLEMENTING, tmp_path)
+
+        assert ergebnis == "weiter"
+        verdikt_datei = tmp_path / pl.stages.VERDIKT_DATEI
+        assert not verdikt_datei.is_file(), \
+            "veraltetes Review-Urteil hat den Implement-Lauf überlebt"
+        # Ohne den Schnitt läse _waehle_stufe hier das alte "fail" und würde
+        # sofort auf die Fix-Stufe umschalten, obwohl die Review-Stufe für den
+        # neuen Code noch nie gelaufen ist.
+        stufe, ist_fix = pl._waehle_stufe(m.REVIEWING, tmp_path)
+        assert ist_fix is False
+        assert stufe.name == "review"
