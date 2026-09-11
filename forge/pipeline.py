@@ -14,6 +14,12 @@ Rückgabewerte:
   "fehler"  — Rate-Limit; Zustand bewusst unverändert, Plan 3 hängt hier die
               Wartezeit ein. Ein Park hier würde jede Kontingentgrenze in
               einen verlorenen Task verwandeln.
+  "kontingent" — jeder Anbieter der Kette ist für diese Nacht leer (Task 1,
+              2026-09-10). Zustand ebenfalls unverändert, aber eigener
+              Rückgabewert statt "fehler": der zählt sonst in die
+              Fehler-Spirale des Daemons und schaltet nach drei Nächten in
+              Folge die ganze Forge ab, obwohl niemand etwas falsch gemacht
+              hat.
 """
 import json
 import logging
@@ -564,14 +570,20 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
         # einzigen LLM-Aufruf.
         if ketten.kette_erschoepft(stufe.name):
             # Kontingent, nicht Fehlverhalten: Zustand bewusst unverändert
-            # lassen (wie der Rate-Limit-Pfad weiter unten), damit der Task
-            # weiterläuft, sobald die Anbieter wieder da sind. Spec Zeile 264:
-            # "Erst wenn jede Kette trocken ist, endet die Nacht."
+            # lassen, damit der Task weiterläuft, sobald die Anbieter wieder da
+            # sind. Spec Zeile 264: "Erst wenn jede Kette trocken ist, endet
+            # die Nacht."
+            #
+            # Eigener Rückgabewert statt "fehler": daemon.main zählt "fehler"
+            # in die Fehler-Spirale, und drei in Folge schreiben die
+            # Not-Aus-Datei ~/.mantis-forge-stop, die jeden Neustart überlebt.
+            # Eine Nacht mit leeren Kontingenten hätte die Forge damit für alle
+            # folgenden Nächte stillgelegt.
             grund = (f"Kette für Stufe '{stufe.name}' erschöpft — jeder Anbieter ist für diese "
                      f"Nacht raus; Task {task_id} bleibt liegen (kein Park)")
             log.warning(f"Forge-Pipeline: {grund}")
             journal.log(task_id, "stage_failed", grund)
-            return "fehler"
+            return "kontingent"
         # Reviewer-Kollision: übrig bliebe nur das Modell, das implementiert
         # hat. Hier verlangt die Spec (Zeile 183) ausdrücklich Parken — ein
         # Modell, das seinen eigenen Code abnimmt, sieht nur aus wie ein Review.

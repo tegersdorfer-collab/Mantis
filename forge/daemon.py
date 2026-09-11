@@ -45,11 +45,11 @@ FAILURE_SLEEP_SECONDS = 30
 # weiter — ein ganzer Backlog ist so in Sekunden verbrannt. Kürzer als
 # FAILURE_SLEEP_SECONDS, weil ein Park den Task aus der Queue nimmt und der
 # nächste durchaus echte Arbeit sein kann.
-#
-# Der Kontingent-Fall braucht hier KEINEN eigenen Zweig: eine erschöpfte Kette
-# meldet seit dem Abschluss-Review C2 "fehler" statt "geparkt"
-# (forge/pipeline.py) und bekommt damit FAILURE_SLEEP_SECONDS.
 PARK_SLEEP_SECONDS = 10
+# Wartezeit, wenn alle Anbieter für diese Nacht leer sind. Deutlich länger als
+# die anderen Bremsen: vor dem nächsten Kontingent-Fenster ändert sich nichts,
+# und jeder Tick bis dahin ist eine Datenbankabfrage ohne Ergebnis.
+KONTINGENT_SLEEP_SECONDS = 900
 
 
 def should_run(failures: int) -> tuple[bool, str]:
@@ -106,7 +106,7 @@ def _gate_und_abschliessen(task_id: int, baum: Path) -> str:
 
 
 def tick() -> str:
-    """Ein Durchlauf. Rückgabe: 'leerlauf' | 'weiter' | 'fertig' | 'geparkt' | 'fehler'.
+    """Ein Durchlauf. Rückgabe: 'leerlauf' | 'weiter' | 'fertig' | 'geparkt' | 'fehler' | 'kontingent'.
 
     Bringt den aktiven (oder nächsten) Task genau eine Pipeline-Stufe weiter
     (forge/pipeline.py). Meldet die Pipeline "fertig", ist der Task in GATING
@@ -212,6 +212,8 @@ def main() -> None:
             time.sleep(FAILURE_SLEEP_SECONDS)
         elif ergebnis == "geparkt":
             time.sleep(PARK_SLEEP_SECONDS)
+        elif ergebnis == "kontingent":
+            time.sleep(KONTINGENT_SLEEP_SECONDS)
 
 
 if __name__ == "__main__":

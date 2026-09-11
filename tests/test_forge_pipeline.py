@@ -1310,10 +1310,15 @@ class TestKettenwahl:
         Nacht" — der Task bleibt unangetastet liegen und läuft weiter, sobald
         das Kontingent zurück ist. Vorher parkte dieser Pfad, und weil der
         Daemon bei "geparkt" nicht schlief, war ein ganzer Backlog in Sekunden
-        geparkt, mit je einem Worktree und Branch."""
+        geparkt, mit je einem Worktree und Branch.
+
+        Task 1 (2026-09-10): der Ausgang heißt seither "kontingent" statt
+        "fehler" — sonst zählte der Daemon eine leere Kette in seine
+        Fehler-Spirale und schrieb nach drei Nächten in Folge die
+        Not-Aus-Datei."""
         monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
         ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
-        assert ergebnis == "fehler", "erschöpfte Kette darf nicht als Park gemeldet werden"
+        assert ergebnis == "kontingent", "erschöpfte Kette darf nicht als Park gemeldet werden"
         assert stubs["parks"] == [], f"Task wurde trotzdem geparkt: {stubs['parks']}"
         assert stubs["states"] == [], f"Zustand wurde verändert: {stubs['states']}"
         assert stubs["fehlschlaege"] == [], "Fehlschlag-Zähler darf nicht anspringen"
@@ -1327,7 +1332,7 @@ class TestKettenwahl:
         monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
         monkeypatch.setattr(pl.backends, "hole", lambda name: (
             lambda *a, **kw: pytest.fail("Backend trotz erschöpfter Kette aufgerufen")))
-        assert pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path) == "fehler"
+        assert pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path) == "kontingent"
 
     def test_review_bekommt_das_implementierer_modell_als_verboten(self, monkeypatch, stubs, tmp_path):
         gesehen = {}
@@ -1412,13 +1417,30 @@ class TestKettenwahl:
         irreführenden Grund 'Fix-Runden-Grenze erreicht' geparkt, obwohl in
         Wirklichkeit kein Anbieter mehr verfügbar war.
 
-        Seit Abschluss-Review C2 (2026-09-10) meldet dieser Pfad "fehler"
-        statt zu parken (Kontingent ist kein Fehlverhalten) — die Zusicherung
-        dieses Tests bleibt davon unberührt: gezählt wird nichts."""
+        Seit Abschluss-Review C2 (2026-09-10) meldet dieser Pfad nicht mehr
+        Park, seit Task 1 (2026-09-10) meldet er "kontingent" statt "fehler"
+        (Kontingent ist kein Fehlverhalten) — die Zusicherung dieses Tests
+        bleibt davon unberührt: gezählt wird nichts."""
         _verdikt(tmp_path, "fail", [{"severity": "important", "what": "x"}])
         monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
         ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.REVIEWING, tmp_path)
-        assert ergebnis == "fehler"
+        assert ergebnis == "kontingent"
         assert stubs["fixrunden"] == 0, \
             "eine erschöpfte Kette hat trotzdem eine Fixrunde verbraucht"
         assert stubs["parks"] == [], "Kontingent-Erschöpfung darf nicht parken"
+
+
+class TestKontingentAusgang:
+    def test_erschoepfte_kette_liefert_kontingent_nicht_fehler(self, monkeypatch, stubs, tmp_path):
+        """'fehler' würde in die Fehler-Spirale zählen und die Forge abschalten."""
+        monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
+        monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: True)
+        ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert ergebnis == "kontingent"
+
+    def test_reviewer_kollision_bleibt_geparkt(self, monkeypatch, stubs, tmp_path):
+        """Nur Erschöpfung ist Kontingent. Eine Kollision ist weiterhin ein Park."""
+        monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
+        monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: False)
+        ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        assert ergebnis == "geparkt"

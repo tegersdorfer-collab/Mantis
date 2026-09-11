@@ -343,3 +343,74 @@ class TestTickUeberlebtAbsturz:
         # main() darf hierbei nicht selbst mit der RuntimeError aus dem Test fliegen.
         d.main()
         assert stop.exists()
+
+
+class TestKontingentImDaemon:
+    def test_kontingent_zaehlt_nicht_in_die_fehler_spirale(self, monkeypatch, tmp_path):
+        """Drei Kontingent-Ticks dürfen den Not-Aus NICHT auslösen.
+
+        STOP_FILE wird hier (wie in TestFehlerSpiraleUeberlebtNeustart) durch
+        einen echten tmp_path-Pfad ersetzt statt seine Methoden zu stubben:
+        unter Python 3.14 verweigert pathlib.Path das Setzen von
+        Instanz-Attributen (`AttributeError: 'PosixPath' object attribute
+        'exists' is read-only') — monkeypatch.setattr auf STOP_FILE.exists
+        selbst scheitert also, bevor der eigentliche Testfall geprüft wird."""
+        gesehen = {"schlaefe": []}
+        ticks = iter(["kontingent"] * 5)
+
+        class _Halt(BaseException):
+            pass
+
+        def _tick():
+            try:
+                return next(ticks)
+            except StopIteration:
+                raise _Halt
+
+        def _sleep(s):
+            gesehen["schlaefe"].append(s)
+
+        stop = tmp_path / "stop"
+        monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
+        monkeypatch.setattr(d, "tick", _tick)
+        monkeypatch.setattr(d.time, "sleep", _sleep)
+        monkeypatch.setattr(d.journal, "log", lambda *a, **k: None)
+
+        try:
+            d.main()
+        except _Halt:
+            pass
+
+        assert not stop.exists(), "Not-Aus trotz reinem Kontingent-Grund"
+        assert gesehen["schlaefe"], "Kontingent-Tick hat gar nicht geschlafen"
+        assert all(s == d.KONTINGENT_SLEEP_SECONDS for s in gesehen["schlaefe"])
+
+    def test_fehler_loest_den_not_aus_weiterhin_aus(self, monkeypatch, tmp_path):
+        """Die Spirale bleibt für echte Fehler erhalten."""
+        ticks = iter(["fehler"] * 5)
+
+        class _Halt(BaseException):
+            pass
+
+        def _tick():
+            try:
+                return next(ticks)
+            except StopIteration:
+                raise _Halt
+
+        stop = tmp_path / "stop"
+        monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
+        monkeypatch.setattr(d, "tick", _tick)
+        monkeypatch.setattr(d.time, "sleep", lambda s: None)
+        monkeypatch.setattr(d.journal, "log", lambda *a, **k: None)
+
+        try:
+            d.main()
+        except _Halt:
+            pass
+
+        assert stop.exists()
