@@ -1444,3 +1444,59 @@ class TestKontingentAusgang:
         monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: False)
         ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
         assert ergebnis == "geparkt"
+
+
+class TestFixStufeErreichbar:
+    def _review_mit_verdikt(self, monkeypatch, tmp_path, ok: bool):
+        """Lässt die Review-Stufe laufen und legt das angegebene Urteil ab.
+
+        Angepasst gegenüber dem Brief-Wortlaut (siehe Report, Abschnitt
+        "Angepasste Tests"): das Urteil wird HIER als Seiteneffekt des
+        gestubbten Laufs geschrieben, nicht davor. In Produktion legt
+        runner_agy.py review.json aus der Modellantwort an, WÄHREND der Lauf
+        stattfindet — _waehle_stufe() sieht beim Eintritt in REVIEWING also
+        noch KEIN Urteil und wählt zu Recht die echte Review-Stufe
+        (ist_fix=False). Läge die Datei schon vor dem Aufruf da, würde
+        _waehle_stufe() bei einem negativen Urteil sofort auf FIX_STAGE
+        umschalten (ist_fix=True) — dann liefe gar nicht die Review-Stufe,
+        sondern deren next_state-Sonderfall (ziel=IMPLEMENTING bei ist_fix),
+        und der hier zu prüfende frühe Return (stufe.name == "review") käme
+        nie zum Zug. Empirisch geprüft: mit der Vorab-Schreibweise aus dem
+        Brief war test_negatives_verdikt_bleibt_in_reviewing schon VOR der
+        Implementierung grün (RED-Lauf lieferte 3/3 passed statt der
+        erwarteten 1 Fehlschlag) und wäre auch bei entferntem frühen Return
+        grün geblieben.
+        """
+        (tmp_path / ".forge").mkdir(parents=True, exist_ok=True)
+
+        def _run(prompt, cwd, timeout, agent, model):
+            (tmp_path / ".forge" / "review.json").write_text(
+                json.dumps({"verdict": "pass" if ok else "fail",
+                            "findings": [] if ok else [{"severity": "critical", "what": "x"}]}))
+            return RunResult(ok=True, text="egal")
+
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        monkeypatch.setattr(pl, "_schreibe_diff", lambda w: None)
+        return pl._eine_stufe_intern({"id": 1}, 1, m.REVIEWING, tmp_path)
+
+    def test_negatives_verdikt_bleibt_in_reviewing(self, monkeypatch, stubs, tmp_path):
+        """Sonst wählt _waehle_stufe nie die Fix-Stufe."""
+        self._review_mit_verdikt(monkeypatch, tmp_path, ok=False)
+        ziele = [z for z in stubs["states"]]
+        assert m.GATING not in [z[1] for z in ziele], \
+            "Review ist trotz negativem Urteil nach GATING vorgerueckt"
+
+    def test_positives_verdikt_geht_weiter_nach_gating(self, monkeypatch, stubs, tmp_path):
+        self._review_mit_verdikt(monkeypatch, tmp_path, ok=True)
+        assert m.GATING in [z[1] for z in stubs["states"]]
+
+    def test_naechster_durchlauf_waehlt_die_fix_stufe(self, tmp_path):
+        """Der Beweis, dass die Schleife wirklich geschlossen ist."""
+        (tmp_path / ".forge").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".forge" / "review.json").write_text(
+            json.dumps({"verdict": "fail",
+                        "findings": [{"severity": "critical", "what": "x"}]}))
+        stufe, ist_fix = pl._waehle_stufe(m.REVIEWING, tmp_path)
+        assert ist_fix is True
+        assert stufe.name == "fix"

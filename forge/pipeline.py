@@ -735,6 +735,23 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
     # Fix muss die Kette erneut durch die Review laufen, nicht direkt zum
     # Gate. models.can_transition erlaubt REVIEWING -> IMPLEMENTING genau
     # dafür.
+    # Ein negatives Review rückt NICHT vor. Die Fix-Schleife ist vollständig
+    # gebaut (_waehle_stufe → FIX_STAGE, FIX_STAGE → IMPLEMENTING,
+    # _verwirf_review_artefakte, MAX_FIXRUNDEN), aber sie war nie erreichbar:
+    # die Review-Stufe ging auch mit negativem Urteil nach GATING, der Zustand
+    # stand danach nie wieder auf REVIEWING, und das Gate parkte den Task.
+    # Das erste negative Review war damit ein Sackgassen-Park.
+    #
+    # Ein Selbstübergang REVIEWING → REVIEWING ist in forge/models.py bewusst
+    # NICHT erlaubt, deshalb wird hier gar kein Zustandswechsel versucht: der
+    # Task bleibt schlicht stehen, und der nächste Durchlauf trifft ihn in
+    # REVIEWING mit vorliegendem negativem Urteil an — genau die Bedingung,
+    # auf die _waehle_stufe wartet.
+    if stufe.name == "review" and _hat_negatives_verdikt(worktree):
+        journal.log(task_id, "stage_done",
+                    f"Review negativ für Task {task_id} — Fix-Runde folgt")
+        return "weiter"
+
     ziel = m.IMPLEMENTING if ist_fix else stufe.next_state
     if not queue.set_state(task_id, ziel, current=state):
         # Compare-and-Swap ist fehlgeschlagen (verbotener Übergang oder ein
