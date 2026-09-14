@@ -49,9 +49,10 @@ class TestShouldRun:
 
 class TestFehlerSpiraleUeberlebtNeustart:
     def test_spirale_setzt_die_not_aus_datei(self, monkeypatch, tmp_path):
-        # Der launchd-Job läuft mit KeepAlive=true. Ohne diese Datei würde der
-        # Daemon 30s nach dem Selbst-Stopp mit failures=0 neu starten und
-        # dieselben Fehlläufe erneut verbrennen — die Bremse wäre keine.
+        # launchd startet den Job per Kalender erst wieder um NACHT_BEGINN_STUNDE
+        # Uhr. Ohne diese Datei würde der Daemon in der nächsten Nacht mit
+        # failures=0 neu starten und dieselben Fehlläufe erneut verbrennen —
+        # die Bremse wäre keine.
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
         monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: True)
@@ -450,9 +451,14 @@ class TestNachtfenster:
 
 
 class TestFensterUndHaltImMain:
-    def _main_mit(self, monkeypatch, tmp_path, fenster, halt_datei_da, ticks):
+    def _main_mit(self, monkeypatch, tmp_path, fenster, halt_datei_da, ticks, tick_callback=None):
         """Lässt main() laufen; `fenster` ist die Folge der Antworten von
-        im_nachtfenster(), `ticks` zählt die tick()-Aufrufe."""
+        im_nachtfenster(), `ticks` zählt die tick()-Aufrufe. `tick_callback`
+        (optional) wird nach jedem tick()-Aufruf mit der bisherigen
+        Tick-Anzahl aufgerufen — damit lässt sich z.B. die Halt-Datei
+        mitten im Lauf anlegen (ein "echter" Stop, während der Daemon läuft,
+        im Gegensatz zu einer bereits beim Start vorhandenen, veralteten
+        Datei)."""
         antworten = iter(fenster)
 
         class _Halt(BaseException):
@@ -460,6 +466,8 @@ class TestFensterUndHaltImMain:
 
         def _tick():
             ticks.append(1)
+            if tick_callback is not None:
+                tick_callback(len(ticks))
             if len(ticks) > 10:
                 raise _Halt
             return "leerlauf"
@@ -495,15 +503,87 @@ class TestFensterUndHaltImMain:
         assert ergebnis == "beendet"
         assert len(ticks) == 2
 
-    def test_halt_datei_beendet_und_wird_geloescht(self, monkeypatch, tmp_path):
+    def test_live_halt_beendet_nach_dem_laufenden_tick_und_wird_geloescht(self, monkeypatch, tmp_path):
+        """Ein Halt, der WÄHREND eines laufenden Ticks angefordert wird
+        (forge.cli stop mitten im Lauf), beendet erst den nächsten
+        Schleifendurchlauf — die laufende Stufe läuft zu Ende, exakt wie
+        beim Nachtfenster. Anders als eine beim Start bereits vorhandene
+        Datei (siehe test_veraltete_halt_datei_beim_start_wird_entfernt)
+        ist das kein Altlast-Fall, sondern eine echte, laufende Anfrage."""
         ticks = []
-        ergebnis, halt = self._main_mit(monkeypatch, tmp_path, [True] * 5, True, ticks)
+
+        def _stop_waehrend_erstem_tick(anzahl):
+            if anzahl == 1:
+                (tmp_path / "halt").write_text("stop")
+
+        ergebnis, halt = self._main_mit(
+            monkeypatch, tmp_path, [True, False], False, ticks,
+            tick_callback=_stop_waehrend_erstem_tick,
+        )
         assert ergebnis == "beendet"
-        assert ticks == [], "Halt lag vor dem ersten Tick vor — kein Tick erlaubt"
+        assert ticks == [1]
         assert not halt.exists(), "Halt-Datei überlebt das Beenden"
+
+    def test_veraltete_halt_datei_beim_start_wird_entfernt(self, monkeypatch, tmp_path):
+        """Eine Halt-Datei, die schon VOR main() existiert, ist eine
+        Anfrage an einen Daemon, der nie gestartet ist — sie stammt aus
+        einem Absturz/SIGKILL vor dem Löschen (oder, vor diesem Fix, aus
+        einem Fensterausgang, der sie überleben ließ). Timos Stop am Tag
+        darf die kommende Nacht nicht canceln, also entfernt der Start sie
+        stillschweigend, statt sofort zu beenden — der Daemon arbeitet
+        stattdessen ganz normal weiter."""
+        ticks = []
+        ergebnis, halt = self._main_mit(monkeypatch, tmp_path, [True] * 20, True, ticks)
+        assert ergebnis == "laeuft_noch", "eine veraltete Halt-Datei darf den Lauf nicht sofort beenden"
+        assert len(ticks) == 11
+        assert not halt.exists()
 
     def test_ohne_halt_und_im_fenster_laeuft_es(self, monkeypatch, tmp_path):
         ticks = []
         ergebnis, _ = self._main_mit(monkeypatch, tmp_path, [True] * 20, False, ticks)
         assert ergebnis == "laeuft_noch"
         assert len(ticks) == 11
+
+    def test_reihenfolge_fenster_und_halt_vor_should_run(self, monkeypatch, tmp_path):
+        """Fenster- und Halt-Prüfung müssen VOR should_run() laufen: mit
+        gesetzter Not-Aus-Datei UND ausserhalb des Fensters muss main()
+        sofort per return enden, ohne je in den should_run()-Zweig
+        (sleep(BLOCKED_SLEEP_SECONDS)) zu geraten. Eine vertauschte
+        Reihenfolge (should_run() zuerst) würde stattdessen endlos in der
+        300s-Pause hängen — der sleep-Stub bricht das nach drei Aufrufen
+        kontrolliert mit einer eigenen Ausnahme ab, statt den Testlauf
+        aufzuhängen."""
+        class _Haengt(BaseException):
+            pass
+
+        ticks = []
+        schlaefe = []
+
+        def _sleep(s):
+            schlaefe.append(s)
+            if len(schlaefe) > 3:
+                raise _Haengt
+
+        def _tick():
+            ticks.append(1)
+            return "leerlauf"
+
+        stop = tmp_path / "stop"
+        stop.write_text("Fehler-Spirale\n")
+        monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "HALT_FILE", tmp_path / "halt")
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: False)
+        monkeypatch.setattr(d, "tick", _tick)
+        monkeypatch.setattr(d.time, "sleep", _sleep)
+        monkeypatch.setattr(d.journal, "log", lambda *a, **k: None)
+        monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
+
+        try:
+            d.main()
+            ergebnis = "beendet"
+        except _Haengt:
+            ergebnis = "haengt_in_should_run"
+
+        assert ergebnis == "beendet"
+        assert ticks == []

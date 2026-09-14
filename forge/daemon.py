@@ -206,19 +206,28 @@ def main() -> None:
     db.run_migrations()
     journal.log(None, "daemon_start", "Forge gestartet")
     log.info("Forge-Daemon gestartet")
+    # Ein Halt ist eine Bitte an den LAUFENDEN Daemon (forge.cli stop). Beim
+    # Start läuft noch keiner — die Datei ist also veraltet: entweder ein
+    # Absturz/SIGKILL zwischen dem Setzen und dem Löschen, oder ein
+    # Fensterausgang, der die Datei (vor diesem Fix) überleben ließ. Timos
+    # Stop am Tag darf die kommende Nacht nicht canceln — dafür gibt es die
+    # Not-Aus-Datei (STOP_FILE).
+    if HALT_FILE.exists():
+        HALT_FILE.unlink(missing_ok=True)
+        log.warning("Forge: veraltete Halt-Datei beim Start entfernt — eine Halt ist eine Bitte an den laufenden Daemon")
 
     failures = 0
     while True:
+        if halt_angefordert():
+            journal.log(None, "daemon_stop", "Weicher Stop angefordert (forge.cli stop) — Daemon beendet sich")
+            log.info("Forge: weicher Stop")
+            HALT_FILE.unlink(missing_ok=True)
+            return
         if not im_nachtfenster():
             journal.log(None, "daemon_stop",
                         f"Nachtfenster zu Ende ({NACHT_ENDE_STUNDE}:00) — Daemon beendet sich, "
                         f"launchd startet um {NACHT_BEGINN_STUNDE}:00 neu")
             log.info("Forge: Nachtfenster zu Ende")
-            return
-        if halt_angefordert():
-            journal.log(None, "daemon_stop", "Weicher Stop angefordert (forge.cli stop) — Daemon beendet sich")
-            log.info("Forge: weicher Stop")
-            HALT_FILE.unlink(missing_ok=True)
             return
 
         erlaubt, grund = should_run(failures)
@@ -231,6 +240,11 @@ def main() -> None:
                 # mit failures=0 abwarten und dieselben drei Fehlläufe in der nächsten
                 # Nacht erneut verbrennen. Die Not-Aus-Datei ist der einzige Zustand,
                 # den auch dieser Neustart nicht vergisst.
+                # Bekannte Lücke: greift die Spirale in den letzten FAILURE_SLEEP_SECONDS
+                # vor NACHT_ENDE_STUNDE, kann der Daemon durch das Nachtfenster hindurch
+                # beendet werden, BEVOR diese Zeile läuft — die nächste Nacht startet
+                # dann mit failures=0 und wiederholt bis zu drei Fehlläufe. Begrenzt auf
+                # FAILURE_SLEEP_SECONDS und bewusst in Kauf genommen.
                 STOP_FILE.write_text(f"Fehler-Spirale: {grund}\n")
                 journal.log(None, "daemon_stop", f"{grund} — Not-Aus gesetzt, Freigabe durch Timo")
                 return
