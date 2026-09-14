@@ -17,6 +17,7 @@ Verwendung:
 import asyncio
 import logging
 import time
+from contextvars import ContextVar
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ DEFAULT_TIMEOUT = 120       # Sekunden
 # Aktiver Subagent-Registry (für Observability)
 _active: dict[str, dict] = {}
 
-_depth_var: int = 0  # Thread-local-ähnlich via asyncio context
+_depth_var: ContextVar[int] = ContextVar("delegation_depth", default=0)
 
 
 async def run_subagent(
@@ -57,12 +58,10 @@ async def run_subagent(
     timeout: Max Sekunden
     parent_id: Für Observability
     """
-    global _depth_var
-
-    if _depth_var >= MAX_DEPTH:
+    if _depth_var.get() >= MAX_DEPTH:
         return f"FEHLER: Max Delegations-Tiefe ({MAX_DEPTH}) erreicht."
 
-    if len(_active) >= MAX_CONCURRENT:
+    if sum(row["status"] == "running" for row in _active.values()) >= MAX_CONCURRENT:
         return f"FEHLER: Max parallele Subagenten ({MAX_CONCURRENT}) erreicht."
 
     import uuid
@@ -80,8 +79,8 @@ async def run_subagent(
 
     log.info(f"[Subagent {sub_id}] Start: {goal[:80]}")
 
+    depth_token = _depth_var.set(_depth_var.get() + 1)
     try:
-        _depth_var += 1
         result = await asyncio.wait_for(
             _execute_subagent(sub_id, goal, context, allowed_tools),
             timeout=timeout,
@@ -89,6 +88,10 @@ async def run_subagent(
         _active[sub_id]["status"] = "done"
         log.info(f"[Subagent {sub_id}] Fertig in {time.time()-started:.1f}s")
         return result
+
+    except asyncio.CancelledError:
+        _active[sub_id]["status"] = "cancelled"
+        raise
 
     except asyncio.TimeoutError:
         _active[sub_id]["status"] = "timeout"
@@ -101,12 +104,9 @@ async def run_subagent(
         return f"Subagent-Fehler: {e}"
 
     finally:
-        _depth_var -= 1
+        _depth_var.reset(depth_token)
         # Nach 60s aus active-Dict entfernen
-        async def _cleanup():
-            await asyncio.sleep(60)
-            _active.pop(sub_id, None)
-        asyncio.create_task(_cleanup())
+        asyncio.get_running_loop().call_later(60, _active.pop, sub_id, None)
 
 
 async def _execute_subagent(
@@ -118,7 +118,7 @@ async def _execute_subagent(
     """Baut isolierten Agent-Context und führt ReAct-Loop aus."""
     from core import tools as T
     from core.agent import Agent
-    from llm.local import OllamaProvider
+    from core.backends.ollama import OllamaBackend
     import config
 
     # Tool-Set: alle nicht-geblockten, oder explizite Liste
@@ -130,12 +130,7 @@ async def _execute_subagent(
     _active[sub_id]["tool_count"] = len(tool_names)
 
     # Frischer LLM (eigene Connection, kein State)
-    llm = OllamaProvider(
-        model=config.OLLAMA_MODEL,
-        base_url=config.OLLAMA_URL,
-    )
-
-    agent = Agent(llm=llm)
+    agent = Agent(backend=OllamaBackend(model=config.OLLAMA_MODEL))
 
     system = f"""Du bist ein spezialisierter Unteragent von Mantis.
 
@@ -153,19 +148,16 @@ REGELN:
 
     messages = [{"role": "user", "content": f"Führe diese Aufgabe aus: {goal}"}]
 
-    try:
-        response, trace = await agent.run(
-            messages=messages,
-            system=system,
-            allowed_tools=tool_names,
-            force_tools=True,
-            temperature=0.4,
-            max_tokens=2000,
-        )
-        _active[sub_id]["tool_count"] = len(trace)
-        return response or "Aufgabe abgeschlossen (keine Ausgabe)."
-    except Exception as e:
-        return f"Subagent-Ausführungsfehler: {e}"
+    response, trace = await agent.run(
+        messages=messages,
+        system=system,
+        allowed_tools=tool_names,
+        force_tools=True,
+        temperature=0.4,
+        max_tokens=2000,
+    )
+    _active[sub_id]["tool_count"] = len(trace)
+    return response or "Aufgabe abgeschlossen (keine Ausgabe)."
 
 
 def get_active_subagents() -> list[dict]:

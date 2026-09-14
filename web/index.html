@@ -348,7 +348,23 @@ const NAV=[['home','⌂','Home'],['chat','◎','Chat'],['body','♡','Health'],[
 const $=(s,r=document)=>r.querySelector(s);
 const el=(h)=>{const d=document.createElement('div');d.innerHTML=h.trim();return d.firstChild;};
 const view=()=>$('#view');
-async function api(p,o){const r=await fetch(API+p,o);return r.json();}
+function showLogin(message='Bitte Dashboard-Token eingeben.') {
+  let login=document.getElementById('authLogin');
+  if(!login){
+    login=document.createElement('div');login.id='authLogin';
+    login.style.cssText='position:fixed;inset:0;z-index:99999;background:#0a0f1e;display:grid;place-items:center';
+    login.innerHTML='<form style="width:min(360px,90vw)"><h2>Mantis anmelden</h2><p id="authMessage"></p><input name="token" type="password" autocomplete="current-password" placeholder="Dashboard-Token" required><button type="submit">Anmelden</button></form>';
+    login.querySelector('form').onsubmit=async e=>{
+      e.preventDefault();const input=login.querySelector('input');
+      try{const r=await fetch('/auth/session',{method:'POST',headers:{Authorization:'Bearer '+input.value}});input.value='';
+        if(r.ok){location.reload();return;}showLogin(r.status===503?'DASHBOARD_TOKEN muss auf dem Server gesetzt werden.':'Token ungültig.');
+      }catch(e){showLogin('Server nicht erreichbar.');}
+    };
+    document.body.appendChild(login);
+  }
+  document.getElementById('authMessage').textContent=message;
+}
+async function api(p,o){const r=await fetch(API+p,o);if(r.status===401||r.status===503){showLogin(r.status===503?'Server nicht bereit. DASHBOARD_TOKEN prüfen.':undefined);throw new Error('Authentication required');}if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}
 async function post(p,b){return api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});}
 async function del(p){return api(p,{method:'DELETE'});}
 async function put(p,b){return api(p,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});}
@@ -362,7 +378,7 @@ function closeSheet(){$('#sheet').classList.remove('open');}
 
 setInterval(()=>{const t=new Date();$('#clock').textContent=t.toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'});},1000);
 async function status(){try{const s=await api('/api/status');const dot=$('#dot');dot.style.background=s.running?'var(--green)':'var(--red)';dot.style.boxShadow=s.running?'0 0 8px rgba(0,229,160,.6)':'0 0 8px rgba(255,51,102,.5)';const t=`${s.running?'ONLINE':'OFFLINE'} · ${s.model}`;$('#sub').textContent=t;const ss=$('#sideStatus');if(ss)ss.textContent=s.running?'● ONLINE':'○ OFFLINE';const h=new Date().getHours();$('#hello').textContent=h<11?'Guten Morgen':h<18?'Mantis':'Guten Abend';}catch(e){}}
-status();setInterval(status,60000);
+setInterval(status,60000);
 
 // ── Live-Status-Stream ────────────────────────────────────────────────────────
 const STATUS_ICONS={thinking:'💭',tool:'🔧',memory:'🧠',learning:'💡',idle:'✅',autopilot:'🤖',error:'⚠️',task_working:'⚙️'};
@@ -444,7 +460,6 @@ function startStatusStream(){
   es.onmessage=ev=>{try{applyStatus(JSON.parse(ev.data));}catch(e){}};
   es.onerror=()=>setTimeout(startStatusStream, 5000); // reconnect
 }
-startStatusStream();
 
 // Build sidebar
 function buildSidebar(){
@@ -2483,7 +2498,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catc
   },{passive:true});
 })();
 
-go('home');
+api('/api/status').then(()=>{status();startStatusStream();go('home');}).catch(()=>{});
 </script>
 </body>
 </html>

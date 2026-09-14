@@ -12,7 +12,8 @@ import subprocess
 import urllib.request
 
 MANTIS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HEALTH_URL = "http://localhost:7779/api/status"
+sys.path.insert(0, MANTIS_DIR)
+from web.client_auth import dashboard_url, dashboard_headers
 HEALTH_TIMEOUT = 90   # Sekunden bis Mantis hochkommen muss
 CHECK_INTERVAL = 3
 
@@ -23,7 +24,8 @@ def log(msg: str):
 
 def mantis_healthy() -> bool:
     try:
-        with urllib.request.urlopen(HEALTH_URL, timeout=5) as r:
+        request = urllib.request.Request(f"{dashboard_url()}/api/status", headers=dashboard_headers())
+        with urllib.request.urlopen(request, timeout=5) as r:
             return r.status == 200
     except Exception:
         return False

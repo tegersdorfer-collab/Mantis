@@ -41,6 +41,11 @@
    - `--allowedTools, --allowed-tools <tools...>` — Komma- oder leerzeichengetrennt, Muster erlaubt: `"Bash(git *) Edit"`
    - `--disallowedTools, --disallowed-tools <tools...>` — gleiche Form
    - `--permission-mode <mode>` — `acceptEdits | auto | bypassPermissions | default | dontAsk | plan`
+8. **Gemessen in Task 1 am 2026-08-14, unabhängig gegengeprüft — und es widerlegt den ursprünglichen Entwurf dieses Plans:**
+   - **`acceptEdits` setzt `--allowedTools` für Datei-Edits außer Kraft.** Ein Lauf mit `--allowedTools "Read"` hat die Datei trotzdem geschrieben. Ein Rechteprofil in diesem Modus ist wirkungslos. **Alle Stufen laufen deshalb mit `dontAsk`.**
+   - `dontAsk` verhält sich symmetrisch korrekt: Erlaubtes läuft, Unerlaubtes wird verweigert, und beides kehrt sauber zurück. **Kein Modus hängt** — die ursprüngliche Sorge um 30-Minuten-Hänger ist ausgeräumt.
+   - **`is_error` bleibt `false`, auch wenn ein Tool verweigert wurde.** Das Modell erklärt die Ablehnung in Prosa und beendet den Turn regulär. Der einzige verlässliche Marker ist das Array `permission_denials` im Result-Event. Eine Stufe mit zu engem Profil sieht also wie ein Erfolg aus — deshalb muss `runner.parse_stream` dieses Feld durchreichen und die Pipeline es auswerten (siehe Task 6).
+9. **Bepfadetes `Write(<muster>)` wurde gemessen NICHT zu funktionieren** (CLI 2.1.126, 2026-08-14, Proben (d)–(f) in `tests/fixtures/permission_probe.md`): ein Write innerhalb des Musters wird ebenso verweigert wie eines außerhalb. Die ursprüngliche Einschränkung von `spec`/`plan`/`review` auf `Write(<eigenes Artefakt>)` (Commit `f1fc16a`) beruhte auf einem Fehlschluss und wurde zurückgenommen — diese drei Stufen laufen mit bare `Write`, geschützt durch fehlendes `Edit`/`Bash` plus die Sperrzonen-Prüfung des Gates.
 
 ## Neu in diesem Plan: der Agent schreibt
 
@@ -148,7 +153,7 @@ class TestProfilWirdUebergeben:
     def test_erlaubte_tools_landen_im_befehl(self, monkeypatch, tmp_path):
         auf = _Aufzeichnung()
         monkeypatch.setattr(runner.subprocess, "run", auf)
-        profil = runner.PermissionProfile(allowed=("Read", "Grep"), mode="acceptEdits")
+        profil = runner.PermissionProfile(allowed=("Read", "Grep"), mode="dontAsk")
         runner.run("egal", cwd=tmp_path, profile=profil)
         assert "--allowedTools" in auf.befehl
         i = auf.befehl.index("--allowedTools")
@@ -158,7 +163,7 @@ class TestProfilWirdUebergeben:
         auf = _Aufzeichnung()
         monkeypatch.setattr(runner.subprocess, "run", auf)
         runner.run("egal", cwd=tmp_path,
-                   profile=runner.PermissionProfile(allowed=("Read",), mode="acceptEdits"))
+                   profile=runner.PermissionProfile(allowed=("Read",), mode="dontAsk"))
         i = auf.befehl.index("--permission-mode")
         assert auf.befehl[i + 1] == "acceptEdits"
 
@@ -182,7 +187,7 @@ class TestProfilWirdUebergeben:
         # würde als 30-Minuten-Hänger enden statt als Fehlermeldung.
         import pytest
         with pytest.raises(ValueError):
-            runner.PermissionProfile(allowed=(), mode="acceptEdits")
+            runner.PermissionProfile(allowed=(), mode="dontAsk")
 
     def test_stdin_bleibt_abgeklemmt(self, monkeypatch, tmp_path):
         # Regressionsschutz für den Plan-1-Befund (3s Wartezeit pro Lauf).
@@ -200,7 +205,7 @@ class TestProfilWirdUebergeben:
 
         monkeypatch.setattr(runner.subprocess, "run", _run)
         runner.run("egal", cwd=tmp_path,
-                   profile=runner.PermissionProfile(allowed=("Read",), mode="acceptEdits"))
+                   profile=runner.PermissionProfile(allowed=("Read",), mode="dontAsk"))
         assert gesehen["stdin"] == runner.subprocess.DEVNULL
 ```
 
@@ -213,11 +218,38 @@ Expected: FAIL mit `AttributeError: module 'forge.runner' has no attribute 'Perm
 
 In `forge/runner.py` ergänzen (den bestehenden `RunResult`- und `parse_stream`-Code nicht anfassen):
 
+> Der Codeblock unten war der ursprüngliche Entwurf. Die Messung aus Step 1 /
+> Befund 8 hat ihn überholt: `acceptEdits` setzt `--allowedTools` für
+> Datei-Edits außer Kraft, und `auto`/`default`/`plan` wurden nie gemessen.
+> `_ERLAUBTE_MODI` enthält deshalb nur, was eine Aufnahme in
+> `tests/fixtures/permission_probe.md` belegt hat — aktuell ausschließlich
+> `dontAsk`. Ein Modus kommt erst dazu, wenn eine ebensolche Aufnahme ihn
+> nachweist; das gilt als Regel für den Code, nicht nur für diesen Task.
+
 ```python
-# Modi, die für einen unbeaufsichtigten Daemon in Frage kommen. bypassPermissions
-# ist bewusst NICHT dabei: ein Prozess, der nachts ohne Aufsicht läuft, darf sich
-# nicht selbst alle Rechte erteilen — das ist der ganze Sinn der Profile.
-_ERLAUBTE_MODI = frozenset({"acceptEdits", "dontAsk", "plan", "default", "auto"})
+# Modi, die für einen unbeaufsichtigten Daemon in Frage kommen. Ein Modus kommt
+# NUR dann in dieses Set, wenn eine Aufnahme (siehe tests/fixtures/permission_probe.md)
+# belegt hat, dass er --allowedTools tatsächlich durchsetzt — plausibel klingen oder
+# in `claude --help` aufgeführt sein reicht nicht. `acceptEdits` sah ebenso plausibel
+# aus und hat sich in Probe (b1) als wirkungslos für Datei-Edits erwiesen: eine Datei
+# entstand, obwohl `Write` nicht in `--allowedTools` stand. `auto`, `default` und
+# `plan` sind aus demselben Grund draußen — sie wurden schlicht nie gemessen, und ein
+# ungemessener Modus in einer Sicherheitsschranke ist derselbe Fehler, nur unbewiesen.
+# `bypassPermissions` ist zusätzlich bewusst nie zu erwägen: ein Prozess, der nachts
+# ohne Aufsicht läuft, darf sich nicht selbst alle Rechte erteilen. Bis zur nächsten
+# Aufnahme ist `dontAsk` der einzige belegte Modus (Proben b2/b3).
+_ERLAUBTE_MODI = frozenset({"dontAsk"})
+
+# Modi, die nachweislich NICHT durchsetzen und deshalb eine erklärende statt einer
+# generischen Ablehnung verdienen, wenn sie versucht werden. Die Quelle je Eintrag
+# ist die Probe in tests/fixtures/permission_probe.md.
+_WIDERLEGTE_MODI = {
+    "acceptEdits": (
+        "gemessen als wirkungslos für Datei-Edits (tests/fixtures/permission_probe.md, "
+        "Probe b1, 2026-08-14): --allowedTools wurde ignoriert, eine Datei entstand, "
+        "obwohl 'Write' nicht erlaubt war. Nutze stattdessen 'dontAsk'."
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -226,15 +258,35 @@ class PermissionProfile:
 
     `allowed` folgt der CLI-Syntax (verifiziert 2026-08-14): Tool-Namen oder
     Muster wie "Bash(git *)", von der CLI leerzeichengetrennt erwartet.
+
+    Der Default-Modus ist `dontAsk`, und `mode` akzeptiert aktuell AUSSCHLIESSLICH
+    `dontAsk` (siehe `_ERLAUBTE_MODI`): die Aufnahme in
+    tests/fixtures/permission_probe.md (Probe b1) zeigt, dass `acceptEdits` einen
+    Write-Aufruf durchwinkt, obwohl `Write` nicht in `allowed` stand — das Profil
+    wäre für Datei-Edits wirkungslos, deshalb wird `acceptEdits` hier verweigert,
+    nicht nur als Default vermieden. `dontAsk` verweigert denselben Zugriff
+    nachweislich korrekt (sichtbar in `permission_denials`) und hängt dabei nicht.
+    Ein weiterer Modus kommt erst dann dazu, wenn eine ebensolche Aufnahme ihn belegt.
     """
     allowed: tuple[str, ...]
-    mode: str = "acceptEdits"
+    mode: str = "dontAsk"
 
     def __post_init__(self):
         if not self.allowed:
             raise ValueError("Rechteprofil ohne Tools — der Lauf könnte nur hängen bleiben")
+        for tool in self.allowed:
+            if not tool or not tool.strip():
+                raise ValueError(f"Ungültiger Werkzeugname im Rechteprofil: {tool!r}")
         if self.mode not in _ERLAUBTE_MODI:
-            raise ValueError(f"Unzulässiger Permission-Modus: {self.mode}")
+            grund = _WIDERLEGTE_MODI.get(self.mode)
+            if grund:
+                raise ValueError(f"Permission-Modus {self.mode!r} abgelehnt: {grund}")
+            raise ValueError(
+                f"Unzulässiger Permission-Modus: {self.mode!r} — nicht in _ERLAUBTE_MODI. "
+                "Ein Modus gehört erst dann in dieses Set, wenn eine Aufnahme in "
+                "tests/fixtures/permission_probe.md belegt, dass er --allowedTools "
+                "durchsetzt."
+            )
 ```
 
 und in `run()` die Signatur um `profile: PermissionProfile | None = None` erweitern, sowie vor dem Aufruf:
@@ -248,7 +300,9 @@ und in `run()` die Signatur um `profile: PermissionProfile | None = None` erweit
 - [ ] **Step 5: Test laufen lassen, grün bestätigen**
 
 Run: `python3.14 -m pytest tests/test_forge_runner_rechte.py -v`
-Expected: PASS, 6 Tests
+Expected: PASS, 14 Tests (die ursprünglichen 6 plus Härtungstests aus der Messung:
+Tool-Namen-Validierung, `dontAsk`-Default und die Ablehnung von `acceptEdits`
+mitsamt Begründung)
 
 - [ ] **Step 6: Lint und Commit**
 
@@ -476,6 +530,14 @@ class TestReihenfolge:
 
 
 class TestRechteprofile:
+    def test_jede_stufe_nutzt_dontask(self):
+        # Gemessen am 2026-08-14 und unabhängig gegengeprüft: unter
+        # `acceptEdits` ignoriert die CLI --allowedTools für Datei-Edits — eine
+        # Datei entstand, obwohl Write nicht erlaubt war. In diesem Modus wäre
+        # das gesamte Rechteprofil Dekoration. Nur `dontAsk` verweigert wirklich.
+        for stufe in s.ALLE_STUFEN:
+            assert stufe.profile.mode == "dontAsk"
+
     def test_keine_stufe_darf_alles(self):
         for stufe in s.ALLE_STUFEN:
             assert stufe.profile.mode != "bypassPermissions"
@@ -530,6 +592,13 @@ class TestPrompts:
     def test_review_prompt_verlangt_das_verdikt_als_datei(self):
         text = s.fuer_state(m.REVIEWING).baue_prompt(self._task(), kontext={})
         assert ".forge/review.json" in text
+
+    def test_review_prompt_verweist_auf_die_diff_datei(self):
+        # review hat kein Bash und kann sich also keinen eigenen Diff erzeugen
+        # (kein `git diff`) — der Prompt muss stattdessen auf die Datei
+        # verweisen, die die Pipeline (Task 6) vorher schreibt.
+        text = s.fuer_state(m.REVIEWING).baue_prompt(self._task(), kontext={})
+        assert s.DIFF_DATEI in text
 ```
 
 - [ ] **Step 2: Test laufen lassen, Fehlschlag bestätigen**
@@ -549,8 +618,32 @@ läuft über Artefakte im Worktree, nie über Gesprächsverlauf — deshalb steh
 jedem Prompt, wo das Ergebnis der Vorstufe liegt, statt es mitzuschicken.
 
 Die Rechteprofile sind die einzige Schranke zwischen einem unbeaufsichtigten
-Agenten und dem Dateisystem. Sie sind absichtlich eng: nur `implementing` darf
-editieren und Befehle ausführen.
+Agenten und dem Dateisystem. Sie sind absichtlich eng: nur `implement` und
+`fix` dürfen editieren und Befehle ausführen (`Edit`, `Bash`). `spec`, `plan`
+und `review` bekommen `Write`, aber NICHT bepfadet. Diese drei Stufen könnten
+also grundsätzlich jede Datei im Worktree anlegen oder überschreiben,
+einschließlich forge/gate.py. Der eigentliche Schutz dagegen ist zweifach:
+(1) keine der drei Stufen hat `Edit` oder `Bash` — sie können also nur neue
+Dateien anlegen, keine bestehenden gezielt verändern und keine Befehle
+ausführen; (2) das deterministische Gate (forge/gate.py, Sperrzonen-Prüfung,
+siehe Plan-Task 5) bewertet den entstandenen Diff nach dem Lauf und weist
+Änderungen an gesperrten Pfaden zurück, unabhängig davon, welche Stufe sie
+verursacht hat. Das Rechteprofil ist die erste, das Gate die zweite und
+verlässlichere Schranke.
+
+Fehlgeschlagener Versuch (2026-08-14): `Write(<pfad>/**)` sollte das Write
+dieser drei Stufen auf ihr eigenes Artefaktverzeichnis beschränken (Probe (d)
+in tests/fixtures/permission_probe.md). Zwei weitere Proben gegen die echte
+CLI (2.1.126) zeigen, dass ein Write INNERHALB des angegebenen Musters
+ebenfalls verweigert wird (Proben (e) und (f) ebendort) —
+`Write(<muster>)` verweigert in dieser CLI-Version grundsätzlich jeden
+Schreibzugriff, unabhängig vom Pfad. Die frühere Schlussfolgerung aus Probe
+(d) war ein Fehlschluss: sie hatte nur belegt, dass ein Write AUSSERHALB des
+Musters verweigert wird — das ist mit "das Muster grenzt korrekt ein" genauso
+vereinbar wie mit "Write(<muster>) verweigert grundsätzlich alles", und es
+war Letzteres. Nur bare `Write` (siehe Probe (a)) funktioniert. Deshalb unten
+bare `Write` — NICHT wieder auf ein Pfad-Muster umstellen, ohne eine neue
+Messung, die das Gegenteil zeigt.
 """
 from dataclasses import dataclass
 from typing import Callable
@@ -563,6 +656,15 @@ from forge.runner import PermissionProfile
 SPEC_VERZEICHNIS = "docs/superpowers/specs"
 PLAN_VERZEICHNIS = "docs/superpowers/plans"
 VERDIKT_DATEI = ".forge/review.json"
+
+# Die Review-Stufe hat absichtlich kein Bash und kann sich also KEINEN eigenen
+# Diff erzeugen (kein `git diff`, kein sonstiger Befehl) — sonst könnte sie
+# sich eine ihr genehme Sicht auf die Änderung zusammenbauen, statt die
+# tatsächliche zu prüfen. Stattdessen liest sie den Diff aus dieser Datei.
+# WICHTIG: forge/pipeline.py (Task 6) MUSS diese Datei schreiben, BEVOR die
+# Review-Stufe läuft — ohne sie prüft review eine Spec ohne jede Sicht auf
+# das, was tatsächlich geändert wurde, und das Gate-Urteil stünde auf nichts.
+DIFF_DATEI = ".forge/diff.patch"
 
 
 @dataclass(frozen=True)
@@ -625,7 +727,9 @@ def _review_prompt(task: dict, kontext: dict) -> str:
     return (
         _kopf(task) + "\n\n"
         f"Die Spec liegt unter: {kontext.get('spec_path', '(unbekannt)')}\n"
-        "Prüfe den Diff dieses Branches gegen die Spec. Du hast den "
+        f"Der Diff dieses Branches gegen die Spec liegt unter: {DIFF_DATEI}. Das "
+        "ist deine einzige verlässliche Sicht auf die Änderung — lies diese "
+        "Datei, statt einen eigenen Diff zu erzeugen. Du hast den "
         "Entstehungsverlauf NICHT gesehen und sollst ihm auch nicht vertrauen.\n"
         f"Schreibe dein Urteil als JSON nach {VERDIKT_DATEI}:\n"
         '{"verdict": "pass" oder "fail", "findings": [{"severity": "critical|important|minor", '
@@ -648,17 +752,17 @@ def _fix_prompt(task: dict, kontext: dict) -> str:
 # Die Kette: vier Stufen, lückenlos von speccing bis gating.
 STAGES: tuple[Stage, ...] = (
     Stage("spec", m.SPECCING, m.PLANNING,
-          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="acceptEdits"),
+          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _spec_prompt, lambda t: t.get("spec_path")),
     Stage("plan", m.PLANNING, m.IMPLEMENTING,
-          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="acceptEdits"),
+          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _plan_prompt, lambda t: t.get("plan_path")),
     Stage("implement", m.IMPLEMENTING, m.REVIEWING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
-                            mode="acceptEdits"),
+                            mode="dontAsk"),
           _implement_prompt, lambda t: None),
     Stage("review", m.REVIEWING, m.GATING,
-          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="acceptEdits"),
+          PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _review_prompt, lambda t: VERDIKT_DATEI),
 )
 
@@ -669,7 +773,7 @@ STAGES: tuple[Stage, ...] = (
 FIX_STAGE = Stage(
     "fix", m.REVIEWING, m.GATING,
     PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
-                      mode="acceptEdits"),
+                      mode="dontAsk"),
     _fix_prompt, lambda t: None,
 )
 
@@ -1127,6 +1231,11 @@ git commit -m "feat(forge): deterministisches Gate"
 - Produces:
   - `forge.pipeline.MAX_FIXRUNDEN: int`
   - `forge.pipeline.eine_stufe(task: dict, worktree: Path) -> str` — Rückgabe: `"weiter" | "fertig" | "geparkt" | "fehler"`
+- Ändert außerdem: `forge.runner.RunResult` bekommt ein Feld `denials: list[dict]`, gefüllt aus `permission_denials` des Result-Events; `parse_stream` liest es mit.
+
+**Warum das Feld hier dazukommt:** Die Messung aus Task 1 hat gezeigt, dass ein verweigertes Tool `is_error` **nicht** setzt — der Lauf sieht wie ein Erfolg aus, nur ohne Ergebnis. Ohne `denials` würde eine Stufe mit zu engem Rechteprofil als „Artefakt fehlt" geparkt, und niemand käme darauf, dass in Wahrheit die Rechte zu eng waren. Die Pipeline muss deshalb: bei nicht-leerem `denials` mit einem Grund parken, der die verweigerten Tools **beim Namen nennt**. Schreibe dafür einen Test, der genau diese Unterscheidung prüft — gleicher `ok=True`, einmal mit und einmal ohne `denials`, und die Park-Gründe müssen sich unterscheiden.
+
+**Diff-Artefakt für die Review-Stufe:** `review` hat kein `Bash` (siehe Task 1/3) und kann sich also keinen eigenen Diff erzeugen. Bevor `eine_stufe` die Review-Stufe laufen lässt, muss die Pipeline deshalb `forge.stages.DIFF_DATEI` (`.forge/diff.patch`) im Worktree mit dem Diff dieses Branches gegen seine Basis befüllen — sonst prüft review eine Spec ohne jede Sicht auf die tatsächliche Änderung, und das Gate-Urteil stünde auf nichts.
 
 - [ ] **Step 1: Test schreiben, der fehlschlägt**
 

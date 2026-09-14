@@ -639,6 +639,36 @@ MIGRATIONS = [
     "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS recovery_pct        DOUBLE PRECISION;",
     "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS sleep_score         INT;",
     "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS stress_avg          DOUBLE PRECISION;",
+
+    # forge_journal: Cache-Token-Spalten (siehe forge/runner.py RunResult) —
+    # gemessen an einer echten Aufnahme lagen cache_read/cache_creation um
+    # Größenordnungen über tokens_in/tokens_out; ohne diese Spalten würde
+    # journal.log() Werte entgegennehmen, die nirgendwo persistiert werden.
+    "ALTER TABLE forge_journal ADD COLUMN IF NOT EXISTS cache_read INTEGER NOT NULL DEFAULT 0;",
+    "ALTER TABLE forge_journal ADD COLUMN IF NOT EXISTS cache_creation INTEGER NOT NULL DEFAULT 0;",
+
+    # forge_budget: je Nacht und Anbieter eine Zeile. Die Zahlen sind eine
+    # vorsorgliche Bremse, KEINE genaue Buchhaltung — die Anbieter melden ihren
+    # Reststand nicht, und die opencode-CLI reicht keine Response-Header durch.
+    # Das verlässliche Signal ist erschoepft_seit, gesetzt aus einer echten
+    # Rate-Limit-Antwort.
+    """
+    CREATE TABLE IF NOT EXISTS forge_budget (
+        nacht          DATE NOT NULL,
+        provider       TEXT NOT NULL,
+        laeufe         INTEGER NOT NULL DEFAULT 0,
+        tokens_in      BIGINT  NOT NULL DEFAULT 0,
+        tokens_out     BIGINT  NOT NULL DEFAULT 0,
+        erschoepft_seit TIMESTAMPTZ,
+        grund          TEXT,
+        PRIMARY KEY (nacht, provider)
+    );
+    """,
+
+    # Welches Modell die implement/fix-Stufe zuletzt benutzt hat. Die
+    # Review-Stufe liest das, um NICHT dasselbe Modell zu wählen: ein Modell,
+    # das seinen eigenen Code abnimmt, sieht nur aus wie ein Review.
+    "ALTER TABLE forge_tasks ADD COLUMN IF NOT EXISTS implement_model TEXT;",
 ]
 
 

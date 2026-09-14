@@ -1,3 +1,4 @@
+import { authenticatedEventSource } from './api-auth';
 export type SleepNight = { date: string; hours: number | null; deep_hours: number | null };
 export type WidgetSlot = { widget: string; payload: { nights: SleepNight[] } };
 export type UiEvent = { layout: string | null; slots: Record<string, WidgetSlot>; ts?: number };
@@ -8,7 +9,7 @@ export type EventSourceLike = {
 };
 
 function defaultEsFactory(url: string): EventSourceLike {
-  return new EventSource(url) as unknown as EventSourceLike;
+  return authenticatedEventSource(url);
 }
 
 export function subscribeUiState(

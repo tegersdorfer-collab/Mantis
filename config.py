@@ -6,6 +6,8 @@ kommen jetzt aber aus dem typisierten `settings.cfg` (Pydantic BaseSettings).
 from settings import cfg
 
 DASHBOARD_HOST           = cfg.DASHBOARD_HOST
+DASHBOARD_TOKEN          = cfg.DASHBOARD_TOKEN
+DASHBOARD_ALLOWED_ORIGINS = cfg.DASHBOARD_ALLOWED_ORIGINS
 DASHBOARD_PORT           = cfg.DASHBOARD_PORT
 
 OLLAMA_MODEL             = cfg.OLLAMA_MODEL
@@ -22,6 +24,7 @@ CLAUDE_CHAT_MODEL        = cfg.CLAUDE_CHAT_MODEL
 BG_DEFAULT_MODEL         = cfg.BG_DEFAULT_MODEL or cfg.OLLAMA_MODEL
 BG_REASONING_MODEL       = cfg.BG_REASONING_MODEL
 BG_CODE_MODEL            = cfg.BG_CODE_MODEL
+BG_CODE_TEMPERATURE      = cfg.BG_CODE_TEMPERATURE
 VISION_MODEL             = cfg.VISION_MODEL
 
 TELEGRAM_BOT_TOKEN       = cfg.TELEGRAM_BOT_TOKEN

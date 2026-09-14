@@ -16,20 +16,27 @@ _log = logging.getLogger(__name__)
 KINDS = frozenset({
     "daemon_start", "daemon_stop", "stage_start", "stage_done", "stage_failed",
     "gate_pass", "gate_fail", "merged", "reverted", "paused", "resumed",
-    "idea_added", "parked", "lock_cleared",
+    "idea_added", "parked", "lock_cleared", "kontingent",
 })
 
 
 def log(task_id: int | None, kind: str, message: str = "",
-        tokens_in: int = 0, tokens_out: int = 0) -> None:
-    """Schreibt ein Ereignis. Fehler hier dürfen den Daemon nie stoppen."""
+        tokens_in: int = 0, tokens_out: int = 0,
+        cache_read: int = 0, cache_creation: int = 0) -> None:
+    """Schreibt ein Ereignis. Fehler hier dürfen den Daemon nie stoppen.
+
+    cache_read/cache_creation additiv angehängt (siehe forge/runner.py,
+    RunResult): erst mit der zugehörigen Migration in core/db.py hat
+    forge_journal die passenden Spalten dafür.
+    """
     if kind not in KINDS:
         _log.debug(f"Forge-Journal: unbekannte Ereignisart '{kind}' — wird trotzdem geschrieben")
     try:
         db.execute(
-            "INSERT INTO forge_journal (task_id, kind, message, tokens_in, tokens_out) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            (task_id, kind, message, tokens_in, tokens_out),
+            "INSERT INTO forge_journal "
+            "(task_id, kind, message, tokens_in, tokens_out, cache_read, cache_creation) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (task_id, kind, message, tokens_in, tokens_out, cache_read, cache_creation),
         )
     except Exception as exc:  # Journal darf nie der Grund für einen Abbruch sein
         _log.error(f"Forge-Journal-Schreibfehler: {exc}")
@@ -41,6 +48,25 @@ def recent(limit: int = 20) -> list[dict]:
         "SELECT * FROM forge_journal ORDER BY ts DESC LIMIT %s",
         (limit,),
     )
+
+
+def letzte_daemon_ereignisse() -> dict[str, dict]:
+    """Der jüngste daemon_start und der jüngste daemon_stop, je einer, als
+    {kind: zeile}. Für den Morgenbericht (Abschluss-Review 2c, I4): ob die
+    Nacht überhaupt stattgefunden hat und wie sie endete. Daemon-Ereignisse
+    hängen an keinem Task (task_id IS NULL). Fehlt ein Kind, fehlt der
+    Schlüssel; ein Lesefehler liefert ein leeres Dict — der Bericht soll
+    trotzdem erscheinen."""
+    try:
+        zeilen = db.query(
+            "SELECT DISTINCT ON (kind) kind, ts, message FROM forge_journal "
+            "WHERE task_id IS NULL AND kind IN ('daemon_start', 'daemon_stop') "
+            "ORDER BY kind, ts DESC",
+        )
+    except Exception as exc:
+        _log.error(f"Forge-Journal: Daemon-Ereignisse nicht lesbar: {exc}")
+        return {}
+    return {z["kind"]: z for z in zeilen}
 
 
 def for_task(task_id: int) -> list[dict]:

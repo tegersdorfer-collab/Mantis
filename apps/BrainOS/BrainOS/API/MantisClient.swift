@@ -1,10 +1,42 @@
 import Foundation
+import Security
 
 final class MantisClient {
     static let shared = MantisClient()
 
     var baseURL: String {
         UserDefaults.standard.string(forKey: "mantis_base_url") ?? "http://macbook-air-von-timo.tail7e29ff.ts.net:7779"
+    }
+
+
+    // Store the credential in this app's Keychain, never in preferences or URLs.
+    var apiToken: String {
+        get {
+            let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "mantis-dashboard", kSecAttrAccount as String: baseURL,
+                kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+            var result: CFTypeRef?
+            guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+                  let data = result as? Data else { return "" }
+            return String(data: data, encoding: .utf8) ?? ""
+        }
+        set {
+            let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "mantis-dashboard", kSecAttrAccount as String: baseURL]
+            SecItemDelete(query as CFDictionary)
+            if !newValue.isEmpty {
+                var item = query
+                item[kSecValueData as String] = Data(newValue.utf8)
+                item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+                SecItemAdd(item as CFDictionary, nil)
+            }
+        }
+    }
+
+    private func authorizedRequest(_ url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(apiToken)", forHTTPHeaderField: "Authorization")
+        return request
     }
 
     private let session: URLSession = {
@@ -16,12 +48,12 @@ final class MantisClient {
     }()
 
     func get<T: Decodable>(_ path: String) async throws -> T {
-        let data = try await withRetry { try await self.session.data(from: self.url(path)) }
+        let data = try await withRetry { try await self.session.data(for: self.authorizedRequest(try self.url(path))) }
         return try decode(T.self, data)
     }
 
     func post<B: Encodable, T: Decodable>(_ path: String, body: B) async throws -> T {
-        var req = URLRequest(url: try url(path))
+        var req = authorizedRequest(try url(path))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONEncoder().encode(body)
@@ -30,7 +62,7 @@ final class MantisClient {
     }
 
     func put<B: Encodable, T: Decodable>(_ path: String, body: B) async throws -> T {
-        var req = URLRequest(url: try url(path))
+        var req = authorizedRequest(try url(path))
         req.httpMethod = "PUT"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONEncoder().encode(body)
@@ -39,7 +71,7 @@ final class MantisClient {
     }
 
     func delete(_ path: String) async throws {
-        var req = URLRequest(url: try url(path))
+        var req = authorizedRequest(try url(path))
         req.httpMethod = "DELETE"
         _ = try await withRetry { try await self.session.data(for: req) }
     }
@@ -47,7 +79,7 @@ final class MantisClient {
     var isReachable: Bool {
         get async {
             guard let u = URL(string: baseURL + "/health") else { return false }
-            do { let (_, r) = try await session.data(from: u); return (r as? HTTPURLResponse)?.statusCode == 200 }
+            do { let (_, r) = try await session.data(for: authorizedRequest(u)); return (r as? HTTPURLResponse)?.statusCode == 200 }
             catch { return false }
         }
     }

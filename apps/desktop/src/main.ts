@@ -1,3 +1,4 @@
+import { authenticatedFetch } from './api-auth';
 import { getBaseUrl } from './config';
 import { checkBackendHealth } from './backend';
 import { deriveHudState } from './hud-state';
@@ -329,9 +330,9 @@ function renderWidget(container: HTMLElement, slot: WidgetSlot): void {
     case 'skills':
       renderList(
         container,
-        `${icon('skills')} Skill-Factory — ${p.total_tools} Tools gesamt`,
+        `${icon('skills')} Skill-Entwürfe (inaktiv) — ${p.total_tools} aktive Tools`,
         (p.dynamic_skills ?? []).length > 0
-          ? p.dynamic_skills.map((s: string) => `🛠️ ${s}`)
+          ? p.dynamic_skills.map((s: string) => `🛠️ ${s} (Prüfung erforderlich)`)
           : ['Noch keine selbst erstellten Skills.'],
       );
       break;
@@ -410,7 +411,7 @@ export async function initVoiceCapture(
   onSegment: (r: VoiceSegmentResult) => void,
 ): Promise<() => void> {
   try {
-    const res = await fetch(`${baseUrl}/api/voice/stream-mode`);
+    const res = await authenticatedFetch(`${baseUrl}/api/voice/stream-mode`);
     const { mode } = await res.json();
     return mode === 'websocket'
       ? startVoiceCaptureStream(baseUrl, onSegment)

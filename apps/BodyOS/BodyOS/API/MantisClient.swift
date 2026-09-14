@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 final class MantisClient {
     static let shared = MantisClient()
@@ -7,8 +8,35 @@ final class MantisClient {
         UserDefaults.standard.string(forKey: "mantis_base_url") ?? "http://macbook-air-von-timo.tail7e29ff.ts.net:7779"
     }
 
-    /// Direkte Tailscale-IP als Fallback, falls MagicDNS auf dem Gerät mal nicht auflöst.
-    private let fallbackBase = "http://100.107.172.123:7779"
+    // Store the credential in this app's Keychain, never in preferences or URLs.
+    var apiToken: String {
+        get {
+            let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "mantis-dashboard", kSecAttrAccount as String: baseURL,
+                kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+            var result: CFTypeRef?
+            guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+                  let data = result as? Data else { return "" }
+            return String(data: data, encoding: .utf8) ?? ""
+        }
+        set {
+            let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "mantis-dashboard", kSecAttrAccount as String: baseURL]
+            SecItemDelete(query as CFDictionary)
+            if !newValue.isEmpty {
+                var item = query
+                item[kSecValueData as String] = Data(newValue.utf8)
+                item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+                SecItemAdd(item as CFDictionary, nil)
+            }
+        }
+    }
+
+    private func authorizedRequest(_ url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(apiToken)", forHTTPHeaderField: "Authorization")
+        return request
+    }
 
     private let session: URLSession = {
         let config = URLSessionConfiguration.default
@@ -18,21 +46,14 @@ final class MantisClient {
         return URLSession(configuration: config)
     }()
 
-    /// Führt eine Anfrage aus: erst über den konfigurierten Host, bei Netz-/DNS-Fehler
-    /// automatisch über die Tailscale-IP. Server-Fehler (HTTP) lösen KEINEN Fallback aus.
+    /// Credentials are sent only to the explicitly configured server.
     private func perform(_ make: (String) throws -> URLRequest) async throws -> Data {
-        do {
-            return try await withRetry { try await self.session.data(for: try make(self.baseURL)) }
-        } catch let e as MantisError {
-            throw e
-        } catch {
-            return try await withRetry { try await self.session.data(for: try make(self.fallbackBase)) }
-        }
+        return try await withRetry { try await self.session.data(for: try make(self.baseURL)) }
     }
 
     func get<T: Decodable>(_ path: String) async throws -> T {
         let data = try await perform { base in
-            var r = URLRequest(url: try self.makeURL(path, base: base)); r.httpMethod = "GET"; return r
+            var r = self.authorizedRequest(try self.makeURL(path, base: base)); r.httpMethod = "GET"; return r
         }
         return try decode(T.self, from: data)
     }
@@ -40,7 +61,7 @@ final class MantisClient {
     func post<Body: Encodable, T: Decodable>(_ path: String, body: Body) async throws -> T {
         let payload = try JSONEncoder().encode(body)
         let data = try await perform { base in
-            var r = URLRequest(url: try self.makeURL(path, base: base)); r.httpMethod = "POST"
+            var r = self.authorizedRequest(try self.makeURL(path, base: base)); r.httpMethod = "POST"
             r.setValue("application/json", forHTTPHeaderField: "Content-Type"); r.httpBody = payload; return r
         }
         return try decode(T.self, from: data)
@@ -49,14 +70,14 @@ final class MantisClient {
     func put<Body: Encodable, T: Decodable>(_ path: String, body: Body) async throws -> T {
         let payload = try JSONEncoder().encode(body)
         let data = try await perform { base in
-            var r = URLRequest(url: try self.makeURL(path, base: base)); r.httpMethod = "PUT"
+            var r = self.authorizedRequest(try self.makeURL(path, base: base)); r.httpMethod = "PUT"
             r.setValue("application/json", forHTTPHeaderField: "Content-Type"); r.httpBody = payload; return r
         }
         return try decode(T.self, from: data)
     }
 
     func postMultipart(_ path: String, imageData: Data, text: String?) async throws -> Data {
-        var req = URLRequest(url: try makeURL(path))
+        var req = authorizedRequest(try makeURL(path))
         req.httpMethod = "POST"
         let boundary = UUID().uuidString
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -79,15 +100,15 @@ final class MantisClient {
 
     func delete(_ path: String) async throws {
         _ = try await perform { base in
-            var r = URLRequest(url: try self.makeURL(path, base: base)); r.httpMethod = "DELETE"; return r
+            var r = self.authorizedRequest(try self.makeURL(path, base: base)); r.httpMethod = "DELETE"; return r
         }
     }
 
     var isReachable: Bool {
         get async {
-            for base in [baseURL, fallbackBase] {
+            for base in [baseURL] {
                 if let url = URL(string: base + "/health"),
-                   let (_, r) = try? await session.data(from: url),
+                   let (_, r) = try? await session.data(for: authorizedRequest(url)),
                    (r as? HTTPURLResponse)?.statusCode == 200 { return true }
             }
             return false

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct BodySettingsView: View {
     @AppStorage("mantis_base_url") private var baseURL = "http://macbook-air-von-timo.tail7e29ff.ts.net:7779"
+    @State private var apiToken = MantisClient.shared.apiToken
     @State private var isConnected: Bool? = nil
     @State private var isTesting = false
     @State private var profile: TrainingProfile?
@@ -11,6 +12,12 @@ struct BodySettingsView: View {
         NavigationStack {
             Form {
                 Section("Mantis Verbindung") {
+                    SecureField("Dashboard-Token", text: $apiToken)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .onChange(of: apiToken) { _, value in MantisClient.shared.apiToken = value }
+                        .onChange(of: baseURL) { _, _ in apiToken = MantisClient.shared.apiToken }
+
                     TextField("URL", text: $baseURL)
                         .keyboardType(.URL)
                         .autocapitalization(.none)

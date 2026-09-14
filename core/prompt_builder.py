@@ -140,8 +140,9 @@ class PromptBuilder:
             "Erst das Tool, dann eine kurze Bestätigung.\n"
             "AUFGABEN-ZUWEISUNG: Wenn du create_task aufrufst, entscheidet das System automatisch "
             "ob du (Mantis) oder Timo die Aufgabe bekommt – ruf einfach create_task auf.\n"
-            "FÄHIGKEITSLÜCKEN: Wenn KEIN passendes Tool existiert → create_skill nutzen um dir selbst "
-            "ein neues Tool zu bauen (Python-Code, sofort aktiv, kein Neustart nötig).\n"
+            "FÄHIGKEITSLÜCKEN: Wenn KEIN passendes Tool existiert, kann create_skill einen "
+            "inaktiven Python-Entwurf speichern. Manuelle Prüfung und Integration sind nötig; "
+            "der Entwurf erweitert deine verfügbaren Tools nicht automatisch.\n"
             "ZEIT/DATUM: Nutze den Wert aus '## Aktuell'. Für Termine: 'morgen 14:00', 'heute 18:30' "
             "oder 'TT.MM.JJJJ HH:MM' – immer LOKALE Zeit, niemals UTC.\n"
         )

@@ -20,6 +20,10 @@ Phasen-Historie: `docs/superpowers/plans/2026-07-04-*.md`.
   Hostname des Macs für Remote-Clients wie einen Windows-PC)
 - **System**: Tray-Icon, Fenster-State-Persistenz, Autostart bei Login
 
+## Verbindung einrichten
+
+Im Backend `DASHBOARD_TOKEN` setzen. Mit Cmd/Ctrl+, die Backend-Adresse und denselben Zugangsschlüssel eintragen. Der Schlüssel wird lokal pro Backend-Adresse gespeichert; beim Ändern der Adresse muss der passende Schlüssel neu eingetragen werden. HTTP und SSE verwenden Bearer-Header, der Voice-WebSocket einen Authentifizierungs-Subprotocol. Tokens stehen nie in URLs. Remote-Verbindungen über Tailscale oder HTTPS betreiben.
+
 ## Entwicklung
 
 ```

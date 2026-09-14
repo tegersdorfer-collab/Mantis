@@ -12,7 +12,13 @@ PLANNING = "planning"
 IMPLEMENTING = "implementing"
 REVIEWING = "reviewing"
 GATING = "gating"
-AWAITING_RESTART = "awaiting_restart_window"
+# Nachtrag 2c: das grüne Gate wartet hier auf Timos Freigabe (forge/cli.py,
+# ab Plan 3 der Telegram-Bot). Gehört bewusst NICHT zu ACTIVE_STATES — ein
+# Task, der auf Timo wartet, blockiert keine Bahn. Der frühere Zustand
+# awaiting_restart_window (Daemon-Neustart nach Merges in forge/) ist
+# entfernt: die Agenten dürfen forge/ nicht anfassen, kein Merge braucht
+# einen Neustart, und am 2026-09-14 stand keine Zeile in dem Zustand.
+AWAITING_APPROVAL = "awaiting_approval"
 MERGED = "merged"
 PARKED = "parked"
 FAILED = "failed"
@@ -20,7 +26,7 @@ FAILED = "failed"
 # Zustände, in denen ein Task als "in Arbeit" gilt. Findet der Daemon beim Start
 # einen solchen Task, setzt er dort wieder auf, statt einen neuen zu ziehen.
 ACTIVE_STATES = frozenset({
-    SPECCING, PLANNING, IMPLEMENTING, REVIEWING, GATING, AWAITING_RESTART,
+    SPECCING, PLANNING, IMPLEMENTING, REVIEWING, GATING,
 })
 
 # Jede Pipeline-Stufe darf jederzeit parken oder endgültig scheitern.
@@ -31,11 +37,15 @@ _TRANSITIONS: dict[str, set[str]] = {
     SPECCING: {PLANNING} | _ESCAPES,
     PLANNING: {IMPLEMENTING} | _ESCAPES,
     IMPLEMENTING: {REVIEWING} | _ESCAPES,
-    # Negatives Review-Verdict schickt den Task in die Fix-Runde zurück.
-    REVIEWING: {GATING, IMPLEMENTING} | _ESCAPES,
-    # MERGED direkt aus GATING: Docs-only-Diffs brauchen kein Neustart-Fenster.
-    GATING: {AWAITING_RESTART, MERGED} | _ESCAPES,
-    AWAITING_RESTART: {MERGED, PARKED},
+    # Nachtrag 2c: ein Fix bleibt in REVIEWING (kein Zustandswechsel, altes
+    # Urteil wird verworfen, nächster Tick reviewt). Der frühere Übergang
+    # REVIEWING -> IMPLEMENTING liess die Implement-Stufe nach jedem Fix ein
+    # zweites Mal laufen und ist ersatzlos entfernt.
+    REVIEWING: {GATING} | _ESCAPES,
+    # Kein automatischer Merge aus GATING, auch nicht für Docs (Spec,
+    # "Bewusst nicht enthalten"). Grün heisst: warten auf Timo.
+    GATING: {AWAITING_APPROVAL} | _ESCAPES,
+    AWAITING_APPROVAL: {MERGED, PARKED},
     MERGED: set(),                  # Endzustand
     PARKED: {QUEUED},               # Freigabe durch Timo
     FAILED: {QUEUED},               # manueller Neuanlauf

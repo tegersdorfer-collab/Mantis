@@ -10,7 +10,7 @@ import time
 from communication.base import IncomingMessage
 from core.background_review import run_background_review
 from core.status import BUS
-from core import skills, db, ui_state, fast_commands
+from core import skills, db, ui_state, fast_commands, skill_request
 
 log = logging.getLogger(__name__)
 
@@ -181,6 +181,21 @@ class MessageHandler:
                 result = f"❌ {fast.tool} fehlgeschlagen: {e}"
             log.info("⚡ Fast-Path %s → %s(%s)", fast.label, fast.tool, fast.args)
             return result, [{"tool": fast.tool, "args": fast.args, "result": result[:500]}]
+
+        # Skill-Factory: eigener Fast-Path, weil hier Quellcode erzeugt werden muss
+        # und der Agent das Pflichtargument skill_name reproduzierbar verschluckt
+        # (siehe core/skill_request.py). Name und Beschreibung kommen determi-
+        # nistisch aus der Äußerung, nur der Code aus einem engen LLM-Call.
+        skill_req = skill_request.match(text)
+        if skill_req is not None:
+            try:
+                result = await skill_request.erzeuge(skill_req, self.bg_llm)
+            except Exception as e:
+                log.error(f"Skill-Fast-Path fehlgeschlagen: {e}")
+                db.log_error("skill_fast_path", e)
+                result = f"❌ Skill-Erstellung fehlgeschlagen: {e}"
+            args = {"skill_name": skill_req.skill_name, "description": skill_req.spec}
+            return result, [{"tool": "create_skill", "args": args, "result": result[:500]}]
 
         system = await self.prompt_builder.build(text)
         allowed = skills.T.select_tools(text)

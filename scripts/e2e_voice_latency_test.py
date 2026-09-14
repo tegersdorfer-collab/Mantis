@@ -8,16 +8,20 @@ import glob
 import time
 import httpx
 
-BASE_URL = "http://localhost:7779"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from web.client_auth import dashboard_url, dashboard_headers
 DATA_DIR = "data/stt_benchmark"
 
 
 def main():
+    base_url = dashboard_url()
     wavs = sorted(glob.glob(f"{DATA_DIR}/*.wav"))
-    print(f"{len(wavs)} Testfälle gegen laufendes Backend ({BASE_URL})\n")
+    print(f"{len(wavs)} Testfälle gegen laufendes Backend ({base_url})\n")
 
     results = []
-    with httpx.Client(timeout=60) as client:
+    with httpx.Client(timeout=60, headers=dashboard_headers()) as client:
         for wav_path in wavs:
             key = wav_path.rsplit("/", 1)[-1].replace(".wav", "")
             with open(wav_path, "rb") as f:
@@ -25,7 +29,7 @@ def main():
 
             t0 = time.time()
             resp = client.post(
-                f"{BASE_URL}/api/voice/segment",
+                f"{base_url}/api/voice/segment",
                 files={"audio": (f"{key}.wav", audio_bytes, "audio/wav")},
             )
             total = time.time() - t0

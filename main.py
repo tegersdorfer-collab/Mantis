@@ -33,6 +33,16 @@ def ensure_single_instance():
     atexit.register(lambda: os.unlink(pidfile) if os.path.exists(pidfile) else None)
 
 
+def validate_dashboard_host(host: str) -> str:
+    """Accept only explicit loopback or Tailscale addresses; never wildcard/LAN."""
+    import ipaddress
+    address = ipaddress.ip_address(host)
+    tailnets = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+    if not address.is_loopback and not any(address in network for network in tailnets):
+        raise ValueError("DASHBOARD_HOST must be a loopback or explicit Tailscale IP")
+    return str(address)
+
+
 async def main():
     ensure_single_instance()
 
@@ -115,34 +125,10 @@ async def main():
         channel=channel, lzg=lzg, thermal=thermal,
     )
 
-    # Dashboard-API im selben Prozess (geteilter State mit dem Agent).
-    # Bindet NUR auf die Tailscale-IP – im normalen LAN/WLAN unsichtbar, kein
-    # App-Token mehr nötig (PWA-Homescreen-Start_url kann so fix "/" bleiben).
-    # Fällt auf localhost zurück falls Tailscale gerade nicht läuft (z.B. Debug).
-    import socket as _socket
+    # Default is loopback; remote access must use an explicit Tailnet address.
     import uvicorn
     from web.api import create_app
-
-    def _local_ips() -> set[str]:
-        ips = set()
-        try:
-            for info in _socket.getaddrinfo(_socket.gethostname(), None):
-                ips.add(info[4][0])
-        except Exception:
-            pass
-        try:
-            import subprocess as _sp
-            out = _sp.run(["ifconfig"], capture_output=True, text=True, timeout=3).stdout
-            ips.update(_re.findall(r"inet (\d+\.\d+\.\d+\.\d+)", out))
-        except Exception:
-            pass
-        return ips
-
-    import re as _re
-    dashboard_host = cfg.DASHBOARD_HOST
-    if dashboard_host not in ("0.0.0.0", "::") and dashboard_host not in _local_ips():
-        log.warning(f"⚠️  {dashboard_host} nicht aktiv – Dashboard bindet auf localhost.")
-        dashboard_host = "127.0.0.1"
+    dashboard_host = validate_dashboard_host(cfg.DASHBOARD_HOST)
 
     # SKILL.md Index beim Start laden
     from core import skill_md as _skill_md
@@ -151,7 +137,7 @@ async def main():
         log.info(f"📘 {n_skills} Skill-Prozedur(en) geladen")
 
     api_app = create_app(orchestrator)
-    api_conf = uvicorn.Config(api_app, host=dashboard_host, port=7779, log_level="warning")
+    api_conf = uvicorn.Config(api_app, host=dashboard_host, port=cfg.DASHBOARD_PORT, log_level="warning")
     api_server = uvicorn.Server(api_conf)
 
     loop = asyncio.get_event_loop()
@@ -168,8 +154,7 @@ async def main():
 
     await orchestrator.start()
     asyncio.create_task(api_server.serve())
-    display_host = "macbook-air-von-timo.tail7e29ff.ts.net" if dashboard_host == "0.0.0.0" else dashboard_host
-    log.info(f"🖥️  Dashboard läuft auf http://{display_host}:7779 (bindet auf {dashboard_host})")
+    log.info(f"🖥️  Dashboard läuft auf http://{dashboard_host}:{cfg.DASHBOARD_PORT} (bindet auf {dashboard_host})")
     await stop_event.wait()
 
 

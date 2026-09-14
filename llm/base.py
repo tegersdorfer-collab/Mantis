@@ -43,6 +43,20 @@ class LLMProvider(ABC):
         """Antwort als Stream (Token für Token)."""
         ...
 
+    async def complete(
+        self,
+        prompt: str,
+        system: str | None = None,
+        **kwargs,
+    ) -> str:
+        """Einmalige Antwort auf einen einzelnen Prompt — Convenience um chat().
+
+        Bewusst konkret statt @abstractmethod: jeder Provider, der chat()
+        erfüllt, bekommt complete() automatisch mit. Sonst reißt die Lücke
+        wieder auf, durch die RoutedLLMProvider.complete() ins Leere lief.
+        """
+        return await self.chat([Message(role="user", content=prompt)], system=system, **kwargs)
+
     @abstractmethod
     async def embed(self, text: str) -> list[float]:
         """Text in Embedding-Vektor umwandeln (für LZG)."""

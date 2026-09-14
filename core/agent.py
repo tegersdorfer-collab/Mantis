@@ -69,6 +69,8 @@ class Agent:
         else:
             schemas = toolreg.ollama_schemas()
 
+        # Schemas guide the model; enforce the same permissions at dispatch too.
+        permitted_tools = {s["function"]["name"] for s in (schemas or [])}
         trace: list[dict] = []
 
         for step in range(self._max_steps):
@@ -88,7 +90,7 @@ class Agent:
 
             if not tool_calls:
                 # Math-Guard: Antwort enthält Rechnung ohne calculate aufgerufen?
-                if schemas and _needs_calculate(content) and not any(
+                if "calculate" in permitted_tools and _needs_calculate(content) and not any(
                     t["tool"] == "calculate" for t in trace
                 ):
                     log.debug("Math-Guard: erzwinge calculate-Tool-Call")
@@ -151,7 +153,9 @@ class Agent:
                     except Exception:
                         args = {}
                 BUS.emit("tool", f"🔧 {name}", detail=_short(args) or None)
-                if dry_run_tools:
+                if name not in permitted_tools:
+                    result = f"FEHLER: Tool '{name}' ist in diesem Lauf nicht erlaubt."
+                elif dry_run_tools:
                     result = f"[Eval-Dry-Run] Tool '{name}' würde ausgeführt (Argumente akzeptiert)."
                 else:
                     result = await toolreg.execute(name, args)

@@ -1,3 +1,4 @@
+import { authenticatedFetch } from './api-auth';
 // Skilltree-Overlay — Achsen-Level + Nodes + adaptive Quests. Holt /api/skilltree
 // selbst. Reine Render-Funktionen (overviewHtml/axisDetailHtml/widgetHtml) sind
 // vom Fetch getrennt und per vitest getestet. Ehrlich: Level 0 statt Fake.
@@ -65,7 +66,7 @@ export function widgetHtml(p: SkilltreeData): string {
   return `<div class="widget-title">🌳 Skilltree</div><div class="st-chips">${axes}</div>`;
 }
 
-export function initSkilltreeOverlay(baseUrl: string, fetchImpl: typeof fetch = fetch): { open: () => void } {
+export function initSkilltreeOverlay(baseUrl: string, fetchImpl: typeof fetch = authenticatedFetch): { open: () => void } {
   let data: SkilltreeData | null = null;
   const { el, open } = createOverlay({
     id: 'skilltree-overlay',
