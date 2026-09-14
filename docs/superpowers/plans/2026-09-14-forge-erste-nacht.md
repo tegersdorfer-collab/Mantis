@@ -2018,14 +2018,37 @@ einzeln zurueckgedreht rot."
 ## Danach
 
 **Timos Schritte ausserhalb des Worktrees** (nicht Teil des Plans, weil sie
-das System verändern):
+das System verändern). Die Reihenfolge ist der Punkt: das lokale `main` liegt
+am 2026-09-14 75 Commits hinter `forge/pipeline` und enthält nur die Forge
+aus Plan 1 — ein `git checkout main` als erster Schritt würde genau diese
+alte Forge unter launchd stellen (Abschluss-Review 2c, C2).
 
-1. `git checkout main` im Hauptrepo — `freigeben` verweigert sonst.
-   Alternativ `forge/pipeline` nach `main` mergen; Timos Entscheidung.
-2. plist installieren (drei Zeilen in `forge/launchd/README.md`).
-3. Vor der ersten Nacht: `python3.14 -m forge.cli status` — muss den leeren
-   Bericht drucken; ein Task per `queue.enqueue` einreihen; am Morgen
-   `status`, dann `approve`.
+1. `forge/2c-erste-nacht` nach `forge/pipeline` mergen.
+2. `main` nachziehen: `git merge --ff-only forge/pipeline` — ff-only, damit
+   `main` exakt der geprüfte Stand ist und kein Merge-Commit dazwischenliegt.
+3. `git checkout main` in `~/Mantis`.
+4. `git status --porcelain --untracked-files=no` muss leer sein (das ist die
+   Prüfung, die `freigeben` macht; untracked Dateien stören nicht).
+5. plist installieren (drei Zeilen in `forge/launchd/README.md`) **vor
+   23:00**. Tagesprobe: `launchctl kickstart -k gui/$(id -u)/com.mantis.forge`
+   — das Log (`/tmp/mantis_forge_out.log`) zeigt „Nachtfenster zu Ende", das
+   Journal hat ein `daemon_start`- und ein `daemon_stop`-Paar. Damit ist
+   bewiesen, dass launchd den richtigen Interpreter, das richtige Repo und
+   die DB findet.
+6. `python3.14 -m forge.cli status` — druckt den Bericht mit „Daemon:
+   gestartet …, beendet …" aus der Tagesprobe. Die alten Parks (Tasks 3–6,
+   Worktrees aus dem Vor-2a-`main`) **nicht** requeuen — ihre Worktrees
+   basieren auf einem Stand ohne Kettenwahl und Fix-Schleife.
+7. Genau **einen** kleinen Task einreihen, der vollständig in den erlaubten
+   Zonen (`tests/`, `docs/`, `scripts/`, `tools/`, `core/skills/`) liegt.
+8. Mac wach und am Strom; keine `~/.mantis-forge-stop` und keine
+   `~/.mantis-forge-halt`.
+9. Zwischen 23 und 7 kein manuelles `pytest tests/` — die beiden DB-Tests
+   kollidieren mit dem Gate-Lauf auf `source='test'`. Kein `launchctl bootout`
+   mitten im Lauf; wenn es sein muss: `python3.14 -m forge.cli stop` (weicher
+   Halt nach dem laufenden Tick).
+10. Morgens `python3.14 -m forge.cli status`, den Diff des Worktrees prüfen,
+    dann `approve <id>` (oder `reject <id> "<grund>"`).
 
 **Plan 2d:** Parallelität, Kurzbahn, Mistral-Commit-Texte. **Plan 3:** Scout
 und Telegram-Bot (ruft `freigabe.*` und `bericht.morgenbericht`). **Plan 4:**

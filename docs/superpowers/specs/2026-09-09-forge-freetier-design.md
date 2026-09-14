@@ -546,8 +546,10 @@ Danach werden Invarianten geprüft, nicht Einzelzustände:
 Szenarien: gute Nacht (zwei Tasks → `AWAITING_APPROVAL`); zwei negative
 Reviews (→ `PARKED`, `refusals = 2`, kein dritter Fix-Lauf); Rate-Limit-Kaskade
 über beide Anbieter der Implement-Kette (→ `"kontingent"`, Zustand steht, keine
-Not-Aus-Datei, Fortsetzung nach Budget-Reset); Absturz nach dem Fix vor
-`_verwirf_review_artefakte` (→ nächster Tick reviewt, fixt nicht);
+Not-Aus-Datei, Fortsetzung nach Budget-Reset); Absturz nach
+`_verwirf_review_artefakte`, vor der Rundenzählung (→ nächster Tick reviewt,
+fixt nicht; ein Absturz *vor* `_verwirf` fixt einmal erneut, ungezählt und
+begrenzt);
 Fensterende mitten in einer Stufe (→ Exit 0, Task aktiv, nächste Nacht setzt
 auf). Mutationsnachweis: die vier Importants aus dem 2b-Abschlussreview
 (Rate-Limit-Spirale, Implement-Re-Run, veraltetes Verdikt, verbrauchte Runde)
