@@ -370,3 +370,34 @@ class TestQuellenTrennung:
         q.claim_next()
         assert all("source <> %s" in sql and params[-1] == q.TEST_QUELLE
                    for sql, params in rec.queries)
+
+
+class TestHoleUndNachZustand:
+    def test_hole_liefert_die_zeile(self, monkeypatch):
+        _patch(monkeypatch, rows=[{"id": 7, "state": m.PARKED}])
+        assert q.hole(7)["id"] == 7
+
+    def test_hole_ohne_treffer_none(self, monkeypatch):
+        _patch(monkeypatch, rows=[])
+        assert q.hole(7) is None
+
+    def test_nach_zustand_filtert_die_testquelle_aus(self, monkeypatch):
+        rec = _patch(monkeypatch, rows=[])
+        q.nach_zustand(m.AWAITING_APPROVAL)
+        sql, params = rec.queries[-1]
+        assert "source <> %s" in sql and params == (m.AWAITING_APPROVAL, q.TEST_QUELLE)
+
+
+class TestRequeue:
+    def test_setzt_zaehler_und_grund_zurueck(self, monkeypatch):
+        rec = _patch(monkeypatch, rows=[{"id": 7, "state": m.PARKED}])
+        assert q.requeue(7) is True
+        sql, params = rec.executes[-1]
+        assert "attempts=0" in sql and "refusals=0" in sql and "parked_reason=NULL" in sql
+        assert "state=%s" in sql and params[0] == m.QUEUED
+        assert "AND state=%s" in sql, "kein Compare-and-Swap"
+
+    def test_nur_aus_parked_oder_failed(self, monkeypatch):
+        rec = _patch(monkeypatch, rows=[{"id": 7, "state": m.REVIEWING}])
+        assert q.requeue(7) is False
+        assert rec.executes == []

@@ -224,3 +224,37 @@ def zaehle_fixrunde(task_id: int) -> int:
         (task_id,),
     )
     return int(zeile["refusals"]) if zeile else 0
+
+
+def hole(task_id: int) -> dict | None:
+    """Eine Zeile, oder None."""
+    return db.query_one("SELECT * FROM forge_tasks WHERE id=%s", (task_id,))
+
+
+def nach_zustand(state: str, quelle: str | None = None) -> list[dict]:
+    """Alle Tasks in einem Zustand, älteste zuerst. `quelle` siehe TEST_QUELLE."""
+    filter_sql, filter_params = _quellen_filter(quelle)
+    return db.query(
+        f"SELECT * FROM forge_tasks WHERE state=%s {filter_sql} ORDER BY updated_at ASC",
+        (state, *filter_params),
+    )
+
+
+def requeue(task_id: int) -> bool:
+    """Reiht einen geparkten oder gescheiterten Task neu ein (Nachtrag 2c).
+
+    Setzt die Zähler zurück: `attempts` (Fehlschlag-Spirale) und `refusals`
+    (Fix-Runden) — sonst parkt der Task beim ersten Fix sofort wieder mit
+    'Fix-Runden-Grenze erreicht'. Der Worktree bleibt stehen; die Arbeit darin
+    ist der Grund, warum der Task erneut laufen soll. Ein dort liegendes altes
+    Review-Urteil räumt die Implement-Stufe weg (forge/pipeline.py).
+    """
+    task = hole(task_id)
+    if task is None or not m.can_transition(task["state"], m.QUEUED):
+        return False
+    betroffen = db.execute(
+        "UPDATE forge_tasks SET state=%s, attempts=0, refusals=0, parked_reason=NULL, "
+        "updated_at=NOW() WHERE id=%s AND state=%s",
+        (m.QUEUED, task_id, task["state"]),
+    )
+    return betroffen == 1
