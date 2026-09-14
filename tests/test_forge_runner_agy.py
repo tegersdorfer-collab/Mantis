@@ -233,3 +233,20 @@ class TestFehlermodi:
         r = ra.run("x", cwd=tmp_path, timeout=60, agent="review", model="m")
         assert r.ok is False
         assert "Permission denied" in (r.error or "")
+
+
+class TestPrintTimeout:
+    """Erste Nacht (2026-09-14): agy hat einen eigenen `--print-timeout`,
+    Default 5m0s. Ohne den Parameter bräche agy ein Opus-Thinking-Review nach
+    fünf Minuten selbst ab, obwohl die Stufe 30 Minuten hätte — die Pipeline
+    sähe einen leeren Lauf ohne Verdikt und parkte."""
+
+    def test_stufen_timeout_wird_an_agy_durchgereicht(self, monkeypatch, tmp_path):
+        _mit_diff(tmp_path)
+        auf = {}
+        monkeypatch.setattr(ra, "AGY_BIN", "/usr/local/bin/agy")
+        monkeypatch.setattr(subprocess, "run", _fake(auf, '{"verdict": "pass", "findings": []}'))
+        ra.run("x", cwd=tmp_path, timeout=1800, agent="review", model="m")
+        cmd = auf["cmd"]
+        assert "--print-timeout" in cmd
+        assert cmd[cmd.index("--print-timeout") + 1] == "1800s"

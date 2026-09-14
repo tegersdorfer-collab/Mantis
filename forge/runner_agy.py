@@ -118,7 +118,11 @@ def run(prompt: str, cwd: Path, timeout: int, agent: str, model: str) -> RunResu
 
     try:
         ergebnis = subprocess.run(
-            [AGY_BIN, "-p", voll, "--model", model],
+            # agys eigener --print-timeout (Default 5m0s) läge sonst unter dem
+            # Stufen-Timeout: ein langes Opus-Thinking-Review bräche agy selbst
+            # ab, und die Pipeline sähe einen leeren Lauf ohne Verdikt
+            # (Befund vor der ersten Nacht, 2026-09-14). Go-Dauerformat.
+            [AGY_BIN, "-p", voll, "--model", model, "--print-timeout", f"{timeout}s"],
             capture_output=True, text=True, timeout=timeout,
             cwd=str(cwd), stdin=subprocess.DEVNULL,
         )
