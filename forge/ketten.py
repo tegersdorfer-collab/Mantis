@@ -16,7 +16,7 @@ KETTEN: dict[str, tuple[tuple[str, str], ...]] = {
     # Kimi K3 wie in der Plan-Kette als letzte Reserve (siehe dort).
     "spec": (
         ("opencode", "google/gemini-3.6-flash"),
-        ("opencode", "nvidia/minimaxai/minimax-m3"),
+        ("opencode", "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"),
         ("opencode", "nvidia/moonshotai/kimi-k3"),
     ),
     # Erste Nacht (2026-09-14): Kimi K3 als erstes Glied lieferte in 30 Minuten
@@ -25,9 +25,12 @@ KETTEN: dict[str, tuple[tuple[str, str], ...]] = {
     # desselben Tasks in 2½ Minuten. Kimi bleibt als letzte Reserve.
     "plan": (
         ("opencode", "google/gemini-3.6-flash"),
-        ("opencode", "nvidia/minimaxai/minimax-m3"),
+        ("opencode", "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"),
         ("opencode", "nvidia/moonshotai/kimi-k3"),
     ),
+    # MiniMax M3 (bis 2026-09-14 erstes Glied von implement und fix) ist bei
+    # NVIDIA seit 2026-09-09 abgeschaltet — 410 Gone, "end of life". Aufgefallen
+    # in der ersten Nacht, als die Spec-Stufe darauf auswich und parkte.
     # Die letzten Glieder von implement und fix liegen bewusst bei einem
     # ANDEREN Anbieter. Erschöpfung gilt anbieterweit — eine Kette aus lauter
     # NVIDIA-Modellen wäre mit einer einzigen Rate-Limit-Meldung komplett tot,
@@ -35,13 +38,11 @@ KETTEN: dict[str, tuple[tuple[str, str], ...]] = {
     # für Code schwächer als MiniMax; ein schwächeres Modell, dessen Arbeit das
     # Gate prüft und Timo freigibt, ist besser als gar keine Stufe.
     "implement": (
-        ("opencode", "nvidia/minimaxai/minimax-m3"),
         ("opencode", "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"),
         ("opencode", "nvidia/moonshotai/kimi-k3"),
         ("opencode", "google/gemini-3.6-flash"),
     ),
     "fix": (
-        ("opencode", "nvidia/minimaxai/minimax-m3"),
         ("opencode", "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"),
         ("opencode", "nvidia/moonshotai/kimi-k3"),
         ("opencode", "google/gemini-3.6-flash"),
