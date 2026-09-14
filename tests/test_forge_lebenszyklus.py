@@ -14,7 +14,6 @@ nicht der Prüfgegenstand.
 import json
 import os
 import sys
-from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -43,34 +42,15 @@ pytestmark = pytest.mark.skipif(
 def task_id():
     """Ein echter Task in der echten Tabelle, hinterher restlos entfernt.
 
-    Fund F1 (Abschluss-Review Plan 2b): dieser Test läuft gegen die ECHTE
-    Queue, aus der ein ECHTER Daemon claimt. Wird pytest zwischen `enqueue`
-    und der Teardown-Zeile SIGKILLed — die Forge's eigenes Gate ruft pytest
-    mit `timeout=1800` und killt beim Überschreiten, dasselbe droht bei
-    Strg-C oder wenn der Laptop einschläft —, läuft die Teardown nie, und der
-    Task bliebe als claimbare Zeile in der Produktionsqueue liegen. Ein
-    Daemon, der in der Zwischenzeit tickt, würde ihn über `active()`
-    claimen und echte, kostenpflichtige LLM-Läufe daran verschwenden.
-    Umgekehrt könnte ein laufender Daemon genau diese Zeile claimen, während
-    der Test selbst noch läuft, und ihr unter den Füßen den Zustand
-    wegziehen.
-
-    Zwei Maßnahmen dagegen:
-      1. `queue.pause` (forge/queue.py:162) hält den Task 3650 Tage lang
-         pausiert. `queue.active()` und `queue.claim_next()` filtern beide
-         auf `paused_until IS NULL OR paused_until <= NOW()`, ein
-         pausierter Task ist für den Daemon also unsichtbar — und
-         `_eine_stufe_intern` liest `paused_until` nirgends, die Tests
-         dieser Datei bleiben davon unberührt.
-      2. Ein Sweep VOR dem `enqueue` räumt Leichen aus früher gekillten
-         Testläufen weg, damit sie sich nicht unbegrenzt ansammeln.
+    Schutz gegen die Produktion (Nachtrag 2c): die Zeile trägt
+    `source='test'`, und `queue.active()`/`queue.claim_next()` filtern diese
+    Quelle in der Produktion aus. Ein Daemon, der parallel tickt, sieht den
+    Task nie — auch dann nicht, wenn pytest per SIGKILL endet (das Gate der
+    Forge ruft pytest mit `timeout=1800`) und die Teardown-Zeile nie läuft.
+    Der Sweep am Anfang räumt Leichen aus genau solchen Läufen weg.
     """
-    # Sweep zuerst (siehe Docstring, Maßnahme 2): Leichen aus einem früher
-    # gekillten Testlauf dürfen sich nicht unbegrenzt ansammeln.
-    db.execute("DELETE FROM forge_tasks WHERE source='test' AND title='Lebenszyklus-Test'")
-    neue_id = queue.enqueue("Lebenszyklus-Test", "wegwerf", source="test", priority=1)
-    queue.pause(neue_id, "Lebenszyklus-Test — nie vom Daemon anfassen",
-                datetime.now() + timedelta(days=3650))
+    db.execute("DELETE FROM forge_tasks WHERE source=%s", (queue.TEST_QUELLE,))
+    neue_id = queue.enqueue("Lebenszyklus-Test", "wegwerf", source=queue.TEST_QUELLE, priority=1)
     yield neue_id
     # forge_journal.task_id trägt ON DELETE CASCADE (core/db.py), die
     # Journaleinträge verschwinden also mit dem Task.
@@ -204,12 +184,22 @@ class TestLebenszyklus:
         assert _zustand(task_id) == m.SPECCING, "Zustand wurde trotz Kontingent veraendert"
 
 
-class TestTaskFixturePausiertSichSelbst:
-    def test_task_id_fixture_pausiert_den_task(self, task_id):
-        """Fund F1 (Abschluss-Review Plan 2b): die Sicherung gegen einen
-        claimbaren Waisen-Task (siehe Docstring der `task_id`-Fixture) hängt
-        an `paused_until` — ein künftiger Refactor, der das Pausieren
-        stillschweigend fallen ließe, muss hier auffallen."""
-        zeile = db.query_one("SELECT paused_until FROM forge_tasks WHERE id=%s", (task_id,))
-        assert zeile["paused_until"] is not None, \
-            "Lebenszyklus-Test-Task ist nicht pausiert — waere fuer einen Daemon claimbar"
+class TestQuellenTrennungGegenEchteDb:
+    def test_produktion_sieht_den_testtask_nicht_einmal_aktiv(self, task_id):
+        """Der Beweis, auf dem alle DB-Tests dieses Plans stehen."""
+        queue.set_state(task_id, m.SPECCING, current=m.QUEUED)
+        gesehen = queue.active()
+        assert gesehen is None or gesehen["id"] != task_id, \
+            "Produktions-active() hat den Testtask geliefert"
+        assert queue.active(quelle=queue.TEST_QUELLE)["id"] == task_id
+
+    def test_produktion_claimt_den_testtask_nicht(self, task_id):
+        anzahl = db.query_one(
+            "SELECT count(*) AS n FROM forge_tasks WHERE state=%s AND source<>%s",
+            (m.QUEUED, queue.TEST_QUELLE))["n"]
+        if anzahl > 0:
+            pytest.skip("echter queued-Task vorhanden — Claim-Test übersprungen")
+        gesehen = queue.claim_next()
+        assert gesehen is None or gesehen["id"] != task_id, \
+            "Produktions-claim_next() hat den Testtask geclaimt"
+        assert _zustand(task_id) == m.QUEUED, "claim_next hat den Testtask trotzdem bewegt"

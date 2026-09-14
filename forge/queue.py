@@ -31,6 +31,23 @@ log = logging.getLogger(__name__)
 # `zaehle_fehlschlag` und `versuche_zuruecksetzen`.
 AUTO_PARK_AFTER_ATTEMPTS = 3
 
+# Quelle, deren Zeilen der Daemon nie anfasst. Zwei Testdateien
+# (tests/test_forge_lebenszyklus.py, tests/test_forge_nachtlauf.py) legen echte
+# Zeilen in forge_tasks an, und das Gate der Forge führt diese Tests im
+# Worktree eines Tasks aus. Ohne diese Trennung könnte ein per SIGKILL
+# beendeter Testlauf eine claimbare Zeile hinterlassen, die der nächste Tick
+# mit echten LLM-Läufen bearbeitet — und umgekehrt könnte der Daemon einen
+# Testtask claimen, während der Test noch läuft.
+TEST_QUELLE = "test"
+
+
+def _quellen_filter(quelle: str | None) -> tuple[str, tuple]:
+    """SQL-Fragment und Parameter: Produktion (None) sieht alles ausser
+    TEST_QUELLE, ein Test sieht ausschliesslich seine Quelle."""
+    if quelle is None:
+        return "AND source <> %s", (TEST_QUELLE,)
+    return "AND source = %s", (quelle,)
+
 
 def enqueue(title: str, description: str = "", source: str = "timo", priority: int = 50) -> int:
     """Reiht einen neuen Task ein und gibt seine ID zurück."""
@@ -41,22 +58,24 @@ def enqueue(title: str, description: str = "", source: str = "timo", priority: i
     )
 
 
-def active() -> dict | None:
+def active(quelle: str | None = None) -> dict | None:
     """Der Task, der gerade in Arbeit ist — oder None.
 
     Pausierte Tasks (Rate-Limit, Not-Aus) gelten NICHT als aktiv, sonst würde
-    eine Pause den Daemon für ihre gesamte Dauer blockieren.
+    eine Pause den Daemon für ihre gesamte Dauer blockieren. `quelle` siehe
+    TEST_QUELLE.
     """
+    filter_sql, filter_params = _quellen_filter(quelle)
     rows = db.query(
         "SELECT * FROM forge_tasks "
         "WHERE state = ANY(%s) AND (paused_until IS NULL OR paused_until <= NOW()) "
-        "ORDER BY updated_at ASC LIMIT 1",
-        (list(m.ACTIVE_STATES),),
+        f"{filter_sql} ORDER BY updated_at ASC LIMIT 1",
+        (list(m.ACTIVE_STATES), *filter_params),
     )
     return rows[0] if rows else None
 
 
-def claim_next() -> dict | None:
+def claim_next(quelle: str | None = None) -> dict | None:
     """Der Task, an dem als Nächstes gearbeitet wird.
 
     Zuerst ein bereits laufender (Wiederaufsetzen nach Absturz), sonst der
@@ -67,17 +86,18 @@ def claim_next() -> dict | None:
     selbst Richtung Auto-Park zählen, nur weil sie mehrfach geclaimt wird
     (siehe AUTO_PARK_AFTER_ATTEMPTS). Wer einen Fehlschlag zählen will, ruft
     `zaehle_fehlschlag` auf; ein erfolgreicher Stufen-Abschluss ruft
-    `versuche_zuruecksetzen`.
+    `versuche_zuruecksetzen`. `quelle` siehe TEST_QUELLE.
     """
-    laufend = active()
+    laufend = active(quelle)
     if laufend is not None:
         return laufend
 
+    filter_sql, filter_params = _quellen_filter(quelle)
     rows = db.query(
         "SELECT * FROM forge_tasks "
         "WHERE state = %s AND (paused_until IS NULL OR paused_until <= NOW()) "
-        "ORDER BY priority DESC, id ASC LIMIT 1",
-        (m.QUEUED,),
+        f"{filter_sql} ORDER BY priority DESC, id ASC LIMIT 1",
+        (m.QUEUED, *filter_params),
     )
     if not rows:
         return None

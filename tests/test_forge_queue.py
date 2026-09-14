@@ -338,3 +338,35 @@ class TestPause:
         bis = datetime.now(timezone.utc) + timedelta(hours=1)
         q.pause(9, "ratelimit", bis)
         assert rec.executes[-1][1] == ("ratelimit", bis, 9)
+
+
+class TestQuellenTrennung:
+    """Nachtrag 2c: Testzeilen sind für den Daemon unsichtbar, und Tests sehen
+    nur ihre eigenen. Beides über EINE Regel in der SQL, nicht über eine Pause."""
+
+    def test_produktion_schliesst_die_testquelle_aus(self, monkeypatch):
+        rec = _patch(monkeypatch, rows=[])
+        q.active()
+        sql, params = rec.queries[-1]
+        assert "source <> %s" in sql
+        assert params[-1] == q.TEST_QUELLE
+
+    def test_testlauf_sieht_nur_seine_quelle(self, monkeypatch):
+        rec = _patch(monkeypatch, rows=[])
+        q.active(quelle="test")
+        sql, params = rec.queries[-1]
+        assert "source = %s" in sql
+        assert params[-1] == "test"
+
+    def test_claim_next_traegt_die_quelle_in_beide_abfragen(self, monkeypatch):
+        rec = _patch(monkeypatch, rows=[])
+        q.claim_next(quelle="test")
+        assert len(rec.queries) == 2, "active() und die Queue-Abfrage"
+        assert all("source = %s" in sql and params[-1] == "test"
+                   for sql, params in rec.queries)
+
+    def test_claim_next_ohne_quelle_ist_produktion(self, monkeypatch):
+        rec = _patch(monkeypatch, rows=[])
+        q.claim_next()
+        assert all("source <> %s" in sql and params[-1] == q.TEST_QUELLE
+                   for sql, params in rec.queries)
