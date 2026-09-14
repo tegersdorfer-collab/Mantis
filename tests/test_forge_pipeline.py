@@ -69,6 +69,8 @@ def stubs(monkeypatch):
         aufz["fixrunden"] += 1
         return aufz["fixrunden"]
     monkeypatch.setattr(pl.queue, "zaehle_fixrunde", _fixrunde)
+    # Nachtrag 2c: die Grenzprüfung liest nur, gezählt wird nach dem Lauf.
+    monkeypatch.setattr(pl.queue, "fixrunden", lambda tid: aufz["fixrunden"])
 
     # Default: jeder gitctl-Aufruf gelingt. Tests, die ein Diff oder einen
     # gescheiterten Commit brauchen, überschreiben pl.gitctl.run lokal — das
@@ -404,19 +406,24 @@ class TestFehlgeschlagenerGitDiffParkt:
 
 
 class TestKritisch1FixRundeErzwingtErneutesReview:
-    """Kritischer Fund 1, reproduziert über genau drei aufeinanderfolgende
-    eine_stufe()-Aufrufe an EINEM Worktree:
+    """Kritischer Fund 1, reproduziert über zwei aufeinanderfolgende
+    eine_stufe()-Aufrufe an EINEM Worktree.
+
+    Nachtrag 2c angepasst (siehe Report, Abschnitt "Angepasste Tests"): vor
+    2c brauchte es drei Ticks (fix -> implement -> review), weil der Fix nach
+    IMPLEMENTING ging und die Implement-Stufe ein zweites Mal auf dem
+    fertigen Baum lief. Seit 2c bleibt der Fix in REVIEWING, also sind es nur
+    noch zwei Ticks:
 
     Tick 1: REVIEWING mit bereits vorliegendem negativem (Vor-Fix-)Urteil
-            -> Fix-Stufe läuft, Task geht nach IMPLEMENTING.
-    Tick 2: IMPLEMENTING läuft durch, Task geht zurück nach REVIEWING.
-    Tick 3: Ohne den Fix in Task 6 fände _hat_negatives_verdikt dasselbe
+            -> Fix-Stufe läuft, Task bleibt in REVIEWING (kein Übergang).
+    Tick 2: Ohne den Fix in Task 6 fände _hat_negatives_verdikt dasselbe
             Vor-Fix-Urteil noch vor und schickte den Task sofort wieder in
             die Fix-Stufe, OHNE dass Review je gelaufen wäre. Mit dem Fix
-            muss Tick 3 die echte Review-Stufe anfordern.
+            muss Tick 2 die echte Review-Stufe anfordern.
     """
 
-    def test_dritter_tick_laeuft_review_stufe_nicht_fix_stufe(self, monkeypatch, stubs, tmp_path):
+    def test_zweiter_tick_laeuft_review_stufe_nicht_fix_stufe(self, monkeypatch, stubs, tmp_path):
         _verdikt(tmp_path, "fail", [{"severity": "important", "what": "x"}])
 
         def _fake_gitctl(*args, cwd=None, timeout=300):
@@ -430,7 +437,7 @@ class TestKritisch1FixRundeErzwingtErneutesReview:
         monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text="gefixt")))
         # Artefakt-Pflicht ist hier nicht der Prüfgegenstand — implement/fix
         # versprechen ohnehin kein Artefakt (siehe _ARTEFAKT_FELD_JE_STUFE),
-        # nur die Review-Stufe (VERDIKT_DATEI) tut es in Tick 3.
+        # nur die Review-Stufe (VERDIKT_DATEI) tut es in Tick 2.
         monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
 
         task = _task(m.REVIEWING)
@@ -438,23 +445,18 @@ class TestKritisch1FixRundeErzwingtErneutesReview:
         # Tick 1: negatives Vor-Fix-Urteil liegt vor -> Fix-Stufe.
         ergebnis1 = pl.eine_stufe(task, tmp_path)
         assert ergebnis1 == "weiter"
-        assert stubs["states"][-1] == (5, m.IMPLEMENTING)
+        # Nachtrag 2c: kein Zustandswechsel — der Fix bleibt in REVIEWING.
+        assert stubs["states"] == [], f"Fix hat den Zustand gewechselt: {stubs['states']}"
         # Die Fix-Stufe ist an ihrem Agent-Namen 'fix' erkennbar.
         assert stubs["agenten"][-1] == "fix"
         # Kritischer Fund 1: das Vor-Fix-Urteil muss jetzt weg sein.
         assert not (tmp_path / pl.stages.VERDIKT_DATEI).is_file()
-        task["state"] = m.IMPLEMENTING
+        # task["state"] bleibt REVIEWING — kein Übergang zu übernehmen.
 
-        # Tick 2: IMPLEMENTING läuft durch, Task geht zurück nach REVIEWING.
-        ergebnis2 = pl.eine_stufe(task, tmp_path)
-        assert ergebnis2 == "weiter"
-        assert stubs["states"][-1] == (5, m.REVIEWING)
-        task["state"] = m.REVIEWING
-
-        # Tick 3: kein Verdikt mehr vorhanden -> _hat_negatives_verdikt ist
+        # Tick 2: kein Verdikt mehr vorhanden -> _hat_negatives_verdikt ist
         # False -> die echte Review-Stufe muss laufen, nicht die Fix-Stufe.
         stubs["journal"].clear()
-        ergebnis3 = pl.eine_stufe(task, tmp_path)
+        ergebnis2 = pl.eine_stufe(task, tmp_path)
 
         # Der Agent-Name ist jetzt 'review', nicht mehr 'fix'.
         assert stubs["agenten"][-1] == "review"
@@ -465,7 +467,7 @@ class TestKritisch1FixRundeErzwingtErneutesReview:
         assert "'fix'" not in meldung
         # Review ist die letzte Kettenstufe (next_state=GATING) — mit dem
         # gestubbten Artefakt-Check meldet die Kette entsprechend "fertig".
-        assert ergebnis3 == "fertig"
+        assert ergebnis2 == "fertig"
         assert stubs["states"][-1] == (5, m.GATING)
 
 
@@ -1566,3 +1568,78 @@ class TestStalesVerdiktNachImplement:
         stufe, ist_fix = pl._waehle_stufe(m.REVIEWING, tmp_path)
         assert ist_fix is False
         assert stufe.name == "review"
+
+
+class TestFixBleibtInReviewing:
+    """Nachtrag 2c: ein Fix wechselt keinen Zustand. Der nächste Tick trifft
+    REVIEWING ohne Urteil an und lässt die echte Review-Stufe laufen."""
+
+    def _fix_lauf(self, monkeypatch, stubs, tmp_path, ergebnis=None):
+        _verdikt(tmp_path, "fail", [{"severity": "critical", "what": "x"}])
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda prompt, cwd, timeout, agent, model: ergebnis or RunResult(ok=True, text="egal")))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        monkeypatch.setattr(pl, "_committe_stufenarbeit", lambda *a: None)
+        return pl._eine_stufe_intern({"id": 1}, 1, m.REVIEWING, tmp_path)
+
+    def test_erfolgreicher_fix_wechselt_keinen_zustand(self, monkeypatch, stubs, tmp_path):
+        ergebnis = self._fix_lauf(monkeypatch, stubs, tmp_path)
+        assert ergebnis == "weiter"
+        assert stubs["states"] == [], f"Fix hat den Zustand gewechselt: {stubs['states']}"
+        assert stubs["parks"] == []
+
+    def test_nach_dem_fix_ist_das_urteil_weg_und_review_folgt(self, monkeypatch, stubs, tmp_path):
+        self._fix_lauf(monkeypatch, stubs, tmp_path)
+        assert not (tmp_path / pl.stages.VERDIKT_DATEI).is_file()
+        stufe, ist_fix = pl._waehle_stufe(m.REVIEWING, tmp_path)
+        assert ist_fix is False and stufe.name == "review"
+
+    def test_erfolgreicher_fix_zaehlt_genau_eine_runde(self, monkeypatch, stubs, tmp_path):
+        self._fix_lauf(monkeypatch, stubs, tmp_path)
+        assert stubs["fixrunden"] == 1
+
+    def test_rate_limit_im_fix_verbraucht_keine_runde(self, monkeypatch, stubs, tmp_path):
+        """Fund I4 aus dem 2b-Review: zwei Rate-Limits im Fix parkten den Task
+        mit 'Fix-Runden-Grenze erreicht', ohne dass je ein Fix lief."""
+        monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: False)
+        ergebnis = self._fix_lauf(monkeypatch, stubs, tmp_path,
+                                  RunResult(ok=False, rate_limited=True, error="429"))
+        assert ergebnis == "fehler"
+        assert stubs["fixrunden"] == 0
+        assert (tmp_path / pl.stages.VERDIKT_DATEI).is_file(), "Urteil weg, obwohl kein Fix lief"
+
+    def test_fehlgeschlagener_fix_verbraucht_keine_runde(self, monkeypatch, stubs, tmp_path):
+        ergebnis = self._fix_lauf(monkeypatch, stubs, tmp_path,
+                                  RunResult(ok=False, error="kaputt"))
+        assert ergebnis == "geparkt"
+        assert stubs["fixrunden"] == 0
+
+    def test_grenze_wird_vor_dem_lauf_gelesen_nicht_gezaehlt(self, monkeypatch, stubs, tmp_path):
+        stubs["fixrunden"] = pl.MAX_FIXRUNDEN
+        gelaufen = []
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda *a, **k: gelaufen.append(1) or RunResult(ok=True, text="egal")))
+        _verdikt(tmp_path, "fail", [{"severity": "critical", "what": "x"}])
+        ergebnis = pl._eine_stufe_intern({"id": 1}, 1, m.REVIEWING, tmp_path)
+        assert ergebnis == "geparkt"
+        assert gelaufen == [], "Fix lief trotz erreichter Grenze"
+        assert stubs["fixrunden"] == pl.MAX_FIXRUNDEN, "Grenzprüfung hat gezählt"
+        assert "Fix-Runden-Grenze" in stubs["parks"][-1][1]
+
+
+class TestKontingentJournalKind:
+    def test_erschoepfte_kette_journalt_als_kontingent(self, monkeypatch, stubs, tmp_path):
+        monkeypatch.setattr(pl.ketten, "waehle", lambda name, verboten=frozenset(): None)
+        monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: True)
+        pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        kinds = [a[1] for a, kw in stubs["journal"]]
+        assert "kontingent" in kinds
+        assert "stage_failed" not in kinds, "Kontingent zählt im Journal als Fehler"
+
+    def test_rate_limit_das_die_kette_leert_journalt_als_kontingent(self, monkeypatch, stubs, tmp_path):
+        monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: True)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda *a, **k: RunResult(ok=False, rate_limited=True, error="429")))
+        pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
+        kinds = [a[1] for a, kw in stubs["journal"]]
+        assert "kontingent" in kinds

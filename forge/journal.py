@@ -16,7 +16,7 @@ _log = logging.getLogger(__name__)
 KINDS = frozenset({
     "daemon_start", "daemon_stop", "stage_start", "stage_done", "stage_failed",
     "gate_pass", "gate_fail", "merged", "reverted", "paused", "resumed",
-    "idea_added", "parked", "lock_cleared",
+    "idea_added", "parked", "lock_cleared", "kontingent",
 })
 
 

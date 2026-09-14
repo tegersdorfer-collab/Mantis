@@ -8,8 +8,9 @@ Platz für die Budget-Prüfung, die zwischen "Stufe bestimmen" und "Stufe
 ausführen" treten wird.
 
 Rückgabewerte:
-  "weiter"  — ein Übergang wurde vollzogen, es geht mit der nächsten Stufe weiter
-  "fertig"  — die Kette hat GATING erreicht, Plan 3 übernimmt (Merge/Restart)
+  "weiter"  — ein Übergang wurde vollzogen, es geht mit der nächsten Stufe weiter,
+              oder ein Fix ist abgeschlossen (kein Übergang, Review folgt)
+  "fertig"  — die Kette hat GATING erreicht, der Daemon lässt das Gate laufen
   "geparkt" — der Task liegt zur manuellen Sichtung bereit
   "fehler"  — Rate-Limit; Zustand bewusst unverändert, Plan 3 hängt hier die
               Wartezeit ein. Ein Park hier würde jede Kontingentgrenze in
@@ -585,7 +586,7 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
             grund = (f"Kette für Stufe '{stufe.name}' erschöpft — jeder Anbieter ist für diese "
                      f"Nacht raus; Task {task_id} bleibt liegen (kein Park)")
             log.warning(f"Forge-Pipeline: {grund}")
-            journal.log(task_id, "stage_failed", grund)
+            journal.log(task_id, "kontingent", grund)
             return "kontingent"
         # Reviewer-Kollision: übrig bliebe nur das Modell, das implementiert
         # hat. Hier verlangt die Spec (Zeile 183) ausdrücklich Parken — ein
@@ -597,10 +598,13 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
     backend_name, modell = wahl
 
     if ist_fix:
-        runden = queue.zaehle_fixrunde(task_id)
-        if runden > MAX_FIXRUNDEN:
+        # Nachtrag 2c: nur lesen. Gezählt wird nach einem erfolgreichen Lauf —
+        # ein Rate-Limit, ein Timeout ohne Produkt oder ein Absturz im Fix
+        # verbraucht keine Runde (Fund I4, Abschluss-Review Plan 2b).
+        runden = queue.fixrunden(task_id)
+        if runden >= MAX_FIXRUNDEN:
             _park(task_id, state,
-                  f"Fix-Runden-Grenze erreicht ({runden} > {MAX_FIXRUNDEN}), Task {task_id}")
+                  f"Fix-Runden-Grenze erreicht ({runden} von {MAX_FIXRUNDEN} verbraucht), Task {task_id}")
             return "geparkt"
     elif state == m.REVIEWING:
         # Nur die eigentliche Review-Stufe braucht den Diff — sie hat kein
@@ -674,7 +678,12 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
         # und kein Fehlverhalten: "fehler" zählte in die Fehler-Spirale des
         # Daemons, und zwei Rate-Limits plus ein Tick-Absturz schrieben sonst die
         # Not-Aus-Datei, obwohl nur die Anbieter leer sind.
-        return "kontingent" if ketten.kette_erschoepft(stufe.name) else "fehler"
+        if ketten.kette_erschoepft(stufe.name):
+            journal.log(task_id, "kontingent",
+                        f"Rate-Limit hat die Kette für Stufe '{stufe.name}' geleert — "
+                        f"Task {task_id} bleibt liegen")
+            return "kontingent"
+        return "fehler"
 
     if ergebnis.denials:
         # I5: der Fehlertext des Laufs stand auf diesem Pfad nirgends — der
@@ -737,34 +746,35 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
             journal.log(task_id, "stage_done",
                          f"Artefakt der Stufe '{stufe.name}' committet: {erwartet}")
 
-    # Die Fix-Stufe teilt sich REVIEWING mit der Review-Stufe, aber ihr
-    # next_state (GATING, siehe forge/stages.py) gilt hier NICHT: nach einem
-    # Fix muss die Kette erneut durch die Review laufen, nicht direkt zum
-    # Gate. models.can_transition erlaubt REVIEWING -> IMPLEMENTING genau
-    # dafür. Das hat seinen Preis: die Implement-Stufe läuft danach ein
-    # zweites Mal auf einem bereits implementierten Baum, jede Fix-Runde
-    # kostet also fix + implement + review statt nur fix + review. Ob der Fix
-    # stattdessen in REVIEWING bleiben und direkt ins Review sollte, ist eine
-    # Plan-2c-Entscheidung (Abschluss-Review Plan 2b, Fund F4) — hier bewusst
-    # unverändert.
-    # Ein negatives Review rückt NICHT vor. Die Fix-Schleife ist vollständig
-    # gebaut (_waehle_stufe → FIX_STAGE, FIX_STAGE → IMPLEMENTING,
-    # _verwirf_review_artefakte, MAX_FIXRUNDEN), aber sie war nie erreichbar:
-    # die Review-Stufe ging auch mit negativem Urteil nach GATING, der Zustand
-    # stand danach nie wieder auf REVIEWING, und das Gate parkte den Task.
-    # Das erste negative Review war damit ein Sackgassen-Park.
-    #
-    # Ein Selbstübergang REVIEWING → REVIEWING ist in forge/models.py bewusst
-    # NICHT erlaubt, deshalb wird hier gar kein Zustandswechsel versucht: der
-    # Task bleibt schlicht stehen, und der nächste Durchlauf trifft ihn in
-    # REVIEWING mit vorliegendem negativem Urteil an — genau die Bedingung,
-    # auf die _waehle_stufe wartet.
+    # Ein negatives Review rückt NICHT vor (Plan 2b): der Task bleibt in
+    # REVIEWING, und der nächste Durchlauf trifft ihn mit vorliegendem
+    # negativem Urteil an — die Bedingung, auf die _waehle_stufe wartet.
     if stufe.name == "review" and _hat_negatives_verdikt(worktree):
         journal.log(task_id, "stage_done",
                     f"Review negativ für Task {task_id} — Fix-Runde folgt")
         return "weiter"
 
-    ziel = m.IMPLEMENTING if ist_fix else stufe.next_state
+    if ist_fix:
+        # Nachtrag 2c: ein Fix wechselt keinen Zustand. Das alte Urteil (und
+        # der Diff, den es beurteilt hat) werden verworfen; der nächste Tick
+        # trifft REVIEWING ohne Urteil an und lässt die echte Review-Stufe
+        # laufen. Vorher ging der Fix nach IMPLEMENTING und die
+        # Implement-Stufe lief ein zweites Mal auf dem fertigen Baum — jede
+        # Runde kostete fix + implement + review.
+        #
+        # Reihenfolge: erst verwerfen, dann zählen. Stirbt der Prozess
+        # dazwischen, fehlt eine Zählung (harmlos); umgekehrt läge ein
+        # veraltetes Urteil neben einem gezählten Fix, und der nächste Tick
+        # würde erneut fixen statt reviewen.
+        _verwirf_review_artefakte(worktree)
+        runden = queue.zaehle_fixrunde(task_id)
+        queue.versuche_zuruecksetzen(task_id)
+        journal.log(task_id, "stage_done",
+                    f"Fix-Runde {runden} von {MAX_FIXRUNDEN} abgeschlossen für Task {task_id} — "
+                    f"erneutes Review folgt")
+        return "weiter"
+
+    ziel = stufe.next_state
     if not queue.set_state(task_id, ziel, current=state):
         # Compare-and-Swap ist fehlgeschlagen (verbotener Übergang oder ein
         # anderer Schreiber war schneller) — der Task steckt tatsächlich noch
@@ -778,25 +788,12 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
     # ein länger zurückliegender Fehlschlag einen inzwischen gesunden Task
     # weiter Richtung Park-Schwelle mitzählen.
     queue.versuche_zuruecksetzen(task_id)
-    if ist_fix or stufe.name == "implement":
-        # Kritischer Fund 1 (ist_fix): das Vor-Fix-Urteil (und der Diff, den es
-        # beurteilt hat) sind jetzt veraltet — ohne diesen Schnitt läse die
-        # nächste REVIEWING-Stufe dasselbe Urteil erneut und würde nie wirklich
-        # neu reviewen.
-        #
-        # Fund F3 (Abschluss-Review Plan 2b): dieselbe Falle lauert an zwei
-        # weiteren Stellen, an denen ein VERALTETES Urteil auf FRISCHEM Code
-        # liegen bleiben kann: (1) ein Absturz zwischen dem set_state hier
-        # (IMPLEMENTING -> REVIEWING) und diesem Aufruf hinterließe sonst das
-        # alte Verdikt, das eine spätere Fix-Runde erst geschrieben hatte; (2)
-        # ein geparkter Task, den jemand manuell mit demselben Worktree neu
-        # einreiht, trägt im Worktree noch das alte Urteil, während der Code
-        # sich seither geändert haben kann. Beim Abschluss der
-        # Implement-Stufe (IMPLEMENTING -> REVIEWING) ist jedes zu diesem
-        # Zeitpunkt vorliegende Urteil per Definition älter als der Code, den
-        # es beurteilen müsste — deshalb wird hier zusätzlich zum Fix-Pfad
-        # aufgeräumt. `_verwirf_review_artefakte` nutzt `missing_ok=True`,
-        # der normale erste Durchlauf (noch kein Urteil vorhanden) bleibt
-        # also ein No-op.
+    if stufe.name == "implement":
+        # Fund F3 (Abschluss-Review Plan 2b): ein geparkter Task, den jemand
+        # mit demselben Worktree neu einreiht, trägt dort noch das alte
+        # Urteil, während der Code sich seither geändert hat. Beim Abschluss
+        # der Implement-Stufe ist jedes vorliegende Urteil per Definition
+        # älter als der Code, den es beurteilen müsste. `missing_ok=True`
+        # macht den normalen ersten Durchlauf zum No-op.
         _verwirf_review_artefakte(worktree)
     return "fertig" if ziel == m.GATING else "weiter"

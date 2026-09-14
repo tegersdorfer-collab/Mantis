@@ -205,6 +205,17 @@ def merke_implement_modell(task_id: int, model: str) -> None:
     db.execute("UPDATE forge_tasks SET implement_model=%s, updated_at=NOW() WHERE id=%s", (model, task_id))
 
 
+def fixrunden(task_id: int) -> int:
+    """Wie viele Fix-Runden dieser Task verbraucht hat — nur lesen.
+
+    Nachtrag 2c: die Grenzprüfung VOR dem Fix-Lauf liest, gezählt wird erst
+    NACH einem erfolgreichen Lauf (zaehle_fixrunde). Sonst verbraucht ein
+    Rate-Limit oder Absturz im Fix eine Runde, ohne dass je ein Fix lief.
+    """
+    zeile = db.query_one("SELECT refusals FROM forge_tasks WHERE id=%s", (task_id,))
+    return int(zeile["refusals"]) if zeile else 0
+
+
 def zaehle_fixrunde(task_id: int) -> int:
     """Erhöht den Fix-Runden-Zähler und gibt den neuen Stand zurück."""
     zeile = db.query_one(

@@ -15,10 +15,6 @@ class TestTransitions:
         # den das Gate verhindern soll.
         assert m.can_transition(m.QUEUED, m.MERGED) is False
 
-    def test_reviewing_darf_zurueck_nach_implementing(self):
-        # Fix-Runde nach negativem Review-Verdict.
-        assert m.can_transition(m.REVIEWING, m.IMPLEMENTING) is True
-
     def test_gating_darf_direkt_nach_merged(self):
         # Docs-only-Merges brauchen kein Neustart-Fenster (Spec §6.2 Schritt 1).
         assert m.can_transition(m.GATING, m.MERGED) is True
@@ -36,6 +32,17 @@ class TestTransitions:
 
     def test_unbekannter_zustand_ist_kein_uebergang(self):
         assert m.can_transition("voelliger_quatsch", m.QUEUED) is False
+
+
+class TestFixSchleifeOhneImplementReRun:
+    def test_reviewing_geht_nicht_mehr_nach_implementing(self):
+        """Nachtrag 2c: der Fix bleibt in REVIEWING; der Übergang wäre ungenutzt,
+        und ungenutzte Übergänge sind das, was die Fix-Schleife bis 2b
+        unerreichbar gemacht hat."""
+        assert not m.can_transition(m.REVIEWING, m.IMPLEMENTING)
+
+    def test_reviewing_geht_weiterhin_nach_gating(self):
+        assert m.can_transition(m.REVIEWING, m.GATING)
 
 
 class TestActiveStates:

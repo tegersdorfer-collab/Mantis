@@ -164,12 +164,13 @@ class TestLebenszyklus:
 
         task = db.query_one("SELECT * FROM forge_tasks WHERE id=%s", (task_id,))
         pl._eine_stufe_intern(task, task_id, m.REVIEWING, tmp_path)
-        assert _zustand(task_id) == m.IMPLEMENTING, "Fix-Stufe hat nicht nach IMPLEMENTING gefuehrt"
-        # Fund F7 (Abschluss-Review Plan 2b): das Verwerfen ist hier
-        # tragend für die Schleife — ohne es läse die nächste REVIEWING-Stufe
-        # dasselbe alte "fail" erneut und die Fix-Schleife schlösse sich nie.
+        assert _zustand(task_id) == m.REVIEWING, "Fix hat den Zustand gewechselt"
         assert not (tmp_path / stages.VERDIKT_DATEI).is_file(), \
-            "veraltetes Review-Urteil hat die Fix-Runde überlebt"
+            "altes Urteil liegt nach dem Fix noch im Worktree"
+        stufe, ist_fix = pl._waehle_stufe(m.REVIEWING, tmp_path)
+        assert ist_fix is False and stufe.name == "review", "nach dem Fix folgt kein Review"
+        zeile = db.query_one("SELECT refusals FROM forge_tasks WHERE id=%s", (task_id,))
+        assert zeile["refusals"] == 1
 
     def test_erschoepfte_kette_laesst_den_zustand_stehen(self, task_id, monkeypatch, tmp_path):
         """Kontingent darf keinen Zustand verbrennen — der Fehler aus Task 1."""

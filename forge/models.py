@@ -31,8 +31,11 @@ _TRANSITIONS: dict[str, set[str]] = {
     SPECCING: {PLANNING} | _ESCAPES,
     PLANNING: {IMPLEMENTING} | _ESCAPES,
     IMPLEMENTING: {REVIEWING} | _ESCAPES,
-    # Negatives Review-Verdict schickt den Task in die Fix-Runde zurück.
-    REVIEWING: {GATING, IMPLEMENTING} | _ESCAPES,
+    # Nachtrag 2c: ein Fix bleibt in REVIEWING (kein Zustandswechsel, altes
+    # Urteil wird verworfen, nächster Tick reviewt). Der frühere Übergang
+    # REVIEWING -> IMPLEMENTING liess die Implement-Stufe nach jedem Fix ein
+    # zweites Mal laufen und ist ersatzlos entfernt.
+    REVIEWING: {GATING} | _ESCAPES,
     # MERGED direkt aus GATING: Docs-only-Diffs brauchen kein Neustart-Fenster.
     GATING: {AWAITING_RESTART, MERGED} | _ESCAPES,
     AWAITING_RESTART: {MERGED, PARKED},
