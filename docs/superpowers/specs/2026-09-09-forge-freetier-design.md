@@ -410,3 +410,161 @@ Review-Stufe je wieder als eingegrenzt gelten soll.
 - **Kein Mistral-Repo-Zugriff.** Der Gratis-Tarif trainiert auf den Daten.
 - **Kein lokales Modell.** Ausdrücklich ausgeschlossen.
 - **Keine Selbstmodifikation.** `forge/` ist für die Agenten tabu.
+
+## Nachtrag 2c (2026-09-14)
+
+Nach dem Merge von Plan 2b (Commit 81192e3). Die Vorbedingungen aus dem
+Abschnitt „Offene Vorbedingungen für Plan 2b" sind geschlossen; das
+Abschluss-Review von 2b hat vier Designfragen aufgeworfen, die hier entschieden
+sind. Wo dieser Nachtrag der Spec oben widerspricht, gilt der Nachtrag.
+
+### Schnitt: 2c und 2d
+
+**2c** enthält alles, was die erste unbeaufsichtigte Nacht mit **einer** Bahn
+braucht: Fix-Schleife, Zustand nach dem Gate, Freigabe-CLI, Nachtfenster,
+Test-Isolation, Nachtlauf-Simulator.
+
+**2d** enthält Parallelität (`FOR UPDATE SKIP LOCKED`, Spalte `worker`),
+Kurzbahn und Mistral-Commit-Texte. Zwei Bahnen verdoppeln jede
+Wechselwirkungsklasse, die das 2b-Review gefunden hat (Absturzfenster,
+veraltete Artefakte, Zähler über Ticks). Erst muss eine Bahn eine Nacht
+bewiesen haben.
+
+### Fix-Schleife
+
+Ein erfolgreicher Fix-Lauf wechselt **keinen** Zustand. Der Task bleibt in
+`REVIEWING`, `_verwirf_review_artefakte` entfernt das alte Urteil und den Diff,
+die Stufe liefert `"weiter"`. Der nächste Tick trifft `REVIEWING` ohne Urteil an
+und lässt die echte Review-Stufe laufen. Die Implement-Stufe läuft nach einem
+Fix **nicht** erneut — das war das Verhalten seit August, kostete je Runde
+einen zusätzlichen opencode-Lauf und liess ein zweites Modell die Fix-Arbeit
+überschreiben.
+
+Der Übergang `REVIEWING → IMPLEMENTING` wird aus `forge/models.py` entfernt.
+Er wird ungenutzt, und ungenutzte Übergänge sind genau das, was die
+Fix-Schleife bis 2b unerreichbar gemacht hat.
+
+Eine Fix-Runde ist ein **abgeschlossener** Fix-Lauf. Die Grenzprüfung vor dem
+Lauf liest nur (`queue.fixrunden(task_id) -> int`); gezählt wird
+(`queue.zaehle_fixrunde`) erst nach `ok=True`. Rate-Limit, Timeout ohne
+Produkt, Absturz und verweigerte Werkzeuge verbrauchen keine Runde — ein Task,
+dessen Fix zweimal am Kontingent scheiterte, darf nicht mit „Fix-Runden-Grenze
+erreicht" parken.
+
+`"kontingent"` bekommt den eigenen Journal-Kind `kontingent` statt
+`stage_failed`. Der Morgenbericht zählt Kontingent nicht als Fehler.
+
+### Zustand nach dem Gate
+
+```
+GATING → AWAITING_APPROVAL → MERGED | PARKED
+```
+
+`AWAITING_APPROVAL` gehört nicht zu `ACTIVE_STATES` — ein Task, der auf Timo
+wartet, blockiert keine Bahn. `AWAITING_RESTART` wird nicht mehr angesteuert:
+die Agenten dürfen `forge/` nicht anfassen, also braucht kein Merge je einen
+Daemon-Neustart. Die Konstante wird samt ihren Übergängen entfernt — am
+2026-09-14 steht keine Zeile in diesem Zustand (geprüft: 4 Tasks, alle
+`parked`), es gibt nichts zu migrieren.
+
+### Freigabe ohne Telegram
+
+Plan 3 bringt den Bot; `FORGE_BOT_TOKEN` fehlt noch. Damit die Nacht ohne Bot
+betreibbar ist, bekommt 2c `forge/cli.py`:
+
+```
+python3.14 -m forge.cli status
+python3.14 -m forge.cli approve <id>
+python3.14 -m forge.cli reject <id> "<grund>"
+python3.14 -m forge.cli requeue <id>
+python3.14 -m forge.cli stop
+```
+
+Plan 3 ruft dieselben Funktionen aus dem Bot auf; das CLI ist die Referenz.
+
+- `approve` merged wie im Abschnitt „Merge": prüft, ob `main` sauber ist und
+  ob es sich seit Anlage des Worktrees bewegt hat (dann `git merge` im
+  Worktree-Branch, bei Konflikt `PARKED` mit Hinweis statt raten). Erfolg →
+  `MERGED`, Worktree und Branch entfernt.
+- `reject` → `PARKED` mit Grund.
+- `requeue` (aus `PARKED` oder `FAILED`) setzt `refusals` und `attempts` auf 0
+  und behält den Worktree — die Arbeit darin ist der Grund, warum der Task
+  erneut laufen soll.
+- `status` druckt den Morgenbericht: was durch ist (`AWAITING_APPROVAL`), was
+  geparkt wurde und warum, welche Anbieter leer sind, Verbrauch je Anbieter.
+  Plan 3 schickt genau diesen Text per Telegram.
+- `stop` schreibt `~/.mantis-forge-halt` (siehe Nachtfenster).
+
+### Nachtfenster
+
+launchd startet den Daemon per `StartCalendarInterval` um 23:00 statt mit
+`RunAtLoad` + `KeepAlive`. `daemon.main` prüft vor jedem Tick
+`im_nachtfenster()` (23:00–07:00, beide Grenzen Konstanten); ausserhalb endet
+der Prozess mit Code 0, und launchd startet ihn nicht neu. Ein Task, der beim
+Fensterende aktiv ist, bleibt aktiv — die nächste Nacht setzt auf derselben
+Stufe auf, wie nach einem Absturz.
+
+Weicher Stop: `~/.mantis-forge-halt`. Der Daemon prüft die Datei vor jedem
+Tick; ist sie da, endet er nach dem laufenden Tick (die aktuelle Stufe läuft
+zu Ende) und löscht die Datei beim Exit. Der Not-Aus `~/.mantis-forge-stop`
+bleibt unverändert: sofort, überlebt Neustarts, nur von Hand zu entfernen.
+
+Leere Kontingente beenden die Nacht nicht vorzeitig: `"kontingent"` schläft
+900 s, bis 07:00 sind das höchstens 32 Ticks à eine Datenbankabfrage.
+
+### Test-Isolation gegen die Produktion
+
+Zeilen mit `forge_tasks.source = 'test'` sind für den Daemon unsichtbar:
+`queue.claim_next()` und `queue.active()` filtern `AND source <> 'test'`.
+Tests rufen beide mit `quelle="test"` und sehen ausschliesslich ihre eigenen
+Zeilen. Das ersetzt die zehnjährige Pause aus Plan 2b (eine Regel statt zwei)
+und hält auch dann, wenn das Gate der Forge diese Tests im Worktree eines Tasks
+ausführt — was es tut, weil es `pytest -q` über die ganze Suite laufen lässt.
+Jede Test-Fixture räumt am Anfang Leichen früherer, abgebrochener Läufe weg
+(`DELETE … WHERE source='test'`).
+
+### Nachtlauf-Simulator
+
+`tests/test_forge_nachtlauf.py` treibt das echte `daemon.main()` gegen die
+echte Datenbank. Gemockt sind nur die Ränder: `worktree.create` (→
+`tmp_path`), `gate.pruefe`, `time.sleep` (zählt Ticks, wartet nicht), die
+Fenster-Uhr, und die LLM-Backends durch ein **Drehbuch**: eine Liste von
+Antworten je Aufruf — `ok`, `rate_limited`, `ok=False`, „Verdikt schreiben",
+oder **Absturz** (eine `BaseException` aus einem Hook nach einem realen
+`set_state`, die den Tick an genau dieser Zeile beendet). Nach N Ticks hält
+eine `BaseException` das `main()` an.
+
+Danach werden Invarianten geprüft, nicht Einzelzustände:
+
+- keine Not-Aus-Datei;
+- `refusals ≤ MAX_FIXRUNDEN` für jeden Task;
+- kein Task in `REVIEWING` mit `review.json`, ohne dass im Journal ein
+  Review-Lauf nach dem letzten Implement/Fix steht;
+- jeder Task in genau einem Zustand, und jeder aktive Task hat einen
+  Journal-Eintrag aus dem letzten Tick, der ihn berührt hat.
+
+Szenarien: gute Nacht (zwei Tasks → `AWAITING_APPROVAL`); zwei negative
+Reviews (→ `PARKED`, `refusals = 2`, kein dritter Fix-Lauf); Rate-Limit-Kaskade
+über beide Anbieter der Implement-Kette (→ `"kontingent"`, Zustand steht, keine
+Not-Aus-Datei, Fortsetzung nach Budget-Reset); Absturz nach dem Fix vor
+`_verwirf_review_artefakte` (→ nächster Tick reviewt, fixt nicht);
+Fensterende mitten in einer Stufe (→ Exit 0, Task aktiv, nächste Nacht setzt
+auf). Mutationsnachweis: die vier Importants aus dem 2b-Abschlussreview
+(Rate-Limit-Spirale, Implement-Re-Run, veraltetes Verdikt, verbrauchte Runde)
+müssen einzeln zurückgedreht den Simulator rot machen.
+
+### Review-Regel für 2c
+
+Drei Pläne in Folge haben Task-Reviews grün gesehen, was das Abschluss-Review
+als Critical fand. Das Modell war nie der Engpass (2b lief auf Opus); der
+Zuschnitt war es: ein Diff-Review stellt Systemfragen nicht von selbst. Jedes
+Task-Review-Briefing in 2c enthält deshalb fünf feste Fragen, jede mit einer
+Codestelle zu beantworten:
+
+1. Wer führt diesen Code noch aus, ausser dem Daemon? (Gate, CLI, Tests)
+2. Was tut der nächste Tick mit dem Zustand, den diese Änderung hinterlässt?
+3. Was passiert, wenn der Prozess zwischen zwei Zeilen dieser Änderung stirbt?
+4. Was überlebt einen Neustart — Dateien, Worktrees, Zeilen, Zähler?
+5. Was schreibt diese Änderung in Produktionstabellen, und wer räumt es weg?
+
+Das Abschluss-Review auf dem stärksten Modell bleibt.
