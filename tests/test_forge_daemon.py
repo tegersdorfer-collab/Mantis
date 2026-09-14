@@ -217,6 +217,10 @@ class TestGateAnschluss:
 
         monkeypatch.setattr(d.gate, "pruefe", lambda baum, **kw: d.gate.GateErgebnis(ok=True, gruende=[]))
         monkeypatch.setattr(d.queue, "set_state", lambda *a, **kw: True)
+        # Ohne diesen Stub schrieb der Test bei jedem Lauf still
+        # `attempts=0` für Task 11 in die echte forge_tasks — aufgefallen erst,
+        # als das Gate die Suite mit umgeleiteter DATABASE_URL ausführte.
+        monkeypatch.setattr(d.queue, "versuche_zuruecksetzen", lambda tid: None)
         monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
         assert d.tick() == "fertig"
 
