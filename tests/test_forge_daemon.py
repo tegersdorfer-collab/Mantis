@@ -6,6 +6,8 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from datetime import datetime
+
 import pytest
 
 from forge import daemon as d
@@ -52,6 +54,8 @@ class TestFehlerSpiraleUeberlebtNeustart:
         # dieselben Fehlläufe erneut verbrennen — die Bremse wäre keine.
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: True)
+        monkeypatch.setattr(d, "HALT_FILE", tmp_path / "halt")
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d.time, "sleep", lambda *a, **kw: None)
@@ -223,6 +227,8 @@ class TestFailureBackoff:
         # Vollpreis-Claude-Läufe in Sekunden statt in gedrosseltem Abstand.
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: True)
+        monkeypatch.setattr(d, "HALT_FILE", tmp_path / "halt")
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
@@ -244,6 +250,8 @@ class TestFailureBackoff:
 
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: True)
+        monkeypatch.setattr(d, "HALT_FILE", tmp_path / "halt")
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
@@ -299,6 +307,8 @@ class TestTickUeberlebtAbsturz:
         # Fehler-Spirale-Bremse nicht vor einem kaputten Runner.
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: True)
+        monkeypatch.setattr(d, "HALT_FILE", tmp_path / "halt")
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d.time, "sleep", lambda *a, **kw: None)
@@ -325,6 +335,8 @@ class TestTickUeberlebtAbsturz:
         # stirbt der ganze Daemon-Prozess an einem einzigen kaputten Lauf.
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: True)
+        monkeypatch.setattr(d, "HALT_FILE", tmp_path / "halt")
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d.time, "sleep", lambda *a, **kw: None)
@@ -372,6 +384,8 @@ class TestKontingentImDaemon:
 
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: True)
+        monkeypatch.setattr(d, "HALT_FILE", tmp_path / "halt")
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d, "tick", _tick)
@@ -402,6 +416,8 @@ class TestKontingentImDaemon:
 
         stop = tmp_path / "stop"
         monkeypatch.setattr(d, "STOP_FILE", stop)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: True)
+        monkeypatch.setattr(d, "HALT_FILE", tmp_path / "halt")
         monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
         monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
         monkeypatch.setattr(d, "tick", _tick)
@@ -414,3 +430,80 @@ class TestKontingentImDaemon:
             pass
 
         assert stop.exists()
+
+
+class TestNachtfenster:
+    def test_23_uhr_ist_drin(self):
+        assert d.im_nachtfenster(datetime(2026, 9, 14, 23, 0)) is True
+
+    def test_3_uhr_ist_drin(self):
+        assert d.im_nachtfenster(datetime(2026, 9, 15, 3, 30)) is True
+
+    def test_7_uhr_ist_draussen(self):
+        assert d.im_nachtfenster(datetime(2026, 9, 15, 7, 0)) is False
+
+    def test_mittag_ist_draussen(self):
+        assert d.im_nachtfenster(datetime(2026, 9, 15, 12, 0)) is False
+
+    def test_22_59_ist_draussen(self):
+        assert d.im_nachtfenster(datetime(2026, 9, 14, 22, 59)) is False
+
+
+class TestFensterUndHaltImMain:
+    def _main_mit(self, monkeypatch, tmp_path, fenster, halt_datei_da, ticks):
+        """Lässt main() laufen; `fenster` ist die Folge der Antworten von
+        im_nachtfenster(), `ticks` zählt die tick()-Aufrufe."""
+        antworten = iter(fenster)
+
+        class _Halt(BaseException):
+            pass
+
+        def _tick():
+            ticks.append(1)
+            if len(ticks) > 10:
+                raise _Halt
+            return "leerlauf"
+
+        halt = tmp_path / "halt"
+        if halt_datei_da:
+            halt.write_text("stop")
+        monkeypatch.setattr(d, "HALT_FILE", halt)
+        monkeypatch.setattr(d, "STOP_FILE", tmp_path / "stop")
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: next(antworten))
+        monkeypatch.setattr(d, "tick", _tick)
+        monkeypatch.setattr(d.time, "sleep", lambda s: None)
+        monkeypatch.setattr(d.journal, "log", lambda *a, **k: None)
+        monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
+        try:
+            d.main()
+            return "beendet", halt
+        except _Halt:
+            return "laeuft_noch", halt
+
+    def test_ausserhalb_des_fensters_kein_tick(self, monkeypatch, tmp_path):
+        ticks = []
+        ergebnis, _ = self._main_mit(monkeypatch, tmp_path, [False], False, ticks)
+        assert ergebnis == "beendet"
+        assert ticks == []
+
+    def test_fensterende_beendet_nach_dem_laufenden_tick(self, monkeypatch, tmp_path):
+        """Die laufende Stufe läuft zu Ende; erst der nächste Durchlauf prüft
+        das Fenster."""
+        ticks = []
+        ergebnis, _ = self._main_mit(monkeypatch, tmp_path, [True, True, False], False, ticks)
+        assert ergebnis == "beendet"
+        assert len(ticks) == 2
+
+    def test_halt_datei_beendet_und_wird_geloescht(self, monkeypatch, tmp_path):
+        ticks = []
+        ergebnis, halt = self._main_mit(monkeypatch, tmp_path, [True] * 5, True, ticks)
+        assert ergebnis == "beendet"
+        assert ticks == [], "Halt lag vor dem ersten Tick vor — kein Tick erlaubt"
+        assert not halt.exists(), "Halt-Datei überlebt das Beenden"
+
+    def test_ohne_halt_und_im_fenster_laeuft_es(self, monkeypatch, tmp_path):
+        ticks = []
+        ergebnis, _ = self._main_mit(monkeypatch, tmp_path, [True] * 20, False, ticks)
+        assert ergebnis == "laeuft_noch"
+        assert len(ticks) == 11

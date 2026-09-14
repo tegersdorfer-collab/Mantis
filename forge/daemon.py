@@ -9,7 +9,11 @@ laufen. Ein grünes Gate bringt den Task nach `awaiting_approval`, wo er auf
 Timos Freigabe wartet (forge.cli approve, Plan 3). Gemerged wird hier noch
 nichts.
 
-Der Daemon hält sich an zwei Bremsen: Not-Aus-Datei und drei Fehlschläge in Folge.
+Der Daemon hält sich an zwei Bremsen: Not-Aus-Datei und drei Fehlschläge in
+Folge. Dazu kommt ab Plan 2c das Nachtfenster (23:00-07:00, launchd startet,
+der Daemon beendet sich selbst) und der weiche Stop per Halt-Datei
+(forge.cli stop) — beide sind kein Not-Aus, sondern beendete Läufe mit
+Exit-Code 0.
 
 Bewusst KEINE Bremse: eine parallel laufende interaktive Claude-Sitzung. Timo
 hat sich am 2026-08-14 dagegen entschieden — die Forge soll durchlaufen, auch
@@ -21,6 +25,7 @@ konservativ ausgelegt sein.
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from core import db
@@ -50,6 +55,27 @@ PARK_SLEEP_SECONDS = 10
 # die anderen Bremsen: vor dem nächsten Kontingent-Fenster ändert sich nichts,
 # und jeder Tick bis dahin ist eine Datenbankabfrage ohne Ergebnis.
 KONTINGENT_SLEEP_SECONDS = 900
+# Nachtrag 2c: launchd startet um NACHT_BEGINN_STUNDE (forge/launchd/
+# com.mantis.forge.plist, StartCalendarInterval), der Daemon beendet sich
+# selbst ab NACHT_ENDE_STUNDE. Ein Task, der beim Fensterende aktiv ist,
+# bleibt aktiv — die nächste Nacht setzt auf derselben Stufe auf, genau wie
+# nach einem Absturz.
+NACHT_BEGINN_STUNDE = 23
+NACHT_ENDE_STUNDE = 7
+# Weicher Stop (forge.cli stop): der laufende Tick endet, dann der Daemon.
+# Anders als STOP_FILE wird die Datei beim Beenden gelöscht — sie ist eine
+# Bitte, kein Not-Aus.
+HALT_FILE = Path.home() / ".mantis-forge-halt"
+
+
+def im_nachtfenster(jetzt: datetime | None = None) -> bool:
+    """23:00 bis 06:59 — die Stunden, in denen die Forge arbeitet."""
+    jetzt = jetzt or datetime.now()
+    return jetzt.hour >= NACHT_BEGINN_STUNDE or jetzt.hour < NACHT_ENDE_STUNDE
+
+
+def halt_angefordert() -> bool:
+    return HALT_FILE.exists()
 
 
 def should_run(failures: int) -> tuple[bool, str]:
@@ -183,15 +209,28 @@ def main() -> None:
 
     failures = 0
     while True:
+        if not im_nachtfenster():
+            journal.log(None, "daemon_stop",
+                        f"Nachtfenster zu Ende ({NACHT_ENDE_STUNDE}:00) — Daemon beendet sich, "
+                        f"launchd startet um {NACHT_BEGINN_STUNDE}:00 neu")
+            log.info("Forge: Nachtfenster zu Ende")
+            return
+        if halt_angefordert():
+            journal.log(None, "daemon_stop", "Weicher Stop angefordert (forge.cli stop) — Daemon beendet sich")
+            log.info("Forge: weicher Stop")
+            HALT_FILE.unlink(missing_ok=True)
+            return
+
         erlaubt, grund = should_run(failures)
         if not erlaubt:
             log.info(f"Forge pausiert: {grund}")
             if failures >= MAX_CONSECUTIVE_FAILURES:
-                # Die Bremse MUSS den launchd-Neustart überleben. Der Job läuft mit
-                # KeepAlive=true; ein bloßes return würde 30s später neu starten, den
-                # Zähler auf 0 setzen und dieselben drei Fehlläufe erneut verbrennen —
-                # eine Endlosschleife statt einer Bremse. Die Not-Aus-Datei ist der
-                # einzige Zustand, den ein Neustart nicht vergisst.
+                # Die Bremse MUSS den launchd-Neustart überleben. launchd startet nicht
+                # mehr per KeepAlive neu, sondern erst wieder um NACHT_BEGINN_STUNDE
+                # Uhr (StartCalendarInterval) — ein bloßes return würde diesen Neustart
+                # mit failures=0 abwarten und dieselben drei Fehlläufe in der nächsten
+                # Nacht erneut verbrennen. Die Not-Aus-Datei ist der einzige Zustand,
+                # den auch dieser Neustart nicht vergisst.
                 STOP_FILE.write_text(f"Fehler-Spirale: {grund}\n")
                 journal.log(None, "daemon_stop", f"{grund} — Not-Aus gesetzt, Freigabe durch Timo")
                 return

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mantis.forge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14</string>
+        <string>-u</string>
+        <string>-m</string>
+        <string>forge.daemon</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/timoegersdorfer/Mantis</string>
+    <!-- Ein launchd-User-Agent bekommt nur PATH=/usr/bin:/bin:/usr/sbin:/sbin.
+         opencode und agy liegen unter ~/.local/bin bzw. /opt/homebrew/bin —
+         ohne diesen Eintrag scheitert jeder Backend-Aufruf mit
+         FileNotFoundError, und jeder Task wird mit null Tokens geparkt. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/timoegersdorfer/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <!-- Nachtrag 2c: Kalenderstart statt Dauerlauf. Der Daemon beendet sich
+         selbst ab 07:00 (forge/daemon.py, im_nachtfenster) und wird nicht
+         neu gestartet — KeepAlive würde ihn 30 s später wieder hochziehen. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>23</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/mantis_forge_out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mantis_forge_err.log</string>
+</dict>
+</plist>
