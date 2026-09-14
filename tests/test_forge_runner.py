@@ -114,6 +114,26 @@ class TestRateLimitErkennung:
                               "is_error": True, "result": "Datei nicht gefunden"})]
         assert runner.parse_stream(zeilen).rate_limited is False
 
+    def test_google_free_tier_429_ist_ein_rate_limit(self):
+        """Erste Nacht (2026-09-14, 23:46): Googles Tageslimit (20 Requests je
+        Modell) kam als APIError mit statusCode 429 / RESOURCE_EXHAUSTED und
+        "exceeded your current quota" — kein Marker passte, der Task wurde
+        geparkt statt auf das nächste Kettenglied auszuweichen."""
+        google = ('{"name": "APIError", "data": {"message": "You exceeded your current quota, '
+                  'please check your plan and billing details. * Quota exceeded for metric: '
+                  'generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20", '
+                  '"statusCode": 429, "isRetryable": true, "responseBody": "{\\"status\\": '
+                  '\\"RESOURCE_EXHAUSTED\\"}"}}')
+        assert runner._ist_rate_limit(google) is True
+
+    def test_429_als_nackte_zahl_im_modelltext_ist_kein_rate_limit(self):
+        """Der Marker darf nicht auf jede 429 im Text anspringen — Modelle
+        schreiben Zahlen."""
+        assert runner._ist_rate_limit("Die Datei hat 429 Zeilen.") is False
+
+    def test_too_many_requests_ist_ein_rate_limit(self):
+        assert runner._ist_rate_limit("HTTP 429 Too Many Requests") is True
+
 
 class TestRunFehlerpfade:
     """Deckt die Fehlerpfade von run() ab, die parse_stream allein nicht prüft.

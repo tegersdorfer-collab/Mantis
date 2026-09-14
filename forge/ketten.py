@@ -13,10 +13,11 @@ from forge import budget
 
 # Stufenname → geordnete Folge von (backend, model).
 KETTEN: dict[str, tuple[tuple[str, str], ...]] = {
+    # Kimi K3 wie in der Plan-Kette als letzte Reserve (siehe dort).
     "spec": (
         ("opencode", "google/gemini-3.6-flash"),
-        ("opencode", "nvidia/moonshotai/kimi-k3"),
         ("opencode", "nvidia/minimaxai/minimax-m3"),
+        ("opencode", "nvidia/moonshotai/kimi-k3"),
     ),
     # Erste Nacht (2026-09-14): Kimi K3 als erstes Glied lieferte in 30 Minuten
     # keinen Plan (Stufen-Timeout, keine Datei) — passend zur Messung "~200 s
