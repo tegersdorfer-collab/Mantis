@@ -324,7 +324,7 @@ class TestPruefe:
         pytest_aufruf = next(kw for cmd, kw in aufrufe if cmd[2] == "pytest")
         assert pytest_aufruf["env"]["DATABASE_URL"] != "postgresql://localhost:5432/mantis"
 
-
+    def test_timeout_der_test_suite_wird_zu_grund_nicht_zu_exception(self, tmp_path, monkeypatch):
         # Das Wichtigste an diesem Modul: pruefe() läuft im Daemon-Tick. Eine
         # durchschlagende TimeoutExpired würde den ganzen Tick mitreißen.
         self._stub_sauberer_git(monkeypatch)
