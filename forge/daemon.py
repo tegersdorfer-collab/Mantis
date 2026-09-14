@@ -5,9 +5,9 @@ Plan 2 (dieser Stand): der Trockenlauf ist der vollen fünfstufigen Pipeline
 (forge/pipeline.py) und dem deterministischen Gate (forge/gate.py) gewichen.
 `tick()` bringt einen Task pro Aufruf genau eine Stufe weiter; meldet die
 Pipeline "fertig" (Zustand GATING erreicht), lässt der Daemon selbst das Gate
-laufen. Ein grünes Gate bringt den Task nach `awaiting_restart_window`, wo er
-liegen bleibt — Merge und Neustart-Etikette folgen erst in Plan 3. Gemerged
-wird hier noch nichts.
+laufen. Ein grünes Gate bringt den Task nach `awaiting_approval`, wo er auf
+Timos Freigabe wartet (forge.cli approve, Plan 3). Gemerged wird hier noch
+nichts.
 
 Der Daemon hält sich an zwei Bremsen: Not-Aus-Datei und drei Fehlschläge in Folge.
 
@@ -78,21 +78,21 @@ def _park(task_id: int, current: str, reason: str) -> None:
 
 def _gate_und_abschliessen(task_id: int, baum: Path) -> str:
     """Der Task steht in GATING. Lässt das deterministische Gate laufen und
-    schließt ihn ab — grün bringt ihn nach `awaiting_restart_window`, wo er
-    liegen bleibt (Merge und Neustart-Etikette folgen erst in Plan 3), rot
-    parkt ihn mit allen gesammelten Gründen.
+    schließt ihn ab — grün bringt ihn nach `awaiting_approval`, wo er auf
+    Timos Freigabe wartet (forge.cli approve, Plan 3), rot parkt ihn mit
+    allen gesammelten Gründen.
 
     Rückgabe: 'fertig' bei grünem Gate, 'geparkt' bei rotem oder wenn der
     Zustandswechsel selbst scheitert (CAS verloren).
     """
     ergebnis = gate.pruefe(baum)
     if ergebnis.ok:
-        journal.log(task_id, "gate_pass", "Gate bestanden — wartet auf Neustart-Fenster (Plan 3)")
-        if not queue.set_state(task_id, m.AWAITING_RESTART, current=m.GATING):
+        journal.log(task_id, "gate_pass", "Gate bestanden — wartet auf Freigabe (forge.cli approve)")
+        if not queue.set_state(task_id, m.AWAITING_APPROVAL, current=m.GATING):
             # CAS verloren — "fertig" zurückzugeben würde einen Fortschritt
             # vorgaukeln, der laut DB nie stattfand.
             _park(task_id, m.GATING,
-                  f"Zustandswechsel {m.GATING} -> {m.AWAITING_RESTART} schlug fehl (Task {task_id})")
+                  f"Zustandswechsel {m.GATING} -> {m.AWAITING_APPROVAL} schlug fehl (Task {task_id})")
             return "geparkt"
         # Grünes Gate ist der Abschluss der Kette — der Fehlschlag-Zähler
         # beginnt neu (siehe forge/queue.py: versuche_zuruecksetzen).

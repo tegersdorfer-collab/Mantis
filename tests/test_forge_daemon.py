@@ -110,7 +110,7 @@ class TestTick:
 class TestGateAnschluss:
     """Meldet die Pipeline 'fertig' (Zustand jetzt GATING), lässt tick() das
     Gate laufen, journalt das Urteil mit allen Gründen und beendet den Task:
-    grün -> awaiting_restart_window (bleibt liegen), rot -> parken."""
+    grün -> awaiting_approval (wartet auf Timos Freigabe), rot -> parken."""
 
     def _vorbereitet(self, monkeypatch, tmp_path, task_id=10, ausgangszustand=m.REVIEWING):
         monkeypatch.setattr(d.queue, "claim_next", lambda: _task(task_id, ausgangszustand))
@@ -122,7 +122,7 @@ class TestGateAnschluss:
         monkeypatch.setattr(d.queue, "zaehle_fehlschlag", lambda tid, current: False)
         monkeypatch.setattr(d.queue, "versuche_zuruecksetzen", lambda tid: None)
 
-    def test_gruenes_gate_geht_in_awaiting_restart(self, monkeypatch, frei, tmp_path):
+    def test_gruenes_gate_geht_in_awaiting_approval(self, monkeypatch, frei, tmp_path):
         self._vorbereitet(monkeypatch, tmp_path)
         monkeypatch.setattr(d.gate, "pruefe", lambda baum, **kw: d.gate.GateErgebnis(ok=True, gruende=[]))
         aufrufe = []
@@ -130,7 +130,7 @@ class TestGateAnschluss:
                             lambda tid, target, current: aufrufe.append((tid, target, current)) or True)
         monkeypatch.setattr(d.journal, "log", lambda *a, **kw: None)
         assert d.tick() == "fertig"
-        assert aufrufe == [(10, m.AWAITING_RESTART, m.GATING)]
+        assert aufrufe == [(10, m.AWAITING_APPROVAL, m.GATING)]
 
     def test_gruenes_gate_journalt_gate_pass(self, monkeypatch, frei, tmp_path):
         self._vorbereitet(monkeypatch, tmp_path)
