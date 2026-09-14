@@ -591,3 +591,35 @@ class TestFensterUndHaltImMain:
 
         assert ergebnis == "beendet"
         assert ticks == []
+
+
+class TestApiSchluesselAusDatei:
+    """Erste Nacht (2026-09-14, 23:00): launchd sourct keine .zshrc, die
+    Schlüssel aus ~/.config/ai-keys.env fehlten dem Daemon, opencode meldete
+    'Method doesn't allow unregistered callers', Task 365 parkte nach drei
+    Sekunden. Der Daemon lädt die Datei deshalb selbst."""
+
+    def _datei(self, tmp_path, inhalt):
+        p = tmp_path / "ai-keys.env"
+        p.write_text(inhalt)
+        return p
+
+    def test_laedt_export_und_nackte_zuweisungen(self, monkeypatch, tmp_path):
+        p = self._datei(tmp_path, 'export GEMINI_API_KEY="abc"\nNVIDIA_API_KEY=xyz\n# Kommentar\n\n')
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+        geladen = d.lade_api_schluessel(p)
+        assert geladen == ["GEMINI_API_KEY", "NVIDIA_API_KEY"]
+        import os
+        assert os.environ["GEMINI_API_KEY"] == "abc"
+        assert os.environ["NVIDIA_API_KEY"] == "xyz"
+
+    def test_ueberschreibt_keine_vorhandene_variable(self, monkeypatch, tmp_path):
+        p = self._datei(tmp_path, "GROQ_API_KEY=aus_datei\n")
+        monkeypatch.setenv("GROQ_API_KEY", "aus_umgebung")
+        assert d.lade_api_schluessel(p) == []
+        import os
+        assert os.environ["GROQ_API_KEY"] == "aus_umgebung"
+
+    def test_fehlende_datei_ist_kein_fehler(self, tmp_path):
+        assert d.lade_api_schluessel(tmp_path / "gibt-es-nicht") == []

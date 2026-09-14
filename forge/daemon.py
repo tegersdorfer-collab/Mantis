@@ -23,6 +23,7 @@ Budget-Reserve die einzige Schranke dagegen; sie muss entsprechend
 konservativ ausgelegt sein.
 """
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -66,6 +67,13 @@ NACHT_ENDE_STUNDE = 7
 # Anders als STOP_FILE wird die Datei beim Beenden gelöscht — sie ist eine
 # Bitte, kein Not-Aus.
 HALT_FILE = Path.home() / ".mantis-forge-halt"
+# Die API-Schlüssel der Gratis-Anbieter (NVIDIA, Google, Groq, Mistral) liegen
+# hier und werden interaktiv aus .zshrc gesourct. launchd sourct keine .zshrc:
+# in der ersten Nacht (2026-09-14, 23:00) startete der Daemon ohne einen
+# einzigen Schlüssel, opencode meldete "Method doesn't allow unregistered
+# callers", und Task 365 parkte nach drei Sekunden. Der Daemon lädt die Datei
+# deshalb selbst — und loggt dabei nur die NAMEN, nie die Werte.
+API_SCHLUESSEL_DATEI = Path.home() / ".config" / "ai-keys.env"
 
 
 def im_nachtfenster(jetzt: datetime | None = None) -> bool:
@@ -76,6 +84,29 @@ def im_nachtfenster(jetzt: datetime | None = None) -> bool:
 
 def halt_angefordert() -> bool:
     return HALT_FILE.exists()
+
+
+def lade_api_schluessel(datei: Path = API_SCHLUESSEL_DATEI) -> list[str]:
+    """Lädt `KEY=WERT`-Zeilen (auch mit `export`, auch in Anführungszeichen)
+    in os.environ — nur Variablen, die dort noch fehlen. Rückgabe: die Namen
+    der geladenen Variablen. Eine fehlende Datei ist kein Fehler: dann muss
+    die Umgebung die Schlüssel schon mitbringen."""
+    if not datei.is_file():
+        return []
+    geladen: list[str] = []
+    for zeile in datei.read_text().splitlines():
+        zeile = zeile.strip()
+        if not zeile or zeile.startswith("#") or "=" not in zeile:
+            continue
+        if zeile.startswith("export "):
+            zeile = zeile[len("export "):]
+        name, wert = zeile.split("=", 1)
+        name, wert = name.strip(), wert.strip().strip('"').strip("'")
+        if not name or name in os.environ:
+            continue
+        os.environ[name] = wert
+        geladen.append(name)
+    return geladen
 
 
 def should_run(failures: int) -> tuple[bool, str]:
@@ -201,6 +232,8 @@ def main() -> None:
     ein weicher Halt angefordert wird (forge.cli stop), der Not-Aus steht oder
     die Fehler-Spirale greift. Die ersten beiden enden mit Exit 0."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+    schluessel = lade_api_schluessel()
+    log.info(f"Forge: API-Schlüssel aus {API_SCHLUESSEL_DATEI.name} geladen: {', '.join(schluessel) or 'keine'}")
     db.init_pool()
     # Die Forge ist bewusst unabhängig vom laufenden Mantis-Assistant (siehe
     # forge/__init__.py) — sie darf sich also nicht darauf verlassen, dass
