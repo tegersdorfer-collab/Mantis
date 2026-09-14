@@ -50,6 +50,25 @@ def recent(limit: int = 20) -> list[dict]:
     )
 
 
+def letzte_daemon_ereignisse() -> dict[str, dict]:
+    """Der jüngste daemon_start und der jüngste daemon_stop, je einer, als
+    {kind: zeile}. Für den Morgenbericht (Abschluss-Review 2c, I4): ob die
+    Nacht überhaupt stattgefunden hat und wie sie endete. Daemon-Ereignisse
+    hängen an keinem Task (task_id IS NULL). Fehlt ein Kind, fehlt der
+    Schlüssel; ein Lesefehler liefert ein leeres Dict — der Bericht soll
+    trotzdem erscheinen."""
+    try:
+        zeilen = db.query(
+            "SELECT DISTINCT ON (kind) kind, ts, message FROM forge_journal "
+            "WHERE task_id IS NULL AND kind IN ('daemon_start', 'daemon_stop') "
+            "ORDER BY kind, ts DESC",
+        )
+    except Exception as exc:
+        _log.error(f"Forge-Journal: Daemon-Ereignisse nicht lesbar: {exc}")
+        return {}
+    return {z["kind"]: z for z in zeilen}
+
+
 def for_task(task_id: int) -> list[dict]:
     """Der vollständige Verlauf eines Tasks, von vorn."""
     return db.query(

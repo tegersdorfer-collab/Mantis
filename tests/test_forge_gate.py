@@ -177,37 +177,56 @@ class TestSchwellen:
         assert gate.MAX_DIFF_ZEILEN == 800
 
 
+def _stub_sauberer_git(monkeypatch, dateien="tests/foo.py\n", numstat="10\t2\ttests/foo.py\n", roh=""):
+    """gitctl.run nach Drehbuch: Dateiliste, numstat und --raw-Ausgabe."""
+    def fake_gitctl_run(*args, cwd=None, timeout=300):
+        if "--name-only" in args:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=dateien, stderr="")
+        if "--numstat" in args:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=numstat, stderr="")
+        if "--raw" in args:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=roh, stderr="")
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gate.gitctl, "run", fake_gitctl_run)
+
+
 class TestPruefe:
     """Deckt pruefe() selbst ab: subprocess.run und gitctl.run werden gestubbt,
     damit hier nie die echte Suite oder echtes ruff läuft (das würde rekursieren)."""
 
     def _stub_sauberer_git(self, monkeypatch, dateien="tests/foo.py\n", numstat="10\t2\ttests/foo.py\n",
                            roh=""):
-        def fake_gitctl_run(*args, cwd=None, timeout=300):
-            if "--name-only" in args:
-                return subprocess.CompletedProcess(args=args, returncode=0, stdout=dateien, stderr="")
-            if "--numstat" in args:
-                return subprocess.CompletedProcess(args=args, returncode=0, stdout=numstat, stderr="")
-            if "--raw" in args:
-                return subprocess.CompletedProcess(args=args, returncode=0, stdout=roh, stderr="")
-            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(gate.gitctl, "run", fake_gitctl_run)
+        _stub_sauberer_git(monkeypatch, dateien=dateien, numstat=numstat, roh=roh)
 
     def _stub_subprocess(self, monkeypatch, pytest_rc=0, pytest_stdout="1 passed", pytest_exc=None,
                           ruff_rc=0, ruff_stdout="", ruff_exc=None):
+        """Stubbt subprocess.run und zeichnet jeden Aufruf als (argv, kwargs) auf.
+
+        Verteilt nach dem Modul hinter `-m`, nicht nach argv[0]: seit dem
+        Abschluss-Review 2c (C1) ruft das Gate pytest und ruff über
+        `sys.executable -m …` auf. Ein nackter Binärname ("python3.14",
+        "ruff") ist unter dem launchd-PATH nicht auflösbar (Journal
+        2026-08-15) und gilt hier als unerwarteter Aufruf."""
+        aufrufe: list[tuple[list, dict]] = []
+
         def fake_run(cmd, **kwargs):
-            if cmd[0] == "python3.14":
+            aufrufe.append((list(cmd), kwargs))
+            if cmd[0] != sys.executable:
+                raise AssertionError(f"Gate ruft nicht den eigenen Interpreter auf: {cmd}")
+            modul = cmd[2] if len(cmd) > 2 and cmd[1] == "-m" else None
+            if modul == "pytest":
                 if pytest_exc is not None:
                     raise pytest_exc
                 return subprocess.CompletedProcess(args=cmd, returncode=pytest_rc, stdout=pytest_stdout, stderr="")
-            if cmd[0] == "ruff":
+            if modul == "ruff":
                 if ruff_exc is not None:
                     raise ruff_exc
                 return subprocess.CompletedProcess(args=cmd, returncode=ruff_rc, stdout=ruff_stdout, stderr="")
             raise AssertionError(f"unerwarteter subprocess-Aufruf: {cmd}")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
+        return aufrufe
 
     def _schreibe_pass_verdikt(self, tmp_path):
         (tmp_path / ".forge").mkdir(parents=True, exist_ok=True)
@@ -240,26 +259,72 @@ class TestPruefe:
     def test_drei_gleichzeitige_verstoesse_ergeben_drei_gruende(self, tmp_path, monkeypatch):
         # Ein Gate, das nur den ersten Grund meldet, führt zu einer Fix-Runde,
         # die den Rest erst danach entdeckt — teuer bei jedem einzelnen Fund.
-        # "scripts/fix_bluetooth.sh" liegt in der erlaubten Zone "scripts/",
-        # ist aber trotzdem eine Sperrzone (exakter Dateiname in SPERRZONEN) —
-        # so löst die Datei Sperrzone aus, ohne zusätzlich (und am eigentlichen
-        # Testzweck vorbei) die neue Zonen-Prüfung zu triggern.
+        # Bis zum Abschluss-Review 2c (I1) war der dritte Grund hier eine
+        # Sperrzone; seitdem beendet ein Zonenverstoss das Gate VOR den Tests
+        # (siehe TestZonenverstossKurzschluss). Drei Gründe, die zusammen
+        # auftreten können, sind jetzt: zu grosser Diff, rote Tests, ruff.
         self._stub_sauberer_git(
             monkeypatch,
-            dateien="scripts/fix_bluetooth.sh\ntests/foo.py\n",
-            numstat="500\t0\tscripts/fix_bluetooth.sh\n400\t0\ttests/foo.py\n",
+            dateien="tests/foo.py\n",
+            numstat="900\t0\ttests/foo.py\n",
         )
-        self._stub_subprocess(monkeypatch, pytest_rc=1, pytest_stdout="1 failed")
+        self._stub_subprocess(monkeypatch, pytest_rc=1, pytest_stdout="1 failed",
+                              ruff_rc=1, ruff_stdout="tests/foo.py:1:1: F401 unused import")
         self._schreibe_pass_verdikt(tmp_path)
         ergebnis = gate.pruefe(tmp_path)
         assert ergebnis.ok is False
         assert len(ergebnis.gruende) == 3
         gruende_text = " ".join(ergebnis.gruende)
-        assert "Sperrzone" in gruende_text
         assert "Diff zu groß" in gruende_text
         assert "Tests rot" in gruende_text
+        assert "ruff" in gruende_text
 
-    def test_timeout_der_test_suite_wird_zu_grund_nicht_zu_exception(self, tmp_path, monkeypatch):
+    # --- Abschluss-Review 2c, C1: Aufruf über den eigenen Interpreter --------
+    # Unter dem launchd-PATH (forge/launchd/com.mantis.forge.plist) sind weder
+    # `python3.14` noch `ruff` auflösbar — das Journal vom 2026-08-15 zeigt
+    # genau diesen Ausfall ("Tests rot: Aufruf fehlgeschlagen"). Der Daemon
+    # selbst läuft aber, also existiert sein Interpreter: sys.executable.
+
+    def test_pytest_und_ruff_laufen_ueber_den_eigenen_interpreter(self, tmp_path, monkeypatch):
+        self._stub_sauberer_git(monkeypatch)
+        aufrufe = self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        assert gate.pruefe(tmp_path).ok is True
+        argvs = [cmd for cmd, _ in aufrufe]
+        assert [sys.executable, "-m", "pytest", "-q"] in argvs, argvs
+        assert [sys.executable, "-m", "ruff", "check", "."] in argvs, argvs
+        assert all(cmd[0] == sys.executable for cmd in argvs), \
+            f"nackter Binärname im Gate-Aufruf: {argvs}"
+
+    # --- Abschluss-Review 2c, I1: die Suite darf die Produktions-DB nicht sehen --
+    # Das Gate lässt `pytest -q` über die GANZE Suite im Worktree eines Tasks
+    # laufen — inklusive tests/, das der Agent selbst editieren darf. Ohne
+    # Umleitung sähe jeder Test dort die echte Postgres (settings.cfg liest
+    # DATABASE_URL aus Umgebung > .env > Default).
+
+    def test_suite_laeuft_gegen_eine_unerreichbare_datenbank(self, tmp_path, monkeypatch):
+        self._stub_sauberer_git(monkeypatch)
+        aufrufe = self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        gate.pruefe(tmp_path)
+        pytest_aufruf = next(kw for cmd, kw in aufrufe if cmd[2] == "pytest")
+        env = pytest_aufruf.get("env")
+        assert env is not None, "pytest erbt die Umgebung des Daemons samt echter DATABASE_URL"
+        assert env["DATABASE_URL"] == gate.GATE_DATABASE_URL
+        assert ":1/" in env["DATABASE_URL"], "Port 1 — dort hört kein Postgres"
+        # Alles andere aus der Umgebung bleibt erhalten (PATH, HOME, …).
+        assert env.get("PATH") == os.environ.get("PATH")
+
+    def test_umleitung_ueberschreibt_eine_gesetzte_datenbank_url(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://localhost:5432/mantis")
+        self._stub_sauberer_git(monkeypatch)
+        aufrufe = self._stub_subprocess(monkeypatch)
+        self._schreibe_pass_verdikt(tmp_path)
+        gate.pruefe(tmp_path)
+        pytest_aufruf = next(kw for cmd, kw in aufrufe if cmd[2] == "pytest")
+        assert pytest_aufruf["env"]["DATABASE_URL"] != "postgresql://localhost:5432/mantis"
+
+
         # Das Wichtigste an diesem Modul: pruefe() läuft im Daemon-Tick. Eine
         # durchschlagende TimeoutExpired würde den ganzen Tick mitreißen.
         self._stub_sauberer_git(monkeypatch)
@@ -423,6 +488,65 @@ class TestPruefe:
         self._schreibe_pass_verdikt(tmp_path)
         ergebnis = gate.pruefe(tmp_path)
         assert ergebnis.gruende == []
+
+
+class TestZonenverstossKurzschluss:
+    """Abschluss-Review 2c, I1: ein Diff, der eine Sperrzone berührt oder die
+    erlaubten Zonen verlässt, ist durch nichts mergefähig, was die Tests
+    beweisen könnten. Bis zu 30 Minuten pytest für einen ohnehin verlorenen
+    Task sind dann reine Verschwendung — und jeder dieser Läufe führt
+    agentengeschriebene Tests aus."""
+
+    def _stub_git(self, monkeypatch, dateien, numstat):
+        _stub_sauberer_git(monkeypatch, dateien=dateien, numstat=numstat)
+
+    def _kein_subprocess(self, monkeypatch):
+        aufrufe = []
+
+        def fake_run(cmd, **kwargs):
+            aufrufe.append(list(cmd))
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        return aufrufe
+
+    def test_datei_ausserhalb_der_zonen_erspart_tests_und_ruff(self, tmp_path, monkeypatch):
+        self._stub_git(monkeypatch, dateien="core/db.py\n", numstat="1\t0\tcore/db.py\n")
+        aufrufe = self._kein_subprocess(monkeypatch)
+        ergebnis = gate.pruefe(tmp_path)
+        assert ergebnis.ok is False
+        assert any("ausserhalb der erlaubten Zonen" in g for g in ergebnis.gruende)
+        assert aufrufe == [], f"Tests/ruff liefen trotz Zonenverstoss: {aufrufe}"
+
+    def test_sperrzone_erspart_tests_und_ruff(self, tmp_path, monkeypatch):
+        self._stub_git(monkeypatch, dateien="scripts/fix_bluetooth.sh\n",
+                       numstat="1\t0\tscripts/fix_bluetooth.sh\n")
+        aufrufe = self._kein_subprocess(monkeypatch)
+        ergebnis = gate.pruefe(tmp_path)
+        assert ergebnis.ok is False
+        assert any("Sperrzone" in g for g in ergebnis.gruende)
+        assert aufrufe == []
+
+    def test_kurzschluss_sammelt_die_billigen_gruende_trotzdem(self, tmp_path, monkeypatch):
+        # Der Kurzschluss spart nur die teuren Läufe. Diff-Grösse und Verdikt
+        # kosten nichts und gehören weiter in den Bericht — sonst findet die
+        # nächste Runde sie erst nach dem Zonen-Fix.
+        self._stub_git(monkeypatch, dateien="core/db.py\n",
+                       numstat=f"{gate.MAX_DIFF_ZEILEN + 1}\t0\tcore/db.py\n")
+        self._kein_subprocess(monkeypatch)
+        ergebnis = gate.pruefe(tmp_path)   # kein Verdikt geschrieben
+        gruende_text = " ".join(ergebnis.gruende)
+        assert "ausserhalb der erlaubten Zonen" in gruende_text
+        assert "Diff zu groß" in gruende_text
+        assert "Review-Verdikt negativ" in gruende_text
+
+    def test_sauberer_diff_laesst_tests_und_ruff_laufen(self, tmp_path, monkeypatch):
+        # Gegenprobe: ohne Zonenverstoss laufen beide teuren Prüfungen.
+        self._stub_git(monkeypatch, dateien="tests/foo.py\n", numstat="1\t0\ttests/foo.py\n")
+        aufrufe = self._kein_subprocess(monkeypatch)
+        gate.pruefe(tmp_path)
+        module = [cmd[2] for cmd in aufrufe if len(cmd) > 2]
+        assert module == ["pytest", "ruff"]
 
 
 class TestGegenEchtesGit:

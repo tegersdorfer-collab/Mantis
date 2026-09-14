@@ -12,9 +12,10 @@ Rückgabewerte:
               oder ein Fix ist abgeschlossen (kein Übergang, Review folgt)
   "fertig"  — die Kette hat GATING erreicht, der Daemon lässt das Gate laufen
   "geparkt" — der Task liegt zur manuellen Sichtung bereit
-  "fehler"  — Rate-Limit; Zustand bewusst unverändert, Plan 3 hängt hier die
-              Wartezeit ein. Ein Park hier würde jede Kontingentgrenze in
-              einen verlorenen Task verwandeln.
+  "fehler"  — Rate-Limit; Zustand bewusst unverändert, der Daemon schläft
+              FAILURE_SLEEP_SECONDS (forge/daemon.py) und versucht es
+              erneut. Ein Park hier würde jede Kontingentgrenze in einen
+              verlorenen Task verwandeln.
   "kontingent" — jeder Anbieter der Kette ist für diese Nacht leer. Zwei
               Quellen führen hierher (Task 1, 2026-09-10, und Fund F2 des
               Abschluss-Reviews zu Plan 2b): entweder findet die Kettenwahl
@@ -375,11 +376,26 @@ def _committe_artefakt(worktree: Path, stufe_name: str, task_id: int, pfad: str)
     andere, nicht zu dieser Stufe gehörende Änderungen enthalten (z.B. ein
     Artefakt einer vorherigen, geparkten Stufe), und die dürfen hier nicht
     versehentlich mit hineinrutschen.
+
+    Idempotent (Abschluss-Review 2c, I2): steht das Artefakt schon genau so
+    in HEAD — Requeue mit bestehender Spec, oder Absturz zwischen diesem
+    Commit und set_state —, endet `git commit -- pfad` mit 1 ("nothing to
+    commit"), und die Stufe würde geparkt, obwohl sie ihre Aufgabe erfüllt
+    hat. Deshalb nach dem `add` ein `git diff --cached --quiet -- pfad`:
+    rc 0 heisst nichts gestaged, also nichts zu committen. Bewusst
+    `--cached` statt `diff --quiet HEAD`: eine neue, noch nicht getrackte
+    Datei ist für letzteres unsichtbar und käme fälschlich als "unverändert"
+    durch — nach dem `add` ist sie im Index und wird korrekt gesehen.
     """
     hinzugefuegt = gitctl.run("add", "--", pfad, cwd=worktree)
     if hinzugefuegt.returncode != 0:
         return (f"git add fehlgeschlagen (returncode {hinzugefuegt.returncode}): "
                 f"{(hinzugefuegt.stderr or '').strip()[:300]}")
+    gestaged = gitctl.run("diff", "--cached", "--quiet", "--", pfad, cwd=worktree)
+    if gestaged.returncode == 0:
+        log.info(f"Forge-Pipeline: Artefakt {pfad} der Stufe '{stufe_name}' ist unverändert "
+                 f"in HEAD — kein neuer Commit (Task {task_id})")
+        return None
     nachricht = f"docs(forge): Artefakt der Stufe '{stufe_name}' für Task {task_id} committet"
     committet = gitctl.run("commit", "-m", nachricht, "--", pfad, cwd=worktree)
     if committet.returncode != 0:

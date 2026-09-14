@@ -102,6 +102,34 @@ class TestForTask:
         assert "ORDER BY ts ASC" in rec.queries[-1][0]
 
 
+class TestLetzteDaemonEreignisse:
+    """Abschluss-Review 2c, I4: der Morgenbericht braucht den jüngsten
+    daemon_start und daemon_stop (task_id IS NULL), je einen."""
+
+    def test_liefert_je_kind_die_juengste_zeile(self, monkeypatch):
+        rec = _patch(monkeypatch, rows=[
+            {"kind": "daemon_start", "ts": "2026-09-14 23:00", "message": "Forge gestartet"},
+            {"kind": "daemon_stop", "ts": "2026-09-15 07:00", "message": "Nachtfenster zu Ende"},
+        ])
+        ereignisse = j.letzte_daemon_ereignisse()
+        assert ereignisse["daemon_start"]["message"] == "Forge gestartet"
+        assert ereignisse["daemon_stop"]["message"] == "Nachtfenster zu Ende"
+        sql = rec.queries[-1][0]
+        assert "task_id IS NULL" in sql
+        assert "DISTINCT ON (kind)" in sql
+        assert "ts DESC" in sql
+
+    def test_ohne_zeilen_leeres_dict(self, monkeypatch):
+        _patch(monkeypatch, rows=[])
+        assert j.letzte_daemon_ereignisse() == {}
+
+    def test_datenbankfehler_wird_zu_leerem_dict(self, monkeypatch):
+        # Der Bericht läuft auch, wenn das Journal gerade nicht lesbar ist —
+        # eine fehlende Daemon-Zeile ist besser als gar kein Bericht.
+        monkeypatch.setattr(j.db, "query", _boom)
+        assert j.letzte_daemon_ereignisse() == {}
+
+
 class TestKinds:
     def test_bekannte_arten_sind_dokumentiert(self, monkeypatch):
         for kind in ["stage_start", "stage_done", "gate_pass", "gate_fail",

@@ -46,7 +46,10 @@ class _Git:
 
 @pytest.fixture
 def welt(monkeypatch, tmp_path):
-    """Task 7 in AWAITING_APPROVAL, alle Seiteneffekte aufgezeichnet."""
+    """Task 7 in AWAITING_APPROVAL, alle Seiteneffekte aufgezeichnet. Der
+    Worktree-Ordner existiert (Abschluss-Review 2c, I6: freigeben prüft das,
+    bevor es git im Worktree aufruft)."""
+    (tmp_path / "task-7").mkdir()
     aufz = {"states": [], "parks": [], "journal": [], "worktree_removed": []}
     monkeypatch.setattr(f.queue, "hole", lambda tid: {"id": tid, "state": m.AWAITING_APPROVAL, "title": "T"})
     monkeypatch.setattr(f.queue, "set_state",
@@ -109,6 +112,50 @@ class TestFreigebenVertrag:
         monkeypatch.setattr(f.queue, "hole", lambda tid: {"id": tid, "state": m.PARKED})
         _git(monkeypatch, {})
         assert f.freigeben(7, repo=tmp_path) == "abgelehnt"
+
+
+class TestI6UntrackedUndFehlenderWorktree:
+    """Abschluss-Review 2c, I6: `git status --porcelain` meldet auch
+    untracked Dateien — in ~/Mantis liegt praktisch immer eine (Notiz,
+    Scratch-Skript), und jede Freigabe wäre "abgelehnt". Untracked Dateien
+    können einen Merge nicht kaputt machen, solange der Branch sie nicht
+    anlegt (dann bricht git selbst ab). Und: ein fehlender Worktree (Ledger
+    T5) darf keinen git-Aufruf darin auslösen."""
+
+    def test_untracked_datei_in_main_verhindert_die_freigabe_nicht(self, monkeypatch, welt, tmp_path):
+        def _status(args):
+            # Nur mit --untracked-files=no ist der Baum "sauber".
+            return (0, "") if "--untracked-files=no" in args else (0, "?? notiz.md\n")
+        git = _git(monkeypatch, {"status": _status,
+                                 "rev-parse": [(0, "main\n"), (0, "abc\n")],
+                                 "merge-base": (0, "abc\n")})
+        assert f.freigeben(7, repo=tmp_path) == "gemerged"
+        status = next(a for a, _ in git.aufrufe if a[0] == "status")
+        assert "--untracked-files=no" in status, status
+        assert "--porcelain" in status
+
+    def test_geaenderte_getrackte_datei_lehnt_weiterhin_ab(self, monkeypatch, welt, tmp_path):
+        _git(monkeypatch, {"status": (0, " M forge/x.py\n"), "rev-parse": (0, "main\n")})
+        assert f.freigeben(7, repo=tmp_path) == "abgelehnt"
+        assert welt["states"] == []
+
+    def test_fehlender_worktree_lehnt_ab_ohne_git_zu_mutieren(self, monkeypatch, welt, tmp_path):
+        (tmp_path / "task-7").rmdir()
+        git = _git(monkeypatch, {"status": (0, ""),
+                                 "rev-parse": [(0, "main\n"), (0, "neu\n")],
+                                 "merge-base": (0, "alt\n")})
+        assert f.freigeben(7, repo=tmp_path) == "abgelehnt"
+        assert welt["states"] == [] and welt["parks"] == []
+        assert not any(a[0] == "merge" for a, _ in git.aufrufe), "git merge trotz fehlendem Worktree"
+        assert not any(cwd == tmp_path / "task-7" for _, cwd in git.aufrufe)
+
+    def test_ablehnungsgrund_steht_im_log(self, monkeypatch, welt, tmp_path, caplog):
+        # Der String-Vertrag bleibt "abgelehnt"; das Warum geht per
+        # log.warning ans CLI (das logging auf WARNING konfiguriert).
+        _git(monkeypatch, {"status": (0, ""), "rev-parse": (0, "forge/pipeline\n")})
+        with caplog.at_level("WARNING", logger="forge.freigabe"):
+            assert f.freigeben(7, repo=tmp_path) == "abgelehnt"
+        assert any("forge/pipeline" in r.getMessage() for r in caplog.records)
 
 
 class TestAblehnenUndNeuEinreihen:

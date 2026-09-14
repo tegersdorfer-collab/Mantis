@@ -46,5 +46,75 @@ class TestCli:
         _stumm(monkeypatch)
         halt = tmp_path / "halt"
         monkeypatch.setattr(cli.daemon, "HALT_FILE", halt)
+        monkeypatch.setattr(cli, "_daemon_laeuft", lambda: True)
         assert cli.main(["stop"]) == 0
         assert halt.exists()
+
+
+class TestStopOhneDaemon:
+    """Abschluss-Review 2c, I3: ohne laufenden Daemon schrieb `stop` die
+    Halt-Datei und meldete "der Daemon beendet sich" — beim nächsten Start
+    räumt daemon.main() genau diese Datei als veraltet weg (Halt ist eine
+    Bitte an den LAUFENDEN Daemon). Timo glaubte, die Nacht sei abgesagt, und
+    sie lief trotzdem. `_daemon_laeuft` ist gepatcht, nicht pgrep: ein
+    `pgrep -f forge.daemon` würde auch diesen pytest-Prozess treffen, sobald
+    sein argv den String enthält."""
+
+    def test_ohne_daemon_keine_halt_datei_und_exit_1(self, monkeypatch, tmp_path, capsys):
+        _stumm(monkeypatch)
+        halt = tmp_path / "halt"
+        monkeypatch.setattr(cli.daemon, "HALT_FILE", halt)
+        monkeypatch.setattr(cli, "_daemon_laeuft", lambda: False)
+        assert cli.main(["stop"]) == 1
+        assert not halt.exists()
+
+    def test_ohne_daemon_nennt_den_not_aus_und_launchctl(self, monkeypatch, tmp_path, capsys):
+        _stumm(monkeypatch)
+        monkeypatch.setattr(cli.daemon, "HALT_FILE", tmp_path / "halt")
+        monkeypatch.setattr(cli, "_daemon_laeuft", lambda: False)
+        cli.main(["stop"])
+        out = capsys.readouterr().out
+        assert "Kein Daemon läuft" in out
+        assert "touch ~/.mantis-forge-stop" in out
+        assert "launchctl bootout gui/$(id -u)/com.mantis.forge" in out
+
+    def test_mit_daemon_meldet_den_halt(self, monkeypatch, tmp_path, capsys):
+        _stumm(monkeypatch)
+        monkeypatch.setattr(cli.daemon, "HALT_FILE", tmp_path / "halt")
+        monkeypatch.setattr(cli, "_daemon_laeuft", lambda: True)
+        assert cli.main(["stop"]) == 0
+        assert "Halt angefordert" in capsys.readouterr().out
+
+    def test_daemon_laeuft_fragt_pgrep_nach_forge_daemon(self, monkeypatch):
+        aufrufe = []
+
+        class _R:
+            returncode = 0
+
+        def _run(cmd, **kw):
+            aufrufe.append(cmd)
+            return _R()
+
+        monkeypatch.setattr(cli.subprocess, "run", _run)
+        assert cli._daemon_laeuft() is True
+        assert aufrufe == [["pgrep", "-f", "forge.daemon"]]
+
+    def test_daemon_laeuft_ist_false_bei_pgrep_rc_1(self, monkeypatch):
+        class _R:
+            returncode = 1
+        monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: _R())
+        assert cli._daemon_laeuft() is False
+
+
+class TestAblehnungsgrundErreichtDasTerminal:
+    """Abschluss-Review 2c, I6: `freigeben` meldet "abgelehnt" und nennt den
+    Grund nur per log.warning. Das CLI konfiguriert logging, damit der Grund
+    im Terminal steht — der String-Vertrag der Funktion bleibt für Plan 3."""
+
+    def test_main_konfiguriert_logging_auf_warning(self, monkeypatch):
+        _stumm(monkeypatch)
+        konfiguriert = []
+        monkeypatch.setattr(cli.logging, "basicConfig", lambda **kw: konfiguriert.append(kw))
+        monkeypatch.setattr(cli.freigabe, "freigeben", lambda tid: "abgelehnt")
+        assert cli.main(["approve", "7"]) == 1
+        assert konfiguriert and konfiguriert[0]["level"] == cli.logging.WARNING

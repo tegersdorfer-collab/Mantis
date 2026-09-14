@@ -4,12 +4,14 @@ Bewusst ohne LLM. Alles andere in der Pipeline ist ein Sprachmodell, das sich
 selbst beurteilt; hier entscheiden Rückgabewerte. Ein Lauf kann das Gate nicht
 überreden, nur bestehen.
 
-Der Merge selbst passiert hier NICHT — das ist Plan 3. Das Gate liefert nur
-das Urteil.
+Der Merge selbst passiert hier NICHT — das macht forge/freigabe.py nach Timos
+Freigabe. Das Gate liefert nur das Urteil.
 """
 import json
 import logging
+import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -69,6 +71,19 @@ _HARTE_BEFUNDE = frozenset({"critical", "important"})
 # Zeitbudget für die beiden externen Aufrufe, die pruefe() macht.
 _TEST_TIMEOUT_SEKUNDEN = 1800
 _LINT_TIMEOUT_SEKUNDEN = 300
+
+# Abschluss-Review 2c, I1: die DATABASE_URL, die die Suite im Gate sieht.
+# Das Gate lässt `pytest -q` über die GANZE Suite im Worktree eines Tasks
+# laufen — und tests/ ist eine erlaubte Zone, ein Agent darf dort schreiben.
+# Ohne Umleitung erbte pytest die Umgebung des Daemons und damit die echte
+# Postgres (settings.cfg liest DATABASE_URL mit Vorrang Umgebung > .env >
+# Default; ein Wert in der Umgebung gewinnt also auch gegen ~/Mantis/.env,
+# geprüft 2026-09-14). Port 1 hört nirgends: die beiden Dateien, die die
+# echte DB brauchen (tests/test_forge_lebenszyklus.py, tests/
+# test_forge_nachtlauf.py), überspringen sich über `_db_erreichbar()`, und
+# jeder agentengeschriebene Test, der nach der DB greift, wird rot statt in
+# Produktionstabellen zu schreiben.
+GATE_DATABASE_URL = "postgresql://localhost:1/forge-gate-ohne-db"
 
 
 @dataclass
@@ -236,13 +251,28 @@ def _diff_groesse(worktree: Path, basis: str) -> tuple[int, list[str]]:
     return summe, binaere
 
 
+# Abschluss-Review 2c, C1: pytest und ruff laufen über den Interpreter, in
+# dem das Gate selbst läuft — nie über einen nackten Binärnamen. Unter dem
+# launchd-PATH der plist (~/.local/bin, /opt/homebrew/bin, /usr/bin, …) war
+# weder `python3.14` noch `ruff` auflösbar; das Journal vom 2026-08-15 zeigt
+# genau diesen Ausfall ("Tests rot: Aufruf fehlgeschlagen"). sys.executable
+# existiert per Definition, und `python3.14 -m ruff` funktioniert, weil ruff
+# als Paket im selben Interpreter installiert ist (geprüft 2026-09-14:
+# ruff 0.15.20).
+_PYTEST_ARGV = [sys.executable, "-m", "pytest", "-q"]
+_RUFF_ARGV = [sys.executable, "-m", "ruff", "check", "."]
+
+
 def _tests_pruefen(worktree: Path) -> str | None:
     """Führt die Suite aus. Timeout oder ein fehlendes Interpreter-Binary
     dürfen niemals als Exception aus pruefe() herausschlagen — pruefe() läuft
     im Daemon-Tick, und unter launchd ist PATH nicht die interaktive Shell."""
+    # Siehe GATE_DATABASE_URL: die Suite im Task-Worktree darf die
+    # Produktions-DB nicht sehen. Alles andere aus der Umgebung bleibt.
+    umgebung = {**os.environ, "DATABASE_URL": GATE_DATABASE_URL}
     try:
         ergebnis = subprocess.run(
-            ["python3.14", "-m", "pytest", "-q"], cwd=str(worktree),
+            _PYTEST_ARGV, cwd=str(worktree), env=umgebung,
             capture_output=True, text=True, timeout=_TEST_TIMEOUT_SEKUNDEN,
         )
     except subprocess.TimeoutExpired:
@@ -260,7 +290,7 @@ def _lint_pruefen(worktree: Path) -> str | None:
     nicht zu einer Exception."""
     try:
         ergebnis = subprocess.run(
-            ["ruff", "check", "."], cwd=str(worktree),
+            _RUFF_ARGV, cwd=str(worktree),
             capture_output=True, text=True, timeout=_LINT_TIMEOUT_SEKUNDEN,
         )
     except subprocess.TimeoutExpired:
@@ -305,6 +335,19 @@ def pruefe(worktree: Path, basis: str = "main") -> GateErgebnis:
     if binaere:
         gruende.append(f"binäre Änderung erkannt: {', '.join(binaere)}")
 
+    verdikt_ok, befunde = lies_verdikt(baum)
+    if not verdikt_ok:
+        gruende.append(f"Review-Verdikt negativ: {len(befunde)} harte Befunde")
+
+    # Abschluss-Review 2c, I1: ein Diff, der eine Sperrzone berührt oder die
+    # erlaubten Zonen verlässt, ist durch nichts mergefähig, was die Tests
+    # beweisen könnten. Die billigen Gründe oben stehen trotzdem alle im
+    # Bericht; nur die teuren Läufe (bis zu 30 min pytest, dazu ruff)
+    # entfallen — und mit ihnen ein Lauf agentengeschriebener Tests für einen
+    # ohnehin verlorenen Task.
+    if verboten or draussen:
+        return GateErgebnis(ok=False, gruende=gruende)
+
     tests_grund = _tests_pruefen(baum)
     if tests_grund:
         gruende.append(tests_grund)
@@ -312,9 +355,5 @@ def pruefe(worktree: Path, basis: str = "main") -> GateErgebnis:
     lint_grund = _lint_pruefen(baum)
     if lint_grund:
         gruende.append(lint_grund)
-
-    verdikt_ok, befunde = lies_verdikt(baum)
-    if not verdikt_ok:
-        gruende.append(f"Review-Verdikt negativ: {len(befunde)} harte Befunde")
 
     return GateErgebnis(ok=not gruende, gruende=gruende)

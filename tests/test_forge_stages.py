@@ -202,6 +202,27 @@ class TestPrompts:
                     f"{state_name}-Prompt nennt {verbotener_pfad} nicht"
                 )
 
+    def test_implement_und_fix_nennen_jede_erlaubte_zone(self):
+        # Abschluss-Review 2c, I5: das Gate weist alles ausserhalb von
+        # gate.ERLAUBTE_ZONEN zurück — ein Agent, dem das niemand sagt,
+        # verbrennt einen ganzen Zyklus, um es herauszufinden. Die Liste
+        # kommt aus der Gate-Konstante, nicht aus einer Kopie im Prompt.
+        from forge import gate
+        for state_name in ("implement", "fix"):
+            stufe = next(st for st in s.ALLE_STUFEN if st.name == state_name)
+            text = stufe.baue_prompt(self._task(), kontext={})
+            for zone in gate.ERLAUBTE_ZONEN:
+                assert zone in text, f"{state_name}-Prompt nennt die erlaubte Zone {zone} nicht"
+            assert "Gate" in text and "ausschließlich" in text
+
+    def test_erlaubte_zonen_im_prompt_folgen_der_gate_konstante(self, monkeypatch):
+        # Kein Hardcoding: eine neue Zone im Gate steht beim nächsten Prompt
+        # ohne weitere Änderung drin.
+        from forge import gate
+        monkeypatch.setattr(gate, "ERLAUBTE_ZONEN", ("tests/", "zauberwald/"))
+        stufe = next(st for st in s.ALLE_STUFEN if st.name == "implement")
+        assert "zauberwald/" in stufe.baue_prompt(self._task(), kontext={})
+
     def test_kontext_fehlt_bricht_prompt_nicht(self):
         # Ohne kontext (leeres dict) müssen plan/implement/review trotzdem
         # einen Prompt bauen können, statt mit KeyError zu crashen.

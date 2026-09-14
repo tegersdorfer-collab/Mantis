@@ -197,7 +197,9 @@ def tick() -> str:
 
 
 def main() -> None:
-    """launchd-Einstieg. Läuft bis zum Not-Aus oder bis zur Fehler-Spirale."""
+    """launchd-Einstieg. Läuft, bis das Nachtfenster endet (NACHT_ENDE_STUNDE),
+    ein weicher Halt angefordert wird (forge.cli stop), der Not-Aus steht oder
+    die Fehler-Spirale greift. Die ersten beiden enden mit Exit 0."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
     db.init_pool()
     # Die Forge ist bewusst unabhängig vom laufenden Mantis-Assistant (siehe
@@ -214,7 +216,7 @@ def main() -> None:
     # Not-Aus-Datei (STOP_FILE).
     if HALT_FILE.exists():
         HALT_FILE.unlink(missing_ok=True)
-        log.warning("Forge: veraltete Halt-Datei beim Start entfernt — eine Halt ist eine Bitte an den laufenden Daemon")
+        log.warning("Forge: veraltete Halt-Datei beim Start entfernt — ein Halt ist eine Bitte an den laufenden Daemon")
 
     failures = 0
     while True:

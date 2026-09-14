@@ -799,7 +799,9 @@ class TestFund3ArtefaktWirdCommittet:
             aufgezeichnete_aufrufe.append(args)
 
             class _R:
-                returncode = 0
+                # `diff --cached --quiet` antwortet 1 = "es ist etwas
+                # gestaged" (siehe TestI2ArtefaktCommitIdempotent).
+                returncode = 1 if args[0] == "diff" else 0
                 stdout = ""
                 stderr = ""
             return _R()
@@ -813,6 +815,7 @@ class TestFund3ArtefaktWirdCommittet:
         assert ergebnis == "weiter"
         assert aufgezeichnete_aufrufe == [
             ("add", "--", pfad),
+            ("diff", "--cached", "--quiet", "--", pfad),
             ("commit", "-m", "docs(forge): Artefakt der Stufe 'spec' für Task 5 committet", "--", pfad),
         ], (
             "muss exakt diesen einen Pfad committen, nie 'git add -A' oder eine andere Datei"
@@ -862,6 +865,88 @@ class TestFund3ArtefaktWirdCommittet:
         assert ergebnis == "weiter"
         assert stubs["artefakte"] == []
         assert not any("Artefakt der Stufe" in str(a) for a in aufrufe)
+
+
+class TestI2ArtefaktCommitIdempotent:
+    """Abschluss-Review 2c, I2: `git commit -- pfad` endet mit 1 ("nothing to
+    commit"), wenn das Artefakt schon so in HEAD steht — beim Requeue mit
+    bestehender Spec oder nach einem Absturz zwischen Artefakt-Commit und
+    set_state. Die Stufe hat ihre Aufgabe dann erfüllt; ein Park wäre falsch.
+    Deshalb: `git add`, dann `git diff --cached --quiet -- pfad`; rc 0 heisst
+    nichts gestaged, also nichts zu committen."""
+
+    def _gitctl(self, monkeypatch, diff_rc):
+        aufrufe = []
+
+        def _run(*args, cwd=None, timeout=300):
+            aufrufe.append(args)
+
+            class _R:
+                returncode = diff_rc if args[0] == "diff" else 0
+                stdout = ""
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(pl.gitctl, "run", _run)
+        return aufrufe
+
+    def test_unveraendertes_artefakt_wird_nicht_committet(self, monkeypatch, tmp_path):
+        aufrufe = self._gitctl(monkeypatch, diff_rc=0)
+        assert pl._committe_artefakt(tmp_path, "spec", 5, "docs/x.md") is None
+        assert [a[0] for a in aufrufe] == ["add", "diff"], aufrufe
+
+    def test_gestagedes_artefakt_wird_committet(self, monkeypatch, tmp_path):
+        aufrufe = self._gitctl(monkeypatch, diff_rc=1)
+        assert pl._committe_artefakt(tmp_path, "spec", 5, "docs/x.md") is None
+        assert [a[0] for a in aufrufe] == ["add", "diff", "commit"], aufrufe
+
+    def test_spec_stufe_mit_unveraendertem_artefakt_geht_weiter(self, monkeypatch, stubs, tmp_path):
+        pfad = "docs/superpowers/specs/2026-08-15-x-design.md"
+        self._gitctl(monkeypatch, diff_rc=0)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _lauf(stubs, RunResult(ok=True, text=pfad)))
+        monkeypatch.setattr(pl, "_artefakt_vorhanden", lambda *a: True)
+        assert pl.eine_stufe(_task(m.SPECCING), tmp_path) == "weiter"
+        assert stubs["parks"] == []
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        ort = tmp_path / "repo"
+        ort.mkdir()
+
+        def g(*args):
+            return subprocess.run(["git", *args], cwd=str(ort), check=True,
+                                  capture_output=True, text=True).stdout
+        g("init", "-b", "main")
+        g("config", "user.email", "test@example.com")
+        g("config", "user.name", "Test")
+        (ort / "README.md").write_text("hallo\n")
+        g("add", "README.md")
+        g("commit", "-m", "erster Commit")
+        return ort, g
+
+    def test_zweiter_commit_desselben_artefakts_ist_kein_fehler_gegen_echtes_git(self, monkeypatch, repo):
+        ort, g = repo
+        monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
+        (ort / "docs").mkdir()
+        (ort / "docs" / "spec.md").write_text("# Spec\n")
+
+        assert pl._committe_artefakt(ort, "spec", 5, "docs/spec.md") is None
+        assert g("rev-list", "--count", "HEAD").strip() == "2"
+        # Requeue / Absturz nach dem Commit: dieselbe Stufe committet erneut.
+        assert pl._committe_artefakt(ort, "spec", 5, "docs/spec.md") is None
+        assert g("rev-list", "--count", "HEAD").strip() == "2", "leerer Commit oder Fehler beim zweiten Mal"
+
+    def test_neue_datei_wird_gegen_echtes_git_committet(self, monkeypatch, repo):
+        # Gegenprobe zur Idempotenz: eine noch nicht getrackte Datei ist kein
+        # "unverändert" — `git diff --quiet HEAD -- pfad` hätte sie mit rc 1
+        # als Änderung gemeldet, `diff --cached` sieht sie nach dem add.
+        ort, g = repo
+        monkeypatch.setattr(pl.gitctl, "run", _echtes_gitctl)
+        (ort / "docs").mkdir()
+        (ort / "docs" / "plan.md").write_text("# Plan\n")
+        assert pl._committe_artefakt(ort, "plan", 5, "docs/plan.md") is None
+        assert g("rev-list", "--count", "HEAD").strip() == "2"
+        assert g("status", "--porcelain").strip() == ""
 
 
 def _gitctl_aufzeichnend(monkeypatch, status_stdout="", returncodes=None):

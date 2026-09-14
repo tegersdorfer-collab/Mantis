@@ -28,8 +28,10 @@ def freigeben(task_id: int, repo: Path | None = None) -> str:
                     konfliktfrei nachziehen, oder der Merge selbst scheitert;
                     Task ist PARKED mit Hinweis
       "abgelehnt" — nichts passiert: falscher Zustand, schmutziges main,
-                    Hauptrepo nicht auf main. Der Aufrufer sagt Timo warum
-                    (siehe log).
+                    Hauptrepo nicht auf main, Worktree fehlt. Der Grund geht
+                    per log.warning raus (forge.cli konfiguriert logging auf
+                    WARNING, damit er im Terminal steht); der String-Vertrag
+                    bleibt für Plan 3 unverändert.
     """
     task = queue.hole(task_id)
     if task is None or task["state"] != m.AWAITING_APPROVAL:
@@ -40,15 +42,28 @@ def freigeben(task_id: int, repo: Path | None = None) -> str:
     zweig = worktree.branch_for(task_id)
     baum = worktree.path_for(task_id)
 
+    # 0. Ohne Worktree kein Nachziehen und kein Aufräumen (Ledger T5): git
+    #    in einem nicht existierenden Verzeichnis aufzurufen ist ein Fehler
+    #    ohne Aussage. Timo entscheidet, ob der Branch von Hand gemerged wird.
+    if not baum.is_dir():
+        log.warning(f"Forge-Freigabe: Worktree {baum} fehlt — Branch {zweig} von Hand prüfen "
+                    f"(git worktree remove --force, siehe forge/launchd/README.md)")
+        return "abgelehnt"
+
     # 1. Das Hauptrepo muss auf main stehen und sauber sein. Wir wechseln
     #    keine Branches unter Timo weg.
     kopf = _ausgabe(gitctl.run("rev-parse", "--abbrev-ref", "HEAD", cwd=quelle))
     if kopf != BASIS_BRANCH:
         log.warning(f"Forge-Freigabe: Hauptrepo steht auf '{kopf}', nicht auf '{BASIS_BRANCH}'")
         return "abgelehnt"
-    status = gitctl.run("status", "--porcelain", cwd=quelle)
+    # Abschluss-Review 2c, I6: untracked Dateien zählen nicht als schmutzig.
+    # In ~/Mantis liegt praktisch immer eine (Notiz, Scratch-Skript), und sie
+    # können einen Merge nicht beschädigen — legt der Branch dieselbe Datei
+    # an, bricht git den Merge selbst ab und wir landen bei "konflikt".
+    status = gitctl.run("status", "--porcelain", "--untracked-files=no", cwd=quelle)
     if status.returncode != 0 or _ausgabe(status):
-        log.warning("Forge-Freigabe: main ist nicht sauber — erst committen oder stashen")
+        log.warning("Forge-Freigabe: main ist nicht sauber — erst committen oder stashen: "
+                    f"{_ausgabe(status)[:300] or 'git status fehlgeschlagen'}")
         return "abgelehnt"
 
     # 2. Hat main sich seit Anlage des Worktrees bewegt? Dann den Branch im

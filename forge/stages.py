@@ -47,6 +47,7 @@ Messung, die das Gegenteil zeigt.
 from dataclasses import dataclass
 from typing import Callable
 
+from forge import gate
 from forge import models as m
 from forge import prompts
 from forge.runner import PermissionProfile
@@ -135,6 +136,18 @@ def _plan_prompt(task: dict, kontext: dict) -> str:
     )
 
 
+def _zonen_satz() -> str:
+    """Abschluss-Review 2c, I5: implement und fix nennen die erlaubten Zonen.
+    Die Liste kommt zur Laufzeit aus gate.ERLAUBTE_ZONEN — eine Kopie hier
+    würde beim nächsten Zonen-Umbau stillschweigend veralten, und ein Agent,
+    dem die Zonen niemand sagt, verbrennt einen ganzen Zyklus, um sie am Gate
+    herauszufinden."""
+    zonen = list(gate.ERLAUBTE_ZONEN)
+    aufzaehlung = ", ".join(zonen[:-1]) + " und " + zonen[-1] if len(zonen) > 1 else zonen[0]
+    return (f"Arbeite ausschließlich unter {aufzaehlung} — Änderungen außerhalb "
+            "weist das Gate zurück.")
+
+
 def _implement_prompt(task: dict, kontext: dict) -> str:
     return (
         _kopf(task) + "\n\n"
@@ -144,6 +157,7 @@ def _implement_prompt(task: dict, kontext: dict) -> str:
         "die Implementierung. Halte dich an die Konventionen der "
         "Codebase (Kommentare auf Deutsch, ruff select F+E9, line-length 120).\n"
         "Fasse NICHT an: .env, data/, forge/gate.py, forge/runner.py.\n"
+        + _zonen_satz() + "\n"
         "Du hast keine Shell: keine Befehle, kein git, keine Testläufe. Lass "
         "deine Arbeit einfach im Worktree stehen — die Pipeline committet sie."
     )
@@ -171,6 +185,7 @@ def _fix_prompt(task: dict, kontext: dict) -> str:
         "Behebe ausschließlich die dort als critical oder important markierten "
         "Befunde. Baue nichts darüber hinaus.\n"
         "Fasse NICHT an: .env, data/, forge/gate.py, forge/runner.py.\n"
+        + _zonen_satz() + "\n"
         "Du hast keine Shell: keine Befehle, kein git, keine Testläufe. Lass "
         "deine Arbeit einfach im Worktree stehen — die Pipeline committet sie."
     )
