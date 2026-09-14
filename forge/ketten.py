@@ -18,10 +18,14 @@ KETTEN: dict[str, tuple[tuple[str, str], ...]] = {
         ("opencode", "nvidia/moonshotai/kimi-k3"),
         ("opencode", "nvidia/minimaxai/minimax-m3"),
     ),
+    # Erste Nacht (2026-09-14): Kimi K3 als erstes Glied lieferte in 30 Minuten
+    # keinen Plan (Stufen-Timeout, keine Datei) — passend zur Messung "~200 s
+    # pro Antwort, nichts für Agent-Loops". Gemini Flash schrieb die Spec
+    # desselben Tasks in 2½ Minuten. Kimi bleibt als letzte Reserve.
     "plan": (
-        ("opencode", "nvidia/moonshotai/kimi-k3"),
         ("opencode", "google/gemini-3.6-flash"),
         ("opencode", "nvidia/minimaxai/minimax-m3"),
+        ("opencode", "nvidia/moonshotai/kimi-k3"),
     ),
     # Die letzten Glieder von implement und fix liegen bewusst bei einem
     # ANDEREN Anbieter. Erschöpfung gilt anbieterweit — eine Kette aus lauter
