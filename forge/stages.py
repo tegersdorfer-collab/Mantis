@@ -196,16 +196,16 @@ STAGES: tuple[Stage, ...] = (
     Stage("spec", m.SPECCING, m.PLANNING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _spec_prompt, lambda t: t.get("spec_path"),
-          backend="opencode", model="google/gemini-3.6-flash"),
+          backend="opencode", model="nvidia/nvidia/nemotron-3-super-120b-a12b"),
     Stage("plan", m.PLANNING, m.IMPLEMENTING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _plan_prompt, lambda t: t.get("plan_path"),
-          backend="opencode", model="nvidia/moonshotai/kimi-k3"),
+          backend="opencode", model="nvidia/nvidia/nemotron-3-super-120b-a12b"),
     Stage("implement", m.IMPLEMENTING, m.REVIEWING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                             mode="dontAsk"),
           _implement_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN,
-          backend="opencode", model="nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"),
+          backend="opencode", model="nvidia/nvidia/nemotron-3-super-120b-a12b"),
     Stage("review", m.REVIEWING, m.GATING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _review_prompt, lambda t: VERDIKT_DATEI,
@@ -221,7 +221,7 @@ FIX_STAGE = Stage(
     PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                       mode="dontAsk"),
     _fix_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN,
-    backend="opencode", model="nvidia/nvidia/nemotron-3.5-lightning-30b-a3b",
+    backend="opencode", model="nvidia/nvidia/nemotron-3-super-120b-a12b",
 )
 
 ALLE_STUFEN: tuple[Stage, ...] = STAGES + (FIX_STAGE,)

@@ -1317,7 +1317,9 @@ class TestBudgetMeldung:
     # (siehe Review-Finding 2: mit dem Namen statt Modell landet jeder
     # provider_von_modell()-Aufruf bei "antigravity" statt beim echten
     # Anbieter).
-    SPEC_MODELL = "google/gemini-3.6-flash"
+    # Aus stages gelesen statt hart codiert: die Ketten wurden am 2026-09-15
+    # nach Messung umgebaut, und der Test prüft die Buchung, nicht das Modell.
+    SPEC_MODELL = pl.stages.fuer_state(m.SPECCING).model
 
     def _budget_stub(self, monkeypatch):
         gebucht, erschoepft = [], []
