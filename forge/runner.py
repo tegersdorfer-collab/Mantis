@@ -17,7 +17,17 @@ log = logging.getLogger(__name__)
 
 # Textmarker, an denen ein erschöpftes Kontingent erkannt wird. Plan 3 nutzt das
 # Flag, um bis zum Reset zu schlafen, statt den Task zu parken.
-_RATE_LIMIT_MARKER = ("usage limit reached", "rate limit", "rate_limit")
+# Die ersten drei stammen aus der Claude-Code-Zeit. Der Rest kam in der ersten
+# Nacht (2026-09-14) dazu: Googles Tageslimit meldet sich als APIError mit
+# statusCode 429 / RESOURCE_EXHAUSTED / "exceeded your current quota" — ohne
+# diese Marker parkte der Task, statt auf das nächste Kettenglied auszuweichen.
+# "429" absichtlich nur als JSON-Feld, nicht als nackte Zahl: Modelle schreiben
+# Zahlen, und der Text des Laufs wird mitgeprüft.
+_RATE_LIMIT_MARKER = (
+    "usage limit reached", "rate limit", "rate_limit",
+    '"statuscode": 429', "too many requests", "resource_exhausted",
+    "quota exceeded", "exceeded your current quota",
+)
 
 # Modi, die für einen unbeaufsichtigten Daemon in Frage kommen. Ein Modus kommt
 # NUR dann in dieses Set, wenn eine Aufnahme (siehe tests/fixtures/permission_probe.md)

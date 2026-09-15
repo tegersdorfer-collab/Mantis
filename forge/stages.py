@@ -120,7 +120,7 @@ def _spec_prompt(task: dict, kontext: dict) -> str:
         f"YYYY-MM-DD-<kurzer-slug>-design.md.\n"
         "Inhalt: Ziel, betroffene Module, Datenfluss, Fehlerbehandlung, was "
         "ausdrücklich NICHT gebaut wird, und alle getroffenen Annahmen.\n"
-        "Ändere sonst nichts. Antworte am Ende nur mit dem Pfad der Datei."
+        "Ändere sonst nichts. " + _artefakt_satz()
     )
 
 
@@ -132,7 +132,20 @@ def _plan_prompt(task: dict, kontext: dict) -> str:
         "Dateiname: YYYY-MM-DD-<kurzer-slug>-plan.md.\n"
         "Zerlege in Schritte mit je einem eigenständig testbaren Ergebnis. Jeder "
         "Schritt nennt die exakten Dateipfade und enthält den Test ZUERST.\n"
-        "Ändere sonst nichts. Antworte am Ende nur mit dem Pfad der Datei."
+        "Ändere sonst nichts. " + _artefakt_satz()
+    )
+
+
+def _artefakt_satz() -> str:
+    """Messlauf 2026-09-15: Nemotron 3 Super las alle Quellen und meldete den
+    Plan-Pfad, ohne je `write` aufzurufen — die Pipeline parkte mit
+    'Erwartetes Artefakt fehlt'. Reasoning-Modelle halten die Aufgabe für
+    erledigt, sobald der Inhalt im Kopf ist. Der Vertrag steht deshalb
+    ausdrücklich im Prompt."""
+    return (
+        "Die Datei muss mit dem write-Werkzeug tatsächlich angelegt werden — erst "
+        "schreiben, dann antworten. Ein gemeldeter Pfad ohne angelegte Datei gilt "
+        "als Fehlschlag. Antworte am Ende nur mit dem Pfad der Datei."
     )
 
 
@@ -196,16 +209,16 @@ STAGES: tuple[Stage, ...] = (
     Stage("spec", m.SPECCING, m.PLANNING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _spec_prompt, lambda t: t.get("spec_path"),
-          backend="opencode", model="google/gemini-3.6-flash"),
+          backend="opencode", model="nvidia/nvidia/nemotron-3-super-120b-a12b"),
     Stage("plan", m.PLANNING, m.IMPLEMENTING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _plan_prompt, lambda t: t.get("plan_path"),
-          backend="opencode", model="nvidia/moonshotai/kimi-k3"),
+          backend="opencode", model="nvidia/nvidia/nemotron-3-super-120b-a12b"),
     Stage("implement", m.IMPLEMENTING, m.REVIEWING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                             mode="dontAsk"),
           _implement_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN,
-          backend="opencode", model="nvidia/minimaxai/minimax-m3"),
+          backend="opencode", model="nvidia/nvidia/nemotron-3-super-120b-a12b"),
     Stage("review", m.REVIEWING, m.GATING,
           PermissionProfile(allowed=("Read", "Grep", "Glob", "Write"), mode="dontAsk"),
           _review_prompt, lambda t: VERDIKT_DATEI,
@@ -221,7 +234,7 @@ FIX_STAGE = Stage(
     PermissionProfile(allowed=("Read", "Grep", "Glob", "Write", "Edit", "Bash"),
                       mode="dontAsk"),
     _fix_prompt, lambda t: None, timeout=IMPLEMENT_TIMEOUT_SEKUNDEN,
-    backend="opencode", model="nvidia/minimaxai/minimax-m3",
+    backend="opencode", model="nvidia/nvidia/nemotron-3-super-120b-a12b",
 )
 
 ALLE_STUFEN: tuple[Stage, ...] = STAGES + (FIX_STAGE,)

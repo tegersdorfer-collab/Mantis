@@ -429,7 +429,8 @@ _MARKDOWN_LINK = re.compile(r"^\[[^\]]*\]\(([^)]+)\)$")
 
 
 def _erwarteter_pfad_und_feld(stufe: stages.Stage, task: dict,
-                               ergebnis: runner.RunResult) -> tuple[str | None, str | None]:
+                               ergebnis: runner.RunResult,
+                               worktree: Path | None = None) -> tuple[str | None, str | None]:
     """Der Artefakt-Pfad, den diese Stufe versprochen hat, plus das Feld, in
     dem er (falls zutreffend) in der Queue landet.
 
@@ -447,10 +448,61 @@ def _erwarteter_pfad_und_feld(stufe: stages.Stage, task: dict,
         return stufe.artefakt(task), None
     roh = _letzte_zeile(ergebnis.text)
     kandidat = _bereinige_pfad(roh)
+    if worktree is not None:
+        kandidat = _unter_worktree_relativ(kandidat, Path(worktree))
     if not _ist_gueltiger_relativer_pfad(kandidat):
         raise _PfadUngueltig(roh)
     angereichert = {**task, feld: kandidat}
     return stufe.artefakt(angereichert), feld
+
+
+def _unter_worktree_relativ(kandidat: str, worktree: Path) -> str:
+    """Zwei harmlose Formen eines 'absoluten' Pfads, die reale Modelle liefern
+    (Messlauf 2026-09-15, Nemotron 3 Super): der volle Pfad INNERHALB des
+    Worktrees, und ein führender Slash vor einem Repo-Pfad ('/docs/…').
+    Beide werden relativ gemacht — aber nur, wenn die Datei unter dem
+    Worktree tatsächlich existiert. Alles andere (etwa '/etc/passwd') bleibt
+    absolut und fällt in _ist_gueltiger_relativer_pfad durch."""
+    if not kandidat.startswith("/"):
+        return kandidat
+    wurzel = worktree.resolve()
+    try:
+        return str(Path(kandidat).resolve().relative_to(wurzel))
+    except ValueError:
+        pass
+    ohne_slash = kandidat.lstrip("/")
+    if ohne_slash and ".." not in Path(ohne_slash).parts and (wurzel / ohne_slash).is_file():
+        return ohne_slash
+    return kandidat
+
+
+def _artefakt_seit_start(stufe: stages.Stage, worktree: Path, start: float) -> str | None:
+    """Das jüngste Dokument im Zielverzeichnis der Stufe, das seit Laufbeginn
+    entstanden ist — oder None. Bewusst NUR seit Laufbeginn: eine ältere
+    Datei (etwa aus dem vorigen Versuch nach requeue) ist kein Produkt dieses
+    Laufs und darf ein fehlendes Artefakt nicht kaschieren."""
+    verzeichnis = Path(worktree) / (stages.SPEC_VERZEICHNIS if stufe.name == "spec" else stages.PLAN_VERZEICHNIS)
+    neuestes = _juengste_datei_seit(verzeichnis, start)
+    return None if neuestes is None else str(neuestes.relative_to(worktree))
+
+
+def _naechstes_glied_oder_park(task: dict, task_id: int, state: str, worktree: Path,
+                               versagt: tuple[tuple[str, str], ...], modell: str, grund: str) -> str:
+    """Messlauf 2026-09-15: kein Gratis-Modell erfüllt den Vertrag 'genau
+    eine Datei, dann der Pfad' zuverlässig (Nemotron Super 1/3, Nano-Omni
+    2/3, Lightning 3/3 mit Beifang). Ein fehlendes Artefakt ist deshalb
+    Modellversagen, kein Task-Problem: das nächste Kettenglied bekommt
+    dieselbe Stufe, im selben Tick. Geparkt wird erst, wenn kein Glied mehr
+    übrig ist (siehe Kettenwahl in _eine_stufe_intern). Der Rekursionsgrund
+    ist endlich: jeder Anlauf sperrt ein weiteres Modell."""
+    journal.log(task_id, "stage_failed",
+                f"Stufe '{stufe_name_aus(state)}': {grund} nach Lauf mit {modell} — nächstes Glied")
+    return _eine_stufe_intern(task, task_id, state, worktree, versagt=versagt + ((modell, grund),))
+
+
+def stufe_name_aus(state: str) -> str:
+    stufe = stages.fuer_state(state)
+    return stufe.name if stufe else state
 
 
 def _letzte_zeile(text: str) -> str:
@@ -561,7 +613,12 @@ def eine_stufe(task: dict, worktree: Path) -> str:
         return "geparkt"
 
 
-def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> str:
+def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path,
+                       versagt: tuple[tuple[str, str], ...] = ()) -> str:
+    """`versagt`: (Modell, Grund) je Glied, das in DIESEM Tick schon gelaufen
+    ist, ohne sein Artefakt zu liefern (siehe _naechstes_glied_oder_park).
+    Die Modelle sind für die Kettenwahl gesperrt, damit der nächste Anlauf ein
+    anderes Glied nimmt; die Gründe landen im Park-Grund, wenn keins liefert."""
     stufe, ist_fix = _waehle_stufe(state, worktree)
     if stufe is None:
         _park(task_id, state, f"Kein Stufen-Handler für Zustand '{state}' (Task {task_id})")
@@ -575,13 +632,24 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
     # irreführenden Grund "Fix-Runden-Grenze erreicht" da, obwohl in
     # Wirklichkeit kein Anbieter mehr verfügbar war.
     # Die Review-Stufe darf nicht auf dem Modell laufen, das implementiert hat.
-    verboten = frozenset()
+    versagte_modelle = tuple(modell_ for modell_, _ in versagt)
+    verboten = frozenset(versagte_modelle)
     if stufe.name == "review":
         vorher = task.get("implement_model")
         if vorher:
-            verboten = frozenset({vorher})
+            verboten = verboten | {vorher}
 
     wahl = ketten.waehle(stufe.name, verboten=verboten)
+    if wahl is not None and wahl[1] in versagte_modelle:
+        # Eine Kettenwahl, die `verboten` ignoriert (Stub, Fehlkonfiguration),
+        # darf nicht endlos dasselbe gescheiterte Glied liefern.
+        wahl = None
+    if wahl is None and versagt:
+        einzeln = "; ".join(f"{modell_}: {grund_}" for modell_, grund_ in versagt)
+        _park(task_id, state,
+              f"Kein Kettenglied hat für Stufe '{stufe.name}' ein Artefakt geliefert — "
+              f"{einzeln} (Task {task_id})")
+        return "geparkt"
     if wahl is None:
         # Zwei Ursachen, zwei Ausgänge (Abschluss-Review C2, 2026-09-10). Vorher
         # parkte hier beides — und weil der Daemon bei "geparkt" nicht schläft,
@@ -736,17 +804,35 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
             # _timeout_produkt tritt an ihre Stelle.
             erwartet, feld = zeitueberschreitung_pfad, _ARTEFAKT_FELD_JE_STUFE[stufe.name]
         else:
-            erwartet, feld = _erwarteter_pfad_und_feld(stufe, task, ergebnis)
+            erwartet, feld = _erwarteter_pfad_und_feld(stufe, task, ergebnis, worktree)
     except _PfadUngueltig as exc:
-        _park(task_id, state,
-              f"Von Stufe '{stufe.name}' gelieferter Pfad sieht auch nach Normalisierung nicht wie "
-              f"ein Repo-relativer Pfad aus — roher Modelltext: {exc.roh!r} (Task {task_id})")
-        return "geparkt"
-    if erwartet is not None:
-        if not _artefakt_vorhanden(worktree, erwartet):
+        if stufe.name in _ARTEFAKT_FELD_JE_STUFE:
+            # Messlauf 2026-09-15: Lightning antwortete mit Prosa, der Plan lag
+            # trotzdem im Verzeichnis. Die Antwort ist ein Hinweis, die Datei
+            # der Beweis — erst suchen, dann urteilen.
+            erwartet, feld = _artefakt_seit_start(stufe, worktree, start), _ARTEFAKT_FELD_JE_STUFE[stufe.name]
+            if erwartet is None:
+                return _naechstes_glied_oder_park(
+                    task, task_id, state, worktree, versagt, modell,
+                    f"Pfad unbrauchbar ({exc.roh!r}) und kein Artefakt seit Laufbeginn")
+        else:
+            _park(task_id, state,
+                  f"Von Stufe '{stufe.name}' gelieferter Pfad sieht auch nach Normalisierung nicht wie "
+                  f"ein Repo-relativer Pfad aus — roher Modelltext: {exc.roh!r} (Task {task_id})")
+            return "geparkt"
+    if erwartet is not None and not _artefakt_vorhanden(worktree, erwartet):
+        if stufe.name in _ARTEFAKT_FELD_JE_STUFE:
+            gefunden = _artefakt_seit_start(stufe, worktree, start)
+            if gefunden is None:
+                return _naechstes_glied_oder_park(
+                    task, task_id, state, worktree, versagt, modell,
+                    f"gemeldetes Artefakt {erwartet} fehlt und keins seit Laufbeginn")
+            erwartet = gefunden
+        else:
             _park(task_id, state,
                   f"Erwartetes Artefakt fehlt: {erwartet} (Stufe '{stufe.name}', Task {task_id})")
             return "geparkt"
+    if erwartet is not None:
         if feld is not None:
             queue.setze_artefakt(task_id, feld, erwartet)
             # Akzeptanzlauf 2026-08-15, Fund 3: ohne diesen Commit sieht das

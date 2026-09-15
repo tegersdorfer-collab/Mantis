@@ -13,32 +13,38 @@ from forge import budget
 
 # Stufenname → geordnete Folge von (backend, model).
 KETTEN: dict[str, tuple[tuple[str, str], ...]] = {
+    # Gemessen am 2026-09-15 (Direkt-Ping + Agent-Loop durch runner_opencode,
+    # Aufgabe: Datei lesen, Datei rückwärts schreiben, Pfad melden):
+    #   nemotron-3-super-120b      8,5 s, korrekt          -> erstes Glied überall
+    #   nemotron-3.5-lightning    30 s, Datei mit Fehlern  -> Reserve
+    #   nemotron-3-nano-omni      72 s, Datei mit Fehlern  -> Reserve
+    #   gpt-oss-20b              109 s, keine Datei        -> raus
+    #   kimi-k3                   60 s ohne ein "OK"       -> raus
+    #   minimax-m3                seit 2026-09-09 abgeschaltet (410) -> raus
+    #   gemini-3.6-flash          gut, aber 20 Requests/TAG je Modell im Free
+    #                             Tier — ein Agent-Loop frisst das in einer
+    #                             Stufe -> nur letztes Glied, nie erstes
+    # Erschöpfung gilt anbieterweit; das letzte Glied liegt deshalb bei einem
+    # anderen Anbieter (google), damit ein NVIDIA-Rate-Limit die Stufe nicht
+    # sofort trockenlegt.
     "spec": (
+        ("opencode", "nvidia/nvidia/nemotron-3-super-120b-a12b"),
+        ("opencode", "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"),
         ("opencode", "google/gemini-3.6-flash"),
-        ("opencode", "nvidia/moonshotai/kimi-k3"),
-        ("opencode", "nvidia/minimaxai/minimax-m3"),
     ),
     "plan": (
-        ("opencode", "nvidia/moonshotai/kimi-k3"),
+        ("opencode", "nvidia/nvidia/nemotron-3-super-120b-a12b"),
+        ("opencode", "nvidia/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"),
         ("opencode", "google/gemini-3.6-flash"),
-        ("opencode", "nvidia/minimaxai/minimax-m3"),
     ),
-    # Die letzten Glieder von implement und fix liegen bewusst bei einem
-    # ANDEREN Anbieter. Erschöpfung gilt anbieterweit — eine Kette aus lauter
-    # NVIDIA-Modellen wäre mit einer einzigen Rate-Limit-Meldung komplett tot,
-    # und zwar bei der Stufe, ohne die kein Task fertig wird. Gemini Flash ist
-    # für Code schwächer als MiniMax; ein schwächeres Modell, dessen Arbeit das
-    # Gate prüft und Timo freigibt, ist besser als gar keine Stufe.
     "implement": (
-        ("opencode", "nvidia/minimaxai/minimax-m3"),
+        ("opencode", "nvidia/nvidia/nemotron-3-super-120b-a12b"),
         ("opencode", "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"),
-        ("opencode", "nvidia/moonshotai/kimi-k3"),
         ("opencode", "google/gemini-3.6-flash"),
     ),
     "fix": (
-        ("opencode", "nvidia/minimaxai/minimax-m3"),
+        ("opencode", "nvidia/nvidia/nemotron-3-super-120b-a12b"),
         ("opencode", "nvidia/nvidia/nemotron-3.5-lightning-30b-a3b"),
-        ("opencode", "nvidia/moonshotai/kimi-k3"),
         ("opencode", "google/gemini-3.6-flash"),
     ),
     # Review ist bewusst Antigravity-only, und die Kette ist deshalb kürzer als
@@ -46,12 +52,8 @@ KETTEN: dict[str, tuple[tuple[str, str], ...]] = {
     # .forge/diff.patch gelesen und in den Prompt eingebettet, das Urteil kommt
     # auf stdout, und der Runner schreibt daraus .forge/review.json. Nur
     # forge/runner_agy.py kann das; forge/runner_opencode.py kennt weder die
-    # eine noch die andere Datei. Ein opencode-Glied hier bekäme einen Prompt,
-    # der "der Diff steht unten" behauptet (er steht nicht da) und "schreib
-    # keine Datei, das macht der Runner" (er macht es nicht) — ein voller Lauf
-    # für nichts, und schlimmstenfalls schriebe das Modell (edit: allow) sich
-    # selbst ein "pass", ohne den Diff je gesehen zu haben. Zwei Glieder sind
-    # die ehrliche Kettenlänge, solange nur ein Backend das Protokoll kann.
+    # eine noch die andere Datei. Zwei Glieder sind die ehrliche Kettenlänge,
+    # solange nur ein Backend das Protokoll kann.
     "review": (
         ("agy", "claude-opus-4-6-thinking"),
         ("agy", "gemini-3.1-pro-high"),

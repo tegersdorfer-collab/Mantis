@@ -604,6 +604,37 @@ class TestPfadNormalisierung:
         assert "/etc/passwd" in grund
         assert stubs["artefakte"] == []
 
+    def test_fuehrender_slash_vor_repo_pfad_wird_entfernt_wenn_datei_da_ist(self, monkeypatch, stubs, tmp_path):
+        """Messlauf 2026-09-15: Nemotron 3 Super schrieb die Datei korrekt und
+        antwortete '/docs/superpowers/plans/…' — mit führendem Slash. Ohne
+        diesen Fall parkte die Stufe mit 'Artefakt fehlt', obwohl es da lag."""
+        (tmp_path / self.ECHTER_PFAD).parent.mkdir(parents=True)
+        (tmp_path / self.ECHTER_PFAD).write_text("x")
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
+                            _lauf(stubs, RunResult(ok=True, text="/" + self.ECHTER_PFAD)))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "weiter"
+        assert ("spec_path", self.ECHTER_PFAD) in stubs["artefakte"]
+
+    def test_absoluter_pfad_innerhalb_des_worktrees_wird_relativ(self, monkeypatch, stubs, tmp_path):
+        (tmp_path / self.ECHTER_PFAD).parent.mkdir(parents=True)
+        (tmp_path / self.ECHTER_PFAD).write_text("x")
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
+                            _lauf(stubs, RunResult(ok=True, text=str(tmp_path / self.ECHTER_PFAD))))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "weiter"
+        assert ("spec_path", self.ECHTER_PFAD) in stubs["artefakte"]
+
+    def test_fuehrender_slash_ohne_datei_bleibt_abgelehnt(self, monkeypatch, stubs, tmp_path):
+        """/etc/passwd darf auch dann nicht durchgehen, wenn es zufällig einen
+        Unterordner etc/ im Worktree gäbe — nur ein EXISTIERENDES Artefakt
+        unter dem Worktree rechtfertigt das Abschneiden des Slashs."""
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
+                            _lauf(stubs, RunResult(ok=True, text="/docs/gibt-es-nicht.md")))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "geparkt"
+        assert stubs["artefakte"] == []
+
     def test_pfad_mit_elternverzeichnis_wird_abgelehnt(self, monkeypatch, stubs, tmp_path):
         monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="docs/../../../etc/passwd")))
@@ -1317,7 +1348,9 @@ class TestBudgetMeldung:
     # (siehe Review-Finding 2: mit dem Namen statt Modell landet jeder
     # provider_von_modell()-Aufruf bei "antigravity" statt beim echten
     # Anbieter).
-    SPEC_MODELL = "google/gemini-3.6-flash"
+    # Aus stages gelesen statt hart codiert: die Ketten wurden am 2026-09-15
+    # nach Messung umgebaut, und der Test prüft die Buchung, nicht das Modell.
+    SPEC_MODELL = pl.stages.fuer_state(m.SPECCING).model
 
     def _budget_stub(self, monkeypatch):
         gebucht, erschoepft = [], []
@@ -1728,3 +1761,96 @@ class TestKontingentJournalKind:
         pl._eine_stufe_intern({"id": 1}, 1, m.SPECCING, tmp_path)
         kinds = [a[1] for a, kw in stubs["journal"]]
         assert "kontingent" in kinds
+
+
+class TestArtefaktFehltNaechstesGlied:
+    """Messlauf 2026-09-15: kein Gratis-Modell erfüllt den Vertrag 'genau eine
+    Datei, dann den Pfad' zuverlässig — Nemotron Super meldet den Pfad in
+    2 von 3 Läufen, ohne je write aufzurufen; Nano-Omni stellt einmal eine
+    Rückfrage; Lightning schreibt drei Dateien. Ein fehlendes Artefakt ist
+    Modellversagen und wird mit dem nächsten Kettenglied beantwortet, nicht
+    mit einem Park. Erst wenn kein Glied liefert, wird geparkt."""
+
+    KETTE = (("opencode", "m/eins"), ("opencode", "m/zwei"), ("opencode", "m/drei"))
+
+    def _kette(self, monkeypatch):
+        def _waehle(name, verboten=frozenset()):
+            for glied in self.KETTE:
+                if glied[1] not in verboten:
+                    return glied
+            return None
+        monkeypatch.setattr(pl.ketten, "waehle", _waehle)
+        monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: False)
+
+    def _backend(self, monkeypatch, stubs, tmp_path, schreibt_ab_lauf):
+        """Jeder Lauf meldet den Pfad; die Datei entsteht erst ab Lauf Nr. n."""
+        laeufe = {"n": 0}
+        pfad = "docs/superpowers/specs/2026-09-15-x-design.md"
+
+        def _run(prompt, cwd, timeout=1800, agent=None, model=None):
+            laeufe["n"] += 1
+            stubs.setdefault("modelle", []).append(model)
+            if laeufe["n"] >= schreibt_ab_lauf:
+                (tmp_path / pfad).parent.mkdir(parents=True, exist_ok=True)
+                (tmp_path / pfad).write_text("spec")
+            return RunResult(ok=True, text=pfad)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
+        return pfad
+
+    def test_zweites_glied_liefert_das_artefakt(self, monkeypatch, stubs, tmp_path):
+        self._kette(monkeypatch)
+        pfad = self._backend(monkeypatch, stubs, tmp_path, schreibt_ab_lauf=2)
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "weiter"
+        assert stubs["modelle"] == ["m/eins", "m/zwei"]
+        assert ("spec_path", pfad) in stubs["artefakte"]
+        assert stubs["parks"] == []
+        vermerke = [a[2] for a, kw in stubs["journal"] if "nächstes Glied" in a[2]]
+        assert vermerke and "m/eins" in vermerke[0]
+
+    def test_alle_glieder_ohne_artefakt_parken_mit_liste(self, monkeypatch, stubs, tmp_path):
+        self._kette(monkeypatch)
+        self._backend(monkeypatch, stubs, tmp_path, schreibt_ab_lauf=99)
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "geparkt"
+        assert stubs["modelle"] == ["m/eins", "m/zwei", "m/drei"]
+        grund = stubs["parks"][-1][1]
+        assert "kein Kettenglied" in grund.lower() or "Kein Kettenglied" in grund
+        assert "m/eins" in grund and "m/drei" in grund
+
+    def test_stub_kette_ohne_verboten_laeuft_nicht_endlos(self, monkeypatch, stubs, tmp_path):
+        """Die stubs-Fixture ignoriert `verboten` — liefert die Kettenwahl ein
+        bereits gescheitertes Glied erneut, gilt die Kette als leer."""
+        self._backend(monkeypatch, stubs, tmp_path, schreibt_ab_lauf=99)
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "geparkt"
+        assert len(stubs["modelle"]) == 1
+
+    def test_unbrauchbarer_pfad_aber_datei_seit_laufbeginn_wird_genommen(self, monkeypatch, stubs, tmp_path):
+        """Lightning V2: die Antwort war Prosa, der Plan lag trotzdem da."""
+        self._kette(monkeypatch)
+        pfad = "docs/superpowers/specs/2026-09-15-y-design.md"
+
+        def _run(prompt, cwd, timeout=1800, agent=None, model=None):
+            (tmp_path / pfad).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / pfad).write_text("spec")
+            return RunResult(ok=True, text="Ich habe die Spec mit allen geforderten Abschnitten geschrieben.")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "weiter"
+        assert ("spec_path", pfad) in stubs["artefakte"]
+
+    def test_alte_datei_im_verzeichnis_zaehlt_nicht_als_produkt(self, monkeypatch, stubs, tmp_path):
+        """Eine Datei von vor dem Laufbeginn (z.B. aus dem vorigen Versuch nach
+        requeue) darf ein fehlendes Artefakt nicht kaschieren."""
+        import os, time
+        self._kette(monkeypatch)
+        alt = tmp_path / "docs/superpowers/specs/2026-09-14-alt-design.md"
+        alt.parent.mkdir(parents=True)
+        alt.write_text("alt")
+        vergangen = time.time() - 3600
+        os.utime(alt, (vergangen, vergangen))
+        self._backend(monkeypatch, stubs, tmp_path, schreibt_ab_lauf=99)
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "geparkt"
+        assert stubs["artefakte"] == []
