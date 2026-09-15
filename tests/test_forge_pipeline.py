@@ -604,6 +604,37 @@ class TestPfadNormalisierung:
         assert "/etc/passwd" in grund
         assert stubs["artefakte"] == []
 
+    def test_fuehrender_slash_vor_repo_pfad_wird_entfernt_wenn_datei_da_ist(self, monkeypatch, stubs, tmp_path):
+        """Messlauf 2026-09-15: Nemotron 3 Super schrieb die Datei korrekt und
+        antwortete '/docs/superpowers/plans/…' — mit führendem Slash. Ohne
+        diesen Fall parkte die Stufe mit 'Artefakt fehlt', obwohl es da lag."""
+        (tmp_path / self.ECHTER_PFAD).parent.mkdir(parents=True)
+        (tmp_path / self.ECHTER_PFAD).write_text("x")
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
+                            _lauf(stubs, RunResult(ok=True, text="/" + self.ECHTER_PFAD)))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "weiter"
+        assert ("spec_path", self.ECHTER_PFAD) in stubs["artefakte"]
+
+    def test_absoluter_pfad_innerhalb_des_worktrees_wird_relativ(self, monkeypatch, stubs, tmp_path):
+        (tmp_path / self.ECHTER_PFAD).parent.mkdir(parents=True)
+        (tmp_path / self.ECHTER_PFAD).write_text("x")
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
+                            _lauf(stubs, RunResult(ok=True, text=str(tmp_path / self.ECHTER_PFAD))))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "weiter"
+        assert ("spec_path", self.ECHTER_PFAD) in stubs["artefakte"]
+
+    def test_fuehrender_slash_ohne_datei_bleibt_abgelehnt(self, monkeypatch, stubs, tmp_path):
+        """/etc/passwd darf auch dann nicht durchgehen, wenn es zufällig einen
+        Unterordner etc/ im Worktree gäbe — nur ein EXISTIERENDES Artefakt
+        unter dem Worktree rechtfertigt das Abschneiden des Slashs."""
+        monkeypatch.setattr(pl.backends, "hole", lambda name:
+                            _lauf(stubs, RunResult(ok=True, text="/docs/gibt-es-nicht.md")))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
+        assert ergebnis == "geparkt"
+        assert stubs["artefakte"] == []
+
     def test_pfad_mit_elternverzeichnis_wird_abgelehnt(self, monkeypatch, stubs, tmp_path):
         monkeypatch.setattr(pl.backends, "hole", lambda name:
                             _lauf(stubs, RunResult(ok=True, text="docs/../../../etc/passwd")))

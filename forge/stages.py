@@ -120,7 +120,7 @@ def _spec_prompt(task: dict, kontext: dict) -> str:
         f"YYYY-MM-DD-<kurzer-slug>-design.md.\n"
         "Inhalt: Ziel, betroffene Module, Datenfluss, Fehlerbehandlung, was "
         "ausdrücklich NICHT gebaut wird, und alle getroffenen Annahmen.\n"
-        "Ändere sonst nichts. Antworte am Ende nur mit dem Pfad der Datei."
+        "Ändere sonst nichts. " + _artefakt_satz()
     )
 
 
@@ -132,7 +132,20 @@ def _plan_prompt(task: dict, kontext: dict) -> str:
         "Dateiname: YYYY-MM-DD-<kurzer-slug>-plan.md.\n"
         "Zerlege in Schritte mit je einem eigenständig testbaren Ergebnis. Jeder "
         "Schritt nennt die exakten Dateipfade und enthält den Test ZUERST.\n"
-        "Ändere sonst nichts. Antworte am Ende nur mit dem Pfad der Datei."
+        "Ändere sonst nichts. " + _artefakt_satz()
+    )
+
+
+def _artefakt_satz() -> str:
+    """Messlauf 2026-09-15: Nemotron 3 Super las alle Quellen und meldete den
+    Plan-Pfad, ohne je `write` aufzurufen — die Pipeline parkte mit
+    'Erwartetes Artefakt fehlt'. Reasoning-Modelle halten die Aufgabe für
+    erledigt, sobald der Inhalt im Kopf ist. Der Vertrag steht deshalb
+    ausdrücklich im Prompt."""
+    return (
+        "Die Datei muss mit dem write-Werkzeug tatsächlich angelegt werden — erst "
+        "schreiben, dann antworten. Ein gemeldeter Pfad ohne angelegte Datei gilt "
+        "als Fehlschlag. Antworte am Ende nur mit dem Pfad der Datei."
     )
 
 

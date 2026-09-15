@@ -429,7 +429,8 @@ _MARKDOWN_LINK = re.compile(r"^\[[^\]]*\]\(([^)]+)\)$")
 
 
 def _erwarteter_pfad_und_feld(stufe: stages.Stage, task: dict,
-                               ergebnis: runner.RunResult) -> tuple[str | None, str | None]:
+                               ergebnis: runner.RunResult,
+                               worktree: Path | None = None) -> tuple[str | None, str | None]:
     """Der Artefakt-Pfad, den diese Stufe versprochen hat, plus das Feld, in
     dem er (falls zutreffend) in der Queue landet.
 
@@ -447,10 +448,32 @@ def _erwarteter_pfad_und_feld(stufe: stages.Stage, task: dict,
         return stufe.artefakt(task), None
     roh = _letzte_zeile(ergebnis.text)
     kandidat = _bereinige_pfad(roh)
+    if worktree is not None:
+        kandidat = _unter_worktree_relativ(kandidat, Path(worktree))
     if not _ist_gueltiger_relativer_pfad(kandidat):
         raise _PfadUngueltig(roh)
     angereichert = {**task, feld: kandidat}
     return stufe.artefakt(angereichert), feld
+
+
+def _unter_worktree_relativ(kandidat: str, worktree: Path) -> str:
+    """Zwei harmlose Formen eines 'absoluten' Pfads, die reale Modelle liefern
+    (Messlauf 2026-09-15, Nemotron 3 Super): der volle Pfad INNERHALB des
+    Worktrees, und ein führender Slash vor einem Repo-Pfad ('/docs/…').
+    Beide werden relativ gemacht — aber nur, wenn die Datei unter dem
+    Worktree tatsächlich existiert. Alles andere (etwa '/etc/passwd') bleibt
+    absolut und fällt in _ist_gueltiger_relativer_pfad durch."""
+    if not kandidat.startswith("/"):
+        return kandidat
+    wurzel = worktree.resolve()
+    try:
+        return str(Path(kandidat).resolve().relative_to(wurzel))
+    except ValueError:
+        pass
+    ohne_slash = kandidat.lstrip("/")
+    if ohne_slash and ".." not in Path(ohne_slash).parts and (wurzel / ohne_slash).is_file():
+        return ohne_slash
+    return kandidat
 
 
 def _letzte_zeile(text: str) -> str:
@@ -736,7 +759,7 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path) -> 
             # _timeout_produkt tritt an ihre Stelle.
             erwartet, feld = zeitueberschreitung_pfad, _ARTEFAKT_FELD_JE_STUFE[stufe.name]
         else:
-            erwartet, feld = _erwarteter_pfad_und_feld(stufe, task, ergebnis)
+            erwartet, feld = _erwarteter_pfad_und_feld(stufe, task, ergebnis, worktree)
     except _PfadUngueltig as exc:
         _park(task_id, state,
               f"Von Stufe '{stufe.name}' gelieferter Pfad sieht auch nach Normalisierung nicht wie "
