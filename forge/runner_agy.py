@@ -122,7 +122,14 @@ def run(prompt: str, cwd: Path, timeout: int, agent: str, model: str) -> RunResu
             # Stufen-Timeout: ein langes Opus-Thinking-Review bräche agy selbst
             # ab, und die Pipeline sähe einen leeren Lauf ohne Verdikt
             # (Befund vor der ersten Nacht, 2026-09-14). Go-Dauerformat.
-            [AGY_BIN, "-p", voll, "--model", model, "--print-timeout", f"{timeout}s"],
+            # --add-dir: agy arbeitet sonst in einem eigenen Scratch-Bereich und
+            # findet die Quellen nicht, die der Reviewer zum Prüfen von
+            # Testerwartungen lesen will (Task 621, 2026-09-16: "The file isn't
+            # in the scratch directory", danach kein Verdikt). --mode plan:
+            # nur lesende Werkzeuge — das Urteil kommt auf stdout, die Datei
+            # schreibt dieser Runner, nicht das Modell.
+            [AGY_BIN, "-p", voll, "--model", model, "--print-timeout", f"{timeout}s",
+             "--add-dir", str(cwd), "--mode", "plan"],
             capture_output=True, text=True, timeout=timeout,
             cwd=str(cwd), stdin=subprocess.DEVNULL,
         )

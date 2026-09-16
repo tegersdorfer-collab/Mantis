@@ -250,3 +250,30 @@ class TestPrintTimeout:
         cmd = auf["cmd"]
         assert "--print-timeout" in cmd
         assert cmd[cmd.index("--print-timeout") + 1] == "1800s"
+
+
+class TestArbeitsbereichUndLesemodus:
+    """Nacht 15./16.09.2026, Task 621: der Reviewer wollte core/skills/utility.py
+    lesen, um die Testerwartungen zu prüfen, und fand die Datei nicht — agy
+    arbeitet in einem eigenen Scratch-Bereich, `cwd` allein reicht ihm nicht.
+    Nach zwei vergeblichen Suchversuchen brach die Ausgabe ohne Verdikt ab.
+    Gemessen am 2026-09-16: mit `--add-dir <worktree>` und `--mode plan`
+    (nur lesende Werkzeuge) liest agy die Datei und antwortet in 18 s."""
+
+    def _cmd(self, monkeypatch, tmp_path):
+        _mit_diff(tmp_path)
+        auf = {}
+        monkeypatch.setattr(ra, "AGY_BIN", "/usr/local/bin/agy")
+        monkeypatch.setattr(subprocess, "run", _fake(auf, '{"verdict": "pass", "findings": []}'))
+        ra.run("x", cwd=tmp_path, timeout=60, agent="review", model="m")
+        return auf["cmd"]
+
+    def test_worktree_wird_als_arbeitsbereich_hinzugefuegt(self, monkeypatch, tmp_path):
+        cmd = self._cmd(monkeypatch, tmp_path)
+        assert "--add-dir" in cmd
+        assert cmd[cmd.index("--add-dir") + 1] == str(tmp_path)
+
+    def test_reviewer_laeuft_im_lesemodus(self, monkeypatch, tmp_path):
+        cmd = self._cmd(monkeypatch, tmp_path)
+        assert "--mode" in cmd
+        assert cmd[cmd.index("--mode") + 1] == "plan"
