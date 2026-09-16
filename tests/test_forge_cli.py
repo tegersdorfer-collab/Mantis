@@ -45,8 +45,8 @@ class TestCli:
     def test_stop_schreibt_die_halt_datei(self, monkeypatch, tmp_path):
         _stumm(monkeypatch)
         halt = tmp_path / "halt"
-        monkeypatch.setattr(cli.daemon, "HALT_FILE", halt)
-        monkeypatch.setattr(cli, "_daemon_laeuft", lambda: True)
+        monkeypatch.setattr(cli.freigabe.daemon, "HALT_FILE", halt)
+        monkeypatch.setattr(cli.freigabe, "daemon_laeuft", lambda: True)
         assert cli.main(["stop"]) == 0
         assert halt.exists()
 
@@ -63,15 +63,15 @@ class TestStopOhneDaemon:
     def test_ohne_daemon_keine_halt_datei_und_exit_1(self, monkeypatch, tmp_path, capsys):
         _stumm(monkeypatch)
         halt = tmp_path / "halt"
-        monkeypatch.setattr(cli.daemon, "HALT_FILE", halt)
-        monkeypatch.setattr(cli, "_daemon_laeuft", lambda: False)
+        monkeypatch.setattr(cli.freigabe.daemon, "HALT_FILE", halt)
+        monkeypatch.setattr(cli.freigabe, "daemon_laeuft", lambda: False)
         assert cli.main(["stop"]) == 1
         assert not halt.exists()
 
     def test_ohne_daemon_nennt_den_not_aus_und_launchctl(self, monkeypatch, tmp_path, capsys):
         _stumm(monkeypatch)
-        monkeypatch.setattr(cli.daemon, "HALT_FILE", tmp_path / "halt")
-        monkeypatch.setattr(cli, "_daemon_laeuft", lambda: False)
+        monkeypatch.setattr(cli.freigabe.daemon, "HALT_FILE", tmp_path / "halt")
+        monkeypatch.setattr(cli.freigabe, "daemon_laeuft", lambda: False)
         cli.main(["stop"])
         out = capsys.readouterr().out
         assert "Kein Daemon läuft" in out
@@ -80,30 +80,10 @@ class TestStopOhneDaemon:
 
     def test_mit_daemon_meldet_den_halt(self, monkeypatch, tmp_path, capsys):
         _stumm(monkeypatch)
-        monkeypatch.setattr(cli.daemon, "HALT_FILE", tmp_path / "halt")
-        monkeypatch.setattr(cli, "_daemon_laeuft", lambda: True)
+        monkeypatch.setattr(cli.freigabe.daemon, "HALT_FILE", tmp_path / "halt")
+        monkeypatch.setattr(cli.freigabe, "daemon_laeuft", lambda: True)
         assert cli.main(["stop"]) == 0
         assert "Halt angefordert" in capsys.readouterr().out
-
-    def test_daemon_laeuft_fragt_pgrep_nach_forge_daemon(self, monkeypatch):
-        aufrufe = []
-
-        class _R:
-            returncode = 0
-
-        def _run(cmd, **kw):
-            aufrufe.append(cmd)
-            return _R()
-
-        monkeypatch.setattr(cli.subprocess, "run", _run)
-        assert cli._daemon_laeuft() is True
-        assert aufrufe == [["pgrep", "-f", "forge.daemon"]]
-
-    def test_daemon_laeuft_ist_false_bei_pgrep_rc_1(self, monkeypatch):
-        class _R:
-            returncode = 1
-        monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: _R())
-        assert cli._daemon_laeuft() is False
 
 
 class TestAblehnungsgrundErreichtDasTerminal:

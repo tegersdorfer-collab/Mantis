@@ -6,9 +6,10 @@ main, ein Hauptrepo auf einem anderen Branch oder ein Konflikt beim Nachziehen
 enden mit einer Meldung, nicht mit einem halben Merge.
 """
 import logging
+import subprocess
 from pathlib import Path
 
-from forge import MANTIS_REPO, gitctl, journal, queue, worktree
+from forge import MANTIS_REPO, daemon, gitctl, journal, queue, worktree
 from forge import models as m
 from forge.pipeline import BASIS_BRANCH
 
@@ -107,9 +108,47 @@ def ablehnen(task_id: int, grund: str) -> bool:
     return ok
 
 
-def neu_einreihen(task_id: int) -> bool:
+def neu_einreihen(task_id: int, quelle: str = "forge.cli requeue") -> bool:
     """PARKED/FAILED -> QUEUED, Zähler zurück (siehe queue.requeue)."""
     ok = queue.requeue(task_id)
     if ok:
-        journal.log(task_id, "resumed", "Neu eingereiht (forge.cli requeue)")
+        journal.log(task_id, "resumed", f"Neu eingereiht ({quelle})")
     return ok
+
+
+def daemon_laeuft() -> bool:
+    """Läuft gerade ein Forge-Daemon? Abschluss-Review 2c, I3.
+
+    `pgrep -f` matcht auf die volle Befehlszeile. Das Muster ist bewusst
+    `-m forge\\.daemon$` (Handoff 16.09., Befund 4): `forge.daemon` allein traf
+    auch `forge.daemon_xyz` und jeden Prozess, der den Pfad im Argument hat —
+    das `$` verankert am Ende, launchd startet mit `... -m forge.daemon`
+    (siehe com.mantis.forge.plist). Das `--` davor ist kein Stil, sondern
+    Pflicht: das BSD-pgrep auf macOS liest ein Muster, das mit `-m` beginnt,
+    sonst als eigene Option und bricht mit "illegal option -- m" (rc 2) ab —
+    Fund aus der Review vom 16.09., ohne `--` wäre `daemon_laeuft()` in
+    Produktion immer `False` gewesen. Eigene kleine Funktion, damit Tests sie
+    patchen können — pgrep würde auch einen pytest-Prozess treffen, dessen
+    argv das Muster enthält."""
+    try:
+        return subprocess.run(
+            ["pgrep", "-f", "--", r"-m forge\.daemon$"], capture_output=True,
+        ).returncode == 0
+    except OSError:
+        return False
+
+
+def stoppen() -> str:
+    """Weicher Stop, geteilt von forge.cli und forge.bot (Nachtrag 3a).
+
+    Ohne laufenden Daemon wird KEINE Halt-Datei geschrieben: daemon.main()
+    räumt sie beim nächsten Start als veraltet weg (ein Halt ist eine Bitte
+    an den laufenden Daemon), die Nacht liefe also trotz "Halt angefordert"
+    — Abschluss-Review 2c, I3. Rückgabe ist der Text für Terminal oder
+    Telegram."""
+    if not daemon_laeuft():
+        return ("Kein Daemon läuft — eine Halt-Datei würde beim nächsten Start als veraltet entfernt. "
+                "Für 'heute Nacht nicht': `touch ~/.mantis-forge-stop` (Not-Aus, von Hand entfernen) "
+                "oder `launchctl bootout gui/$(id -u)/com.mantis.forge`.")
+    daemon.HALT_FILE.write_text("stop\n")
+    return f"Halt angefordert ({daemon.HALT_FILE}) — der Daemon beendet sich nach dem laufenden Tick."

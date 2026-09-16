@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mantis.forge-bot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14</string>
+        <string>-u</string>
+        <string>-m</string>
+        <string>forge.bot</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/timoegersdorfer/Mantis</string>
+    <!-- Nachtrag 3a: der Bot läuft 24/7, damit Timo tagsüber Tasks einreihen
+         kann. KeepAlive zieht ihn nach Absturz oder Netzwechsel wieder hoch;
+         ThrottleInterval verhindert die Schleife, wenn er mit Exit 2 endet
+         (Token oder Allowlist fehlt — steht dann im Log). Der PATH ist der
+         des Daemons (com.mantis.forge.plist), pgrep für /status und /stop
+         liegt unter /usr/bin. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin:/usr/local/bin:/Users/timoegersdorfer/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LC_ALL</key>
+        <string>de_DE.UTF-8</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/mantis_forge_bot_out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mantis_forge_bot_err.log</string>
+</dict>
+</plist>

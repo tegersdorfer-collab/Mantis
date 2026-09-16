@@ -661,16 +661,18 @@ die Referenz (Abschnitt „Freigabe ohne Telegram").
   Fehlen beide, startet der Bot nicht. Kein Trust-on-first-use: der Bot reiht
   Aufgaben ein, die Agenten im Repo ausführen.
 - Fremde Absender werden geloggt (ID) und nicht beantwortet.
-- Callback-Daten haben die Form `verwerfen:<int>`; alles andere wird
-  verworfen. Es gibt keinen Weg von Telegram in einen Shell-Aufruf.
+- Callback-Daten haben die Form `verwerfen:<int>` oder `requeue:<int>` (der
+  [Zurückholen]-Knopf nach dem Verwerfen, Tagesprobe 16.09.); alles andere
+  wird verworfen. Es gibt keinen Weg von Telegram in einen Shell-Aufruf.
 - Der Token steht nur in `~/.config/ai-keys.env`. `melden.sende` und der Bot
   loggen nie den Token und nie eine URL, die ihn enthält.
 
 ### Testbarkeit
 
-- Die Befehlslogik ist eine reine Funktion `antwort_auf(text, absender_ok)
-  -> Antwort` (Text plus Knopfliste) und ein `knopf_gedrueckt(daten) ->
-  Antwort`; die Telegram-Handler sind Dreizeiler darum. Tests treffen die
+- Die Befehlslogik ist eine reine Funktion `antwort_auf(text) -> Antwort`
+  (Text plus Knopfliste) und ein `knopf_gedrueckt(daten) -> Antwort`; die
+  Allowlist-Prüfung (`_absender_ok`) sitzt im Handler, nicht in der reinen
+  Funktion. Die Telegram-Handler sind Dreizeiler darum. Tests treffen die
   Funktionen mit gepatchter `queue`/`freigabe`. **Kein Telegram aus Tests**,
   dieselbe Regel wie für `opencode`/`agy`.
 - `melden.sende`: `urlopen` gepatcht; ohne Token kein Aufruf und `False`;

@@ -45,6 +45,19 @@ pytestmark = pytest.mark.skipif(
     not _db_erreichbar(), reason="PostgreSQL nicht erreichbar — Nachtlauf übersprungen")
 
 
+@pytest.fixture(autouse=True)
+def _kein_telegram_und_keine_echten_schluessel(monkeypatch):
+    """Nachtrag 3a: main() lädt ai-keys.env (mit FORGE_BOT_TOKEN) und .env
+    (mit TELEGRAM_CHAT_ID) und schickt am Ende den Bericht per Telegram.
+    Mindestens TestFensterende (main() kehrt hier über "beendet" tatsächlich
+    zurück, statt über _NachtEnde/_Absturz abgebrochen zu werden) würde sonst
+    _abschluss() gegen die echten Dateien und Telegram laufen lassen — der
+    Review 16.09. hat gezeigt, dass das auf ~/Mantis eine echte Nachricht an
+    Timo verschickt hätte."""
+    monkeypatch.setattr(d.melden, "sende", lambda text: True)
+    monkeypatch.setattr(d, "lade_api_schluessel", lambda *a, **kw: [])
+
+
 class _NachtEnde(BaseException):
     """Hält main() nach N Ticks an. BaseException, damit kein except Exception
     im Daemon sie schluckt."""

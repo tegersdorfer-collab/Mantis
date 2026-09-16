@@ -66,6 +66,8 @@ laufendem Daemon, Abschluss-Review 2c I3). Die Logik zieht aus `cli._stop()`
 nach `freigabe.stoppen()`, und `pgrep` wird auf `-m forge\.daemon` verengt
 (Handoff 16.09., Befund 4: `pgrep -f forge.daemon` matcht auch
 `forge.daemon_xyz` und jeden Editor mit dem Pfad im Fenstertitel).
+Korrektur nach Review 16.09.: BSD-pgrep liest `-m …` als Option — `--` davor,
+`$` als Endanker.
 
 **Files:**
 - Modify: `forge/freigabe.py` (ans Ende)
@@ -119,7 +121,7 @@ class TestStoppen:
 
         monkeypatch.setattr(freigabe.subprocess, "run", _run)
         assert freigabe.daemon_laeuft() is False
-        assert gesehen == [["pgrep", "-f", r"-m forge\.daemon"]]
+        assert gesehen == [["pgrep", "-f", "--", r"-m forge\.daemon$"]]
 
     def test_daemon_laeuft_bei_oserror_false(self, monkeypatch):
         def _run(argv, **kw):
@@ -161,7 +163,7 @@ def daemon_laeuft() -> bool:
     auch einen pytest-Prozess treffen, dessen argv das Muster enthält."""
     try:
         return subprocess.run(
-            ["pgrep", "-f", r"-m forge\.daemon"], capture_output=True,
+            ["pgrep", "-f", "--", r"-m forge\.daemon$"], capture_output=True,
         ).returncode == 0
     except OSError:
         return False
@@ -252,6 +254,9 @@ Der Daemon soll den Morgenbericht schicken, ohne dass ein zweiter Prozess
 läuft: ein synchroner HTTP-POST auf `sendMessage`. Nie werfen — die Nacht
 darf nicht an Telegram scheitern.
 
+Korrektur nach Review 16.09.: http.client-Ausnahmen und Nicht-Objekt-JSON
+entkamen dem Vertrag — Catch-all mit Typname.
+
 **Files:**
 - Create: `forge/melden.py`
 - Test: `tests/test_forge_melden.py`
@@ -267,6 +272,7 @@ darf nicht an Telegram scheitern.
 `tests/test_forge_melden.py`:
 
 ```python
+import http.client
 import io
 import json
 import os
@@ -378,6 +384,43 @@ class TestSende:
             lambda req, timeout=None: _Antwort(b'{"ok": false, "description": "chat not found"}'),
         )
         assert melden.sende("hi") is False
+
+    def test_html_statt_json_ist_false(self, monkeypatch):
+        self._umgebung(monkeypatch)
+        monkeypatch.setattr(
+            melden.urllib.request, "urlopen",
+            lambda req, timeout=None: _Antwort(b"<html>captive portal</html>"),
+        )
+        assert melden.sende("hi") is False
+
+    def test_json_ohne_objekt_ist_false(self, monkeypatch):
+        self._umgebung(monkeypatch)
+        monkeypatch.setattr(
+            melden.urllib.request, "urlopen",
+            lambda req, timeout=None: _Antwort(b"null"),
+        )
+        assert melden.sende("hi") is False
+
+    def test_abgerissene_antwort_ist_false(self, monkeypatch, caplog):
+        self._umgebung(monkeypatch, token="GEHEIM")
+
+        def _urlopen(req, timeout=None):
+            raise http.client.IncompleteRead(b"")
+
+        monkeypatch.setattr(melden.urllib.request, "urlopen", _urlopen)
+        assert melden.sende("hi") is False
+        assert "GEHEIM" not in caplog.text
+
+    def test_unerwartete_ausnahme_ist_false(self, monkeypatch, caplog):
+        self._umgebung(monkeypatch, token="GEHEIM")
+
+        def _urlopen(req, timeout=None):
+            raise RuntimeError("boom GEHEIM")
+
+        monkeypatch.setattr(melden.urllib.request, "urlopen", _urlopen)
+        assert melden.sende("hi") is False
+        assert "RuntimeError" in caplog.text
+        assert "GEHEIM" not in caplog.text
 ```
 
 - [ ] **Step 2: Tests laufen lassen — rot**
@@ -393,9 +436,13 @@ Expected: `ModuleNotFoundError: No module named 'forge.melden'`
 Der Daemon schickt damit den Morgenbericht und die Not-Aus-Meldung. Ein
 synchroner POST auf `sendMessage` reicht: kein Polling, kein zweiter Prozess,
 keine Abhängigkeit vom Bot (forge/bot.py), der tagsüber läuft. Diese Funktion
-wirft nie — die Nacht darf nicht an Telegram scheitern. Sie loggt bei
-Fehlern den HTTP-Status, nie die URL (die enthält den Token).
+wirft nie — die Nacht darf nicht an Telegram scheitern, auch nicht bei einer
+abgerissenen Antwort oder einer sonst unerwarteten Ausnahme (dafür fängt ein
+Catch-all den Rest ab). Sie loggt bei Fehlern den HTTP-Status oder den
+Ausnahme-Typnamen, nie die URL oder `str(exc)` (beide könnten den Token
+enthalten).
 """
+import http.client
 import json
 import logging
 import os
@@ -449,8 +496,17 @@ def sende(text: str) -> bool:
             # exc.code, nie str(exc) oder exc.url — die URL trägt den Token.
             log.warning(f"Telegram-Meldung fehlgeschlagen: HTTP {exc.code}")
             return False
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            log.warning(f"Telegram nicht erreichbar: {getattr(exc, 'reason', exc)}")
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+            # Nie str(exc) — bei OSError/HTTPException wäre das der Fallback
+            # von getattr(exc, "reason", exc), und die URL trägt den Token.
+            log.warning(f"Telegram nicht erreichbar: {type(exc).__name__} {getattr(exc, 'reason', '')}".rstrip())
+            return False
+        except Exception as exc:
+            # Catch-all: nie str(exc) — der Token könnte darin stecken, nur der Typname.
+            log.warning(f"Telegram-Meldung fehlgeschlagen: {type(exc).__name__}")
+            return False
+        if not isinstance(koerper, dict):
+            log.warning("Telegram lehnt ab: unerwartete Antwort")
             return False
         if not koerper.get("ok"):
             log.warning(f"Telegram lehnt ab: {koerper.get('description', 'ohne Grund')}")
@@ -460,11 +516,18 @@ def sende(text: str) -> bool:
 
 Hinweis für den Implementierer: `TimeoutError` ist seit 3.10 Unterklasse von
 `OSError`, `socket.timeout` ein Alias davon — beide sind abgedeckt.
+`http.client.HTTPException` (z. B. `IncompleteRead`, `BadStatusLine`) ist
+keine `OSError`-Unterklasse und braucht einen eigenen Eintrag im Tupel; der
+finale `except Exception` fängt jede sonst unerwartete Ausnahme ab, ohne je
+`str(exc)` zu loggen (nur den Typnamen). Der `isinstance(koerper, dict)`-
+Check danach behandelt eine gültige, aber nicht-objekthafte JSON-Antwort
+(`null`, `[]`, `"x"`) als `ok: false`, statt mit `AttributeError` auf
+`.get()` zu crashen.
 
 - [ ] **Step 4: Tests laufen lassen — grün**
 
 Run: `python3.14 -m pytest tests/test_forge_melden.py -q && python3.14 -m ruff check forge/melden.py tests/test_forge_melden.py`
-Expected: 11 passed, ruff sauber
+Expected: 15 passed, ruff sauber
 
 - [ ] **Step 5: Commit**
 
@@ -485,6 +548,9 @@ Fehler-Spirale. Jeder schickt den Morgenbericht; die Spirale setzt den Grund
 in die erste Zeile. Dafür muss der Daemon `TELEGRAM_CHAT_ID` kennen — die
 steht in `.env`, nicht in `ai-keys.env`.
 
+Korrektur nach Review 16.09.: `.env` nur mit Allowlist (`ENV_NUR`) laden;
+Autouse-Fixture gegen echte Schlüssel/Telegram in Alt-Tests.
+
 **Files:**
 - Modify: `forge/daemon.py` (Konstanten nach `API_SCHLUESSEL_DATEI`, `main()`)
 - Test: `tests/test_forge_daemon.py` (neue Klasse ans Ende)
@@ -492,8 +558,9 @@ steht in `.env`, nicht in `ai-keys.env`.
 **Interfaces:**
 - Consumes: `melden.sende(text) -> bool` (Task 2), `bericht.morgenbericht() -> str` (vorhanden).
 - Produces: `daemon.ENV_DATEI: Path` (= `MANTIS_REPO / ".env"`),
+  `daemon.ENV_NUR: frozenset[str]` (= `{"TELEGRAM_CHAT_ID", "TELEGRAM_ALLOWED_IDS"}`),
   `daemon._abschluss(grund: str | None = None) -> None`. Task 5 nutzt
-  `ENV_DATEI` mit `lade_api_schluessel`.
+  `ENV_DATEI` und `ENV_NUR` mit `lade_api_schluessel`.
 
 - [ ] **Step 1: Failing Tests**
 
@@ -572,14 +639,18 @@ class TestAbschlussMeldung:
 
     def test_main_laedt_auch_die_env_datei(self, monkeypatch, tmp_path):
         """TELEGRAM_CHAT_ID steht in .env, nicht in ai-keys.env. Ohne
-        diesen zweiten Ladevorgang bliebe melden.sende stumm."""
+        diesen zweiten Ladevorgang bliebe melden.sende stumm. Der zweite
+        Aufruf muss zudem die Allowlist ENV_NUR mitgeben — sonst landen die
+        restlichen Geheimnisse der .env ungefiltert in os.environ und von
+        dort in jedem Agenten-Subprozess (Review 16.09.)."""
         gesendet = []
         self._vorbereiten(monkeypatch, tmp_path, gesendet)
         geladen = []
-        monkeypatch.setattr(d, "lade_api_schluessel", lambda datei=None: geladen.append(datei) or [])
+        monkeypatch.setattr(d, "lade_api_schluessel",
+                             lambda datei=None, nur=None: geladen.append((datei, nur)) or [])
         monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: False)
         d.main()
-        assert geladen == [d.API_SCHLUESSEL_DATEI, d.ENV_DATEI]
+        assert geladen == [(d.API_SCHLUESSEL_DATEI, None), (d.ENV_DATEI, d.ENV_NUR)]
 ```
 
 - [ ] **Step 2: Tests laufen lassen — rot**
@@ -603,6 +674,31 @@ Nach `API_SCHLUESSEL_DATEI`:
 # ai-keys.env. Der Daemon lädt beide (nur Namen ins Log, nie Werte); die
 # .env-Werte kennt der Prozess über core.db/settings ohnehin schon.
 ENV_DATEI = MANTIS_REPO / ".env"
+# Korrektur nach Review 16.09.: die Mantis-.env trägt auch ANTHROPIC_API_KEY,
+# den Mantis-Bot-Token, GOOGLE_CLIENT_SECRET usw. — und die Forge reicht
+# os.environ ungefiltert an jeden Agenten-Subprozess weiter (runner_opencode.py:
+# dict(os.environ), gate.py: {**os.environ, ...}). Ungefiltert geladen wären
+# diese Geheimnisse ab dem nächsten Tick in jedem Claude-/opencode-Lauf
+# sichtbar. lade_api_schluessel(ENV_DATEI, nur=ENV_NUR) lädt deshalb nur die
+# beiden Namen, die der Telegram-Bot tatsächlich braucht (Task 5 nutzt
+# dieselbe Konstante für seine eigene Allowlist-Prüfung).
+ENV_NUR = frozenset({"TELEGRAM_CHAT_ID", "TELEGRAM_ALLOWED_IDS"})
+```
+
+`lade_api_schluessel` bekommt einen dritten, optionalen Parameter `nur` —
+ohne ihn bleibt das Verhalten identisch (alles laden), mit ihm werden nur
+Namen aus der Menge übernommen:
+
+```python
+def lade_api_schluessel(datei: Path = API_SCHLUESSEL_DATEI, nur: frozenset[str] | None = None) -> list[str]:
+    """... Mit `nur` gesetzt werden ausschließlich Namen aus dieser Menge
+    geladen — Geheimnisse der Mantis-.env (Anthropic-Key, Bot-Token,
+    OAuth-Secrets, ...) dürfen nicht ungefiltert in Agenten-Subprozesse
+    gelangen."""
+    ...
+    if not name or (nur is not None and name not in nur) or name in os.environ:
+        continue
+    ...
 ```
 
 Neue Funktion vor `main()`:
@@ -624,7 +720,11 @@ def _abschluss(grund: str | None = None) -> None:
         text = f"Morgenbericht nicht erstellbar: {exc}\n"
     if grund:
         text = f"Forge abgeschaltet: {grund}\n\n{text}"
-    melden.sende(text)
+    if not melden.sende(text):
+        # melden.sende loggt Details (HTTP-Status/Ausnahme-Typ) bereits selbst,
+        # nie Token oder URL — diese Zeile ist dafür da, dass das launchd-
+        # stdout um 07:00 überhaupt zeigt, dass etwas fehlte.
+        log.warning("Forge: Abschlussmeldung nicht zugestellt (siehe melden-Warnung)")
 ```
 
 In `main()`:
@@ -632,7 +732,7 @@ In `main()`:
 ```python
     schluessel = lade_api_schluessel(API_SCHLUESSEL_DATEI)
     log.info(f"Forge: API-Schlüssel aus {API_SCHLUESSEL_DATEI.name} geladen: {', '.join(schluessel) or 'keine'}")
-    umgebung = lade_api_schluessel(ENV_DATEI)
+    umgebung = lade_api_schluessel(ENV_DATEI, nur=ENV_NUR)
     log.info(f"Forge: aus {ENV_DATEI.name} geladen: {', '.join(umgebung) or 'nichts Neues'}")
 ```
 
@@ -1089,7 +1189,7 @@ class TestAllowlist:
 
 class TestMainAbbruch:
     def _umgebung(self, monkeypatch):
-        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None: [])
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None, nur=None: [])
         monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: (_ for _ in ()).throw(AssertionError("kein Pool vor der Prüfung")))
         monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: (_ for _ in ()).throw(AssertionError("kein Polling")))
 
@@ -1109,7 +1209,7 @@ class TestMainAbbruch:
         assert "TELEGRAM_CHAT_ID" in caplog.text
 
     def test_mit_token_und_liste_startet_polling(self, monkeypatch):
-        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None: [])
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None, nur=None: [])
         monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: None)
         gesehen = []
         monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: gesehen.append((token, erlaubt)))
@@ -1120,13 +1220,14 @@ class TestMainAbbruch:
 
     def test_main_laedt_beide_dateien(self, monkeypatch):
         geladen = []
-        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None: geladen.append(datei) or [])
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel",
+                             lambda datei=None, nur=None: geladen.append((datei, nur)) or [])
         monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: None)
         monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: None)
         monkeypatch.setenv("FORGE_BOT_TOKEN", "T")
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
         bot.main()
-        assert geladen == [bot.daemon.API_SCHLUESSEL_DATEI, bot.daemon.ENV_DATEI]
+        assert geladen == [(bot.daemon.API_SCHLUESSEL_DATEI, None), (bot.daemon.ENV_DATEI, bot.daemon.ENV_NUR)]
 ```
 
 - [ ] **Step 2: Tests laufen lassen — rot**
@@ -1145,7 +1246,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from core import db
@@ -1154,6 +1255,9 @@ from forge import models as m
 ```
 
 Ans Ende der Datei:
+
+Korrektur nach Review 16.09.: httpx auf WARNING (Token in Request-URL),
+Error-Handler, PG-Ausfall → Exit 3, InaccessibleMessage-Guard.
 
 ```python
 # ---------------------------------------------------------------------------
@@ -1186,6 +1290,10 @@ def _markup(antwort: Antwort) -> InlineKeyboardMarkup | None:
     )
 
 
+# Die Handler rufen synchrone DB-/pgrep-Aufrufe (queue, freigabe) und
+# blockieren die Event-Loop damit kurz — für einen Ein-Personen-Bot in
+# Ordnung, aber nichts Langsames hier reinhängen.
+
 async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     nachricht = update.message
     if nachricht is None or nachricht.from_user is None:
@@ -1194,7 +1302,11 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning(f"Forge-Bot: Nachricht von nicht erlaubter ID {nachricht.from_user.id} ignoriert")
         return
     antwort = antwort_auf(nachricht.text or "")
-    stuecke = melden.teile(antwort.text) or [""]
+    stuecke = melden.teile(antwort.text)
+    if not stuecke:
+        # Telegram lehnt leeren Text ab — kann bei antwort_auf("") nicht
+        # vorkommen (liefert HILFE), aber sicher ist sicher.
+        return
     for i, stueck in enumerate(stuecke):
         # Knöpfe hängen am letzten Stück, damit sie unter dem Text stehen.
         await nachricht.reply_text(stueck, reply_markup=_markup(antwort) if i == len(stuecke) - 1 else None)
@@ -1210,9 +1322,29 @@ async def _on_knopf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await query.answer()
     antwort = knopf_gedrueckt(query.data or "")
-    # Ersetzt die Nachricht mit dem Knopf durch das Ergebnis — der Knopf
-    # verschwindet damit, ein zweiter Druck ist nicht möglich.
-    await query.edit_message_text(antwort.text[:melden.TELEGRAM_MAX])
+    text = antwort.text[:melden.TELEGRAM_MAX]
+    # query.message ist bei einer alten Nachricht ein InaccessibleMessage
+    # (PTB 22) — das kann nicht editiert werden, dann stattdessen neu senden.
+    if isinstance(query.message, Message):
+        # Ersetzt die Nachricht mit dem Knopf durch das Ergebnis — der Knopf
+        # verschwindet damit, ein zweiter Druck ist nicht möglich.
+        await query.edit_message_text(text)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+
+async def _on_fehler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB-Fehlerhandler: sonst Traceback ohne Antwort — Timo sähe nur
+    Stille statt eines Hinweises, dass etwas schiefging."""
+    # log.exception() braucht einen aktiven except-Block — PTB dispatcht
+    # Polling-Fehler aber über create_task außerhalb von einem, sonst käme
+    # nur "NoneType: None" ins Log. exc_info=context.error trägt die
+    # Ausnahme (und ihren Traceback) explizit.
+    log.error("Forge-Bot: Handler-Fehler", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        # Nie context.error selbst in die Antwort — die Ausnahme könnte
+        # Interna oder (bei einem Netzwerkfehler) sogar die Token-URL tragen.
+        await update.effective_message.reply_text("Fehler — siehe /tmp/mantis_forge_bot_err.log")
 
 
 def _polling_starten(token: str, erlaubt: set[str]) -> None:
@@ -1224,17 +1356,24 @@ def _polling_starten(token: str, erlaubt: set[str]) -> None:
     # Voice, Fotos, Dokumente haben keinen Handler und bleiben unbeantwortet.
     app.add_handler(MessageHandler(filters.TEXT, _on_text))
     app.add_handler(CallbackQueryHandler(_on_knopf))
+    app.add_error_handler(_on_fehler)
     log.info("Forge-Bot: Polling gestartet")
     app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 
 
 def main() -> int:
     """launchd-Einstieg (com.mantis.forge-bot). Exit 2 ohne Token oder ohne
-    Allowlist — launchd zieht ihn dank ThrottleInterval nicht in einer
-    Schleife hoch, und die Meldung steht im Log."""
+    Allowlist, Exit 3 wenn die Datenbank nicht erreichbar ist — launchd
+    wartet dank KeepAlive+ThrottleInterval 60 s, dann der nächste Versuch,
+    und die Meldung steht im Log."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+    # httpx (von PTB für die Bot-API genutzt) loggt auf INFO die volle
+    # Request-URL inklusive Token (".../bot<TOKEN>/getUpdates") — bei jedem
+    # Poll, alle paar Sekunden, geradewegs in StandardOutPath. WARNING
+    # unterdrückt das, ohne echte Fehler zu verschlucken.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     daemon.lade_api_schluessel(daemon.API_SCHLUESSEL_DATEI)
-    daemon.lade_api_schluessel(daemon.ENV_DATEI)
+    daemon.lade_api_schluessel(daemon.ENV_DATEI, nur=daemon.ENV_NUR)
     token = os.environ.get("FORGE_BOT_TOKEN", "").strip()
     if not token:
         log.error(f"Forge-Bot: FORGE_BOT_TOKEN fehlt in {daemon.API_SCHLUESSEL_DATEI}")
@@ -1244,7 +1383,12 @@ def main() -> int:
         log.error(f"Forge-Bot: TELEGRAM_CHAT_ID/TELEGRAM_ALLOWED_IDS fehlen in {daemon.ENV_DATEI} — "
                   "kein Trust-on-first-use, der Bot startet nicht")
         return 2
-    db.init_pool()
+    try:
+        db.init_pool()
+    except Exception as exc:
+        log.error(f"Forge-Bot: Datenbank nicht erreichbar ({type(exc).__name__}) — "
+                  "launchd versucht es in 60 s erneut")
+        return 3
     log.info(f"Forge-Bot: {len(erlaubt)} erlaubte ID(s)")
     _polling_starten(token, erlaubt)
     return 0
@@ -1398,7 +1542,7 @@ Worktree nachgezogen.
 - [ ] **Step 1: `melden.sende` echt**
 
 ```bash
-cd <worktree> && python3.14 -c "import logging; logging.basicConfig(level=logging.WARNING); from forge import daemon, melden; daemon.lade_api_schluessel(); daemon.lade_api_schluessel(daemon.ENV_DATEI); print(melden.sende('Forge-Probe: melden.sende aus dem Worktree'))"
+cd <worktree> && python3.14 -c "import logging; logging.basicConfig(level=logging.WARNING); from forge import daemon, melden; daemon.lade_api_schluessel(); daemon.lade_api_schluessel(daemon.ENV_DATEI, nur=daemon.ENV_NUR); print(melden.sende('Forge-Probe: melden.sende aus dem Worktree'))"
 ```
 
 Expected: `True`, Nachricht auf Timos Handy von AIMantisBot. `False` →
@@ -1436,7 +1580,23 @@ Danach `python3.14 -m forge.cli status` in `~/Mantis`: #N steht unter
 Jeder Befund wird als Fix-Commit im Worktree nachgezogen, mit Test, wo ein
 Test ihn hätte finden können. Danach `python3.14 -m pytest tests/ -q`.
 
-- [ ] **Step 5: Ledger-Notiz**
+- [x] **Step 5: Ledger-Notiz**
+
+**Tagesprobe 2026-09-16, 15:03–16:20 (Worktree `forge/bot-3a`, `.env` per Symlink):**
+Schritt 1 `melden.sende` echt → `True`. Schritt 2 Bot mit `env -i` (launchd-PATH,
+`LC_ALL`, `HOME`): Pool, „1 erlaubte ID(s)", Polling, **keine httpx-Zeile** (der
+Token-Leak-Fix aus dem Task-5-Review greift). Schritt 3 Timo live: Freitext →
+#1158 `queued` (`idea_added`), **[Verwerfen]** → `parked` 15:59:42, `/requeue`
+→ `resumed` 16:00:14; `/status`, `/stop` ohne Daemon, `/foo` laut Timo wie in
+der Tabelle. #1158 ist ein echter Task (kein Probe-Text) und bleibt für die
+Nacht in der Queue. Befund im Code: keiner. Befund im Prozess: Timo wollte nach
+dem Verwerfen nicht `/requeue N` tippen → Task 7 ([Zurückholen]-Knopf); dessen
+Knopf ist unit- und handler-getestet, live noch nicht gedrückt. **Nicht
+geprobt:** Start unter launchd selbst (KeepAlive/ThrottleInterval/Logpfade) —
+das ist der Merge-Tag-Schritt „Nach dem Merge", Punkt 2, mit `/status` als
+Abnahme; und `/stop` mit laufendem Daemon (pgrep-Argv gegen den echten
+launchd-Prozess ist per `pgrep -fl` verifiziert: argv endet auf `-m forge.bot`
+bzw. `-m forge.daemon`).
 
 In `docs/superpowers/plans/2026-09-16-forge-telegram-bot-3a.md` unter
 diesem Task eintragen: Datum, was geprobt wurde, was gefunden wurde
@@ -1477,3 +1637,78 @@ Mutationstests im Review: `_absender_ok` mit leerer Liste auf `True` drehen
 entsprechende Test in `TestAbschlussMeldung` rot; `exc.code` durch
 `str(exc)` in `melden.sende` ersetzen → `test_http_fehler_ist_false_ohne_traceback`
 rot (Token im Log).
+
+---
+
+### Task 7: Knopf [Zurückholen] nach dem Verwerfen (Timos Anmerkung aus der Tagesprobe, 16.09.)
+
+Nach dem Verwerfen soll `/requeue N` nicht abgetippt werden müssen. Telegram
+macht `/requeue` klickbar, aber ohne Argument — der richtige Weg ist ein
+zweiter Knopf. Callback-Daten bleiben `<aktion>:<int>`; neue Aktion
+`requeue`, sonst nichts.
+
+**Files:**
+- Modify: `forge/bot.py` (`_KNOPF_VERWERFEN` → allgemeines Muster, `knopf_gedrueckt`, `_verwerfen`, neu `_zurueckholen`)
+- Modify: `docs/forge/betrieb.md` (Tabellenzeile `/queue`/Verwerfen)
+- Test: `tests/test_forge_bot.py`
+
+**Interfaces:**
+- Consumes: `freigabe.neu_einreihen(task_id) -> bool`, `journal.log`.
+- Produces: `knopf_gedrueckt("requeue:<int>") -> Antwort`; die Verworfen-Antwort trägt `[[("Zurückholen", "requeue:<id>")]]`.
+
+- [ ] **Step 1: Failing Tests** — in `TestKnopf`:
+
+```python
+    def test_verwerfen_antwort_hat_zurueckholen_knopf(self, monkeypatch):
+        _stumm(monkeypatch)
+        monkeypatch.setattr(bot.queue, "hole", lambda tid: {"id": tid, "state": m.QUEUED, "title": "Alpha"})
+        monkeypatch.setattr(bot.queue, "park", lambda tid, current, reason: True)
+        a = bot.knopf_gedrueckt("verwerfen:3")
+        assert a.knoepfe == [[("Zurückholen", "requeue:3")]]
+
+    def test_zurueckholen_ruft_neu_einreihen(self, monkeypatch):
+        _stumm(monkeypatch)
+        gesehen = []
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: gesehen.append(tid) or True)
+        a = bot.knopf_gedrueckt("requeue:3")
+        assert gesehen == [3]
+        assert a.text == "#3 neu eingereiht"
+        assert a.knoepfe == []
+
+    def test_zurueckholen_falscher_zustand(self, monkeypatch):
+        _stumm(monkeypatch)
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: False)
+        assert bot.knopf_gedrueckt("requeue:3").text == "#3: nicht geparkt/gescheitert"
+```
+
+`test_fremde_callback_daten_werden_verworfen` bekommt zusätzlich
+`"requeue:"`, `"requeue:x"`, `"merge:3"` in die Liste.
+
+- [ ] **Step 2: rot** — `python3.14 -m pytest tests/test_forge_bot.py::TestKnopf -q`
+- [ ] **Step 3: Implementierung**
+
+```python
+_KNOPF = re.compile(r"^(verwerfen|requeue):(\d+)$")
+
+def knopf_gedrueckt(daten: str) -> Antwort:
+    """Callback eines Inline-Knopfs. Bekannt: `verwerfen:<id>`, `requeue:<id>`."""
+    treffer = _KNOPF.match(daten or "")
+    if not treffer:
+        log.warning("Forge-Bot: unbekannte Callback-Daten verworfen")
+        return Antwort("Unbekannter Knopf.")
+    aktion, task_id = treffer.group(1), int(treffer.group(2))
+    if aktion == "requeue":
+        return _requeue(str(task_id))
+    return _verwerfen(task_id)
+```
+
+`_verwerfen` gibt am Ende
+`Antwort(f"#{task_id} verworfen (geparkt)", [[("Zurückholen", f"requeue:{task_id}")]])`
+zurück — der Text nennt `/requeue` nicht mehr, der Knopf ersetzt ihn.
+`test_verwerfen_parkt_wartenden_task` entsprechend auf den neuen Text
+anpassen. `_requeue(rest)` bleibt die eine Stelle, die `neu_einreihen` ruft
+(Befehl und Knopf teilen sie).
+
+- [ ] **Step 4: grün, ruff, Handbuch** — in `docs/forge/betrieb.md` Tabelle 3a:
+  Verwerfen-Zeile ergänzen „…, Antwort mit **[Zurückholen]**".
+- [ ] **Step 5: Commit** `Forge-Bot: Knopf [Zurückholen] nach dem Verwerfen`
