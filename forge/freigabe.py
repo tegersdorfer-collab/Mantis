@@ -108,11 +108,11 @@ def ablehnen(task_id: int, grund: str) -> bool:
     return ok
 
 
-def neu_einreihen(task_id: int) -> bool:
+def neu_einreihen(task_id: int, quelle: str = "forge.cli requeue") -> bool:
     """PARKED/FAILED -> QUEUED, Zähler zurück (siehe queue.requeue)."""
     ok = queue.requeue(task_id)
     if ok:
-        journal.log(task_id, "resumed", "Neu eingereiht (forge.cli requeue)")
+        journal.log(task_id, "resumed", f"Neu eingereiht ({quelle})")
     return ok
 
 

@@ -1,9 +1,14 @@
+import asyncio
 import logging
 import os
 import sys
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from telegram import Chat, InaccessibleMessage, Message, User
 
 from forge import bot
 from forge import models as m
@@ -71,18 +76,18 @@ class TestBefehle:
     def test_requeue_mit_id(self, monkeypatch):
         _stumm(monkeypatch)
         gesehen = []
-        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: gesehen.append(tid) or True)
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid, quelle=None: gesehen.append((tid, quelle)) or True)
         assert bot.antwort_auf("/requeue 7").text == "#7 neu eingereiht"
-        assert gesehen == [7]
+        assert gesehen == [(7, "Telegram")]
 
     def test_requeue_falscher_zustand(self, monkeypatch):
         _stumm(monkeypatch)
-        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: False)
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid, quelle=None: False)
         assert bot.antwort_auf("/requeue 7").text == "#7: nicht geparkt/gescheitert"
 
     def test_requeue_ohne_oder_mit_kaputter_id(self, monkeypatch):
         _stumm(monkeypatch)
-        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: (_ for _ in ()).throw(AssertionError()))
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid, quelle=None: (_ for _ in ()).throw(AssertionError()))
         assert bot.antwort_auf("/requeue").text == "Nutzung: /requeue <id>"
         assert bot.antwort_auf("/requeue abc").text == "Nutzung: /requeue <id>"
 
@@ -174,7 +179,7 @@ class TestKnopf:
     def test_zurueckholen_ruft_neu_einreihen(self, monkeypatch):
         _stumm(monkeypatch)
         gesehen = []
-        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: gesehen.append(tid) or True)
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid, quelle=None: gesehen.append(tid) or True)
         a = bot.knopf_gedrueckt("requeue:3")
         assert gesehen == [3]
         assert a.text == "#3 neu eingereiht"
@@ -182,7 +187,7 @@ class TestKnopf:
 
     def test_zurueckholen_falscher_zustand(self, monkeypatch):
         _stumm(monkeypatch)
-        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: False)
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid, quelle=None: False)
         assert bot.knopf_gedrueckt("requeue:3").text == "#3: nicht geparkt/gescheitert"
 
     def test_fremde_callback_daten_werden_verworfen(self, monkeypatch):
@@ -298,3 +303,110 @@ class TestMarkup:
         knopf = markup.inline_keyboard[0][0]
         assert knopf.text == "Verwerfen"
         assert knopf.callback_data == "verwerfen:1"
+
+
+class TestHandler:
+    """Reine PTB-Objekte im Speicher (Message/Chat/User/InaccessibleMessage)
+    plus AsyncMock — kein Netzwerk, kein Bot-Prozess. "Kein Telegram aus
+    Tests" heißt kein Netzwerk/Polling, nicht: keine PTB-Objekte im Speicher."""
+
+    def test_on_knopf_editiert_mit_zurueckholen_knopf(self, monkeypatch):
+        _stumm(monkeypatch)
+        monkeypatch.setattr(bot.queue, "hole", lambda tid: {"id": tid, "state": m.QUEUED, "title": "Alpha"})
+        monkeypatch.setattr(bot.queue, "park", lambda tid, current, reason: True)
+        msg = Message(message_id=1, date=datetime.now(), chat=Chat(id=42, type="private"))
+        query = SimpleNamespace(
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=msg,
+            from_user=User(id=42, first_name="T", is_bot=False),
+            data="verwerfen:3",
+        )
+        update = SimpleNamespace(callback_query=query)
+        context = SimpleNamespace(bot_data={"erlaubt": {"42"}}, bot=SimpleNamespace(send_message=AsyncMock()))
+        asyncio.run(bot._on_knopf(update, context))
+        query.answer.assert_awaited_once()
+        query.edit_message_text.assert_awaited_once()
+        args, kwargs = query.edit_message_text.await_args
+        assert args[0].startswith("#3 verworfen")
+        assert kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "requeue:3"
+
+    def test_on_knopf_unzugaengliche_nachricht_sendet_neu(self, monkeypatch):
+        """query.message ist bei einer alten Nachricht ein InaccessibleMessage
+        (PTB 22) — edit_message_text geht nicht, also neu senden."""
+        _stumm(monkeypatch)
+        monkeypatch.setattr(bot.queue, "hole", lambda tid: {"id": tid, "state": m.QUEUED, "title": "Alpha"})
+        monkeypatch.setattr(bot.queue, "park", lambda tid, current, reason: True)
+        msg = InaccessibleMessage(chat=Chat(id=42, type="private"), message_id=1)
+        query = SimpleNamespace(
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=msg,
+            from_user=User(id=42, first_name="T", is_bot=False),
+            data="verwerfen:3",
+        )
+        update = SimpleNamespace(callback_query=query)
+        context = SimpleNamespace(bot_data={"erlaubt": {"42"}}, bot=SimpleNamespace(send_message=AsyncMock()))
+        asyncio.run(bot._on_knopf(update, context))
+        query.edit_message_text.assert_not_awaited()
+        context.bot.send_message.assert_awaited_once()
+        args, kwargs = context.bot.send_message.await_args
+        assert kwargs["chat_id"] == "42"
+        assert kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "requeue:3"
+
+    def test_on_knopf_fremde_id_ohne_antwort(self, monkeypatch):
+        monkeypatch.setattr(bot.queue, "hole", lambda tid: (_ for _ in ()).throw(AssertionError("kein hole")))
+        msg = Message(message_id=1, date=datetime.now(), chat=Chat(id=9, type="private"))
+        query = SimpleNamespace(
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=msg,
+            from_user=User(id=9, first_name="T", is_bot=False),
+            data="verwerfen:3",
+        )
+        update = SimpleNamespace(callback_query=query)
+        context = SimpleNamespace(bot_data={"erlaubt": {"42"}}, bot=SimpleNamespace(send_message=AsyncMock()))
+        asyncio.run(bot._on_knopf(update, context))
+        query.answer.assert_not_awaited()
+        query.edit_message_text.assert_not_awaited()
+
+    def test_on_text_knoepfe_am_letzten_stueck(self, monkeypatch):
+        _stumm(monkeypatch)
+        monkeypatch.setattr(bot.queue, "enqueue", lambda title, description="", **k: 42)
+        nachricht = SimpleNamespace(
+            from_user=User(id=42, first_name="T", is_bot=False),
+            chat_id=42,
+            text="Probe",
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(message=nachricht)
+        context = SimpleNamespace(bot_data={"erlaubt": {"42"}})
+        asyncio.run(bot._on_text(update, context))
+        nachricht.reply_text.assert_awaited_once()
+        args, kwargs = nachricht.reply_text.await_args
+        assert args[0] == "#42 eingereiht: Probe"
+        assert kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "verwerfen:42"
+
+        # Mehrteilige Antwort: Knöpfe hängen nur am letzten Stück.
+        nachricht.reply_text = AsyncMock()
+        monkeypatch.setattr(bot.melden, "teile", lambda text, max_len=bot.melden.TELEGRAM_MAX: ["a", "b"])
+        asyncio.run(bot._on_text(update, context))
+        assert nachricht.reply_text.await_count == 2
+        erster = nachricht.reply_text.await_args_list[0]
+        zweiter = nachricht.reply_text.await_args_list[1]
+        assert erster.args[0] == "a" and erster.kwargs["reply_markup"] is None
+        assert zweiter.args[0] == "b"
+        assert zweiter.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "verwerfen:42"
+
+    def test_on_text_fremde_id_ohne_antwort(self, monkeypatch):
+        monkeypatch.setattr(bot.queue, "enqueue", lambda *a, **k: (_ for _ in ()).throw(AssertionError("kein enqueue")))
+        nachricht = SimpleNamespace(
+            from_user=User(id=9, first_name="T", is_bot=False),
+            chat_id=9,
+            text="Probe",
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(message=nachricht)
+        context = SimpleNamespace(bot_data={"erlaubt": {"42"}})
+        asyncio.run(bot._on_text(update, context))
+        nachricht.reply_text.assert_not_awaited()

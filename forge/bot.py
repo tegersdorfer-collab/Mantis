@@ -106,7 +106,7 @@ def _requeue(rest: str) -> Antwort:
     if not rest.isdigit():
         return Antwort("Nutzung: /requeue <id>")
     task_id = int(rest)
-    if freigabe.neu_einreihen(task_id):
+    if freigabe.neu_einreihen(task_id, quelle="Telegram"):
         return Antwort(f"#{task_id} neu eingereiht")
     return Antwort(f"#{task_id}: nicht geparkt/gescheitert")
 
