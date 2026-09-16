@@ -623,3 +623,84 @@ class TestApiSchluesselAusDatei:
 
     def test_fehlende_datei_ist_kein_fehler(self, tmp_path):
         assert d.lade_api_schluessel(tmp_path / "gibt-es-nicht") == []
+
+
+class TestAbschlussMeldung:
+    """Nachtrag 3a: jedes Ende von main() schickt den Morgenbericht per
+    Telegram; die Fehler-Spirale sofort, mit dem Grund in der ersten Zeile.
+    melden.sende ist gepatcht — kein Telegram aus Tests."""
+
+    def _vorbereiten(self, monkeypatch, tmp_path, gesendet):
+        monkeypatch.setattr(d, "HALT_FILE", tmp_path / "halt")
+        monkeypatch.setattr(d, "STOP_FILE", tmp_path / "stop")
+        monkeypatch.setattr(d.time, "sleep", lambda s: None)
+        monkeypatch.setattr(d.journal, "log", lambda *a, **k: None)
+        monkeypatch.setattr(d.db, "init_pool", lambda *a, **kw: None)
+        monkeypatch.setattr(d.db, "run_migrations", lambda *a, **kw: None)
+        monkeypatch.setattr(d, "lade_api_schluessel", lambda *a, **kw: [])
+        monkeypatch.setattr(d.melden, "sende", lambda text: gesendet.append(text) or True)
+        from forge import bericht
+        monkeypatch.setattr(bericht, "morgenbericht", lambda: "BERICHT\n")
+
+    def test_fensterende_schickt_den_bericht_genau_einmal(self, monkeypatch, tmp_path):
+        gesendet = []
+        self._vorbereiten(monkeypatch, tmp_path, gesendet)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: False)
+        d.main()
+        assert gesendet == ["BERICHT\n"]
+
+    def test_weicher_halt_schickt_den_bericht(self, monkeypatch, tmp_path):
+        gesendet = []
+        self._vorbereiten(monkeypatch, tmp_path, gesendet)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: True)
+        # Halt mitten im Lauf: nach dem ersten Tick (eine vorher vorhandene
+        # Datei gälte als veraltet und würde beim Start entfernt).
+        ticks = []
+
+        def _tick():
+            ticks.append(1)
+            (tmp_path / "halt").write_text("stop")
+            return "leerlauf"
+
+        monkeypatch.setattr(d, "tick", _tick)
+        d.main()
+        assert ticks == [1]
+        assert gesendet == ["BERICHT\n"]
+
+    def test_fehler_spirale_meldet_sofort_mit_grund_zuerst(self, monkeypatch, tmp_path):
+        gesendet = []
+        self._vorbereiten(monkeypatch, tmp_path, gesendet)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: True)
+        monkeypatch.setattr(d, "tick", lambda: "fehler")
+        d.main()
+        assert len(gesendet) == 1
+        erste_zeile = gesendet[0].splitlines()[0]
+        assert erste_zeile.startswith("Forge abgeschaltet:")
+        assert "BERICHT" in gesendet[0]
+
+    def test_bericht_kaputt_meldet_trotzdem(self, monkeypatch, tmp_path):
+        """Ein Fehler beim Bericht darf weder den Daemon-Ausgang noch die
+        Meldung verhindern — dann kommt eben der Fehler als Text."""
+        gesendet = []
+        self._vorbereiten(monkeypatch, tmp_path, gesendet)
+        from forge import bericht
+
+        def _kaputt():
+            raise RuntimeError("DB weg")
+
+        monkeypatch.setattr(bericht, "morgenbericht", _kaputt)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: False)
+        d.main()
+        assert len(gesendet) == 1
+        assert "DB weg" in gesendet[0]
+
+    def test_main_laedt_auch_die_env_datei(self, monkeypatch, tmp_path):
+        """TELEGRAM_CHAT_ID steht in .env, nicht in ai-keys.env. Ohne
+        diesen zweiten Ladevorgang bliebe melden.sende stumm."""
+        gesendet = []
+        self._vorbereiten(monkeypatch, tmp_path, gesendet)
+        geladen = []
+        monkeypatch.setattr(d, "lade_api_schluessel", lambda datei=None: geladen.append(datei) or [])
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: False)
+        d.main()
+        assert geladen == [d.API_SCHLUESSEL_DATEI, d.ENV_DATEI]

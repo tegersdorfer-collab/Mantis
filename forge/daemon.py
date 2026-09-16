@@ -31,7 +31,7 @@ from pathlib import Path
 
 from core import db
 
-from forge import gate, journal, pipeline, queue, worktree
+from forge import MANTIS_REPO, gate, journal, melden, pipeline, queue, worktree
 from forge import models as m
 
 log = logging.getLogger(__name__)
@@ -74,6 +74,10 @@ HALT_FILE = Path.home() / ".mantis-forge-halt"
 # callers", und Task 365 parkte nach drei Sekunden. Der Daemon lädt die Datei
 # deshalb selbst — und loggt dabei nur die NAMEN, nie die Werte.
 API_SCHLUESSEL_DATEI = Path.home() / ".config" / "ai-keys.env"
+# Nachtrag 3a: TELEGRAM_CHAT_ID steht in der Mantis-.env, nicht in
+# ai-keys.env. Der Daemon lädt beide (nur Namen ins Log, nie Werte); die
+# .env-Werte kennt der Prozess über core.db/settings ohnehin schon.
+ENV_DATEI = MANTIS_REPO / ".env"
 
 
 def im_nachtfenster(jetzt: datetime | None = None) -> bool:
@@ -227,13 +231,36 @@ def tick() -> str:
         raise
 
 
+def _abschluss(grund: str | None = None) -> None:
+    """Morgenbericht per Telegram, an jedem Ende von main() (Nachtrag 3a).
+    Bei der Fehler-Spirale steht der Grund in der ersten Zeile, damit Timo
+    das nicht erst um 07:00 im Bericht sucht. Nichts hier darf werfen:
+    melden.sende wirft nie, und ein kaputter Bericht wird als Text gemeldet.
+
+    Der Import ist lokal, weil forge.bericht seinerseits forge.daemon
+    importiert (STOP_FILE) — ein Modul-Import wäre ein Zirkel."""
+    from forge import bericht
+    try:
+        text = bericht.morgenbericht()
+    except Exception as exc:
+        # Der Bericht ist Beiwerk, die Meldung nicht — ein kaputter Bericht
+        # darf die Telegram-Meldung nicht verhindern.
+        log.exception("Forge: Morgenbericht nicht erstellbar")
+        text = f"Morgenbericht nicht erstellbar: {exc}\n"
+    if grund:
+        text = f"Forge abgeschaltet: {grund}\n\n{text}"
+    melden.sende(text)
+
+
 def main() -> None:
     """launchd-Einstieg. Läuft, bis das Nachtfenster endet (NACHT_ENDE_STUNDE),
     ein weicher Halt angefordert wird (forge.cli stop), der Not-Aus steht oder
     die Fehler-Spirale greift. Die ersten beiden enden mit Exit 0."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
-    schluessel = lade_api_schluessel()
+    schluessel = lade_api_schluessel(API_SCHLUESSEL_DATEI)
     log.info(f"Forge: API-Schlüssel aus {API_SCHLUESSEL_DATEI.name} geladen: {', '.join(schluessel) or 'keine'}")
+    umgebung = lade_api_schluessel(ENV_DATEI)
+    log.info(f"Forge: aus {ENV_DATEI.name} geladen: {', '.join(umgebung) or 'nichts Neues'}")
     db.init_pool()
     # Die Forge ist bewusst unabhängig vom laufenden Mantis-Assistant (siehe
     # forge/__init__.py) — sie darf sich also nicht darauf verlassen, dass
@@ -257,12 +284,14 @@ def main() -> None:
             journal.log(None, "daemon_stop", "Weicher Stop angefordert (forge.cli stop) — Daemon beendet sich")
             log.info("Forge: weicher Stop")
             HALT_FILE.unlink(missing_ok=True)
+            _abschluss()
             return
         if not im_nachtfenster():
             journal.log(None, "daemon_stop",
                         f"Nachtfenster zu Ende ({NACHT_ENDE_STUNDE}:00) — Daemon beendet sich, "
                         f"launchd startet um {NACHT_BEGINN_STUNDE}:00 neu")
             log.info("Forge: Nachtfenster zu Ende")
+            _abschluss()
             return
 
         erlaubt, grund = should_run(failures)
@@ -282,6 +311,7 @@ def main() -> None:
                 # FAILURE_SLEEP_SECONDS und bewusst in Kauf genommen.
                 STOP_FILE.write_text(f"Fehler-Spirale: {grund}\n")
                 journal.log(None, "daemon_stop", f"{grund} — Not-Aus gesetzt, Freigabe durch Timo")
+                _abschluss(grund)
                 return
             time.sleep(BLOCKED_SLEEP_SECONDS)
             continue
