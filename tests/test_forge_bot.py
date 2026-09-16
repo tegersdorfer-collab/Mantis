@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from datetime import datetime
@@ -234,3 +235,44 @@ class TestMainAbbruch:
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
         bot.main()
         assert geladen == [(bot.daemon.API_SCHLUESSEL_DATEI, None), (bot.daemon.ENV_DATEI, bot.daemon.ENV_NUR)]
+
+    def test_httpx_logger_wird_gedaempft(self, monkeypatch):
+        """Review 16.09.: httpx loggt auf INFO die volle Request-URL
+        inklusive Token — main() muss das auf WARNING anheben, bevor das
+        Polling beginnt."""
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None, nur=None: [])
+        monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: None)
+        monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: None)
+        monkeypatch.setenv("FORGE_BOT_TOKEN", "T")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+        httpx_logger = logging.getLogger("httpx")
+        zuvor = httpx_logger.level
+        try:
+            bot.main()
+            assert httpx_logger.level >= logging.WARNING
+        finally:
+            httpx_logger.setLevel(zuvor)
+
+    def test_datenbank_nicht_erreichbar_exit_3(self, monkeypatch):
+        """Review 16.09.: ein PG-Ausfall beim Start darf nicht mit Polling
+        weitermachen — Exit 3, launchd versucht es dank ThrottleInterval
+        in 60 s erneut."""
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None, nur=None: [])
+        monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: (_ for _ in ()).throw(AssertionError("kein Polling")))
+        monkeypatch.setenv("FORGE_BOT_TOKEN", "T")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+        assert bot.main() == 3
+
+
+class TestMarkup:
+    def test_ohne_knoepfe_ist_markup_none(self):
+        assert bot._markup(bot.Antwort("x")) is None
+
+    def test_mit_knopf_eine_reihe_ein_knopf(self):
+        markup = bot._markup(bot.Antwort("x", [[("Verwerfen", "verwerfen:1")]]))
+        assert len(markup.inline_keyboard) == 1
+        assert len(markup.inline_keyboard[0]) == 1
+        knopf = markup.inline_keyboard[0][0]
+        assert knopf.text == "Verwerfen"
+        assert knopf.callback_data == "verwerfen:1"

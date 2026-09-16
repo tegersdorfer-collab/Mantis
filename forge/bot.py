@@ -16,7 +16,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from core import db
@@ -152,6 +152,10 @@ def _markup(antwort: Antwort) -> InlineKeyboardMarkup | None:
     )
 
 
+# Die Handler rufen synchrone DB-/pgrep-Aufrufe (queue, freigabe) und
+# blockieren die Event-Loop damit kurz — für einen Ein-Personen-Bot in
+# Ordnung, aber nichts Langsames hier reinhängen.
+
 async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     nachricht = update.message
     if nachricht is None or nachricht.from_user is None:
@@ -160,7 +164,11 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning(f"Forge-Bot: Nachricht von nicht erlaubter ID {nachricht.from_user.id} ignoriert")
         return
     antwort = antwort_auf(nachricht.text or "")
-    stuecke = melden.teile(antwort.text) or [""]
+    stuecke = melden.teile(antwort.text)
+    if not stuecke:
+        # Telegram lehnt leeren Text ab — kann bei antwort_auf("") nicht
+        # vorkommen (liefert HILFE), aber sicher ist sicher.
+        return
     for i, stueck in enumerate(stuecke):
         # Knöpfe hängen am letzten Stück, damit sie unter dem Text stehen.
         await nachricht.reply_text(stueck, reply_markup=_markup(antwort) if i == len(stuecke) - 1 else None)
@@ -176,9 +184,25 @@ async def _on_knopf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await query.answer()
     antwort = knopf_gedrueckt(query.data or "")
-    # Ersetzt die Nachricht mit dem Knopf durch das Ergebnis — der Knopf
-    # verschwindet damit, ein zweiter Druck ist nicht möglich.
-    await query.edit_message_text(antwort.text[:melden.TELEGRAM_MAX])
+    text = antwort.text[:melden.TELEGRAM_MAX]
+    # query.message ist bei einer alten Nachricht ein InaccessibleMessage
+    # (PTB 22) — das kann nicht editiert werden, dann stattdessen neu senden.
+    if isinstance(query.message, Message):
+        # Ersetzt die Nachricht mit dem Knopf durch das Ergebnis — der Knopf
+        # verschwindet damit, ein zweiter Druck ist nicht möglich.
+        await query.edit_message_text(text)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+
+async def _on_fehler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB-Fehlerhandler: sonst Traceback ohne Antwort — Timo sähe nur
+    Stille statt eines Hinweises, dass etwas schiefging."""
+    log.exception("Forge-Bot: Handler-Fehler")
+    if isinstance(update, Update) and update.effective_message:
+        # Nie context.error selbst in die Antwort — die Ausnahme könnte
+        # Interna oder (bei einem Netzwerkfehler) sogar die Token-URL tragen.
+        await update.effective_message.reply_text("Fehler — siehe /tmp/mantis_forge_bot_err.log")
 
 
 def _polling_starten(token: str, erlaubt: set[str]) -> None:
@@ -190,15 +214,22 @@ def _polling_starten(token: str, erlaubt: set[str]) -> None:
     # Voice, Fotos, Dokumente haben keinen Handler und bleiben unbeantwortet.
     app.add_handler(MessageHandler(filters.TEXT, _on_text))
     app.add_handler(CallbackQueryHandler(_on_knopf))
+    app.add_error_handler(_on_fehler)
     log.info("Forge-Bot: Polling gestartet")
     app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 
 
 def main() -> int:
     """launchd-Einstieg (com.mantis.forge-bot). Exit 2 ohne Token oder ohne
-    Allowlist — launchd zieht ihn dank ThrottleInterval nicht in einer
-    Schleife hoch, und die Meldung steht im Log."""
+    Allowlist, Exit 3 wenn die Datenbank nicht erreichbar ist — launchd
+    wartet dank KeepAlive+ThrottleInterval 60 s, dann der nächste Versuch,
+    und die Meldung steht im Log."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+    # httpx (von PTB für die Bot-API genutzt) loggt auf INFO die volle
+    # Request-URL inklusive Token (".../bot<TOKEN>/getUpdates") — bei jedem
+    # Poll, alle paar Sekunden, geradewegs in StandardOutPath. WARNING
+    # unterdrückt das, ohne echte Fehler zu verschlucken.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     daemon.lade_api_schluessel(daemon.API_SCHLUESSEL_DATEI)
     daemon.lade_api_schluessel(daemon.ENV_DATEI, nur=daemon.ENV_NUR)
     token = os.environ.get("FORGE_BOT_TOKEN", "").strip()
@@ -210,7 +241,12 @@ def main() -> int:
         log.error(f"Forge-Bot: TELEGRAM_CHAT_ID/TELEGRAM_ALLOWED_IDS fehlen in {daemon.ENV_DATEI} — "
                   "kein Trust-on-first-use, der Bot startet nicht")
         return 2
-    db.init_pool()
+    try:
+        db.init_pool()
+    except Exception as exc:
+        log.error(f"Forge-Bot: Datenbank nicht erreichbar ({type(exc).__name__}) — "
+                  "launchd versucht es in 60 s erneut")
+        return 3
     log.info(f"Forge-Bot: {len(erlaubt)} erlaubte ID(s)")
     _polling_starten(token, erlaubt)
     return 0

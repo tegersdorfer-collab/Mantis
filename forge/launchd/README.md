@@ -27,3 +27,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mantis.forge-bot.pli
 
 Läuft er? `launchctl list | grep forge-bot` (PID in der ersten Spalte) und
 `/status` im Chat mit t.me/AIMantisBot.
+
+Vor einem manuellen `python3.14 -m forge.bot` (z. B. zum Debuggen) erst den
+Agenten stoppen — `launchctl bootout gui/$(id -u)/com.mantis.forge-bot` —
+sonst pollen zwei Prozesse gleichzeitig und Telegram antwortet mit 409
+Conflict.
