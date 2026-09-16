@@ -497,7 +497,9 @@ def sende(text: str) -> bool:
             log.warning(f"Telegram-Meldung fehlgeschlagen: HTTP {exc.code}")
             return False
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-            log.warning(f"Telegram nicht erreichbar: {getattr(exc, 'reason', exc)}")
+            # Nie str(exc) — bei OSError/HTTPException wäre das der Fallback
+            # von getattr(exc, "reason", exc), und die URL trägt den Token.
+            log.warning(f"Telegram nicht erreichbar: {type(exc).__name__} {getattr(exc, 'reason', '')}".rstrip())
             return False
         except Exception as exc:
             # Catch-all: nie str(exc) — der Token könnte darin stecken, nur der Typname.
@@ -1334,7 +1336,11 @@ async def _on_knopf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _on_fehler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """PTB-Fehlerhandler: sonst Traceback ohne Antwort — Timo sähe nur
     Stille statt eines Hinweises, dass etwas schiefging."""
-    log.exception("Forge-Bot: Handler-Fehler")
+    # log.exception() braucht einen aktiven except-Block — PTB dispatcht
+    # Polling-Fehler aber über create_task außerhalb von einem, sonst käme
+    # nur "NoneType: None" ins Log. exc_info=context.error trägt die
+    # Ausnahme (und ihren Traceback) explizit.
+    log.error("Forge-Bot: Handler-Fehler", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         # Nie context.error selbst in die Antwort — die Ausnahme könnte
         # Interna oder (bei einem Netzwerkfehler) sogar die Token-URL tragen.

@@ -64,7 +64,9 @@ def sende(text: str) -> bool:
             log.warning(f"Telegram-Meldung fehlgeschlagen: HTTP {exc.code}")
             return False
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-            log.warning(f"Telegram nicht erreichbar: {getattr(exc, 'reason', exc)}")
+            # Nie str(exc) — bei OSError/HTTPException wäre das der Fallback
+            # von getattr(exc, "reason", exc), und die URL trägt den Token.
+            log.warning(f"Telegram nicht erreichbar: {type(exc).__name__} {getattr(exc, 'reason', '')}".rstrip())
             return False
         except Exception as exc:
             # Catch-all: nie str(exc) — der Token könnte darin stecken, nur der Typname.

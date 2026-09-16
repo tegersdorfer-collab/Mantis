@@ -90,6 +90,9 @@ class TestBefehle:
         monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid, quelle=None: (_ for _ in ()).throw(AssertionError()))
         assert bot.antwort_auf("/requeue").text == "Nutzung: /requeue <id>"
         assert bot.antwort_auf("/requeue abc").text == "Nutzung: /requeue <id>"
+        # "²".isdigit() ist True, aber int("²") würde ValueError werfen —
+        # isdecimal() muss das schon vorher abfangen.
+        assert bot.antwort_auf("/requeue ²").text == "Nutzung: /requeue <id>"
 
     def test_status_mit_laufendem_daemon_und_aktivem_task(self, monkeypatch):
         _stumm(monkeypatch)
@@ -410,3 +413,13 @@ class TestHandler:
         context = SimpleNamespace(bot_data={"erlaubt": {"42"}})
         asyncio.run(bot._on_text(update, context))
         nachricht.reply_text.assert_not_awaited()
+
+    def test_on_fehler_loggt_traceback_ueber_exc_info(self, caplog):
+        # PTB dispatcht Polling-Fehler via create_task ausserhalb jedes
+        # except-Blocks — log.exception() würde nur "NoneType: None" loggen.
+        # exc_info=context.error muss die Ausnahme samt Traceback tragen.
+        context = SimpleNamespace(error=RuntimeError("kaputt"), bot_data={"erlaubt": {"42"}})
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(bot._on_fehler(None, context))
+        assert "Handler-Fehler" in caplog.text
+        assert "RuntimeError" in caplog.text

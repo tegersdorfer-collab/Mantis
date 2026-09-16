@@ -103,7 +103,9 @@ def _queue() -> Antwort:
 
 
 def _requeue(rest: str) -> Antwort:
-    if not rest.isdigit():
+    # isdecimal() statt isdigit(): "²".isdigit() ist True, aber int("²")
+    # wirft ValueError — isdecimal() lässt nur echte Dezimalziffern durch.
+    if not rest.isdecimal():
         return Antwort("Nutzung: /requeue <id>")
     task_id = int(rest)
     if freigabe.neu_einreihen(task_id, quelle="Telegram"):
@@ -202,7 +204,11 @@ async def _on_knopf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _on_fehler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """PTB-Fehlerhandler: sonst Traceback ohne Antwort — Timo sähe nur
     Stille statt eines Hinweises, dass etwas schiefging."""
-    log.exception("Forge-Bot: Handler-Fehler")
+    # log.exception() braucht einen aktiven except-Block — PTB dispatcht
+    # Polling-Fehler aber über create_task außerhalb von einem, sonst käme
+    # nur "NoneType: None" ins Log. exc_info=context.error trägt die
+    # Ausnahme (und ihren Traceback) explizit.
+    log.error("Forge-Bot: Handler-Fehler", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         # Nie context.error selbst in die Antwort — die Ausnahme könnte
         # Interna oder (bei einem Netzwerkfehler) sogar die Token-URL tragen.

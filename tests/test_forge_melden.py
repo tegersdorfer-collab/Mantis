@@ -103,6 +103,19 @@ class TestSende:
         monkeypatch.setattr(melden.urllib.request, "urlopen", _urlopen)
         assert melden.sende("hi") is False
 
+    def test_oserror_ohne_reason_loggt_nie_str_exc(self, monkeypatch, caplog):
+        # OSError hat kein .reason — getattr(exc, "reason", exc) würde dann
+        # auf str(exc) zurückfallen und den Token verraten. Regressionstest.
+        self._umgebung(monkeypatch, token="GEHEIM")
+
+        def _urlopen(req, timeout=None):
+            raise OSError("boom GEHEIM")
+
+        monkeypatch.setattr(melden.urllib.request, "urlopen", _urlopen)
+        assert melden.sende("hi") is False
+        assert "OSError" in caplog.text
+        assert "GEHEIM" not in caplog.text
+
     def test_telegram_sagt_nicht_ok_ist_false(self, monkeypatch):
         self._umgebung(monkeypatch)
         monkeypatch.setattr(

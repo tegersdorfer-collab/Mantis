@@ -18,6 +18,7 @@ Der Telegram-Bot läuft 24/7 als eigener Agent. Voraussetzungen:
 `FORGE_BOT_TOKEN` in `~/.config/ai-keys.env`, `TELEGRAM_CHAT_ID` in `.env`.
 Ohne eins von beiden endet er mit Exit 2 und einer Zeile in
 `/tmp/mantis_forge_bot_err.log`; launchd wartet dann 60 s (`ThrottleInterval`).
+Exit 3 = Datenbank nicht erreichbar (launchd versucht es nach 60 s erneut).
 
 ```
 launchctl bootout gui/$(id -u)/com.mantis.forge-bot 2>/dev/null

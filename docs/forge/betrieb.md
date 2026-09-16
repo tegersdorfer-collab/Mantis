@@ -38,9 +38,14 @@ Freigeben (`approve`) geht bewusst **nicht** per Telegram — erst Diff im
 Worktree lesen, dann `forge.cli approve` (siehe 2). Merge-Knöpfe kommen mit
 Plan 3b.
 
+Nachrichten, die geschickt wurden, während der Bot nicht lief (Neustart,
+60-s-Wartezeit, DB weg), werden beim Start verworfen (`drop_pending_updates`)
+— nach einem Neustart also nochmal schicken.
+
 Bot antwortet nicht: `launchctl list | grep forge-bot`, dann
 `/tmp/mantis_forge_bot_err.log`. Fremde Absender werden ignoriert und mit
-ID geloggt.
+ID geloggt. Exit 2 = Token oder Allowlist fehlt, Exit 3 = Datenbank nicht
+erreichbar (launchd versucht es nach 60 s erneut).
 
 ## 4) Zustände eines Tasks (Tabelle)
 | Zustand          | Bedeutung                                                            |
