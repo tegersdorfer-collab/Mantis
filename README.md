@@ -19,7 +19,7 @@ Mantis ist ein Eigenprojekt, das ich vollständig allein konzipiert, entwickelt 
 | Programmiersprachen | Python 3.14 · Swift (SwiftUI) · JavaScript |
 | Agent-Tools | Tool-Registry mit semantischem Routing und geprüften Ausführungsrechten |
 | Tests | 1.100+ Python-Tests und 130+ Desktop-Tests; externe Dienste in Tests ersetzt |
-| Laufzeit | 24/7 auf MacBook Pro M3 via launchd |
+| Laufzeit | 24/7 auf MacBook Air M4 via launchd |
 | LLM-Backends | Ollama lokal · Claude API (Haiku/Sonnet) |
 | DB | PostgreSQL 16 + pgvector (Vektorsuche) |
 | iOS-Apps | 3 SwiftUI-Apps gegen dieselbe FastAPI |
