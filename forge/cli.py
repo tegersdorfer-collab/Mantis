@@ -10,12 +10,11 @@ Dünne Hülle: die Logik liegt in forge/freigabe.py und forge/bericht.py.
 """
 import argparse
 import logging
-import subprocess
 import sys
 
 from core import db
 
-from forge import bericht, daemon, freigabe
+from forge import bericht, freigabe
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -33,33 +32,6 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
-def _daemon_laeuft() -> bool:
-    """Läuft gerade ein Forge-Daemon? Abschluss-Review 2c, I3.
-
-    `pgrep -f` matcht auf die volle Befehlszeile (`python3.14 -m forge.daemon`).
-    Eigene kleine Funktion, damit Tests sie patchen können: pgrep würde auch
-    einen pytest-Prozess treffen, dessen argv "forge.daemon" enthält."""
-    try:
-        return subprocess.run(["pgrep", "-f", "forge.daemon"], capture_output=True).returncode == 0
-    except OSError:
-        return False
-
-
-def _stop() -> int:
-    """Weicher Stop. Ohne laufenden Daemon wird KEINE Halt-Datei geschrieben:
-    daemon.main() räumt sie beim nächsten Start als veraltet weg (ein Halt
-    ist eine Bitte an den laufenden Daemon), die Nacht liefe also trotz
-    "Halt angefordert" — Abschluss-Review 2c, I3."""
-    if not _daemon_laeuft():
-        print("Kein Daemon läuft — eine Halt-Datei würde beim nächsten Start als veraltet entfernt. "
-              "Für 'heute Nacht nicht': `touch ~/.mantis-forge-stop` (Not-Aus, von Hand entfernen) "
-              "oder `launchctl bootout gui/$(id -u)/com.mantis.forge`.")
-        return 1
-    daemon.HALT_FILE.write_text("stop\n")
-    print(f"Halt angefordert ({daemon.HALT_FILE}) — der Daemon beendet sich nach dem laufenden Tick.")
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     # Abschluss-Review 2c, I6: freigabe.freigeben() sagt seinen Ablehnungsgrund
     # nur per log.warning, der String-Vertrag ("abgelehnt") bleibt für Plan 3.
@@ -69,7 +41,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
     args = _parser().parse_args(argv)
     if args.befehl == "stop":
-        return _stop()
+        text = freigabe.stoppen()
+        print(text)
+        return 0 if text.startswith("Halt angefordert") else 1
 
     db.init_pool()
     if args.befehl == "status":

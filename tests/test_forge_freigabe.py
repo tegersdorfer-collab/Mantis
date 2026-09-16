@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 
+from forge import freigabe
 from forge import freigabe as f
 from forge import models as m
 from forge import worktree as wt
@@ -201,3 +202,49 @@ class TestFreigebenGegenEchtesGit:
         assert not baum.exists()
         zweige = _sh("git", "branch", "--list", "forge/task-7", cwd=repo).stdout.strip()
         assert zweige == ""
+
+
+class TestStoppen:
+    """Nachtrag 3a: der weiche Stop liegt in freigabe, damit CLI und Bot
+    dieselbe Semantik haben (Abschluss-Review 2c, I3: ohne laufenden Daemon
+    KEINE Halt-Datei — daemon.main() räumt sie beim Start als veraltet weg)."""
+
+    def test_mit_daemon_schreibt_halt_datei(self, monkeypatch, tmp_path):
+        halt = tmp_path / "halt"
+        monkeypatch.setattr(freigabe.daemon, "HALT_FILE", halt)
+        monkeypatch.setattr(freigabe, "daemon_laeuft", lambda: True)
+        text = freigabe.stoppen()
+        assert halt.exists()
+        assert text.startswith("Halt angefordert")
+
+    def test_ohne_daemon_keine_halt_datei(self, monkeypatch, tmp_path):
+        halt = tmp_path / "halt"
+        monkeypatch.setattr(freigabe.daemon, "HALT_FILE", halt)
+        monkeypatch.setattr(freigabe, "daemon_laeuft", lambda: False)
+        text = freigabe.stoppen()
+        assert not halt.exists()
+        assert "Kein Daemon läuft" in text
+        assert ".mantis-forge-stop" in text, "der Hinweis auf den Not-Aus muss bleiben"
+
+    def test_daemon_laeuft_matcht_nur_das_modul(self, monkeypatch):
+        """`pgrep -f forge.daemon` traf auch forge.daemon_xyz und jeden
+        Editor mit dem Pfad im Titel (Handoff 16.09.). Das Muster muss auf
+        `-m forge\\.daemon` verengt sein."""
+        gesehen = []
+
+        class _Ergebnis:
+            returncode = 1
+
+        def _run(argv, **kw):
+            gesehen.append(argv)
+            return _Ergebnis()
+
+        monkeypatch.setattr(freigabe.subprocess, "run", _run)
+        assert freigabe.daemon_laeuft() is False
+        assert gesehen == [["pgrep", "-f", r"-m forge\.daemon"]]
+
+    def test_daemon_laeuft_bei_oserror_false(self, monkeypatch):
+        def _run(argv, **kw):
+            raise OSError("kein pgrep")
+        monkeypatch.setattr(freigabe.subprocess, "run", _run)
+        assert freigabe.daemon_laeuft() is False
