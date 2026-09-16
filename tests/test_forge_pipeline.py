@@ -1854,3 +1854,50 @@ class TestArtefaktFehltNaechstesGlied:
         ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
         assert ergebnis == "geparkt"
         assert stubs["artefakte"] == []
+
+
+class TestWiederaufnahmeUeberspringtVorhandeneArtefakte:
+    """Nach `forge.cli requeue` beginnt ein Task bei spec — mit dem alten
+    Worktree, in dem Spec und Plan des vorigen Anlaufs noch liegen. Bis
+    2026-09-16 liefen die Stufen trotzdem erneut: drei Specs in einem Branch
+    (Task 365), doppelte NVIDIA-Läufe, und die Implement-Stufe fand ihre
+    Datei 'bereits vorhanden'. Eine Stufe, deren Artefakt laut Task-Feld
+    vorliegt, wird übersprungen; wer eine frische Spec will, löscht die Datei."""
+
+    PFAD = "docs/superpowers/specs/2026-09-15-alt-design.md"
+
+    def test_vorhandene_spec_wird_uebersprungen(self, monkeypatch, stubs, tmp_path):
+        (tmp_path / self.PFAD).parent.mkdir(parents=True)
+        (tmp_path / self.PFAD).write_text("alt")
+        gelaufen = []
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (lambda *a, **k: gelaufen.append(1) or RunResult(ok=True, text="x")))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING, spec_path=self.PFAD), tmp_path)
+        assert ergebnis == "weiter"
+        assert gelaufen == [], "Stufe lief trotz vorhandenem Artefakt"
+        assert stubs["states"] == [(5, m.PLANNING)]
+        vermerke = [a[2] for a, kw in stubs["journal"] if "übersprungen" in a[2]]
+        assert vermerke and self.PFAD in vermerke[0]
+
+    def test_gesetztes_feld_ohne_datei_laeuft_normal(self, monkeypatch, stubs, tmp_path):
+        """Die Datei wurde gelöscht — Timo will eine frische Spec."""
+        gelaufen = []
+        def _run(prompt, cwd, timeout=1800, agent=None, model=None):
+            gelaufen.append(1)
+            (tmp_path / self.PFAD).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / self.PFAD).write_text("neu")
+            return RunResult(ok=True, text=self.PFAD)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
+        ergebnis = pl.eine_stufe(_task(m.SPECCING, spec_path=self.PFAD), tmp_path)
+        assert ergebnis == "weiter"
+        assert gelaufen == [1]
+
+    def test_erster_anlauf_ohne_feld_laeuft_normal(self, monkeypatch, stubs, tmp_path):
+        gelaufen = []
+        def _run(prompt, cwd, timeout=1800, agent=None, model=None):
+            gelaufen.append(1)
+            (tmp_path / self.PFAD).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / self.PFAD).write_text("neu")
+            return RunResult(ok=True, text=self.PFAD)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
+        assert pl.eine_stufe(_task(m.SPECCING), tmp_path) == "weiter"
+        assert gelaufen == [1]

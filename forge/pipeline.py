@@ -624,6 +624,24 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path,
         _park(task_id, state, f"Kein Stufen-Handler für Zustand '{state}' (Task {task_id})")
         return "geparkt"
 
+    # Wiederaufnahme (2026-09-16): nach `forge.cli requeue` beginnt der Task
+    # bei spec, aber im alten Worktree liegen Spec und Plan des vorigen
+    # Anlaufs noch — und das Task-Feld kennt sie. Die Stufe erneut laufen zu
+    # lassen kostete einen NVIDIA-Lauf und legte ein zweites Dokument daneben
+    # (Task 365: drei Specs in einem Branch). Liegt das Artefakt vor, wird die
+    # Stufe übersprungen; wer ein frisches will, löscht die Datei.
+    feld_vorhanden = _ARTEFAKT_FELD_JE_STUFE.get(stufe.name)
+    bekannt = task.get(feld_vorhanden) if feld_vorhanden else None
+    if bekannt and _artefakt_vorhanden(worktree, bekannt):
+        journal.log(task_id, "stage_done",
+                    f"Artefakt der Stufe '{stufe.name}' liegt schon vor ({bekannt}) — "
+                    f"Stufe übersprungen (Wiederaufnahme)")
+        if not queue.set_state(task_id, stufe.next_state, current=state):
+            _park(task_id, state,
+                  f"Zustandswechsel {state} -> {stufe.next_state} schlug fehl (Task {task_id})")
+            return "geparkt"
+        return "weiter"
+
     # Die Kettenwahl steht VOR der Fixrunden-Zählung (Review-Finding 3,
     # 2026-09-09): eine erschöpfte Kette parkt, ohne dass dafür je ein Lauf
     # stattfand. Würde erst gezählt und dann die Kette befragt, verbrauchte
