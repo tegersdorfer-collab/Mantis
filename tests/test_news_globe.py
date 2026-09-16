@@ -59,3 +59,21 @@ def test_cached_geo_filters_located_only():
     asyncio.run(news_globe.refresh({"feeds": ["u1"], "topics": []}))
     geo = news_globe.cached_geo()
     assert len(geo) == 1 and geo[0]["place"] == "Tokio" and geo[0]["lat"] == 35.68
+
+
+def test_refresh_adds_google_news_feed_for_configured_topic(monkeypatch):
+    gesehen = []
+
+    async def fake_fetch_all(urls):
+        gesehen.extend(urls)
+        return []
+
+    monkeypatch.setattr(feeds, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(news_globe, "_write_cache", lambda items: None)
+
+    asyncio.run(news_globe.refresh({"feeds": ["u1"], "topics": ["Quantencomputer"]}))
+
+    assert gesehen == [
+        "u1",
+        "https://news.google.com/rss/search?q=Quantencomputer&hl=de&gl=DE&ceid=DE%3Ade",
+    ]

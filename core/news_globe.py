@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from urllib.parse import urlencode
 
 from tools.news import feeds, geolocate
 
@@ -22,6 +23,7 @@ _CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
                           "data", "news_cache.json")
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "data", "news_sources.json")
+_TOPIC_FEED_URL = "https://news.google.com/rss/search"
 
 # Sinnvolle Defaults, falls data/news_sources.json fehlt (data/ ist gitignored,
 # also greift das out-of-the-box). Timo kann die Datei anlegen, um zu überschreiben.
@@ -60,10 +62,25 @@ def _read_cache() -> list[dict]:
         return []
 
 
+def _source_urls(config: dict) -> list[str]:
+    """Erweitert die statischen Feeds um Google-News-Feeds für Themen."""
+    urls = list(config.get("feeds", []) or [])
+    seen = set(urls)
+    for topic in config.get("topics", []) or []:
+        if not isinstance(topic, str) or not topic.strip():
+            continue
+        params = {"q": topic.strip(), "hl": "de", "gl": "DE", "ceid": "DE:de"}
+        url = f"{_TOPIC_FEED_URL}?{urlencode(params)}"
+        if url not in seen:
+            urls.append(url)
+            seen.add(url)
+    return urls
+
+
 async def refresh(config: dict | None = None) -> list[dict]:
     """Feeds holen, geolokalisieren, Cache schreiben, Liste zurückgeben."""
     cfg_ = config or _load_config()
-    raw = await feeds.fetch_all(cfg_.get("feeds", []))
+    raw = await feeds.fetch_all(_source_urls(cfg_))
     located: list[dict] = []
     for item in raw[:_MAX_ITEMS]:
         try:

@@ -526,7 +526,8 @@ Spec: `docs/superpowers/specs/2026-07-10-news-globe-design.md`
 
 **Offen:**
 - [ ] **Visueller Check** von Globus + Karte im Browser (Render, Interaktion) — nur mit Timos Augen.
-- [ ] Themen-News (`topics`) über `web_search` anbinden (aktuell Platzhalter).
+- [x] Themen-News (`topics`) über Google-News-RSS anbinden; werden wie bestehende
+      Quellen geolokalisiert und im Globus-Cache berücksichtigt.
 - [ ] Globe.gl/Leaflet per CDN eingebunden (wie chart.js/vis-network); bei Bedarf lokal vendored.
 
 **Später (eigener Spec):** Karten-Analysen.
