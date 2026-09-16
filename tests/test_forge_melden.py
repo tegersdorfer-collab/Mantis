@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 import os
@@ -109,3 +110,40 @@ class TestSende:
             lambda req, timeout=None: _Antwort(b'{"ok": false, "description": "chat not found"}'),
         )
         assert melden.sende("hi") is False
+
+    def test_html_statt_json_ist_false(self, monkeypatch):
+        self._umgebung(monkeypatch)
+        monkeypatch.setattr(
+            melden.urllib.request, "urlopen",
+            lambda req, timeout=None: _Antwort(b"<html>captive portal</html>"),
+        )
+        assert melden.sende("hi") is False
+
+    def test_json_ohne_objekt_ist_false(self, monkeypatch):
+        self._umgebung(monkeypatch)
+        monkeypatch.setattr(
+            melden.urllib.request, "urlopen",
+            lambda req, timeout=None: _Antwort(b"null"),
+        )
+        assert melden.sende("hi") is False
+
+    def test_abgerissene_antwort_ist_false(self, monkeypatch, caplog):
+        self._umgebung(monkeypatch, token="GEHEIM")
+
+        def _urlopen(req, timeout=None):
+            raise http.client.IncompleteRead(b"")
+
+        monkeypatch.setattr(melden.urllib.request, "urlopen", _urlopen)
+        assert melden.sende("hi") is False
+        assert "GEHEIM" not in caplog.text
+
+    def test_unerwartete_ausnahme_ist_false(self, monkeypatch, caplog):
+        self._umgebung(monkeypatch, token="GEHEIM")
+
+        def _urlopen(req, timeout=None):
+            raise RuntimeError("boom GEHEIM")
+
+        monkeypatch.setattr(melden.urllib.request, "urlopen", _urlopen)
+        assert melden.sende("hi") is False
+        assert "RuntimeError" in caplog.text
+        assert "GEHEIM" not in caplog.text

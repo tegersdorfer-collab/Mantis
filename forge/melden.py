@@ -3,9 +3,13 @@
 Der Daemon schickt damit den Morgenbericht und die Not-Aus-Meldung. Ein
 synchroner POST auf `sendMessage` reicht: kein Polling, kein zweiter Prozess,
 keine Abhängigkeit vom Bot (forge/bot.py), der tagsüber läuft. Diese Funktion
-wirft nie — die Nacht darf nicht an Telegram scheitern. Sie loggt bei
-Fehlern den HTTP-Status, nie die URL (die enthält den Token).
+wirft nie — die Nacht darf nicht an Telegram scheitern, auch nicht bei einer
+abgerissenen Antwort oder einer sonst unerwarteten Ausnahme (dafür fängt ein
+Catch-all den Rest ab). Sie loggt bei Fehlern den HTTP-Status oder den
+Ausnahme-Typnamen, nie die URL oder `str(exc)` (beide könnten den Token
+enthalten).
 """
+import http.client
 import json
 import logging
 import os
@@ -59,8 +63,15 @@ def sende(text: str) -> bool:
             # exc.code, nie str(exc) oder exc.url — die URL trägt den Token.
             log.warning(f"Telegram-Meldung fehlgeschlagen: HTTP {exc.code}")
             return False
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
             log.warning(f"Telegram nicht erreichbar: {getattr(exc, 'reason', exc)}")
+            return False
+        except Exception as exc:
+            # Catch-all: nie str(exc) — der Token könnte darin stecken, nur der Typname.
+            log.warning(f"Telegram-Meldung fehlgeschlagen: {type(exc).__name__}")
+            return False
+        if not isinstance(koerper, dict):
+            log.warning("Telegram lehnt ab: unerwartete Antwort")
             return False
         if not koerper.get("ok"):
             log.warning(f"Telegram lehnt ab: {koerper.get('description', 'ohne Grund')}")

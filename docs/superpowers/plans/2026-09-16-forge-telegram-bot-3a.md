@@ -254,6 +254,9 @@ Der Daemon soll den Morgenbericht schicken, ohne dass ein zweiter Prozess
 läuft: ein synchroner HTTP-POST auf `sendMessage`. Nie werfen — die Nacht
 darf nicht an Telegram scheitern.
 
+Korrektur nach Review 16.09.: http.client-Ausnahmen und Nicht-Objekt-JSON
+entkamen dem Vertrag — Catch-all mit Typname.
+
 **Files:**
 - Create: `forge/melden.py`
 - Test: `tests/test_forge_melden.py`
@@ -269,6 +272,7 @@ darf nicht an Telegram scheitern.
 `tests/test_forge_melden.py`:
 
 ```python
+import http.client
 import io
 import json
 import os
@@ -380,6 +384,43 @@ class TestSende:
             lambda req, timeout=None: _Antwort(b'{"ok": false, "description": "chat not found"}'),
         )
         assert melden.sende("hi") is False
+
+    def test_html_statt_json_ist_false(self, monkeypatch):
+        self._umgebung(monkeypatch)
+        monkeypatch.setattr(
+            melden.urllib.request, "urlopen",
+            lambda req, timeout=None: _Antwort(b"<html>captive portal</html>"),
+        )
+        assert melden.sende("hi") is False
+
+    def test_json_ohne_objekt_ist_false(self, monkeypatch):
+        self._umgebung(monkeypatch)
+        monkeypatch.setattr(
+            melden.urllib.request, "urlopen",
+            lambda req, timeout=None: _Antwort(b"null"),
+        )
+        assert melden.sende("hi") is False
+
+    def test_abgerissene_antwort_ist_false(self, monkeypatch, caplog):
+        self._umgebung(monkeypatch, token="GEHEIM")
+
+        def _urlopen(req, timeout=None):
+            raise http.client.IncompleteRead(b"")
+
+        monkeypatch.setattr(melden.urllib.request, "urlopen", _urlopen)
+        assert melden.sende("hi") is False
+        assert "GEHEIM" not in caplog.text
+
+    def test_unerwartete_ausnahme_ist_false(self, monkeypatch, caplog):
+        self._umgebung(monkeypatch, token="GEHEIM")
+
+        def _urlopen(req, timeout=None):
+            raise RuntimeError("boom GEHEIM")
+
+        monkeypatch.setattr(melden.urllib.request, "urlopen", _urlopen)
+        assert melden.sende("hi") is False
+        assert "RuntimeError" in caplog.text
+        assert "GEHEIM" not in caplog.text
 ```
 
 - [ ] **Step 2: Tests laufen lassen — rot**
@@ -395,9 +436,13 @@ Expected: `ModuleNotFoundError: No module named 'forge.melden'`
 Der Daemon schickt damit den Morgenbericht und die Not-Aus-Meldung. Ein
 synchroner POST auf `sendMessage` reicht: kein Polling, kein zweiter Prozess,
 keine Abhängigkeit vom Bot (forge/bot.py), der tagsüber läuft. Diese Funktion
-wirft nie — die Nacht darf nicht an Telegram scheitern. Sie loggt bei
-Fehlern den HTTP-Status, nie die URL (die enthält den Token).
+wirft nie — die Nacht darf nicht an Telegram scheitern, auch nicht bei einer
+abgerissenen Antwort oder einer sonst unerwarteten Ausnahme (dafür fängt ein
+Catch-all den Rest ab). Sie loggt bei Fehlern den HTTP-Status oder den
+Ausnahme-Typnamen, nie die URL oder `str(exc)` (beide könnten den Token
+enthalten).
 """
+import http.client
 import json
 import logging
 import os
@@ -451,8 +496,15 @@ def sende(text: str) -> bool:
             # exc.code, nie str(exc) oder exc.url — die URL trägt den Token.
             log.warning(f"Telegram-Meldung fehlgeschlagen: HTTP {exc.code}")
             return False
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
             log.warning(f"Telegram nicht erreichbar: {getattr(exc, 'reason', exc)}")
+            return False
+        except Exception as exc:
+            # Catch-all: nie str(exc) — der Token könnte darin stecken, nur der Typname.
+            log.warning(f"Telegram-Meldung fehlgeschlagen: {type(exc).__name__}")
+            return False
+        if not isinstance(koerper, dict):
+            log.warning("Telegram lehnt ab: unerwartete Antwort")
             return False
         if not koerper.get("ok"):
             log.warning(f"Telegram lehnt ab: {koerper.get('description', 'ohne Grund')}")
@@ -462,11 +514,18 @@ def sende(text: str) -> bool:
 
 Hinweis für den Implementierer: `TimeoutError` ist seit 3.10 Unterklasse von
 `OSError`, `socket.timeout` ein Alias davon — beide sind abgedeckt.
+`http.client.HTTPException` (z. B. `IncompleteRead`, `BadStatusLine`) ist
+keine `OSError`-Unterklasse und braucht einen eigenen Eintrag im Tupel; der
+finale `except Exception` fängt jede sonst unerwartete Ausnahme ab, ohne je
+`str(exc)` zu loggen (nur den Typnamen). Der `isinstance(koerper, dict)`-
+Check danach behandelt eine gültige, aber nicht-objekthafte JSON-Antwort
+(`null`, `[]`, `"x"`) als `ok: false`, statt mit `AttributeError` auf
+`.get()` zu crashen.
 
 - [ ] **Step 4: Tests laufen lassen — grün**
 
 Run: `python3.14 -m pytest tests/test_forge_melden.py -q && python3.14 -m ruff check forge/melden.py tests/test_forge_melden.py`
-Expected: 11 passed, ruff sauber
+Expected: 15 passed, ruff sauber
 
 - [ ] **Step 5: Commit**
 
