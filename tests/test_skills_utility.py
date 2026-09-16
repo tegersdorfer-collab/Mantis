@@ -48,10 +48,10 @@ def test_math_funktionen_konstanten():
 
 def test_statistics():
     """Teste statistics."""
-    # statistics.mean([1, 2, 3]) = 2.0
+    # statistics.mean([1, 2, 3]) = 2
     expr = "statistics.mean([1, 2, 3])"
     result = asyncio.run(utility._calculate(expr))
-    assert result == f"{expr} = 2.0"
+    assert result == f"{expr} = 2"
 
 
 def test_fehler_rueckgabe_string():

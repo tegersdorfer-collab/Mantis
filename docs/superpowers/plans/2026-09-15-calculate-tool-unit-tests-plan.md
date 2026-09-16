@@ -4,29 +4,29 @@
 - Dateipfad: tests/test_skills_utility.py
 - Test zuerst:
   ```python
-  import asyncio
-  import core.skills.utility as utility
+import asyncio
+import core.skills.utility as utility
 
-  def test_calculate_grundrechenarten_vorrang():
-      # Test für (80 + 90) / 2
-      expr = "(80 + 90) / 2"
-      result = asyncio.run(utility._calculate(expr))
-      assert result == "85.0"
+def test_calculate_grundrechenarten_vorrang():
+    # Test für (80 + 90) / 2
+    expr = "(80 + 90) / 2"
+    result = asyncio.run(utility._calculate(expr))
+    assert result == "(80 + 90) / 2 = 85.0"
 
-      # Test für 2 ** 10
-      expr = "2 ** 10"
-      result = asyncio.run(utility._calculate(expr))
-      assert result == "1024"
+    # Test für 2 ** 10
+    expr = "2 ** 10"
+    result = asyncio.run(utility._calculate(expr))
+    assert result == "2 ** 10 = 1024"
 
-      # Test für 7 // 2
-      expr = "7 // 2"
-      result = asyncio.run(utility._calculate(expr))
-      assert result == "3"
+    # Test für 7 // 2
+    expr = "7 // 2"
+    result = asyncio.run(utility._calculate(expr))
+    assert result == "7 // 2 = 3"
 
-      # Test für 7 % 2
-      expr = "7 % 2"
-      result = asyncio.run(utility._calculate(expr))
-      assert result == "1"
+    # Test für 7 % 2
+    expr = "7 % 2"
+    result = asyncio.run(utility._calculate(expr))
+    assert result == "7 % 2 = 1"
   ```
 - Dann führe aus: pytest tests/test_skills_utility.py
 - Erwartetes Ergebnis: Der Test läuft erfolgreich.
@@ -35,10 +35,10 @@
 - Dateipfad: tests/test_skills_utility.py
 - Test zuerst:
   ```python
-  def test_calculate_vorzeichen():
-      expr = "-3 + 5"
-      result = asyncio.run(utility._calculate(expr))
-      assert result == "2"
+def test_calculate_vorzeichen():
+    expr = "-3 + 5"
+    result = asyncio.run(utility._calculate(expr))
+    assert result == "-3 + 5 = 2"
   ```
 - Dann führe aus: pytest tests/test_skills_utility.py
 - Erwartetes Ergebnis: Der Test läuft erfolgreich (zusammen mit den Tests aus Schritt 1).
@@ -47,16 +47,16 @@
 - Dateipfad: tests/test_skills_utility.py
 - Test zuerst:
   ```python
-  def test_calculate_math_funktionen_konstanten():
-      # Test für sqrt(16)
-      expr = "sqrt(16)"
-      result = asyncio.run(utility._calculate(expr))
-      assert result == "4.0"
+def test_calculate_math_funktionen_konstanten():
+    # Test für sqrt(16)
+    expr = "sqrt(16)"
+    result = asyncio.run(utility._calculate(expr))
+    assert result == "sqrt(16) = 4.0"
 
-      # Test für pi (Ergebnis beginnt mit 3.14)
-      expr = "pi"
-      result = asyncio.run(utility._calculate(expr))
-      assert result.startswith("3.14")
+    # Test für pi (Ergebnis beginnt mit 3.14)
+    expr = "pi"
+    result = asyncio.run(utility._calculate(expr))
+    assert result.startswith("pi = 3.14")
   ```
 - Dann führe aus: pytest tests/test_skills_utility.py
 - Erwartetes Ergebnis: Der Test läuft erfolgreich (zusammen mit den vorherigen Tests).
@@ -65,10 +65,10 @@
 - Dateipfad: tests/test_skills_utility.py
 - Test zuerst:
   ```python
-  def test_calculate_statistics():
-      expr = "statistics.mean([1, 2, 3])"
-      result = asyncio.run(utility._calculate(expr))
-      assert result == "2"
+def test_calculate_statistics():
+    expr = "statistics.mean([1, 2, 3])"
+    result = asyncio.run(utility._calculate(expr))
+    assert result == "statistics.mean([1, 2, 3]) = 2"
   ```
 - Dann führe aus: pytest tests/test_skills_utility.py
 - Erwartetes Ergebnis: Der Test läuft erfolgreich (zusammen mit den vorherigen Tests).
