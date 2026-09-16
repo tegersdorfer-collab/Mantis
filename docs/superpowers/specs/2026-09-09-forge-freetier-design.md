@@ -570,3 +570,123 @@ Codestelle zu beantworten:
 5. Was schreibt diese Änderung in Produktionstabellen, und wer räumt es weg?
 
 Das Abschluss-Review auf dem stärksten Modell bleibt.
+
+## Nachtrag 3a (2026-09-16)
+
+Nach zwei Tasks, die die Forge komplett bis `main` gebracht hat (#365, #621,
+beide mit Nacharbeit von Hand vor dem `approve`). Plan 3 wird geteilt und
+vor 2d gezogen. Wo dieser Nachtrag dem Abschnitt „Telegram-Bot" oben
+widerspricht, gilt der Nachtrag.
+
+### Schnitt: 3a vor 2d, 3b später
+
+**3a** ist der Bot ohne Merge-Knöpfe: Morgenbericht und Not-Aus per Telegram,
+Freitext → Task, `/status`, `/queue`, `/requeue`, `/stop`. Er kommt vor 2d,
+weil die Queue am 16.09. leer war und das Einreihen per Python-Snippet im
+Terminal (zsh-Backtick-Falle) die tatsächliche Bremse ist — nicht die
+fehlende zweite Bahn. 2d lohnt erst, wenn genug Tasks drin sind.
+
+**3b** bringt die Merge-Freigabe per Knopf (**[Mergen] [Diff] [Verwerfen]**)
+und die Scout-Priorisierung. Beide bisherigen Tasks brauchten Nacharbeit, die
+weder Review noch Gate sahen; ein Merge-Knopf auf dem Handy lädt zum blinden
+Approve ein. 3b kommt, wenn zwei, drei Tasks ohne Nacharbeit durch sind. Bis
+dahin bleibt die Freigabe beim CLI mit Diff-Lesen im Worktree.
+
+### Eigener Bot statt `TelegramChannel`
+
+Der Abschnitt oben nimmt an, `TelegramChannel` liefere die Basis („neu ist
+nur die Befehlslogik"). Das stimmt nicht: die Klasse hängt Voice, Fotos und
+URL-Inhalte direkt an den LLM, `_handle_callback` an die Mantis-Domains, und
+`/status` ist fest verdrahtet. „Kein LLM-Zugang" hieße, fünf Handler
+abzuschalten. `forge/bot.py` steht deshalb direkt auf `python-telegram-bot`
+(vorhanden, v22.7) und übernimmt von `TelegramChannel` nur das Muster der
+Allowlist. Kein Import aus `communication/`, keiner aus den Runnern.
+
+### Prozess und Zustellung
+
+Zwei Wege, weil der Bot tagsüber leben muss und der Daemon nachts nicht auf
+einen zweiten Prozess angewiesen sein darf:
+
+- **`forge/bot.py`** — Polling-Bot, eigener launchd-Agent
+  `com.mantis.forge-bot` mit `KeepAlive`, 24/7. Lädt
+  `~/.config/ai-keys.env` über `daemon.lade_api_schluessel()`, Token aus
+  `FORGE_BOT_TOKEN`. Fehlt der Token, beendet sich der Prozess mit klarer
+  Meldung (launchd zieht ihn nicht in einer Schleife hoch: `ThrottleInterval`
+  gesetzt).
+- **`forge/melden.py`** — `sende(text) -> bool`, synchroner `urllib`-POST auf
+  `sendMessage`, keine Bot-Instanz, kein Polling. Der **Daemon** ruft sie an
+  jedem Ende von `main()`: Fensterende und weicher Halt mit
+  `bericht.morgenbericht()`, Fehler-Spirale sofort mit dem Grund als erster
+  Zeile und dem Bericht darunter. Fehlt der Token oder antwortet Telegram
+  nicht, loggt `sende` (Status, nie die URL) und gibt `False` zurück — die
+  Nacht darf nie an Telegram scheitern. Nachrichten über 4096 Zeichen werden
+  am letzten Zeilenumbruch geteilt.
+
+Nachts sonst Stille. Parks stehen im Morgenbericht, nicht um drei Uhr auf dem
+Handy.
+
+### Befehle
+
+Alles läuft über die Funktionen, die `forge.cli` schon aufruft; das CLI bleibt
+die Referenz (Abschnitt „Freigabe ohne Telegram").
+
+| Eingabe | Wirkung | Antwort |
+|---|---|---|
+| Freitext | `queue.enqueue(title=erste Zeile, description=Rest, source="timo")` | „#42 eingereiht: <Titel>" mit Knopf **[Verwerfen]** |
+| `/status` | Kopfzeile + `bericht.morgenbericht()` | „Daemon läuft, #42 in implementing seit 23:14" bzw. „Daemon läuft nicht", dann der Bericht |
+| `/queue` | `queue.nach_zustand(QUEUED)` | je Task eine Zeile mit Knopf **[Verwerfen]** |
+| `/requeue <id>` | `freigabe.neu_einreihen(id)` | „#42 neu eingereiht" oder „#42: nicht geparkt/gescheitert" |
+| `/stop` | `freigabe.stoppen()` | Text der Funktion |
+| alles andere | nichts | „Kenn ich nicht. Freitext = Task, /status /queue /requeue /stop" |
+
+- **Verwerfen** ist `queue.park(id, "verworfen via Telegram")`, nur aus
+  `QUEUED`. Kein Löschen; geparkt ist nachvollziehbar und per `/requeue`
+  rückholbar. Ist der Task inzwischen aktiv, sagt der Knopf das und tut nichts.
+- **`/stop`**: die Logik aus `cli._stop()` (Halt-Datei nur bei laufendem
+  Daemon, sonst Hinweis auf Not-Aus) wandert nach `freigabe.stoppen() -> str`;
+  CLI und Bot drucken bzw. senden den String. `_daemon_laeuft()` zieht mit
+  und matcht auf `-m forge\.daemon` (Handoff 16.09.: `pgrep -f forge.daemon`
+  ist zu breit).
+- Der Freitext wird nicht interpretiert. Erste Zeile ist der Titel, gekürzt
+  auf 200 Zeichen; der Rest ist die Beschreibung. Priorität bleibt beim
+  Standard — „über Scout-Arbeit" ist Sache von 3b, den Scout gibt es noch
+  nicht.
+- Voice, Fotos, Dokumente: keine Handler. Telegram liefert sie, der Bot
+  ignoriert sie ohne Antwort — sonst müsste er erklären, was er nicht kann.
+
+### Sicherheit
+
+- Allowlist strikt aus `TELEGRAM_CHAT_ID` und `TELEGRAM_ALLOWED_IDS` (die
+  Chat-ID eines Privatchats ist die User-ID, sie gilt für beide Bots).
+  Fehlen beide, startet der Bot nicht. Kein Trust-on-first-use: der Bot reiht
+  Aufgaben ein, die Agenten im Repo ausführen.
+- Fremde Absender werden geloggt (ID) und nicht beantwortet.
+- Callback-Daten haben die Form `verwerfen:<int>`; alles andere wird
+  verworfen. Es gibt keinen Weg von Telegram in einen Shell-Aufruf.
+- Der Token steht nur in `~/.config/ai-keys.env`. `melden.sende` und der Bot
+  loggen nie den Token und nie eine URL, die ihn enthält.
+
+### Testbarkeit
+
+- Die Befehlslogik ist eine reine Funktion `antwort_auf(text, absender_ok)
+  -> Antwort` (Text plus Knopfliste) und ein `knopf_gedrueckt(daten) ->
+  Antwort`; die Telegram-Handler sind Dreizeiler darum. Tests treffen die
+  Funktionen mit gepatchter `queue`/`freigabe`. **Kein Telegram aus Tests**,
+  dieselbe Regel wie für `opencode`/`agy`.
+- `melden.sende`: `urlopen` gepatcht; ohne Token kein Aufruf und `False`;
+  HTTP-Fehler → `False`, kein Traceback; Teilung bei 4096.
+- Daemon: jedes Ende von `main()` ruft `melden.sende` genau einmal; die
+  Fehler-Spirale schickt den Grund in der ersten Zeile.
+- **Tagesprobe vor dem Merge** (Prozess-Lehre aus vier Plänen: Umgebung und
+  Anbieter kommen in keinem Diff vor): Bot per launchd hochziehen, eine
+  Nachricht schicken und den Task in der Queue sehen, `/status` beantworten
+  lassen, `/stop` ohne Daemon, dann `melden.sende("Probe")` aus einem
+  `python3.14 -m`-Aufruf im Repo mit denselben Umgebungsvariablen wie die
+  plist. Der Probe-Task wird danach geparkt, nicht gelöscht.
+
+### Review-Regel für 3a
+
+Die fünf Fragen aus „Review-Regel für 2c" gelten, plus die sechste aus dem
+Handoff vom 16.09.: *Unter welcher Umgebung läuft das wirklich, wurde die
+geprobt?* Für den Bot heißt das: launchd-PATH, Schlüsseldatei, Arbeits-
+verzeichnis, `ThrottleInterval` — mit Codestelle oder Probe belegt.
