@@ -9,9 +9,17 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from forge import runner
 
 FIXTURE = Path(__file__).parent / "fixtures" / "claude_stream_success.jsonl"
+
+
+@pytest.fixture(autouse=True)
+def _mock_claude_binary(monkeypatch):
+    """Runner-Tests bleiben unabhängig vom PATH des Testsystems."""
+    monkeypatch.setattr(runner, "CLAUDE_BIN", "/mock/bin/claude")
 
 
 class TestParseEchteAufnahme:

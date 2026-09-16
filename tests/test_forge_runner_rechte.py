@@ -11,6 +11,12 @@ import pytest
 from forge import runner
 
 
+@pytest.fixture(autouse=True)
+def _mock_claude_binary(monkeypatch):
+    """Die Stub-Subprocess-Aufrufe benötigen kein echtes Claude-Binary."""
+    monkeypatch.setattr(runner, "CLAUDE_BIN", "/mock/bin/claude")
+
+
 class _Aufzeichnung:
     """Fängt den Befehl ab, statt claude wirklich zu starten."""
 
