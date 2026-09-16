@@ -168,3 +168,69 @@ class TestKnopf:
         monkeypatch.setattr(bot.queue, "hole", lambda tid: (_ for _ in ()).throw(AssertionError("kein hole")))
         for daten in ("task_done:3", "verwerfen:3;drop", "verwerfen:", "verwerfen:-1", ""):
             assert bot.knopf_gedrueckt(daten).text == "Unbekannter Knopf."
+
+
+class TestAllowlist:
+    def test_chat_id_und_allowed_ids_zusammen(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_IDS", " 7, 8 ,,")
+        assert bot._allowlist() == {"42", "7", "8"}
+
+    def test_leer_ohne_beides(self, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+        monkeypatch.delenv("TELEGRAM_ALLOWED_IDS", raising=False)
+        assert bot._allowlist() == set()
+
+    def test_absender_ok_nur_aus_der_liste(self):
+        assert bot._absender_ok("42", "42", {"42"}) is True
+        assert bot._absender_ok("7", "42", {"42"}) is True, "Chat-ID reicht (Privatchat: User-ID == Chat-ID)"
+        assert bot._absender_ok("9", "9", {"42"}) is False
+
+    def test_kein_trust_on_first_use(self):
+        """Ohne Liste ist NIEMAND erlaubt — anders als TelegramChannel, der
+        auf den ersten Absender sperrt. Der Bot reiht Aufgaben ein, die
+        Agenten im Repo ausführen."""
+        assert bot._absender_ok("9", "9", set()) is False
+
+
+class TestMainAbbruch:
+    def _umgebung(self, monkeypatch):
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None, nur=None: [])
+        monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: (_ for _ in ()).throw(AssertionError("kein Pool vor der Prüfung")))
+        monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: (_ for _ in ()).throw(AssertionError("kein Polling")))
+
+    def test_ohne_token_exit_2(self, monkeypatch, caplog):
+        self._umgebung(monkeypatch)
+        monkeypatch.delenv("FORGE_BOT_TOKEN", raising=False)
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+        assert bot.main() == 2
+        assert "FORGE_BOT_TOKEN" in caplog.text
+
+    def test_ohne_allowlist_exit_2(self, monkeypatch, caplog):
+        self._umgebung(monkeypatch)
+        monkeypatch.setenv("FORGE_BOT_TOKEN", "T")
+        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+        monkeypatch.delenv("TELEGRAM_ALLOWED_IDS", raising=False)
+        assert bot.main() == 2
+        assert "TELEGRAM_CHAT_ID" in caplog.text
+
+    def test_mit_token_und_liste_startet_polling(self, monkeypatch):
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None, nur=None: [])
+        monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: None)
+        gesehen = []
+        monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: gesehen.append((token, erlaubt)))
+        monkeypatch.setenv("FORGE_BOT_TOKEN", "T")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+        assert bot.main() == 0
+        assert gesehen == [("T", {"42"})]
+
+    def test_main_laedt_beide_dateien(self, monkeypatch):
+        geladen = []
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel",
+                             lambda datei=None, nur=None: geladen.append((datei, nur)) or [])
+        monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: None)
+        monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: None)
+        monkeypatch.setenv("FORGE_BOT_TOKEN", "T")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+        bot.main()
+        assert geladen == [(bot.daemon.API_SCHLUESSEL_DATEI, None), (bot.daemon.ENV_DATEI, bot.daemon.ENV_NUR)]
