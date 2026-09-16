@@ -2,6 +2,7 @@
 
 Geprüft wird, WANN gearbeitet wird — nicht ob claude funktioniert. Alle
 Außenkontakte (Queue, Worktree, Pipeline, Gate) sind gestubbt."""
+import logging
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -12,6 +13,23 @@ import pytest
 
 from forge import daemon as d
 from forge import models as m
+
+# Referenz auf die ECHTE Funktion, festgehalten vor jeder Monkeypatch-Aktion
+# dieser Datei — die modulweite Autouse-Fixture unten stubbt
+# d.lade_api_schluessel für main()-Tests; TestApiSchluesselAusDatei testet
+# aber genau diese Funktion und braucht die echte Parser-Logik zurück.
+_LADE_API_SCHLUESSEL_ECHT = d.lade_api_schluessel
+
+
+@pytest.fixture(autouse=True)
+def _kein_telegram_und_keine_echten_schluessel(monkeypatch):
+    """Nachtrag 3a: main() lädt ai-keys.env (mit FORGE_BOT_TOKEN) und .env
+    (mit TELEGRAM_CHAT_ID) und schickt am Ende den Bericht per Telegram.
+    Kein Test dieser Datei darf echte Schlüssel laden oder eine Nachricht
+    senden — der Review 16.09. hat gezeigt, dass die alten main()-Tests
+    das auf ~/Mantis täten."""
+    monkeypatch.setattr(d.melden, "sende", lambda text: True)
+    monkeypatch.setattr(d, "lade_api_schluessel", lambda *a, **kw: [])
 
 
 @pytest.fixture
@@ -599,6 +617,14 @@ class TestApiSchluesselAusDatei:
     'Method doesn't allow unregistered callers', Task 365 parkte nach drei
     Sekunden. Der Daemon lädt die Datei deshalb selbst."""
 
+    @pytest.fixture(autouse=True)
+    def _echte_funktion(self, monkeypatch):
+        # Diese Klasse testet den Parser von lade_api_schluessel() selbst —
+        # die modulweite Autouse-Fixture (kein Telegram/echte Schlüssel in
+        # main()-Tests, siehe oben) stubbt ihn; hier muss die echte Logik
+        # laufen, sonst würde jeder Aufruf unten nur [] liefern.
+        monkeypatch.setattr(d, "lade_api_schluessel", _LADE_API_SCHLUESSEL_ECHT)
+
     def _datei(self, tmp_path, inhalt):
         p = tmp_path / "ai-keys.env"
         p.write_text(inhalt)
@@ -623,6 +649,25 @@ class TestApiSchluesselAusDatei:
 
     def test_fehlende_datei_ist_kein_fehler(self, tmp_path):
         assert d.lade_api_schluessel(tmp_path / "gibt-es-nicht") == []
+
+    def test_nur_filtert_auf_erlaubte_namen(self, monkeypatch, tmp_path):
+        # Korrektur nach Review 16.09.: die Mantis-.env trägt Geheimnisse, die
+        # nicht in jeden Agenten-Subprozess gehören — nur eine Allowlist darf
+        # tatsächlich in os.environ landen.
+        p = self._datei(tmp_path, "A=1\nB=2\n")
+        monkeypatch.delenv("A", raising=False)
+        monkeypatch.delenv("B", raising=False)
+        geladen = d.lade_api_schluessel(p, nur=frozenset({"B"}))
+        assert geladen == ["B"]
+        import os
+        assert "A" not in os.environ
+        assert os.environ["B"] == "2"
+
+    def test_ohne_nur_laedt_alles(self, monkeypatch, tmp_path):
+        p = self._datei(tmp_path, "A=1\nB=2\n")
+        monkeypatch.delenv("A", raising=False)
+        monkeypatch.delenv("B", raising=False)
+        assert d.lade_api_schluessel(p) == ["A", "B"]
 
 
 class TestAbschlussMeldung:
@@ -696,11 +741,25 @@ class TestAbschlussMeldung:
 
     def test_main_laedt_auch_die_env_datei(self, monkeypatch, tmp_path):
         """TELEGRAM_CHAT_ID steht in .env, nicht in ai-keys.env. Ohne
-        diesen zweiten Ladevorgang bliebe melden.sende stumm."""
+        diesen zweiten Ladevorgang bliebe melden.sende stumm. Der zweite
+        Aufruf muss zudem die Allowlist ENV_NUR mitgeben — sonst landen
+        die restlichen Geheimnisse der .env ungefiltert in os.environ und
+        von dort in jedem Agenten-Subprozess (Review 16.09.)."""
         gesendet = []
         self._vorbereiten(monkeypatch, tmp_path, gesendet)
         geladen = []
-        monkeypatch.setattr(d, "lade_api_schluessel", lambda datei=None: geladen.append(datei) or [])
+        monkeypatch.setattr(d, "lade_api_schluessel",
+                             lambda datei=None, nur=None: geladen.append((datei, nur)) or [])
         monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: False)
         d.main()
-        assert geladen == [d.API_SCHLUESSEL_DATEI, d.ENV_DATEI]
+        assert geladen == [(d.API_SCHLUESSEL_DATEI, None), (d.ENV_DATEI, d.ENV_NUR)]
+
+    def test_fehlgeschlagener_versand_wird_geloggt(self, monkeypatch, tmp_path, caplog):
+        """main() darf bei einer gescheiterten Zustellung nicht schweigen —
+        sonst zeigt das launchd-stdout um 07:00 nicht, dass etwas fehlte."""
+        self._vorbereiten(monkeypatch, tmp_path, [])
+        monkeypatch.setattr(d.melden, "sende", lambda text: False)
+        monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: False)
+        with caplog.at_level(logging.WARNING):
+            d.main()
+        assert "nicht zugestellt" in caplog.text

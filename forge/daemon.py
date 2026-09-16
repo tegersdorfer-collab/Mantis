@@ -78,6 +78,15 @@ API_SCHLUESSEL_DATEI = Path.home() / ".config" / "ai-keys.env"
 # ai-keys.env. Der Daemon lädt beide (nur Namen ins Log, nie Werte); die
 # .env-Werte kennt der Prozess über core.db/settings ohnehin schon.
 ENV_DATEI = MANTIS_REPO / ".env"
+# Korrektur nach Review 16.09.: die Mantis-.env trägt auch ANTHROPIC_API_KEY,
+# den Mantis-Bot-Token, GOOGLE_CLIENT_SECRET usw. — und die Forge reicht
+# os.environ ungefiltert an jeden Agenten-Subprozess weiter (runner_opencode.py:
+# dict(os.environ), gate.py: {**os.environ, ...}). Ungefiltert geladen wären
+# diese Geheimnisse ab dem nächsten Tick in jedem Claude-/opencode-Lauf
+# sichtbar. lade_api_schluessel(ENV_DATEI, nur=ENV_NUR) lädt deshalb nur die
+# beiden Namen, die der Telegram-Bot tatsächlich braucht (Task 5 nutzt
+# dieselbe Konstante für seine eigene Allowlist-Prüfung).
+ENV_NUR = frozenset({"TELEGRAM_CHAT_ID", "TELEGRAM_ALLOWED_IDS"})
 
 
 def im_nachtfenster(jetzt: datetime | None = None) -> bool:
@@ -90,11 +99,14 @@ def halt_angefordert() -> bool:
     return HALT_FILE.exists()
 
 
-def lade_api_schluessel(datei: Path = API_SCHLUESSEL_DATEI) -> list[str]:
+def lade_api_schluessel(datei: Path = API_SCHLUESSEL_DATEI, nur: frozenset[str] | None = None) -> list[str]:
     """Lädt `KEY=WERT`-Zeilen (auch mit `export`, auch in Anführungszeichen)
     in os.environ — nur Variablen, die dort noch fehlen. Rückgabe: die Namen
     der geladenen Variablen. Eine fehlende Datei ist kein Fehler: dann muss
-    die Umgebung die Schlüssel schon mitbringen."""
+    die Umgebung die Schlüssel schon mitbringen. Mit `nur` gesetzt werden
+    ausschließlich Namen aus dieser Menge geladen — Geheimnisse der
+    Mantis-.env (Anthropic-Key, Bot-Token, OAuth-Secrets, ...) dürfen nicht
+    ungefiltert in Agenten-Subprozesse gelangen."""
     if not datei.is_file():
         return []
     geladen: list[str] = []
@@ -106,7 +118,7 @@ def lade_api_schluessel(datei: Path = API_SCHLUESSEL_DATEI) -> list[str]:
             zeile = zeile[len("export "):]
         name, wert = zeile.split("=", 1)
         name, wert = name.strip(), wert.strip().strip('"').strip("'")
-        if not name or name in os.environ:
+        if not name or (nur is not None and name not in nur) or name in os.environ:
             continue
         os.environ[name] = wert
         geladen.append(name)
@@ -249,7 +261,11 @@ def _abschluss(grund: str | None = None) -> None:
         text = f"Morgenbericht nicht erstellbar: {exc}\n"
     if grund:
         text = f"Forge abgeschaltet: {grund}\n\n{text}"
-    melden.sende(text)
+    if not melden.sende(text):
+        # melden.sende loggt Details (HTTP-Status/Ausnahme-Typ) bereits selbst,
+        # nie Token oder URL — diese Zeile ist dafür da, dass das launchd-
+        # stdout um 07:00 überhaupt zeigt, dass etwas fehlte.
+        log.warning("Forge: Abschlussmeldung nicht zugestellt (siehe melden-Warnung)")
 
 
 def main() -> None:
@@ -259,7 +275,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
     schluessel = lade_api_schluessel(API_SCHLUESSEL_DATEI)
     log.info(f"Forge: API-Schlüssel aus {API_SCHLUESSEL_DATEI.name} geladen: {', '.join(schluessel) or 'keine'}")
-    umgebung = lade_api_schluessel(ENV_DATEI)
+    umgebung = lade_api_schluessel(ENV_DATEI, nur=ENV_NUR)
     log.info(f"Forge: aus {ENV_DATEI.name} geladen: {', '.join(umgebung) or 'nichts Neues'}")
     db.init_pool()
     # Die Forge ist bewusst unabhängig vom laufenden Mantis-Assistant (siehe

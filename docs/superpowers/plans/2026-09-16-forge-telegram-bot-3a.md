@@ -546,6 +546,9 @@ Fehler-Spirale. Jeder schickt den Morgenbericht; die Spirale setzt den Grund
 in die erste Zeile. Dafür muss der Daemon `TELEGRAM_CHAT_ID` kennen — die
 steht in `.env`, nicht in `ai-keys.env`.
 
+Korrektur nach Review 16.09.: `.env` nur mit Allowlist (`ENV_NUR`) laden;
+Autouse-Fixture gegen echte Schlüssel/Telegram in Alt-Tests.
+
 **Files:**
 - Modify: `forge/daemon.py` (Konstanten nach `API_SCHLUESSEL_DATEI`, `main()`)
 - Test: `tests/test_forge_daemon.py` (neue Klasse ans Ende)
@@ -553,8 +556,9 @@ steht in `.env`, nicht in `ai-keys.env`.
 **Interfaces:**
 - Consumes: `melden.sende(text) -> bool` (Task 2), `bericht.morgenbericht() -> str` (vorhanden).
 - Produces: `daemon.ENV_DATEI: Path` (= `MANTIS_REPO / ".env"`),
+  `daemon.ENV_NUR: frozenset[str]` (= `{"TELEGRAM_CHAT_ID", "TELEGRAM_ALLOWED_IDS"}`),
   `daemon._abschluss(grund: str | None = None) -> None`. Task 5 nutzt
-  `ENV_DATEI` mit `lade_api_schluessel`.
+  `ENV_DATEI` und `ENV_NUR` mit `lade_api_schluessel`.
 
 - [ ] **Step 1: Failing Tests**
 
@@ -633,14 +637,18 @@ class TestAbschlussMeldung:
 
     def test_main_laedt_auch_die_env_datei(self, monkeypatch, tmp_path):
         """TELEGRAM_CHAT_ID steht in .env, nicht in ai-keys.env. Ohne
-        diesen zweiten Ladevorgang bliebe melden.sende stumm."""
+        diesen zweiten Ladevorgang bliebe melden.sende stumm. Der zweite
+        Aufruf muss zudem die Allowlist ENV_NUR mitgeben — sonst landen die
+        restlichen Geheimnisse der .env ungefiltert in os.environ und von
+        dort in jedem Agenten-Subprozess (Review 16.09.)."""
         gesendet = []
         self._vorbereiten(monkeypatch, tmp_path, gesendet)
         geladen = []
-        monkeypatch.setattr(d, "lade_api_schluessel", lambda datei=None: geladen.append(datei) or [])
+        monkeypatch.setattr(d, "lade_api_schluessel",
+                             lambda datei=None, nur=None: geladen.append((datei, nur)) or [])
         monkeypatch.setattr(d, "im_nachtfenster", lambda jetzt=None: False)
         d.main()
-        assert geladen == [d.API_SCHLUESSEL_DATEI, d.ENV_DATEI]
+        assert geladen == [(d.API_SCHLUESSEL_DATEI, None), (d.ENV_DATEI, d.ENV_NUR)]
 ```
 
 - [ ] **Step 2: Tests laufen lassen — rot**
@@ -664,6 +672,31 @@ Nach `API_SCHLUESSEL_DATEI`:
 # ai-keys.env. Der Daemon lädt beide (nur Namen ins Log, nie Werte); die
 # .env-Werte kennt der Prozess über core.db/settings ohnehin schon.
 ENV_DATEI = MANTIS_REPO / ".env"
+# Korrektur nach Review 16.09.: die Mantis-.env trägt auch ANTHROPIC_API_KEY,
+# den Mantis-Bot-Token, GOOGLE_CLIENT_SECRET usw. — und die Forge reicht
+# os.environ ungefiltert an jeden Agenten-Subprozess weiter (runner_opencode.py:
+# dict(os.environ), gate.py: {**os.environ, ...}). Ungefiltert geladen wären
+# diese Geheimnisse ab dem nächsten Tick in jedem Claude-/opencode-Lauf
+# sichtbar. lade_api_schluessel(ENV_DATEI, nur=ENV_NUR) lädt deshalb nur die
+# beiden Namen, die der Telegram-Bot tatsächlich braucht (Task 5 nutzt
+# dieselbe Konstante für seine eigene Allowlist-Prüfung).
+ENV_NUR = frozenset({"TELEGRAM_CHAT_ID", "TELEGRAM_ALLOWED_IDS"})
+```
+
+`lade_api_schluessel` bekommt einen dritten, optionalen Parameter `nur` —
+ohne ihn bleibt das Verhalten identisch (alles laden), mit ihm werden nur
+Namen aus der Menge übernommen:
+
+```python
+def lade_api_schluessel(datei: Path = API_SCHLUESSEL_DATEI, nur: frozenset[str] | None = None) -> list[str]:
+    """... Mit `nur` gesetzt werden ausschließlich Namen aus dieser Menge
+    geladen — Geheimnisse der Mantis-.env (Anthropic-Key, Bot-Token,
+    OAuth-Secrets, ...) dürfen nicht ungefiltert in Agenten-Subprozesse
+    gelangen."""
+    ...
+    if not name or (nur is not None and name not in nur) or name in os.environ:
+        continue
+    ...
 ```
 
 Neue Funktion vor `main()`:
@@ -685,7 +718,11 @@ def _abschluss(grund: str | None = None) -> None:
         text = f"Morgenbericht nicht erstellbar: {exc}\n"
     if grund:
         text = f"Forge abgeschaltet: {grund}\n\n{text}"
-    melden.sende(text)
+    if not melden.sende(text):
+        # melden.sende loggt Details (HTTP-Status/Ausnahme-Typ) bereits selbst,
+        # nie Token oder URL — diese Zeile ist dafür da, dass das launchd-
+        # stdout um 07:00 überhaupt zeigt, dass etwas fehlte.
+        log.warning("Forge: Abschlussmeldung nicht zugestellt (siehe melden-Warnung)")
 ```
 
 In `main()`:
@@ -693,7 +730,7 @@ In `main()`:
 ```python
     schluessel = lade_api_schluessel(API_SCHLUESSEL_DATEI)
     log.info(f"Forge: API-Schlüssel aus {API_SCHLUESSEL_DATEI.name} geladen: {', '.join(schluessel) or 'keine'}")
-    umgebung = lade_api_schluessel(ENV_DATEI)
+    umgebung = lade_api_schluessel(ENV_DATEI, nur=ENV_NUR)
     log.info(f"Forge: aus {ENV_DATEI.name} geladen: {', '.join(umgebung) or 'nichts Neues'}")
 ```
 
@@ -1150,7 +1187,7 @@ class TestAllowlist:
 
 class TestMainAbbruch:
     def _umgebung(self, monkeypatch):
-        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None: [])
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None, nur=None: [])
         monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: (_ for _ in ()).throw(AssertionError("kein Pool vor der Prüfung")))
         monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: (_ for _ in ()).throw(AssertionError("kein Polling")))
 
@@ -1170,7 +1207,7 @@ class TestMainAbbruch:
         assert "TELEGRAM_CHAT_ID" in caplog.text
 
     def test_mit_token_und_liste_startet_polling(self, monkeypatch):
-        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None: [])
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None, nur=None: [])
         monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: None)
         gesehen = []
         monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: gesehen.append((token, erlaubt)))
@@ -1181,13 +1218,14 @@ class TestMainAbbruch:
 
     def test_main_laedt_beide_dateien(self, monkeypatch):
         geladen = []
-        monkeypatch.setattr(bot.daemon, "lade_api_schluessel", lambda datei=None: geladen.append(datei) or [])
+        monkeypatch.setattr(bot.daemon, "lade_api_schluessel",
+                             lambda datei=None, nur=None: geladen.append((datei, nur)) or [])
         monkeypatch.setattr(bot.db, "init_pool", lambda *a, **k: None)
         monkeypatch.setattr(bot, "_polling_starten", lambda token, erlaubt: None)
         monkeypatch.setenv("FORGE_BOT_TOKEN", "T")
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
         bot.main()
-        assert geladen == [bot.daemon.API_SCHLUESSEL_DATEI, bot.daemon.ENV_DATEI]
+        assert geladen == [(bot.daemon.API_SCHLUESSEL_DATEI, None), (bot.daemon.ENV_DATEI, bot.daemon.ENV_NUR)]
 ```
 
 - [ ] **Step 2: Tests laufen lassen — rot**
@@ -1295,7 +1333,7 @@ def main() -> int:
     Schleife hoch, und die Meldung steht im Log."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
     daemon.lade_api_schluessel(daemon.API_SCHLUESSEL_DATEI)
-    daemon.lade_api_schluessel(daemon.ENV_DATEI)
+    daemon.lade_api_schluessel(daemon.ENV_DATEI, nur=daemon.ENV_NUR)
     token = os.environ.get("FORGE_BOT_TOKEN", "").strip()
     if not token:
         log.error(f"Forge-Bot: FORGE_BOT_TOKEN fehlt in {daemon.API_SCHLUESSEL_DATEI}")
@@ -1459,7 +1497,7 @@ Worktree nachgezogen.
 - [ ] **Step 1: `melden.sende` echt**
 
 ```bash
-cd <worktree> && python3.14 -c "import logging; logging.basicConfig(level=logging.WARNING); from forge import daemon, melden; daemon.lade_api_schluessel(); daemon.lade_api_schluessel(daemon.ENV_DATEI); print(melden.sende('Forge-Probe: melden.sende aus dem Worktree'))"
+cd <worktree> && python3.14 -c "import logging; logging.basicConfig(level=logging.WARNING); from forge import daemon, melden; daemon.lade_api_schluessel(); daemon.lade_api_schluessel(daemon.ENV_DATEI, nur=daemon.ENV_NUR); print(melden.sende('Forge-Probe: melden.sende aus dem Worktree'))"
 ```
 
 Expected: `True`, Nachricht auf Timos Handy von AIMantisBot. `False` →
