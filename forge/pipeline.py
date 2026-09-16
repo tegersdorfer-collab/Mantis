@@ -56,6 +56,11 @@ _ARTEFAKT_FELD_JE_STUFE = {"spec": "spec_path", "plan": "plan_path"}
 # committen — die Pipeline tut es für sie (Kritischer Fund C3).
 _ARBEITSSTUFEN = ("implement", "fix")
 
+# Fehlertext von forge/runner_agy.py, wenn der Reviewer keinen JSON-Block
+# geliefert hat. Nur dieser Fehler geht ans nächste Kettenglied — ein
+# fehlendes Binary oder ein Absturz bleibt ein Park.
+OHNE_VERDIKT_MARKER = "kein JSON-Verdikt"
+
 # Pipeline-interne Ablage im Worktree (diff.patch, review.json). Sie gehört
 # NIE in einen Commit: sie ist Zwischenstand zwischen zwei Stufen, wird nach
 # einer Fix-Runde wieder gelöscht (_verwirf_review_artefakte), und ein
@@ -800,6 +805,13 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path,
         return "geparkt"
 
     if not ergebnis.ok and not zeitueberschreitung_geliefert:
+        if stufe.name == "review" and OHNE_VERDIKT_MARKER in (ergebnis.error or ""):
+            # Task 621 (2026-09-16): der Reviewer las, wollte dann Tests laufen
+            # lassen und brach ohne Urteil ab. Kein Verdikt ist Modellversagen
+            # wie ein fehlendes Artefakt — das nächste Glied der Review-Kette
+            # bekommt denselben Diff.
+            return _naechstes_glied_oder_park(task, task_id, state, worktree, versagt, modell,
+                                              ergebnis.error or OHNE_VERDIKT_MARKER)
         _park(task_id, state, f"Stufe '{stufe.name}' fehlgeschlagen: {ergebnis.error} (Task {task_id})")
         return "geparkt"
 

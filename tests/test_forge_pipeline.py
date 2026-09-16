@@ -1901,3 +1901,56 @@ class TestWiederaufnahmeUeberspringtVorhandeneArtefakte:
         monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
         assert pl.eine_stufe(_task(m.SPECCING), tmp_path) == "weiter"
         assert gelaufen == [1]
+
+
+class TestReviewOhneVerdiktNaechstesGlied:
+    """Task 621, 2026-09-16: Opus brach zweimal ohne JSON-Verdikt ab (erst
+    fehlende Quellen, dann der Wunsch, Tests laufen zu lassen). Ein
+    Review-Lauf ohne Verdikt ist Modellversagen wie ein fehlendes Artefakt —
+    das nächste Glied der Review-Kette bekommt denselben Diff, im selben
+    Tick. Geparkt wird erst, wenn kein Glied urteilt."""
+
+    KETTE = (("agy", "r/eins"), ("agy", "r/zwei"))
+
+    def _kette(self, monkeypatch):
+        def _waehle(name, verboten=frozenset()):
+            for glied in self.KETTE:
+                if glied[1] not in verboten:
+                    return glied
+            return None
+        monkeypatch.setattr(pl.ketten, "waehle", _waehle)
+        monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: False)
+        monkeypatch.setattr(pl, "_schreibe_diff", lambda w: None)
+
+    def test_zweites_glied_urteilt(self, monkeypatch, stubs, tmp_path):
+        self._kette(monkeypatch)
+        laeufe = []
+
+        def _run(prompt, cwd, timeout=1800, agent=None, model=None):
+            laeufe.append(model)
+            if len(laeufe) == 1:
+                return RunResult(ok=False, error="Reviewer lieferte kein JSON-Verdikt")
+            _verdikt(tmp_path, "pass")
+            return RunResult(ok=True, text="{}")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
+        ergebnis = pl.eine_stufe(_task(m.REVIEWING), tmp_path)
+        assert ergebnis == "fertig"
+        assert laeufe == ["r/eins", "r/zwei"]
+        assert stubs["parks"] == []
+
+    def test_kein_glied_urteilt_parkt_mit_beiden_gruenden(self, monkeypatch, stubs, tmp_path):
+        self._kette(monkeypatch)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda *a, **k: RunResult(ok=False, error="Reviewer lieferte kein JSON-Verdikt")))
+        ergebnis = pl.eine_stufe(_task(m.REVIEWING), tmp_path)
+        assert ergebnis == "geparkt"
+        grund = stubs["parks"][-1][1]
+        assert "r/eins" in grund and "r/zwei" in grund and "kein JSON-Verdikt" in grund
+
+    def test_echter_fehler_im_review_parkt_weiterhin(self, monkeypatch, stubs, tmp_path):
+        """Nur 'kein Verdikt' ist Modellversagen; ein Absturz des Backends bleibt ein Park."""
+        self._kette(monkeypatch)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda *a, **k: RunResult(ok=False, error="agy-Binary nicht im PATH gefunden")))
+        assert pl.eine_stufe(_task(m.REVIEWING), tmp_path) == "geparkt"
+        assert "agy-Binary" in stubs["parks"][-1][1]
