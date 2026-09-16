@@ -1615,3 +1615,78 @@ Mutationstests im Review: `_absender_ok` mit leerer Liste auf `True` drehen
 entsprechende Test in `TestAbschlussMeldung` rot; `exc.code` durch
 `str(exc)` in `melden.sende` ersetzen → `test_http_fehler_ist_false_ohne_traceback`
 rot (Token im Log).
+
+---
+
+### Task 7: Knopf [Zurückholen] nach dem Verwerfen (Timos Anmerkung aus der Tagesprobe, 16.09.)
+
+Nach dem Verwerfen soll `/requeue N` nicht abgetippt werden müssen. Telegram
+macht `/requeue` klickbar, aber ohne Argument — der richtige Weg ist ein
+zweiter Knopf. Callback-Daten bleiben `<aktion>:<int>`; neue Aktion
+`requeue`, sonst nichts.
+
+**Files:**
+- Modify: `forge/bot.py` (`_KNOPF_VERWERFEN` → allgemeines Muster, `knopf_gedrueckt`, `_verwerfen`, neu `_zurueckholen`)
+- Modify: `docs/forge/betrieb.md` (Tabellenzeile `/queue`/Verwerfen)
+- Test: `tests/test_forge_bot.py`
+
+**Interfaces:**
+- Consumes: `freigabe.neu_einreihen(task_id) -> bool`, `journal.log`.
+- Produces: `knopf_gedrueckt("requeue:<int>") -> Antwort`; die Verworfen-Antwort trägt `[[("Zurückholen", "requeue:<id>")]]`.
+
+- [ ] **Step 1: Failing Tests** — in `TestKnopf`:
+
+```python
+    def test_verwerfen_antwort_hat_zurueckholen_knopf(self, monkeypatch):
+        _stumm(monkeypatch)
+        monkeypatch.setattr(bot.queue, "hole", lambda tid: {"id": tid, "state": m.QUEUED, "title": "Alpha"})
+        monkeypatch.setattr(bot.queue, "park", lambda tid, current, reason: True)
+        a = bot.knopf_gedrueckt("verwerfen:3")
+        assert a.knoepfe == [[("Zurückholen", "requeue:3")]]
+
+    def test_zurueckholen_ruft_neu_einreihen(self, monkeypatch):
+        _stumm(monkeypatch)
+        gesehen = []
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: gesehen.append(tid) or True)
+        a = bot.knopf_gedrueckt("requeue:3")
+        assert gesehen == [3]
+        assert a.text == "#3 neu eingereiht"
+        assert a.knoepfe == []
+
+    def test_zurueckholen_falscher_zustand(self, monkeypatch):
+        _stumm(monkeypatch)
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: False)
+        assert bot.knopf_gedrueckt("requeue:3").text == "#3: nicht geparkt/gescheitert"
+```
+
+`test_fremde_callback_daten_werden_verworfen` bekommt zusätzlich
+`"requeue:"`, `"requeue:x"`, `"merge:3"` in die Liste.
+
+- [ ] **Step 2: rot** — `python3.14 -m pytest tests/test_forge_bot.py::TestKnopf -q`
+- [ ] **Step 3: Implementierung**
+
+```python
+_KNOPF = re.compile(r"^(verwerfen|requeue):(\d+)$")
+
+def knopf_gedrueckt(daten: str) -> Antwort:
+    """Callback eines Inline-Knopfs. Bekannt: `verwerfen:<id>`, `requeue:<id>`."""
+    treffer = _KNOPF.match(daten or "")
+    if not treffer:
+        log.warning("Forge-Bot: unbekannte Callback-Daten verworfen")
+        return Antwort("Unbekannter Knopf.")
+    aktion, task_id = treffer.group(1), int(treffer.group(2))
+    if aktion == "requeue":
+        return _requeue(str(task_id))
+    return _verwerfen(task_id)
+```
+
+`_verwerfen` gibt am Ende
+`Antwort(f"#{task_id} verworfen (geparkt)", [[("Zurückholen", f"requeue:{task_id}")]])`
+zurück — der Text nennt `/requeue` nicht mehr, der Knopf ersetzt ihn.
+`test_verwerfen_parkt_wartenden_task` entsprechend auf den neuen Text
+anpassen. `_requeue(rest)` bleibt die eine Stelle, die `neu_einreihen` ruft
+(Befehl und Knopf teilen sie).
+
+- [ ] **Step 4: grün, ruff, Handbuch** — in `docs/forge/betrieb.md` Tabelle 3a:
+  Verwerfen-Zeile ergänzen „…, Antwort mit **[Zurückholen]**".
+- [ ] **Step 5: Commit** `Forge-Bot: Knopf [Zurückholen] nach dem Verwerfen`
