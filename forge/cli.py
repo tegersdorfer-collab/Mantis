@@ -85,7 +85,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if ok else 1
     if args.befehl == "requeue":
         ok = freigabe.neu_einreihen(args.task_id)
-        print(f"Task {args.task_id}: {'neu eingereiht' if ok else 'nicht geparkt/gescheitert'}")
+        if ok:
+            print(f"Task {args.task_id}: neu eingereiht — Spec und Plan aus dem alten Worktree "
+                  f"werden übernommen (Datei löschen, wenn die Stufe neu laufen soll)")
+        else:
+            print(f"Task {args.task_id}: nicht geparkt/gescheitert")
         return 0 if ok else 1
     return 2
 

@@ -1854,3 +1854,103 @@ class TestArtefaktFehltNaechstesGlied:
         ergebnis = pl.eine_stufe(_task(m.SPECCING), tmp_path)
         assert ergebnis == "geparkt"
         assert stubs["artefakte"] == []
+
+
+class TestWiederaufnahmeUeberspringtVorhandeneArtefakte:
+    """Nach `forge.cli requeue` beginnt ein Task bei spec — mit dem alten
+    Worktree, in dem Spec und Plan des vorigen Anlaufs noch liegen. Bis
+    2026-09-16 liefen die Stufen trotzdem erneut: drei Specs in einem Branch
+    (Task 365), doppelte NVIDIA-Läufe, und die Implement-Stufe fand ihre
+    Datei 'bereits vorhanden'. Eine Stufe, deren Artefakt laut Task-Feld
+    vorliegt, wird übersprungen; wer eine frische Spec will, löscht die Datei."""
+
+    PFAD = "docs/superpowers/specs/2026-09-15-alt-design.md"
+
+    def test_vorhandene_spec_wird_uebersprungen(self, monkeypatch, stubs, tmp_path):
+        (tmp_path / self.PFAD).parent.mkdir(parents=True)
+        (tmp_path / self.PFAD).write_text("alt")
+        gelaufen = []
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (lambda *a, **k: gelaufen.append(1) or RunResult(ok=True, text="x")))
+        ergebnis = pl.eine_stufe(_task(m.SPECCING, spec_path=self.PFAD), tmp_path)
+        assert ergebnis == "weiter"
+        assert gelaufen == [], "Stufe lief trotz vorhandenem Artefakt"
+        assert stubs["states"] == [(5, m.PLANNING)]
+        vermerke = [a[2] for a, kw in stubs["journal"] if "übersprungen" in a[2]]
+        assert vermerke and self.PFAD in vermerke[0]
+
+    def test_gesetztes_feld_ohne_datei_laeuft_normal(self, monkeypatch, stubs, tmp_path):
+        """Die Datei wurde gelöscht — Timo will eine frische Spec."""
+        gelaufen = []
+        def _run(prompt, cwd, timeout=1800, agent=None, model=None):
+            gelaufen.append(1)
+            (tmp_path / self.PFAD).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / self.PFAD).write_text("neu")
+            return RunResult(ok=True, text=self.PFAD)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
+        ergebnis = pl.eine_stufe(_task(m.SPECCING, spec_path=self.PFAD), tmp_path)
+        assert ergebnis == "weiter"
+        assert gelaufen == [1]
+
+    def test_erster_anlauf_ohne_feld_laeuft_normal(self, monkeypatch, stubs, tmp_path):
+        gelaufen = []
+        def _run(prompt, cwd, timeout=1800, agent=None, model=None):
+            gelaufen.append(1)
+            (tmp_path / self.PFAD).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / self.PFAD).write_text("neu")
+            return RunResult(ok=True, text=self.PFAD)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
+        assert pl.eine_stufe(_task(m.SPECCING), tmp_path) == "weiter"
+        assert gelaufen == [1]
+
+
+class TestReviewOhneVerdiktNaechstesGlied:
+    """Task 621, 2026-09-16: Opus brach zweimal ohne JSON-Verdikt ab (erst
+    fehlende Quellen, dann der Wunsch, Tests laufen zu lassen). Ein
+    Review-Lauf ohne Verdikt ist Modellversagen wie ein fehlendes Artefakt —
+    das nächste Glied der Review-Kette bekommt denselben Diff, im selben
+    Tick. Geparkt wird erst, wenn kein Glied urteilt."""
+
+    KETTE = (("agy", "r/eins"), ("agy", "r/zwei"))
+
+    def _kette(self, monkeypatch):
+        def _waehle(name, verboten=frozenset()):
+            for glied in self.KETTE:
+                if glied[1] not in verboten:
+                    return glied
+            return None
+        monkeypatch.setattr(pl.ketten, "waehle", _waehle)
+        monkeypatch.setattr(pl.ketten, "kette_erschoepft", lambda name: False)
+        monkeypatch.setattr(pl, "_schreibe_diff", lambda w: None)
+
+    def test_zweites_glied_urteilt(self, monkeypatch, stubs, tmp_path):
+        self._kette(monkeypatch)
+        laeufe = []
+
+        def _run(prompt, cwd, timeout=1800, agent=None, model=None):
+            laeufe.append(model)
+            if len(laeufe) == 1:
+                return RunResult(ok=False, error="Reviewer lieferte kein JSON-Verdikt")
+            _verdikt(tmp_path, "pass")
+            return RunResult(ok=True, text="{}")
+        monkeypatch.setattr(pl.backends, "hole", lambda name: _run)
+        ergebnis = pl.eine_stufe(_task(m.REVIEWING), tmp_path)
+        assert ergebnis == "fertig"
+        assert laeufe == ["r/eins", "r/zwei"]
+        assert stubs["parks"] == []
+
+    def test_kein_glied_urteilt_parkt_mit_beiden_gruenden(self, monkeypatch, stubs, tmp_path):
+        self._kette(monkeypatch)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda *a, **k: RunResult(ok=False, error="Reviewer lieferte kein JSON-Verdikt")))
+        ergebnis = pl.eine_stufe(_task(m.REVIEWING), tmp_path)
+        assert ergebnis == "geparkt"
+        grund = stubs["parks"][-1][1]
+        assert "r/eins" in grund and "r/zwei" in grund and "kein JSON-Verdikt" in grund
+
+    def test_echter_fehler_im_review_parkt_weiterhin(self, monkeypatch, stubs, tmp_path):
+        """Nur 'kein Verdikt' ist Modellversagen; ein Absturz des Backends bleibt ein Park."""
+        self._kette(monkeypatch)
+        monkeypatch.setattr(pl.backends, "hole", lambda name: (
+            lambda *a, **k: RunResult(ok=False, error="agy-Binary nicht im PATH gefunden")))
+        assert pl.eine_stufe(_task(m.REVIEWING), tmp_path) == "geparkt"
+        assert "agy-Binary" in stubs["parks"][-1][1]

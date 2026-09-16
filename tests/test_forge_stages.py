@@ -259,3 +259,17 @@ class TestBackendZuordnung:
         import pytest
         with pytest.raises(KeyError, match="unbekanntes Backend"):
             backends.hole("gibtsnicht")
+
+
+class TestReviewPromptNenntDieGrenzen:
+    """Task 621, 2026-09-16: der Reviewer las die Implementierung (seit
+    --add-dir möglich) und wollte dann 'die Tests laufen lassen, um die
+    Erwartungen zu prüfen' — im Lesemodus geht das nicht, und statt zu
+    urteilen brach er ohne Verdikt ab. Der Prompt sagt ihm jetzt, was er
+    kann und was nicht."""
+
+    def test_review_prompt_sagt_kein_shell_kein_testlauf(self):
+        prompt = s._review_prompt({"id": 1, "title": "t", "description": ""}, {"spec_path": "s.md"})
+        assert "keine Shell" in prompt or "keine Tests" in prompt
+        assert "lesen" in prompt.lower()
+        assert "Befund" in prompt

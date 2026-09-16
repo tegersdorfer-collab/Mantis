@@ -56,6 +56,11 @@ _ARTEFAKT_FELD_JE_STUFE = {"spec": "spec_path", "plan": "plan_path"}
 # committen — die Pipeline tut es für sie (Kritischer Fund C3).
 _ARBEITSSTUFEN = ("implement", "fix")
 
+# Fehlertext von forge/runner_agy.py, wenn der Reviewer keinen JSON-Block
+# geliefert hat. Nur dieser Fehler geht ans nächste Kettenglied — ein
+# fehlendes Binary oder ein Absturz bleibt ein Park.
+OHNE_VERDIKT_MARKER = "kein JSON-Verdikt"
+
 # Pipeline-interne Ablage im Worktree (diff.patch, review.json). Sie gehört
 # NIE in einen Commit: sie ist Zwischenstand zwischen zwei Stufen, wird nach
 # einer Fix-Runde wieder gelöscht (_verwirf_review_artefakte), und ein
@@ -624,6 +629,24 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path,
         _park(task_id, state, f"Kein Stufen-Handler für Zustand '{state}' (Task {task_id})")
         return "geparkt"
 
+    # Wiederaufnahme (2026-09-16): nach `forge.cli requeue` beginnt der Task
+    # bei spec, aber im alten Worktree liegen Spec und Plan des vorigen
+    # Anlaufs noch — und das Task-Feld kennt sie. Die Stufe erneut laufen zu
+    # lassen kostete einen NVIDIA-Lauf und legte ein zweites Dokument daneben
+    # (Task 365: drei Specs in einem Branch). Liegt das Artefakt vor, wird die
+    # Stufe übersprungen; wer ein frisches will, löscht die Datei.
+    feld_vorhanden = _ARTEFAKT_FELD_JE_STUFE.get(stufe.name)
+    bekannt = task.get(feld_vorhanden) if feld_vorhanden else None
+    if bekannt and _artefakt_vorhanden(worktree, bekannt):
+        journal.log(task_id, "stage_done",
+                    f"Artefakt der Stufe '{stufe.name}' liegt schon vor ({bekannt}) — "
+                    f"Stufe übersprungen (Wiederaufnahme)")
+        if not queue.set_state(task_id, stufe.next_state, current=state):
+            _park(task_id, state,
+                  f"Zustandswechsel {state} -> {stufe.next_state} schlug fehl (Task {task_id})")
+            return "geparkt"
+        return "weiter"
+
     # Die Kettenwahl steht VOR der Fixrunden-Zählung (Review-Finding 3,
     # 2026-09-09): eine erschöpfte Kette parkt, ohne dass dafür je ein Lauf
     # stattfand. Würde erst gezählt und dann die Kette befragt, verbrauchte
@@ -782,6 +805,13 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path,
         return "geparkt"
 
     if not ergebnis.ok and not zeitueberschreitung_geliefert:
+        if stufe.name == "review" and OHNE_VERDIKT_MARKER in (ergebnis.error or ""):
+            # Task 621 (2026-09-16): der Reviewer las, wollte dann Tests laufen
+            # lassen und brach ohne Urteil ab. Kein Verdikt ist Modellversagen
+            # wie ein fehlendes Artefakt — das nächste Glied der Review-Kette
+            # bekommt denselben Diff.
+            return _naechstes_glied_oder_park(task, task_id, state, worktree, versagt, modell,
+                                              ergebnis.error or OHNE_VERDIKT_MARKER)
         _park(task_id, state, f"Stufe '{stufe.name}' fehlgeschlagen: {ergebnis.error} (Task {task_id})")
         return "geparkt"
 
