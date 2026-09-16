@@ -120,13 +120,19 @@ def daemon_laeuft() -> bool:
     """Läuft gerade ein Forge-Daemon? Abschluss-Review 2c, I3.
 
     `pgrep -f` matcht auf die volle Befehlszeile. Das Muster ist bewusst
-    `-m forge\\.daemon` (Handoff 16.09., Befund 4): `forge.daemon` allein traf
-    auch `forge.daemon_xyz` und jeden Prozess, der den Pfad im Argument hat.
-    Eigene kleine Funktion, damit Tests sie patchen können — pgrep würde
-    auch einen pytest-Prozess treffen, dessen argv das Muster enthält."""
+    `-m forge\\.daemon$` (Handoff 16.09., Befund 4): `forge.daemon` allein traf
+    auch `forge.daemon_xyz` und jeden Prozess, der den Pfad im Argument hat —
+    das `$` verankert am Ende, launchd startet mit `... -m forge.daemon`
+    (siehe com.mantis.forge.plist). Das `--` davor ist kein Stil, sondern
+    Pflicht: das BSD-pgrep auf macOS liest ein Muster, das mit `-m` beginnt,
+    sonst als eigene Option und bricht mit "illegal option -- m" (rc 2) ab —
+    Fund aus der Review vom 16.09., ohne `--` wäre `daemon_laeuft()` in
+    Produktion immer `False` gewesen. Eigene kleine Funktion, damit Tests sie
+    patchen können — pgrep würde auch einen pytest-Prozess treffen, dessen
+    argv das Muster enthält."""
     try:
         return subprocess.run(
-            ["pgrep", "-f", r"-m forge\.daemon"], capture_output=True,
+            ["pgrep", "-f", "--", r"-m forge\.daemon$"], capture_output=True,
         ).returncode == 0
     except OSError:
         return False

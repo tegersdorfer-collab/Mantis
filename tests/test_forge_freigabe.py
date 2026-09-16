@@ -229,7 +229,10 @@ class TestStoppen:
     def test_daemon_laeuft_matcht_nur_das_modul(self, monkeypatch):
         """`pgrep -f forge.daemon` traf auch forge.daemon_xyz und jeden
         Editor mit dem Pfad im Titel (Handoff 16.09.). Das Muster muss auf
-        `-m forge\\.daemon` verengt sein."""
+        `-m forge\\.daemon$` verengt sein, mit `--` davor: BSD-pgrep auf
+        macOS liest ein Muster, das mit `-m` beginnt, sonst als eigene
+        Option (Review 16.09.: `daemon_laeuft()` war dadurch in Produktion
+        immer False)."""
         gesehen = []
 
         class _Ergebnis:
@@ -241,7 +244,14 @@ class TestStoppen:
 
         monkeypatch.setattr(freigabe.subprocess, "run", _run)
         assert freigabe.daemon_laeuft() is False
-        assert gesehen == [["pgrep", "-f", r"-m forge\.daemon"]]
+        assert gesehen == [["pgrep", "-f", "--", r"-m forge\.daemon$"]]
+
+    def test_daemon_laeuft_true_bei_treffer(self, monkeypatch):
+        class _Ergebnis:
+            returncode = 0
+
+        monkeypatch.setattr(freigabe.subprocess, "run", lambda argv, **kw: _Ergebnis())
+        assert freigabe.daemon_laeuft() is True
 
     def test_daemon_laeuft_bei_oserror_false(self, monkeypatch):
         def _run(argv, **kw):

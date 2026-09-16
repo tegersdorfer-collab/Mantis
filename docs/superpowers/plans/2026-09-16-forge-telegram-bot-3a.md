@@ -66,6 +66,8 @@ laufendem Daemon, Abschluss-Review 2c I3). Die Logik zieht aus `cli._stop()`
 nach `freigabe.stoppen()`, und `pgrep` wird auf `-m forge\.daemon` verengt
 (Handoff 16.09., Befund 4: `pgrep -f forge.daemon` matcht auch
 `forge.daemon_xyz` und jeden Editor mit dem Pfad im Fenstertitel).
+Korrektur nach Review 16.09.: BSD-pgrep liest `-m …` als Option — `--` davor,
+`$` als Endanker.
 
 **Files:**
 - Modify: `forge/freigabe.py` (ans Ende)
@@ -119,7 +121,7 @@ class TestStoppen:
 
         monkeypatch.setattr(freigabe.subprocess, "run", _run)
         assert freigabe.daemon_laeuft() is False
-        assert gesehen == [["pgrep", "-f", r"-m forge\.daemon"]]
+        assert gesehen == [["pgrep", "-f", "--", r"-m forge\.daemon$"]]
 
     def test_daemon_laeuft_bei_oserror_false(self, monkeypatch):
         def _run(argv, **kw):
@@ -161,7 +163,7 @@ def daemon_laeuft() -> bool:
     auch einen pytest-Prozess treffen, dessen argv das Muster enthält."""
     try:
         return subprocess.run(
-            ["pgrep", "-f", r"-m forge\.daemon"], capture_output=True,
+            ["pgrep", "-f", "--", r"-m forge\.daemon$"], capture_output=True,
         ).returncode == 0
     except OSError:
         return False
