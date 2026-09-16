@@ -565,12 +565,16 @@ gebauten Wege liefern strukturierte Daten; Vision bleibt späterer Notnagel.
 
 ---
 
-## Spotify-Steuerung (2026-07-10)
+## Spotify-Steuerung (2026-07-10, User-OAuth ergänzt 2026-09-16)
 
 Code: `tools/spotify/` (applescript + web_api), `core/skills/spotify.py` ·
 Spec: `docs/2026-07-10-spotify-control-design.md`
 
 **Fertig:**
+- [x] **Offizielle Web-API für Premium-Playback** — User-OAuth mit lokalem
+      Loopback-Callback, Token-Refresh sowie Play/Pause/Next/Previous/Volume/Status
+      und Suche über den User-Token. Geräteauswahl berücksichtigt auch verfügbare,
+      nicht aktive Computer. AppleScript/Spicetify bleiben als Fallback.
 - [x] **Playback lokal per AppleScript** — Tool `spotify` mit play/pause/next/previous,
       Lautstärke, status („was läuft"), spiel („spiel [X]" via Web-API-Suche). Trotz
       Spicetify voll steuerbar (nur UI gepatcht). 27 Tests grün, End-to-End live
@@ -581,9 +585,9 @@ Spec: `docs/2026-07-10-spotify-control-design.md`
       gefangen, „spiel [X]" extrahiert den Suchbegriff selbst.
 
 **Offen:**
-- [ ] **Spotify-Web-API-Credentials in `.env`** — für „spiel [X]": kostenlose App auf
-      developer.spotify.com, `SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET` eintragen.
-      Ohne Credentials liefert „spiel [X]" einen Setup-Hinweis; alles andere läuft.
+- [ ] **Spotify-Web-API-Login live ausführen** — Developer-App anlegen, Redirect URI
+      `http://127.0.0.1:8084/callback` eintragen, Credentials in `.env` setzen und
+      `python3 scripts/spotify_auth.py` starten.
 - [ ] Free-Tier spielt bei „spiel [Track]" den Album-Kontext (Spotify-Verhalten, kein
       Bug); auf Premium exakt der Song.
 

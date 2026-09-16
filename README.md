@@ -81,7 +81,7 @@ Mantis ist ein Eigenprojekt, das ich vollständig allein konzipiert, entwickelt 
 | **Accountability** | Daily Anchor, Deep-Work-Block-Schutz, Abend-Check-in |
 | **Robotik** | BLE-Steuerung Clementoni X5, per Reverse-Engineering entschlüsselt |
 | **Smart Home** | Flipper Zero: IR-Befehle (Lampe, Ventilator) über USB-Serial |
-| **Spotify** | Playback via AppleScript + Web-API, Spicetify-Bridge |
+| **Spotify** | Playback via official Web-API + User-OAuth, AppleScript/Spicetify fallback |
 | **Gmail** | Lesen, Suchen, Archivieren, Senden (mit Bestätigungs-Gate) |
 
 ### Dashboard (PWA)
@@ -166,6 +166,24 @@ npm --prefix apps/desktop test
 npm --prefix apps/desktop run build
 node --test tests/test_spicetify_bridge.mjs
 ```
+
+### Spotify-Web-API
+
+Für die direkte Steuerung braucht Mantis eine Spotify-Developer-App und ein
+Premium-Konto. In den App-Einstellungen die Redirect URI
+`http://127.0.0.1:8084/callback` eintragen, `SPOTIFY_CLIENT_ID` und
+`SPOTIFY_CLIENT_SECRET` in `.env` setzen und einmalig ausführen:
+
+```bash
+python3 scripts/spotify_auth.py
+```
+
+Der Login speichert den User-Token geschützt unter `data/spotify_token.json`.
+Playback, Status und Suche laufen danach über die offizielle Web-API; AppleScript
+und die Spicetify-Bridge bleiben als Fallback. Spotify steuert dabei das aktuell
+aktive Spotify-Connect-Gerät. Wenn kein Gerät aktiv ist, wählt Mantis automatisch
+einen verfügbaren Computer. Mit `SPOTIFY_DEVICE_NAME` kann optional ein exakter
+Gerätename festgelegt werden.
 
 CI prüft Python-Lint und Tests sowie Desktop-Tests, den Frontend-Build und die Spotify-Bridge bei Pushes und Pull Requests auf `main`. Die Tests ersetzen externe Dienste; sie ersetzen keinen Live-Test mit PostgreSQL, Ollama und echten Geräten.
 

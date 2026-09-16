@@ -119,11 +119,13 @@ class MantisSettings(BaseSettings):
     # ── Search ───────────────────────────────────────────────────────────────
     BRAVE_API_KEY: str = ""
 
-    # ── Spotify (nur für die Suche in „spiel [X]"; Playback läuft lokal) ─────
-    # Kostenlose App auf developer.spotify.com anlegen; leer = Suche deaktiviert,
-    # Play/Pause/Volume/Status funktionieren trotzdem (reines AppleScript).
+    # ── Spotify (Web-API-User-OAuth; Credentials der Developer-App) ─────────
+    # Für Suche und Premium-Playback. Der einmalige Login speichert den User-
+    # Token in data/spotify_token.json; leer bleibt der Legacy-Fallback aktiv.
     SPOTIFY_CLIENT_ID: str = ""
     SPOTIFY_CLIENT_SECRET: str = ""
+    # Optionaler exakter Spotify-Gerätename; leer = aktives Gerät, sonst Computer.
+    SPOTIFY_DEVICE_NAME: str = ""
 
     # ── Google Calendar ───────────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str = ""

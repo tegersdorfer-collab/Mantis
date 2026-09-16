@@ -7,7 +7,8 @@
 Mantis kann Spotify auf dem Mac bedienen: Play/Pause/Next/Previous, Lautstärke,
 „Was läuft?" und „Spiel [Song/Album/Playlist/Künstler]". Steuerung läuft voll
 lokal über AppleScript (`osascript`); nur die Suche für „Spiel [X]" nutzt die
-Spotify-Web-API (Client-Credentials-Flow, kein User-Login, kein Premium nötig).
+Spotify-Web-API (zunächst Client-Credentials-Flow für die Suche; nach der
+Premium-Umstellung User-OAuth für Suche und Playback).
 
 **Verifiziert:** Der installierte Client ist mit Spicetify gepatcht — das ändert
 nur die UI-Schicht (xpui), die AppleScript-Schnittstelle antwortet normal
@@ -29,12 +30,21 @@ AppleScript-Fehler −1728. `current_track()` muss das abfangen und „nichts l�
 zurückgeben statt zu crashen.
 
 ### `tools/spotify/web_api.py`
-- Client-Credentials-Token via httpx (bereits Dependency), gecacht bis Ablauf
+- User-Token via `tools/spotify/oauth.py` für Suche und Premium-Playback;
+  Client-Credentials bleiben vorübergehend als Such-Fallback
 - `search(query)` über Tracks/Alben/Playlists/Künstler → beste URI + Anzeigename
-- Credentials: `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` in `.env`
-  (pydantic-settings, Defaults leer). Fehlen sie, liefert „Spiel [X]" eine
-  freundliche Setup-Anleitung (developer.spotify.com) statt eines Fehlers —
-  alle anderen Befehle funktionieren unabhängig davon.
+- `play_uri(uri)` startet einen Track oder Kontext (Album/Playlist/Künstler)
+- `resume()`, `pause()`, `next_track()`, `previous_track()`, `set_volume()` und
+  `current_track()` verwenden die Player-Endpunkte
+- Player-Befehle ermitteln die Geräte-ID frisch; bevorzugt wird `SPOTIFY_DEVICE_NAME`,
+  sonst ein aktives bzw. verfügbarer Computer. IDs werden nicht dauerhaft gecacht.
+
+### `tools/spotify/oauth.py` und `scripts/spotify_auth.py`
+
+- Server-seitiger Authorization-Code-Flow für den langlebigen lokalen Backend-
+  Prozess
+- Loopback-Callback `http://127.0.0.1:8084/callback`
+- Access-/Refresh-Token in `data/spotify_token.json`, automatische Erneuerung
 
 ### `core/skills/spotify.py`
 Ein `spotify`-Tool via `@T.register`:
@@ -67,5 +77,7 @@ Negativ-Beispiele, die NICHT triggern dürfen: „ich mach mal Pause",
 
 ## Setup (einmalig, User)
 
-Auf developer.spotify.com kostenlose App anlegen, `SPOTIFY_CLIENT_ID` und
-`SPOTIFY_CLIENT_SECRET` in `.env` eintragen. Kann nachträglich passieren.
+Auf developer.spotify.com eine Web-API-App anlegen, die Redirect URI
+`http://127.0.0.1:8084/callback` eintragen, `SPOTIFY_CLIENT_ID` und
+`SPOTIFY_CLIENT_SECRET` in `.env` setzen und `python3 scripts/spotify_auth.py`
+einmalig ausführen. Ohne OAuth bleiben die Legacy-Fallbacks nutzbar.

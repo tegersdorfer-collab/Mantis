@@ -9,6 +9,8 @@ import asyncio
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.spotify import applescript as sp
@@ -84,7 +86,14 @@ def test_current_track_playing():
     assert (t.title, t.artist, t.album, t.state) == ("Kids", "MGMT", "Oracular Spectacular", "playing")
 
 from settings import cfg
+from tools.spotify import oauth
 from tools.spotify import web_api
+
+
+@pytest.fixture(autouse=True)
+def isolate_spotify_oauth(monkeypatch, tmp_path):
+    """Verhindert, dass Tests den echten lokalen Spotify-Token verwenden."""
+    monkeypatch.setattr(oauth, "TOKEN_PATH", tmp_path / "spotify_token.json")
 
 
 def _reset_webapi():
@@ -295,3 +304,153 @@ def test_spiel_falls_back_when_bridge_errors():
         cfg.SPOTIFY_CLIENT_ID, cfg.SPOTIFY_CLIENT_SECRET = old
         _bridge_reset()
     assert out == "▶️ W — X"        # Fallback-Web-API-Weg hat gegriffen
+
+
+# ── Offizielle Web-API mit User-OAuth ─────────────────────────────────────────
+
+def test_oauth_authorize_url_uses_loopback_and_playback_scopes():
+    from urllib.parse import parse_qs, urlsplit
+
+    query = parse_qs(urlsplit(oauth.build_authorize_url("client-1", "state-1")).query)
+    assert query["client_id"] == ["client-1"]
+    assert query["redirect_uri"] == ["http://127.0.0.1:8084/callback"]
+    assert query["response_type"] == ["code"]
+    assert query["state"] == ["state-1"]
+    assert set(query["scope"][0].split()) == {
+        "user-modify-playback-state",
+        "user-read-playback-state",
+        "user-read-currently-playing",
+    }
+
+
+def test_oauth_refreshes_expired_token_and_keeps_refresh_token(tmp_path, monkeypatch):
+    token_path = tmp_path / "spotify_token.json"
+    monkeypatch.setattr(oauth, "TOKEN_PATH", token_path)
+    oauth.save_token({
+        "access_token": "old-access",
+        "refresh_token": "old-refresh",
+        "expires_at": 0,
+    })
+    calls = []
+
+    def fake_token_request(data):
+        calls.append(data)
+        return {"access_token": "new-access", "expires_in": 3600}
+
+    monkeypatch.setattr(oauth, "_token_request", fake_token_request)
+    assert oauth.access_token() == "new-access"
+    assert calls == [{"grant_type": "refresh_token", "refresh_token": "old-refresh"}]
+    assert oauth.load_token()["refresh_token"] == "old-refresh"
+
+
+def test_web_api_search_prefers_user_token(monkeypatch):
+    monkeypatch.setattr(oauth, "access_token", lambda: "user-token")
+
+    async def fake_search(params, token):
+        assert token == "user-token"
+        assert params["type"] == "track,album,playlist,artist"
+        return {"tracks": {"items": [{
+            "uri": "spotify:track:user1", "name": "Kids",
+            "artists": [{"name": "MGMT"}],
+        }]}}
+
+    monkeypatch.setattr(web_api, "_http_get_search", fake_search)
+    uri, name = asyncio.run(web_api.search("kids"))
+    assert (uri, name) == ("spotify:track:user1", "Kids — MGMT")
+
+
+def test_web_api_starts_track_playback_with_user_token(monkeypatch):
+    calls = []
+
+    async def fake_request(method, path, token, *, params=None, body=None):
+        calls.append((method, path, token, params, body))
+        if path == "/me/player/devices":
+            return {"devices": [{
+                "id": "mac-1", "name": "Mantis Mac", "type": "Computer",
+                "is_active": False, "is_restricted": False,
+            }]}
+        return None
+
+    monkeypatch.setattr(oauth, "access_token", lambda: "user-token")
+    monkeypatch.setattr(web_api, "_http_request", fake_request)
+    asyncio.run(web_api.play_uri("spotify:track:abc"))
+    assert calls == [
+        ("GET", "/me/player/devices", "user-token", None, None),
+        ("PUT", "/me/player/play", "user-token", {"device_id": "mac-1"},
+         {"uris": ["spotify:track:abc"]}),
+    ]
+
+
+def test_web_api_starts_context_playback_with_context_uri(monkeypatch):
+    calls = []
+
+    async def fake_request(method, path, token, *, params=None, body=None):
+        calls.append((method, path, token, params, body))
+        if path == "/me/player/devices":
+            return {"devices": [{
+                "id": "mac-1", "name": "Mantis Mac", "type": "Computer",
+                "is_active": False, "is_restricted": False,
+            }]}
+        return None
+
+    monkeypatch.setattr(oauth, "access_token", lambda: "user-token")
+    monkeypatch.setattr(web_api, "_http_request", fake_request)
+    asyncio.run(web_api.play_uri("spotify:playlist:focus"))
+    assert calls[-1][-1] == {"context_uri": "spotify:playlist:focus"}
+
+
+def test_web_api_current_track_maps_playback_response(monkeypatch):
+    async def fake_request(method, path, token, *, params=None, body=None):
+        assert (method, path, token) == ("GET", "/me/player", "user-token")
+        return {
+            "is_playing": False,
+            "item": {
+                "name": "Kids",
+                "artists": [{"name": "MGMT"}],
+                "album": {"name": "Oracular Spectacular"},
+            },
+        }
+
+    monkeypatch.setattr(oauth, "access_token", lambda: "user-token")
+    monkeypatch.setattr(web_api, "_http_request", fake_request)
+    assert asyncio.run(web_api.current_track()) == {
+        "title": "Kids",
+        "artist": "MGMT",
+        "album": "Oracular Spectacular",
+        "playing": False,
+    }
+
+
+def test_skill_prefers_official_api_for_pause(monkeypatch):
+    calls = []
+
+    async def fake_pause():
+        calls.append("api")
+
+    async def forbidden_applescript():
+        raise AssertionError("AppleScript darf bei erfolgreicher API nicht laufen")
+
+    monkeypatch.setattr(web_api, "pause", fake_pause)
+    monkeypatch.setattr(sp, "pause", forbidden_applescript)
+    from core.skills.spotify import _spotify
+    assert asyncio.run(_spotify("pause")) == "⏸️ Pausiert"
+    assert calls == ["api"]
+
+
+def test_skill_spiel_prefers_official_api_when_oauth_exists(monkeypatch):
+    played = []
+
+    async def fake_search(query, typ=None):
+        assert (query, typ) == ("kids", None)
+        return "spotify:track:api1", "Kids — MGMT"
+
+    async def fake_play(uri):
+        played.append(uri)
+
+    monkeypatch.setattr(oauth, "has_token", lambda: True)
+    monkeypatch.setattr(web_api, "search", fake_search)
+    monkeypatch.setattr(web_api, "play_uri", fake_play)
+    monkeypatch.setattr(BRIDGE, "is_connected", lambda: False)
+    from core.skills.spotify import _spotify
+    assert asyncio.run(_spotify("spiel", query="kids")) == "▶️ Kids — MGMT"
+    assert played == ["spotify:track:api1"]

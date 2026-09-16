@@ -1,26 +1,27 @@
-"""Spotify-Steuerung — Playback lokal per AppleScript, Suche über die Web-API.
+"""Spotify-Steuerung — bevorzugt über die offizielle Spotify-Web-API.
 
 Registriert sich via @T.register beim Import (durch core/skills/__init__.py).
-Play/Pause/Next/Volume/Status brauchen weder Key noch Netz; nur „spiel [X]"
-(Suche) braucht SPOTIFY_CLIENT_ID/SECRET in der .env (kostenlose App auf
-developer.spotify.com, kein User-Login).
+Mit Spotify-User-OAuth funktionieren Playback, Status und Suche direkt über die
+Web-API. AppleScript und die Spicetify-Bridge bleiben als Rückfallebenen.
 """
 
 import logging
 
 from core import tools as T
 from tools.spotify import applescript as sp
+from tools.spotify import oauth
 from tools.spotify import web_api
 from tools.spotify.bridge import BRIDGE, BridgeError
 
 log = logging.getLogger("core.skills")
 
 _SETUP_HINT = (
-    "🎧 Für „spiel [X]“ fehlen noch Spotify-API-Zugangsdaten: auf "
-    "developer.spotify.com eine kostenlose App anlegen und SPOTIFY_CLIENT_ID + "
-    "SPOTIFY_CLIENT_SECRET in die .env eintragen. Play/Pause/Next/Lautstärke "
-    "funktionieren auch ohne."
+    "🎧 Spotify ist noch nicht autorisiert: Spotify-App auf "
+    "developer.spotify.com anlegen, SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET "
+    "in die .env eintragen und einmalig `python3 scripts/spotify_auth.py` ausführen."
 )
+
+_API_ERRORS = (oauth.SpotifyOAuthError, web_api.SpotifyApiError)
 
 
 @T.register(
@@ -53,27 +54,69 @@ async def _spotify(action: str, query: str = "", volume: int = -1, typ: str = ""
     a = (action or "").strip().lower()
     try:
         if a == "play":
-            await sp.play()
+            try:
+                await web_api.resume()
+            except _API_ERRORS as e:
+                log.info("Spotify-Web-API-Play fehlgeschlagen, Fallback AppleScript: %s", e)
+                await sp.play()
             return "▶️ Musik läuft"
         if a == "pause":
-            await sp.pause()
+            try:
+                await web_api.pause()
+            except _API_ERRORS as e:
+                log.info("Spotify-Web-API-Pause fehlgeschlagen, Fallback AppleScript: %s", e)
+                await sp.pause()
             return "⏸️ Pausiert"
         if a == "next":
-            await sp.next_track()
-            t = await sp.current_track()
-            return f"⏭️ {t.title} — {t.artist}" if t else "⏭️ Nächster Track"
+            try:
+                await web_api.next_track()
+                np = None
+                try:
+                    np = await web_api.current_track()
+                except _API_ERRORS:
+                    pass
+                return (f"⏭️ {np['title']} — {np['artist']}" if np else "⏭️ Nächster Track")
+            except _API_ERRORS as e:
+                log.info("Spotify-Web-API-Next fehlgeschlagen, Fallback AppleScript: %s", e)
+                await sp.next_track()
+                t = await sp.current_track()
+                return f"⏭️ {t.title} — {t.artist}" if t else "⏭️ Nächster Track"
         if a == "previous":
-            await sp.previous_track()
-            t = await sp.current_track()
-            return f"⏮️ {t.title} — {t.artist}" if t else "⏮️ Vorheriger Track"
+            try:
+                await web_api.previous_track()
+                np = None
+                try:
+                    np = await web_api.current_track()
+                except _API_ERRORS:
+                    pass
+                return (f"⏮️ {np['title']} — {np['artist']}" if np else "⏮️ Vorheriger Track")
+            except _API_ERRORS as e:
+                log.info("Spotify-Web-API-Previous fehlgeschlagen, Fallback AppleScript: %s", e)
+                await sp.previous_track()
+                t = await sp.current_track()
+                return f"⏮️ {t.title} — {t.artist}" if t else "⏮️ Vorheriger Track"
         if a == "volume":
             if volume is None or volume < 0:
                 return "❌ Bitte volume 0-100 angeben."
             v = max(0, min(100, int(volume)))
-            await sp.set_volume(v)
+            try:
+                await web_api.set_volume(v)
+            except _API_ERRORS as e:
+                log.info("Spotify-Web-API-Lautstärke fehlgeschlagen, Fallback AppleScript: %s", e)
+                await sp.set_volume(v)
             return f"🔊 Lautstärke {v} %"
         if a == "status":
-            # Bevorzugt strukturiert über die Spicetify-Bridge; sonst AppleScript.
+            # Bevorzugt strukturiert über die offizielle User-API.
+            try:
+                np = await web_api.current_track()
+                if np is None:
+                    return "🔇 Gerade läuft nichts."
+                suffix = "" if np.get("playing", True) else " (pausiert)"
+                return (f"🎵 {np['title']} — {np.get('artist', '')} · "
+                        f"{np.get('album', '')}{suffix}")
+            except _API_ERRORS as e:
+                log.info("Spotify-Web-API-Status fehlgeschlagen, Legacy-Fallback: %s", e)
+            # Übergangspfad für Installationen ohne OAuth-Token.
             if BRIDGE.is_connected():
                 try:
                     np = await BRIDGE.now_playing()
@@ -102,8 +145,19 @@ async def _spotify(action: str, query: str = "", volume: int = -1, typ: str = ""
 async def _spiel(query: str, typ: str = "") -> str:
     if not (query or "").strip():
         return "❌ Was soll ich spielen? Bitte query angeben."
-    # Bevorzugt: Spicetify-Bridge — strukturierte Suche über die Client-Session,
-    # kein Developer-Key nötig. Fallback auf Web-API + AppleScript.
+    # Bevorzugt: offizielle Web-API im Namen des Premium-Nutzers.
+    if oauth.has_token():
+        try:
+            hit = await web_api.search(query.strip(), typ=(typ or None))
+            if hit is None:
+                return f"🤷 Nichts gefunden zu ‚{query}'."
+            uri, name = hit
+            await web_api.play_uri(uri)
+            return f"▶️ {name}"
+        except (oauth.SpotifyOAuthError, web_api.SpotifySearchError) as e:
+            log.info("Spotify-Web-API-Suche/Playback fehlgeschlagen, Legacy-Fallback: %s", e)
+
+    # Übergangspfad: Spicetify-Bridge ohne OAuth.
     if BRIDGE.is_connected():
         try:
             hit = await BRIDGE.search(query.strip(), typ=(typ or None))
