@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 HILFE = "Kenn ich nicht. Freitext = Task, /status /queue /requeue <id> /stop"
 TITEL_MAX = 200
-_KNOPF_VERWERFEN = re.compile(r"^verwerfen:(\d+)$")
+_KNOPF = re.compile(r"^(verwerfen|requeue):(\d+)$")
 
 
 @dataclass
@@ -61,12 +61,15 @@ def antwort_auf(text: str) -> Antwort:
 
 
 def knopf_gedrueckt(daten: str) -> Antwort:
-    """Callback eines Inline-Knopfs. Nur `verwerfen:<id>` ist bekannt."""
-    treffer = _KNOPF_VERWERFEN.match(daten or "")
+    """Callback eines Inline-Knopfs. Bekannt: `verwerfen:<id>`, `requeue:<id>`."""
+    treffer = _KNOPF.match(daten or "")
     if not treffer:
         log.warning("Forge-Bot: unbekannte Callback-Daten verworfen")
         return Antwort("Unbekannter Knopf.")
-    return _verwerfen(int(treffer.group(1)))
+    aktion, task_id = treffer.group(1), int(treffer.group(2))
+    if aktion == "requeue":
+        return _requeue(str(task_id))
+    return _verwerfen(task_id)
 
 
 def _einreihen(text: str) -> Antwort:
@@ -119,7 +122,7 @@ def _verwerfen(task_id: int) -> Antwort:
     if not queue.park(task_id, m.QUEUED, "verworfen via Telegram"):
         return Antwort(f"#{task_id} ist inzwischen aktiv — nichts getan")
     journal.log(task_id, "parked", "Verworfen via Telegram")
-    return Antwort(f"#{task_id} verworfen (geparkt, /requeue {task_id} holt ihn zurück)")
+    return Antwort(f"#{task_id} verworfen (geparkt)", [[("Zurückholen", f"requeue:{task_id}")]])
 
 
 # ---------------------------------------------------------------------------
@@ -188,11 +191,12 @@ async def _on_knopf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # query.message ist bei einer alten Nachricht ein InaccessibleMessage
     # (PTB 22) — das kann nicht editiert werden, dann stattdessen neu senden.
     if isinstance(query.message, Message):
-        # Ersetzt die Nachricht mit dem Knopf durch das Ergebnis — der Knopf
-        # verschwindet damit, ein zweiter Druck ist nicht möglich.
-        await query.edit_message_text(text)
+        # Ersetzt die Nachricht mit dem Knopf durch das Ergebnis — z.B. beim
+        # Verwerfen durch den [Zurückholen]-Knopf, sonst (wie früher) ohne
+        # Knöpfe.
+        await query.edit_message_text(text, reply_markup=_markup(antwort))
     else:
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=_markup(antwort))
 
 
 async def _on_fehler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

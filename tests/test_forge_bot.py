@@ -142,7 +142,7 @@ class TestKnopf:
         monkeypatch.setattr(bot.queue, "park", lambda tid, current, reason: gesehen.append((tid, current, reason)) or True)
         a = bot.knopf_gedrueckt("verwerfen:3")
         assert gesehen == [(3, m.QUEUED, "verworfen via Telegram")]
-        assert a.text == "#3 verworfen (geparkt, /requeue 3 holt ihn zurück)"
+        assert a.text == "#3 verworfen (geparkt)"
         assert journal_eintraege == [(3, "parked")]
 
     def test_verwerfen_nicht_mehr_wartend(self, monkeypatch):
@@ -164,10 +164,32 @@ class TestKnopf:
         monkeypatch.setattr(bot.queue, "hole", lambda tid: None)
         assert bot.knopf_gedrueckt("verwerfen:99").text == "#99 gibt es nicht"
 
+    def test_verwerfen_antwort_hat_zurueckholen_knopf(self, monkeypatch):
+        _stumm(monkeypatch)
+        monkeypatch.setattr(bot.queue, "hole", lambda tid: {"id": tid, "state": m.QUEUED, "title": "Alpha"})
+        monkeypatch.setattr(bot.queue, "park", lambda tid, current, reason: True)
+        a = bot.knopf_gedrueckt("verwerfen:3")
+        assert a.knoepfe == [[("Zurückholen", "requeue:3")]]
+
+    def test_zurueckholen_ruft_neu_einreihen(self, monkeypatch):
+        _stumm(monkeypatch)
+        gesehen = []
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: gesehen.append(tid) or True)
+        a = bot.knopf_gedrueckt("requeue:3")
+        assert gesehen == [3]
+        assert a.text == "#3 neu eingereiht"
+        assert a.knoepfe == []
+
+    def test_zurueckholen_falscher_zustand(self, monkeypatch):
+        _stumm(monkeypatch)
+        monkeypatch.setattr(bot.freigabe, "neu_einreihen", lambda tid: False)
+        assert bot.knopf_gedrueckt("requeue:3").text == "#3: nicht geparkt/gescheitert"
+
     def test_fremde_callback_daten_werden_verworfen(self, monkeypatch):
         _stumm(monkeypatch)
         monkeypatch.setattr(bot.queue, "hole", lambda tid: (_ for _ in ()).throw(AssertionError("kein hole")))
-        for daten in ("task_done:3", "verwerfen:3;drop", "verwerfen:", "verwerfen:-1", ""):
+        for daten in ("task_done:3", "verwerfen:3;drop", "verwerfen:", "verwerfen:-1", "",
+                      "requeue:", "requeue:x", "merge:3"):
             assert bot.knopf_gedrueckt(daten).text == "Unbekannter Knopf."
 
 

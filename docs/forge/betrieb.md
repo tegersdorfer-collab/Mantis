@@ -30,7 +30,7 @@ wörtlich zum Task, nichts wird interpretiert.
 |---|---|
 | Freitext | neuer Task (erste Zeile = Titel, Rest = Beschreibung), Antwort mit **[Verwerfen]** |
 | `/status` | „Daemon läuft, #42 in implementing seit 23:14" bzw. „Daemon läuft nicht", darunter der Morgenbericht |
-| `/queue` | wartende Tasks, je **[Verwerfen]** (= geparkt mit Grund, `/requeue` holt ihn zurück) |
+| `/queue` | wartende Tasks, je **[Verwerfen]** (= geparkt mit Grund, `/requeue` holt ihn zurück, Antwort mit **[Zurückholen]**) |
 | `/requeue <id>` | wie `forge.cli requeue` |
 | `/stop` | wie `forge.cli stop` (Halt-Datei nur bei laufendem Daemon) |
 
