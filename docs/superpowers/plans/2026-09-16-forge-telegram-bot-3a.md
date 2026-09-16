@@ -1580,7 +1580,23 @@ Danach `python3.14 -m forge.cli status` in `~/Mantis`: #N steht unter
 Jeder Befund wird als Fix-Commit im Worktree nachgezogen, mit Test, wo ein
 Test ihn hätte finden können. Danach `python3.14 -m pytest tests/ -q`.
 
-- [ ] **Step 5: Ledger-Notiz**
+- [x] **Step 5: Ledger-Notiz**
+
+**Tagesprobe 2026-09-16, 15:03–16:20 (Worktree `forge/bot-3a`, `.env` per Symlink):**
+Schritt 1 `melden.sende` echt → `True`. Schritt 2 Bot mit `env -i` (launchd-PATH,
+`LC_ALL`, `HOME`): Pool, „1 erlaubte ID(s)", Polling, **keine httpx-Zeile** (der
+Token-Leak-Fix aus dem Task-5-Review greift). Schritt 3 Timo live: Freitext →
+#1158 `queued` (`idea_added`), **[Verwerfen]** → `parked` 15:59:42, `/requeue`
+→ `resumed` 16:00:14; `/status`, `/stop` ohne Daemon, `/foo` laut Timo wie in
+der Tabelle. #1158 ist ein echter Task (kein Probe-Text) und bleibt für die
+Nacht in der Queue. Befund im Code: keiner. Befund im Prozess: Timo wollte nach
+dem Verwerfen nicht `/requeue N` tippen → Task 7 ([Zurückholen]-Knopf); dessen
+Knopf ist unit- und handler-getestet, live noch nicht gedrückt. **Nicht
+geprobt:** Start unter launchd selbst (KeepAlive/ThrottleInterval/Logpfade) —
+das ist der Merge-Tag-Schritt „Nach dem Merge", Punkt 2, mit `/status` als
+Abnahme; und `/stop` mit laufendem Daemon (pgrep-Argv gegen den echten
+launchd-Prozess ist per `pgrep -fl` verifiziert: argv endet auf `-m forge.bot`
+bzw. `-m forge.daemon`).
 
 In `docs/superpowers/plans/2026-09-16-forge-telegram-bot-3a.md` unter
 diesem Task eintragen: Datum, was geprobt wurde, was gefunden wurde
