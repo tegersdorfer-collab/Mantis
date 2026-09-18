@@ -45,7 +45,7 @@
 
 **Files:** keine Code-Änderung.
 
-- [ ] **Step 1: Worktree + Branch**
+- [x] **Step 1: Worktree + Branch**
 
 ```bash
 cd ~/Mantis && git worktree add .worktrees/jev-decide -b jev/decide main
@@ -69,7 +69,7 @@ Alle folgenden Tasks laufen in `~/Mantis/.worktrees/jev-decide`.
 **Interfaces:**
 - Produces: `config.JEV_ENABLED: bool`, `config.OPENROUTER_API_KEY: str`, `config.JEV_MODEL: str`, `config.JEV_TIMEOUT_S: float`, `config.JEV_COOLDOWN_S: float`
 
-- [ ] **Step 1: Failing test**
+- [x] **Step 1: Failing test**
 
 ```python
 # tests/test_settings_jev.py
@@ -96,9 +96,9 @@ def test_jev_aus_env(monkeypatch):
     assert s.JEV_ENABLED is True and s.OPENROUTER_API_KEY == "sk-test"
 ```
 
-- [ ] **Step 2: Run** `python3 -m pytest tests/test_settings_jev.py -q` → FAIL (`AttributeError: JEV_ENABLED`)
+- [x] **Step 2: Run** `python3 -m pytest tests/test_settings_jev.py -q` → FAIL (`AttributeError: JEV_ENABLED`)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `settings.py` direkt nach der Zeile `LLM_LOCAL_ONLY: bool = False`:
 
@@ -136,8 +136,8 @@ JEV_ENABLED=false
 OPENROUTER_API_KEY=
 ```
 
-- [ ] **Step 4: Run** `python3 -m pytest tests/test_settings_jev.py -q` → PASS
-- [ ] **Step 5: Commit** `git add settings.py config.py .env.example tests/test_settings_jev.py && git commit -m "Jev: Settings (Opt-in, Key, Modell, Timeout, Cooldown)"`
+- [x] **Step 4: Run** `python3 -m pytest tests/test_settings_jev.py -q` → PASS
+- [x] **Step 5: Commit** `git add settings.py config.py .env.example tests/test_settings_jev.py && git commit -m "Jev: Settings (Opt-in, Key, Modell, Timeout, Cooldown)"`
 
 ---
 
@@ -166,7 +166,7 @@ OPENROUTER_API_KEY=
   def reset_for_tests() -> None
   ```
 
-- [ ] **Step 1: Failing tests**
+- [x] **Step 1: Failing tests**
 
 ```python
 # tests/test_decide.py
@@ -293,9 +293,9 @@ def test_fehlende_antwort_id_wirft(monkeypatch):
             asyncio.run(decide.decide("x", {"q": Noul("?")}))
 ```
 
-- [ ] **Step 2: Run** `python3 -m pytest tests/test_decide.py -q` → FAIL (`ModuleNotFoundError: core.decide`)
+- [x] **Step 2: Run** `python3 -m pytest tests/test_decide.py -q` → FAIL (`ModuleNotFoundError: core.decide`)
 
-- [ ] **Step 3: Implement `core/decide.py`**
+- [x] **Step 3: Implement `core/decide.py`**
 
 ```python
 """
@@ -418,8 +418,8 @@ async def decide(state: str | dict | list, questions: dict[str, Noul | Choice]) 
 
 Hinweis für den Implementierer: `KeyError` deckt die fehlende Antwort-ID ab (`answers[qid]`), `httpx.HTTPStatusError` ist ein `httpx.HTTPError`. `_transport` wird beim Aufruf gelesen (nicht beim Import), damit `patch.object(decide, "_transport", …)` greift.
 
-- [ ] **Step 4: Run** `python3 -m pytest tests/test_decide.py -q` → 7 passed
-- [ ] **Step 5: Commit** `git add core/decide.py tests/test_decide.py && git commit -m "Jev: Entscheidungs-Engine mit Circuit-Breaker (core/decide.py)"`
+- [x] **Step 4: Run** `python3 -m pytest tests/test_decide.py -q` → 7 passed
+- [x] **Step 5: Commit** `git add core/decide.py tests/test_decide.py && git commit -m "Jev: Entscheidungs-Engine mit Circuit-Breaker (core/decide.py)"`
 
 ---
 
@@ -445,7 +445,7 @@ Hinweis für den Implementierer: `KeyError` deckt die fehlende Antwort-ID ab (`a
       # (Kategorien mit P ≥ TOOL_CATEGORY_P, aktion True/False/None-wenn-unsicher); None wenn Jev nicht verfügbar
   ```
 
-- [ ] **Step 1: Failing tests**
+- [x] **Step 1: Failing tests**
 
 ```python
 # tests/test_decisions.py
@@ -554,9 +554,9 @@ def test_beschreibungen_decken_registry_kategorien():
     assert not fehlt, f"ohne Beschreibung: {fehlt}"
 ```
 
-- [ ] **Step 2: Run** `python3 -m pytest tests/test_decisions.py -q` → FAIL (`ModuleNotFoundError`)
+- [x] **Step 2: Run** `python3 -m pytest tests/test_decisions.py -q` → FAIL (`ModuleNotFoundError`)
 
-- [ ] **Step 3: Implement `core/decisions.py`**
+- [x] **Step 3: Implement `core/decisions.py`**
 
 ```python
 """
@@ -702,8 +702,8 @@ async def tool_categories(text: str) -> tuple[set[str], bool | None] | None:
     return cats, aktion
 ```
 
-- [ ] **Step 4: Run** `python3 -m pytest tests/test_decisions.py -q` → 9 passed. Schlägt `test_beschreibungen_decken_registry_kategorien` fehl, fehlt eine Kategorie in `TOOL_CATEGORY_DESCRIPTIONS` — ergänzen (Beschreibung aus den Tool-Docstrings ableiten), nicht in `TOOL_CATEGORIES_OHNE_ROUTING` verstecken.
-- [ ] **Step 5: Commit** `git add core/decisions.py tests/test_decisions.py && git commit -m "Jev: Fragenkatalog + Wrapper mit lokalem Fallback (core/decisions.py)"`
+- [x] **Step 4: Run** `python3 -m pytest tests/test_decisions.py -q` → 9 passed. Schlägt `test_beschreibungen_decken_registry_kategorien` fehl, fehlt eine Kategorie in `TOOL_CATEGORY_DESCRIPTIONS` — ergänzen (Beschreibung aus den Tool-Docstrings ableiten), nicht in `TOOL_CATEGORIES_OHNE_ROUTING` verstecken.
+- [x] **Step 5: Commit** `git add core/decisions.py tests/test_decisions.py && git commit -m "Jev: Fragenkatalog + Wrapper mit lokalem Fallback (core/decisions.py)"`
 
 ---
 
@@ -716,9 +716,9 @@ async def tool_categories(text: str) -> tuple[set[str], bool | None] | None:
 **Interfaces:**
 - Consumes: `core.decisions.addressed(text, fallback)`
 
-- [ ] **Step 1: Bestehende Tests anschauen** — `sed -n 95,165p tests/test_voice.py`. Sie patchen `voice.fast.yes_no`. Das muss weiter funktionieren: mit Jev aus ist `fast.yes_no` der Fallback.
+- [x] **Step 1: Bestehende Tests anschauen** — `sed -n 95,165p tests/test_voice.py`. Sie patchen `voice.fast.yes_no`. Das muss weiter funktionieren: mit Jev aus ist `fast.yes_no` der Fallback.
 
-- [ ] **Step 2: Failing test** (ans Ende von `tests/test_voice.py`, innerhalb des vorhandenen Import-Stils der Datei):
+- [x] **Step 2: Failing test** (ans Ende von `tests/test_voice.py`, innerhalb des vorhandenen Import-Stils der Datei):
 
 ```python
 def test_address_check_nutzt_jev_vor_fast():
@@ -735,9 +735,9 @@ def test_address_check_nutzt_jev_vor_fast():
     assert text == "mach das Licht an" and callable(fallback)
 ```
 
-- [ ] **Step 3: Run** `python3 -m pytest tests/test_voice.py -q` → neuer Test FAIL (`AttributeError: core.voice has no attribute decisions`)
+- [x] **Step 3: Run** `python3 -m pytest tests/test_voice.py -q` → neuer Test FAIL (`AttributeError: core.voice has no attribute decisions`)
 
-- [ ] **Step 4: Implement** — in `core/voice.py`: Import `from core import decisions` neben dem vorhandenen `fast`-Import ergänzen. Den Docstring-Absatz „(3) Sonst entscheidet ein kleines dediziertes Modell …" erweitern um: „Seit 18.09.2026 fragt Layer 3 zuerst Jev (core/decisions.addressed, Benchmark 14/14 statt 88 %); das lokale Modell ist Fallback bei Ausfall oder Unsicherheit." Den `return await fast.yes_no(...)`-Block ersetzen durch:
+- [x] **Step 4: Implement** — in `core/voice.py`: Import `from core import decisions` neben dem vorhandenen `fast`-Import ergänzen. Den Docstring-Absatz „(3) Sonst entscheidet ein kleines dediziertes Modell …" erweitern um: „Seit 18.09.2026 fragt Layer 3 zuerst Jev (core/decisions.addressed, Benchmark 14/14 statt 88 %); das lokale Modell ist Fallback bei Ausfall oder Unsicherheit." Den `return await fast.yes_no(...)`-Block ersetzen durch:
 
 ```python
     async def _lokal() -> bool:
@@ -750,8 +750,8 @@ def test_address_check_nutzt_jev_vor_fast():
     return await decisions.addressed(stripped, _lokal)
 ```
 
-- [ ] **Step 5: Run** `python3 -m pytest tests/test_voice.py tests/test_voice_router.py -q` → alle PASS (die alten Tests laufen mit `JEV_ENABLED=False` → `JevUnavailable` → Fallback `fast.yes_no`, wie gepatcht). Falls ein alter Test die `.env` mit `JEV_ENABLED=true` liest und dadurch echtes Netz will: in dem Test `monkeypatch.setattr(config, "JEV_ENABLED", False)` — oder besser in `tests/conftest.py` ein autouse-Fixture, das `core.decide.config.JEV_ENABLED = False` setzt (dann Task 4 Step 2 Test explizit mit `patch` auf `decisions.addressed`, was ohnehin geschieht).
-- [ ] **Step 6: Commit** `git add core/voice.py tests/test_voice.py tests/conftest.py && git commit -m "Voice: Adress-Check fragt Jev, lokales Modell als Fallback"`
+- [x] **Step 5: Run** `python3 -m pytest tests/test_voice.py tests/test_voice_router.py -q` → alle PASS (die alten Tests laufen mit `JEV_ENABLED=False` → `JevUnavailable` → Fallback `fast.yes_no`, wie gepatcht). Falls ein alter Test die `.env` mit `JEV_ENABLED=true` liest und dadurch echtes Netz will: in dem Test `monkeypatch.setattr(config, "JEV_ENABLED", False)` — oder besser in `tests/conftest.py` ein autouse-Fixture, das `core.decide.config.JEV_ENABLED = False` setzt (dann Task 4 Step 2 Test explizit mit `patch` auf `decisions.addressed`, was ohnehin geschieht).
+- [x] **Step 6: Commit** `git add core/voice.py tests/test_voice.py tests/conftest.py && git commit -m "Voice: Adress-Check fragt Jev, lokales Modell als Fallback"`
 
 ---
 
@@ -766,7 +766,7 @@ def test_address_check_nutzt_jev_vor_fast():
 - Consumes: `core.decisions.tool_categories(text) -> (set[str], bool|None) | None`, `TOOL_ACTION_P`
 - Produces: `async def select_tools_async(text: str) -> tuple[list[str], bool]` — (erlaubte Tool-Namen, force_tools)
 
-- [ ] **Step 1: Failing tests**
+- [x] **Step 1: Failing tests**
 
 ```python
 # tests/test_tools_select.py
@@ -822,9 +822,9 @@ def test_deckel_bleibt():
     assert len(names) <= 14 + 3   # 14 Prefill-Deckel + die 3 Skill-Factory-Tools
 ```
 
-- [ ] **Step 2: Run** `python3 -m pytest tests/test_tools_select.py -q` → FAIL (`AttributeError: select_tools_async`)
+- [x] **Step 2: Run** `python3 -m pytest tests/test_tools_select.py -q` → FAIL (`AttributeError: select_tools_async`)
 
-- [ ] **Step 3: Implement** — in `core/tools.py` oben `from core import decisions` importieren (Zirkularität prüfen: `core/decisions.py` importiert nur `core.decide` und `config`, nicht `core.tools` — okay). Nach `select_tools` einfügen:
+- [x] **Step 3: Implement** — in `core/tools.py` oben `from core import decisions` importieren (Zirkularität prüfen: `core/decisions.py` importiert nur `core.decide` und `config`, nicht `core.tools` — okay). Nach `select_tools` einfügen:
 
 ```python
 async def select_tools_async(text: str) -> tuple[list[str], bool]:
@@ -859,8 +859,8 @@ In `core/message_handler.py` Zeilen 201–202 ersetzen:
         allowed, force_tools = await skills.T.select_tools_async(text)
 ```
 
-- [ ] **Step 4: Run** `python3 -m pytest tests/test_tools_select.py tests/test_fast_commands.py -q` und `python3 -c "import core.message_handler"` → PASS
-- [ ] **Step 5: Commit** `git add core/tools.py core/message_handler.py tests/test_tools_select.py && git commit -m "Tools: select_tools_async — Jev-Kategorien ergänzen den Keyword-Pfad"`
+- [x] **Step 4: Run** `python3 -m pytest tests/test_tools_select.py tests/test_fast_commands.py -q` und `python3 -c "import core.message_handler"` → PASS
+- [x] **Step 5: Commit** `git add core/tools.py core/message_handler.py tests/test_tools_select.py && git commit -m "Tools: select_tools_async — Jev-Kategorien ergänzen den Keyword-Pfad"`
 
 ---
 
@@ -873,7 +873,7 @@ In `core/message_handler.py` Zeilen 201–202 ersetzen:
 **Interfaces:**
 - Consumes: `core.decisions.claim_supported(user_text, claim, fallback)`, `core.decisions.supersedes(old, new, fallback)`, `memory.conflict.make_llm_judge(client, model)`
 
-- [ ] **Step 1: Failing tests**
+- [x] **Step 1: Failing tests**
 
 ```python
 # tests/test_memory_verifier.py
@@ -920,9 +920,9 @@ def test_judge_geht_ueber_jev():
     assert (old, new) == ("wohnt in Nürnberg", "nach Fürth gezogen") and callable(fallback)
 ```
 
-- [ ] **Step 2: Run** `python3 -m pytest tests/test_memory_verifier.py -q` → FAIL (`AttributeError: verify_claim`)
+- [x] **Step 2: Run** `python3 -m pytest tests/test_memory_verifier.py -q` → FAIL (`AttributeError: verify_claim`)
 
-- [ ] **Step 3: Implement** — in `memory/extractor.py`: `from core import decisions` importieren. Vor `class MemoryExtractor` drei Modul-Funktionen ergänzen:
+- [x] **Step 3: Implement** — in `memory/extractor.py`: `from core import decisions` importieren. Vor `class MemoryExtractor` drei Modul-Funktionen ergänzen:
 
 ```python
 def verify_prompt(user_text: str, claim: str) -> str:
@@ -977,8 +977,8 @@ Dann im Extraktor den Block „4b. Verifier" (das `try:` mit `verify_prompt = (.
 
 Und bei „6b. Konfliktauflösung" die Zeile `judge = conflict.make_llm_judge(self._client, config.AGENT_MODEL_FAST)` ersetzen durch `judge = make_judge(self._client, config.AGENT_MODEL_FAST)` (der `from memory import conflict`-Import in dem Block kann bleiben, wird für `conflict.resolve` gebraucht).
 
-- [ ] **Step 4: Run** `python3 -m pytest tests/test_memory_verifier.py tests/ -q -k "memory or extractor or conflict or dedup"` → PASS
-- [ ] **Step 5: Commit** `git add memory/extractor.py tests/test_memory_verifier.py && git commit -m "Memory: Verifier + Konflikt-Judge über Jev; lokaler Verifier-Prompt nennt den Sprecher"`
+- [x] **Step 4: Run** `python3 -m pytest tests/test_memory_verifier.py tests/ -q -k "memory or extractor or conflict or dedup"` → PASS
+- [x] **Step 5: Commit** `git add memory/extractor.py tests/test_memory_verifier.py && git commit -m "Memory: Verifier + Konflikt-Judge über Jev; lokaler Verifier-Prompt nennt den Sprecher"`
 
 ---
 
@@ -988,9 +988,9 @@ Und bei „6b. Konfliktauflösung" die Zeile `judge = conflict.make_llm_judge(se
 - Modify: `README.md` (Abschnitt LLM-Stack / Konfiguration — kurzer Absatz „Jev")
 - Modify: `docs/superpowers/plans/2026-09-18-jev-decide.md` (Checkboxen)
 
-- [ ] **Step 1: Volle Suite** `python3 -m pytest tests -q 2>&1 | tail -3` → alles grün; Anzahl gegenüber Task 0 gestiegen.
+- [x] **Step 1: Volle Suite** `python3 -m pytest tests -q 2>&1 | tail -3` → alles grün; Anzahl gegenüber Task 0 gestiegen.
 
-- [ ] **Step 2: Live-Probe gegen echtes Jev** (nur wenn `.env` `JEV_ENABLED=true` hat; setzt der Ausführende **nicht** selbst — Timo entscheidet das per `.env`). Wenn gesetzt:
+- [x] **Step 2: Live-Probe gegen echtes Jev** (nur wenn `.env` `JEV_ENABLED=true` hat; setzt der Ausführende **nicht** selbst — Timo entscheidet das per `.env`). Wenn gesetzt:
 
 ```bash
 cd ~/Mantis/.worktrees/jev-decide && python3 - <<'EOF'
@@ -1009,11 +1009,11 @@ EOF
 
 Expected: `spotify` in der ersten Zeile, `lampe` in der zweiten, `get_health` in der dritten, vierte Zeile `force=False`; `addressed: False True`. Kein Ollama nötig, nichts wird geladen.
 
-- [ ] **Step 3: README** — im Konfigurations-/LLM-Abschnitt drei Sätze: was Jev ist, dass es Opt-in über `JEV_ENABLED` + `OPENROUTER_API_KEY` ist, dass alle Fragen/Schwellen in `core/decisions.py` stehen und der Benchmark in `bench/jev/` liegt.
+- [x] **Step 3: README** — im Konfigurations-/LLM-Abschnitt drei Sätze: was Jev ist, dass es Opt-in über `JEV_ENABLED` + `OPENROUTER_API_KEY` ist, dass alle Fragen/Schwellen in `core/decisions.py` stehen und der Benchmark in `bench/jev/` liegt.
 
-- [ ] **Step 4: Commit** `git add README.md docs/superpowers/plans/2026-09-18-jev-decide.md && git commit -m "Jev: README + Plan-Abschluss"`
+- [x] **Step 4: Commit** `git add README.md docs/superpowers/plans/2026-09-18-jev-decide.md && git commit -m "Jev: README + Plan-Abschluss"`
 
-- [ ] **Step 5: Übergabe** — Branch `jev/decide` ist fertig; **nicht** selbst mergen (Haupt-Tree hat fremde WIP in `core/tools.py`; der Merge ist ein 3-Zeilen-Konflikt in `_CATEGORY_KEYWORDS` und gehört Timo bzw. dem Abschluss-Skill `superpowers:finishing-a-development-branch`).
+- [x] **Step 5: Übergabe** — Branch `jev/decide` ist fertig; **nicht** selbst mergen (Haupt-Tree hat fremde WIP in `core/tools.py`; der Merge ist ein 3-Zeilen-Konflikt in `_CATEGORY_KEYWORDS` und gehört Timo bzw. dem Abschluss-Skill `superpowers:finishing-a-development-branch`).
 
 ---
 

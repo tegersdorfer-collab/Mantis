@@ -124,6 +124,8 @@ Drei fokussierte Apps gegen dieselbe FastAPI (`:7779`), erreichbar über Tailsca
 | Prozess-Management | launchd + KeepAlive (Auto-Restart nach Crash) |
 | CI | GitHub Actions (ruff lint + pytest, Python 3.14) |
 
+Jev ist ein optionales Entscheidungsmodell über OpenRouter, das bei mehrdeutigen Fällen (Werkzeugauswahl, Sprecher-Adressierung, Anspruchs-Prüfung) das lokale Modell ergänzt statt ersetzt. Es ist per Opt-in über `JEV_ENABLED` + `OPENROUTER_API_KEY` in `.env` aktiviert; ohne diese Werte läuft Mantis unverändert lokal weiter. Alle Fragen und Schwellenwerte stehen gebündelt in `core/decisions.py`, der zugehörige Benchmark liegt in `bench/jev/`.
+
 ---
 
 ## Setup
