@@ -14,7 +14,7 @@ import logging
 import time
 
 import config
-from core import fast
+from core import decisions, fast
 
 log = logging.getLogger(__name__)
 
@@ -80,7 +80,9 @@ async def is_addressed_to_mantis(text: str) -> bool:
     adressiert, auch ohne Namen oder klaren Befehl. (3) Sonst entscheidet ein
     kleines dediziertes Modell (core.fast mit ADDRESS_CHECK_MODEL statt dem großen
     AGENT_MODEL_FAST), ob es sich auch ohne Namensnennung um eine an Mantis
-    gerichtete Anfrage handelt (Spec: "nicht nur Wake-Word")."""
+    gerichtete Anfrage handelt (Spec: "nicht nur Wake-Word"). Seit 18.09.2026 fragt
+    Layer 3 zuerst Jev (core/decisions.addressed, Benchmark 14/14 statt 88 %); das
+    lokale Modell ist Fallback bei Ausfall oder Unsicherheit."""
     stripped = text.strip()
     if not stripped:
         return False
@@ -88,9 +90,12 @@ async def is_addressed_to_mantis(text: str) -> bool:
         return True
     if time.monotonic() < _conversation_active_until:
         return True
-    return await fast.yes_no(
-        f"Ist dieser Satz eine Anfrage oder ein Befehl an einen persönlichen KI-Assistenten "
-        f"namens Mantis (nicht nur Small Talk mit jemand anderem im Raum), auch wenn der Name "
-        f"'Mantis' nicht genannt wird?\n\n\"{stripped}\"",
-        model=config.ADDRESS_CHECK_MODEL,
-    )
+
+    async def _lokal() -> bool:
+        return await fast.yes_no(
+            f"Ist dieser Satz eine Anfrage oder ein Befehl an einen persönlichen KI-Assistenten "
+            f"namens Mantis (nicht nur Small Talk mit jemand anderem im Raum), auch wenn der Name "
+            f"'Mantis' nicht genannt wird?\n\n\"{stripped}\"",
+            model=config.ADDRESS_CHECK_MODEL,
+        )
+    return await decisions.addressed(stripped, _lokal)

@@ -160,3 +160,17 @@ class TestConversationFollowup:
         voice.mark_conversation_active()
         result = asyncio.run(voice.is_addressed_to_mantis(""))
         assert result is False
+
+
+def test_address_check_nutzt_jev_vor_fast():
+    """Layer 3: Jev entscheidet; fast.yes_no ist nur noch der Fallback."""
+    from unittest.mock import AsyncMock, patch
+    from core import voice
+    voice._conversation_active_until = 0.0
+    with patch("core.voice.decisions.addressed", new=AsyncMock(return_value=True)) as jev, \
+         patch("core.voice.fast.yes_no", new=AsyncMock(return_value=False)) as fast:
+        assert asyncio.run(voice.is_addressed_to_mantis("mach das Licht an")) is True
+    jev.assert_awaited_once()
+    fast.assert_not_awaited()
+    text, fallback = jev.await_args.args
+    assert text == "mach das Licht an" and callable(fallback)
