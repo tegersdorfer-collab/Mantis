@@ -119,3 +119,41 @@ def test_fehlende_antwort_id_wirft(monkeypatch):
     with patch.object(decide, "_transport", _transport(h)):
         with pytest.raises(JevUnavailable):
             asyncio.run(decide.decide("x", {"q": Noul("?")}))
+
+
+def test_kaputte_antwortform_wird_unavailable(monkeypatch):
+    _enabled(monkeypatch)
+    def h_string(request):
+        return httpx.Response(200, json={"model": "m", "answers": {"q": "kaputt"}, "usage": {}})
+    with patch.object(decide, "_transport", _transport(h_string)):
+        with pytest.raises(JevUnavailable):
+            asyncio.run(decide.decide("x", {"q": Noul("?")}))
+    decide.reset_for_tests()
+    def h_list(request):
+        return httpx.Response(200, json={"model": "m", "answers": {
+            "q": {"type": "choice", "choice": "flipper", "probabilities": [0.9, 0.1], "confidence": 0.9}},
+            "usage": {}})
+    with patch.object(decide, "_transport", _transport(h_list)):
+        with pytest.raises(JevUnavailable):
+            asyncio.run(decide.decide("x", {"q": Choice("?", {"flipper": None, "robot": None})}))
+
+
+def test_choice_ohne_wahrscheinlichkeit_wird_unavailable(monkeypatch):
+    _enabled(monkeypatch)
+    def h(request):
+        return httpx.Response(200, json={"model": "m", "answers": {
+            "q": {"type": "choice", "choice": "robot", "probabilities": {"flipper": 0.9}, "confidence": 0.9}},
+            "usage": {}})
+    with patch.object(decide, "_transport", _transport(h)):
+        with pytest.raises(JevUnavailable):
+            asyncio.run(decide.decide("x", {"q": Choice("?", {"flipper": None, "robot": None})}))
+
+
+def test_nicht_serialisierbarer_state_ist_caller_bug(monkeypatch):
+    _enabled(monkeypatch)
+    def h(request):
+        pytest.fail("Transport darf bei nicht-serialisierbarem state nie aufgerufen werden")
+    with patch.object(decide, "_transport", _transport(h)):
+        with pytest.raises(TypeError):
+            asyncio.run(decide.decide({"x": object()}, {"q": Noul("?")}))
+    assert decide.enabled() is True

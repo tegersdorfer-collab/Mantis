@@ -16,6 +16,7 @@ Endpunkt nicht jeden Turn erst um den Timeout verzögert.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -89,27 +90,35 @@ def _parse(qid: str, raw: dict) -> Answer:
     if raw.get("type") == "choice":
         probs = {k: float(v) for k, v in raw["probabilities"].items()}
         choice = raw["choice"]
-        return Answer("choice", choice, probs.get(choice, 0.0), float(raw["confidence"]), probs)
+        return Answer("choice", choice, probs[choice], float(raw["confidence"]), probs)
     raise JevUnavailable(f"unbekannter Antworttyp für {qid!r}: {raw.get('type')!r}")
 
 
 async def decide(state: str | dict | list, questions: dict[str, Noul | Choice]) -> dict[str, Answer]:
-    """Ein Call, alle Fragen parallel gegen denselben State. Wirft JevUnavailable."""
+    """Ein Call, alle Fragen parallel gegen denselben State. Wirft JevUnavailable.
+
+    Eine Frage, die kein Noul/Choice ist, ist ein Bug im eigenen statischen
+    Fragenkatalog — das fliegt absichtlich als AttributeError vor dem try,
+    statt still auf den lokalen Pfad zurückzufallen.
+    """
     global _down_until
     if not enabled():
         raise JevUnavailable("Jev aus, kein Key oder im Cooldown")
     body = {"model": config.JEV_MODEL, "state": state,
             "questions": {qid: q.payload() for qid, q in questions.items()}}
+    # Serialisierung VOR dem try: ein nicht-JSON-fähiger state ist ein Caller-Bug,
+    # kein Jev-Ausfall — der Breaker darf dafür nicht in Cooldown gehen.
+    payload = json.dumps(body, ensure_ascii=False).encode()
     headers = {"Authorization": f"Bearer {config.OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=config.JEV_TIMEOUT_S, transport=_transport) as client:
-            resp = await client.post(URL, json=body, headers=headers)
+            resp = await client.post(URL, content=payload, headers=headers)
         resp.raise_for_status()
         answers = resp.json()["answers"]
         out = {qid: _parse(qid, answers[qid]) for qid in questions}
     except JevUnavailable:
         raise
-    except (httpx.HTTPError, KeyError, ValueError, TypeError) as e:
+    except (httpx.HTTPError, KeyError, ValueError, TypeError, AttributeError) as e:
         _down_until = time.monotonic() + config.JEV_COOLDOWN_S
         log.warning(f"Jev nicht erreichbar, {config.JEV_COOLDOWN_S:.0f}s lokal: {e!r}")
         raise JevUnavailable(str(e)) from e
