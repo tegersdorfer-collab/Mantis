@@ -53,6 +53,19 @@ class MantisSettings(BaseSettings):
     # Voll-lokaler Betrieb: ignoriert den ANTHROPIC_API_KEY und nutzt überall Ollama
     # (kein Cloud-Call, keine Claude-Fallbacks). Der Key bleibt für Tools/Benchmarks nutzbar.
     LLM_LOCAL_ONLY: bool = False
+    # ── Jev (TypeSafe System-One-Modell via OpenRouter) ───────────────────────
+    # Kleine Ja/Nein- und Kategorie-Entscheidungen (Voice-Adress-Check, Tool-
+    # Auswahl, Memory-Verifier/Konflikt-Judge) laufen über Jev statt über ein
+    # lokales 9B/0.5B-Modell: kalibrierte Wahrscheinlichkeiten, ~0.4 s, hält
+    # den Ollama-GATE nicht. Benchmark 2026-09-18: 86/92 vs. 88 % lokal
+    # (bench/jev/results/report.md). Bewusst UNABHÄNGIG von LLM_LOCAL_ONLY:
+    # Timo hat dem Cloud-Call für diese Daten explizit zugestimmt (18.09.2026).
+    # Ohne JEV_ENABLED oder ohne Key ist der Pfad tot und alles bleibt lokal.
+    JEV_ENABLED: bool = False
+    OPENROUTER_API_KEY: str = ""
+    JEV_MODEL: str = "~typesafe/jev-latest"
+    JEV_TIMEOUT_S: float = 3.0      # danach lokaler Fallback
+    JEV_COOLDOWN_S: float = 120.0   # nach Fehler: so lange kein Jev-Versuch
     # ── Background-LLM Routing ────────────────────────────────────────────────
     # Default: qwen3.5:9b für Memory, Review, Konsolidierung
     BG_DEFAULT_MODEL: str = ""          # leer = OLLAMA_MODEL
