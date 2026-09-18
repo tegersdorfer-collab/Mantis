@@ -43,6 +43,17 @@ def test_jev_aktion_false_ueberstimmt_keyword_nicht():
     assert force is True
 
 
+def test_jev_aktion_ohne_kategorie_erzwingt_nichts():
+    """Keine Keyword-Kategorie, kein Aktionswort → nur das Fallback-Set erlaubt.
+    Jev sagt aktion=True, aber keine Kategorie ≥0.6 — dann NICHT erzwingen, sonst
+    zwingt der Agent z.B. 'calculate' auf eine Anfrage, der das gar nicht hilft."""
+    text = "Ruf mal meine Mutter an"
+    with patch("core.tools.decisions.tool_categories", new=AsyncMock(return_value=(set(), True))):
+        names, force = asyncio.run(T.select_tools_async(text))
+    assert force is False
+    assert names == T.select_tools(text)
+
+
 def test_deckel_bleibt():
     alle = set(T.decisions.TOOL_CATEGORY_DESCRIPTIONS)
     with patch("core.tools.decisions.tool_categories", new=AsyncMock(return_value=(alle, True))):

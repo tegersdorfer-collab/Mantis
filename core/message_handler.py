@@ -197,8 +197,12 @@ class MessageHandler:
             args = {"skill_name": skill_req.skill_name, "description": skill_req.spec}
             return result, [{"tool": "create_skill", "args": args, "result": result[:500]}]
 
-        system = await self.prompt_builder.build(text)
-        allowed, force_tools = await skills.T.select_tools_async(text)
+        # Parallel statt sequenziell: der Jev-Roundtrip in select_tools_async läuft
+        # während der Prompt gebaut wird, statt hinterherzuhängen.
+        system, (allowed, force_tools) = await asyncio.gather(
+            self.prompt_builder.build(text),
+            skills.T.select_tools_async(text),
+        )
         try:
             return await agent.run(
                 messages=self.kzg.recent_messages(max_tokens=3000),

@@ -193,6 +193,12 @@ def is_action(text: str) -> bool:
     return any(w in t for w in _ACTION_WORDS)
 
 
+# Tools, die auch ohne jede erkannte Kategorie verfügbar bleiben (reines Gespräch /
+# unbekannte Anfrage). Eine Quelle, damit select_tools/select_tools_async nicht
+# auseinanderlaufen können.
+_FALLBACK_TOOLS = ("create_skill", "list_dynamic_skills", "delete_skill", "calculate")
+
+
 def select_tools(text: str) -> list[str]:
     """
     Wählt relevante Tools basierend auf der Nachricht.
@@ -211,8 +217,7 @@ def select_tools(text: str) -> list[str]:
     # verfügbar – sonst hat der Agent ausgerechnet bei unerwarteten/neuen Anfragen
     # (die selten in eine Keyword-Kategorie fallen) gar keine Tools zur Wahl.
     if not cats and not has_action:
-        return [n for n in ("create_skill", "list_dynamic_skills", "delete_skill", "calculate")
-                if n in REGISTRY]
+        return [n for n in _FALLBACK_TOOLS if n in REGISTRY]
 
     names = [name for name, tool in REGISTRY.items() if tool.category in cats]
 
@@ -265,7 +270,10 @@ async def select_tools_async(text: str) -> tuple[list[str], bool]:
         factory = [n for n in names if n in ("create_skill", "list_dynamic_skills", "delete_skill")]
         core_names = [n for n in names if n not in factory]
         names = (core_names + extra)[:14] + factory
-    if aktion is True and names:
+    # Nur erzwingen, wenn Jev wirklich etwas beigetragen hat (Kategorie) oder ein
+    # nicht-Fallback-Tool erlaubt ist — sonst zwingt aktion=True den Agenten auf
+    # z.B. "calculate", obwohl das der Anfrage gar nicht hilft (Fallback-Set-Falle).
+    if aktion is True and (cats or any(n not in _FALLBACK_TOOLS for n in names)):
         force = True
     return names, force
 

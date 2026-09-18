@@ -16,6 +16,7 @@ Endpunkt nicht jeden Turn erst um den Timeout verzögert.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -91,7 +92,10 @@ def _parse(qid: str, raw: dict) -> Answer:
         probs = {k: float(v) for k, v in raw["probabilities"].items()}
         choice = raw["choice"]
         return Answer("choice", choice, probs[choice], float(raw["confidence"]), probs)
-    raise JevUnavailable(f"unbekannter Antworttyp für {qid!r}: {raw.get('type')!r}")
+    # ValueError statt JevUnavailable: landet im except-Tupel von decide() und öffnet
+    # so den Breaker — ein dauerhaft geändertes Schema soll nicht jeden Turn erneut
+    # den vollen Roundtrip kosten, bevor lokal zurückgefallen wird.
+    raise ValueError(f"unbekannter Antworttyp für {qid!r}: {raw.get('type')!r}")
 
 
 async def decide(state: str | dict | list, questions: dict[str, Noul | Choice]) -> dict[str, Answer]:
@@ -111,14 +115,18 @@ async def decide(state: str | dict | list, questions: dict[str, Noul | Choice]) 
     payload = json.dumps(body, ensure_ascii=False).encode()
     headers = {"Authorization": f"Bearer {config.OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=config.JEV_TIMEOUT_S, transport=_transport) as client:
-            resp = await client.post(URL, content=payload, headers=headers)
-        resp.raise_for_status()
-        answers = resp.json()["answers"]
-        out = {qid: _parse(qid, answers[qid]) for qid in questions}
+        # asyncio.timeout ist das GESAMTBUDGET (Connect+Read+Parse), httpx.timeout
+        # nur pro Phase — ohne das hier kann ein langsamer Endpunkt mehrfache
+        # Phasen-Timeouts addieren und den globalen Ollama-GATE trotzdem sprengen.
+        async with asyncio.timeout(config.JEV_TIMEOUT_S):
+            async with httpx.AsyncClient(timeout=config.JEV_TIMEOUT_S, transport=_transport) as client:
+                resp = await client.post(URL, content=payload, headers=headers)
+            resp.raise_for_status()
+            answers = resp.json()["answers"]
+            out = {qid: _parse(qid, answers[qid]) for qid in questions}
     except JevUnavailable:
         raise
-    except (httpx.HTTPError, KeyError, ValueError, TypeError, AttributeError) as e:
+    except (TimeoutError, httpx.HTTPError, KeyError, ValueError, TypeError, AttributeError) as e:
         _down_until = time.monotonic() + config.JEV_COOLDOWN_S
         log.warning(f"Jev nicht erreichbar, {config.JEV_COOLDOWN_S:.0f}s lokal: {e!r}")
         raise JevUnavailable(str(e)) from e

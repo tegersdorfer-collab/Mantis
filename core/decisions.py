@@ -16,7 +16,7 @@ import logging
 from collections.abc import Awaitable, Callable
 
 from core import decide
-from core.decide import Choice, JevUnavailable, Noul
+from core.decide import JevUnavailable, Noul
 
 log = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ async def _noul_or_fallback(name: str, state, question: Noul, fallback: Fallback
     except JevUnavailable:
         return await fallback()
     if not ans.sure(SURE):
-        log.debug(f"Jev {name}: unsicher (p={ans.p:.2f}) → lokal")
+        log.debug("Jev %s: unsicher (p=%.2f) → lokal", name, ans.p)
         return await fallback()
     return bool(ans.value)
 

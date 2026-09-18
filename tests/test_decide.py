@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from core import decide
-from core.decide import Noul, Choice, Answer, JevUnavailable
+from core.decide import Noul, Choice, JevUnavailable
 
 
 def _transport(handler):
@@ -157,3 +157,30 @@ def test_nicht_serialisierbarer_state_ist_caller_bug(monkeypatch):
         with pytest.raises(TypeError):
             asyncio.run(decide.decide({"x": object()}, {"q": Noul("?")}))
     assert decide.enabled() is True
+
+
+def test_gesamtbudget_timeout_wird_unavailable(monkeypatch):
+    """asyncio.timeout ist das GESAMTBUDGET über Connect+Read+Parse — nicht nur die
+    httpx-Phasen-Timeout — und muss wie jeder andere Fehler den Breaker öffnen."""
+    _enabled(monkeypatch)
+    monkeypatch.setattr(decide.config, "JEV_TIMEOUT_S", 0.05)
+    async def h(request):
+        await asyncio.sleep(0.2)
+        return _ok_response(request)
+    with patch.object(decide, "_transport", _transport(h)):
+        with pytest.raises(JevUnavailable):
+            asyncio.run(decide.decide("x", {"q": Noul("?")}))
+    assert decide.enabled() is False
+
+
+def test_unbekannter_antworttyp_oeffnet_breaker(monkeypatch):
+    """Ein geändertes Antwortschema soll nicht jeden Turn erneut den vollen
+    Roundtrip kosten, bevor lokal zurückgefallen wird — also Breaker auf."""
+    _enabled(monkeypatch)
+    def h(request):
+        return httpx.Response(200, json={"model": "m", "answers": {
+            "q": {"type": "score", "score": 0.5}}, "usage": {}})
+    with patch.object(decide, "_transport", _transport(h)):
+        with pytest.raises(JevUnavailable):
+            asyncio.run(decide.decide("x", {"q": Noul("?")}))
+    assert decide.enabled() is False
