@@ -18,6 +18,7 @@ import re
 
 import ollama as _ollama
 
+from core import decisions
 from core.jsonutil import extract_json
 from core.llm_gate import GATE
 from memory.lzg import LZG
@@ -25,6 +26,45 @@ from memory.knowledge import KnowledgeGraph
 import config
 
 log = logging.getLogger(__name__)
+
+
+def verify_prompt(user_text: str, claim: str) -> str:
+    """Lokaler Verifier-Prompt. Der Sprecher MUSS genannt sein: Der Text ist in Ich-Form,
+    die Behauptung sagt „Timo" — ohne diesen Satz lehnte der 0.5B-Verifier gültige
+    Ich-Fakten ab (bench/jev: 4/8 → 8/8 allein durch die Sprecher-Angabe)."""
+    return (
+        f"Antworte NUR mit JA oder NEIN, nichts anderes.\n\n"
+        f"Der Text stammt von Timo und ist in der Ich-Form geschrieben (\"ich\" = Timo).\n"
+        f"Text: \"{user_text[:500]}\"\n"
+        f"Behauptung: \"{claim}\"\n\n"
+        f"Wird die Behauptung im Text wörtlich oder eindeutig direkt erwähnt?"
+    )
+
+
+async def verify_claim(client, user_text: str, claim: str) -> bool:
+    """Steht die Behauptung wirklich im Text? Jev zuerst, lokal (qwen2.5:0.5b) als Fallback."""
+    async def _lokal() -> bool:
+        vresp = await client.chat(
+            model="qwen2.5:0.5b",
+            messages=[{"role": "user", "content": verify_prompt(user_text, claim)}],
+            options={"temperature": 0.0, "num_predict": 5, "keep_alive": "5m"},
+            think=False,
+        )
+        return (vresp.message.content or "").strip().upper().startswith("JA")
+    return await decisions.claim_supported(user_text, claim, _lokal)
+
+
+def make_judge(client, model: str):
+    """Konflikt-Judge: Jev zuerst, sonst der bisherige LLM-Judge aus memory/conflict.py."""
+    from memory import conflict
+    lokal = conflict.make_llm_judge(client, model)
+
+    async def _judge(old: str, new: str) -> bool:
+        async def _fb() -> bool:
+            return await lokal(old, new)
+        return await decisions.supersedes(old, new, _fb)
+    return _judge
+
 
 # ── Extraktions-Prompt ────────────────────────────────────────────────────────
 
@@ -211,23 +251,10 @@ class MemoryExtractor:
                 log.debug(f"Extraktor: Text-Duplikat übersprungen: '{text[:60]}'")
                 continue
 
-            # ── 4b. Verifier: steht das wirklich im Text? (0.5B lokal) ────
+            # ── 4b. Verifier: steht das wirklich im Text? (Jev, lokal 0.5B als Fallback) ──
             try:
-                verify_prompt = (
-                    f"Antworte NUR mit JA oder NEIN, nichts anderes.\n\n"
-                    f"Text: \"{user_text[:500]}\"\n"
-                    f"Behauptung: \"{text}\"\n\n"
-                    f"Wird die Behauptung im Text wörtlich oder eindeutig direkt erwähnt?"
-                )
-                vresp = await self._client.chat(
-                    model="qwen2.5:0.5b",
-                    messages=[{"role": "user", "content": verify_prompt}],
-                    options={"temperature": 0.0, "num_predict": 5, "keep_alive": "5m"},
-                    think=False,
-                )
-                verdict = (vresp.message.content or "").strip().upper()
-                if not verdict.startswith("JA"):
-                    log.debug(f"Extraktor: Verifier abgelehnt ('{verdict}'): '{text[:60]}'")
+                if not await verify_claim(self._client, user_text, text):
+                    log.debug(f"Extraktor: Verifier abgelehnt: '{text[:60]}'")
                     continue
             except Exception as ve:
                 log.debug(f"Verifier fehlgeschlagen, überspringe Check: {ve}")
@@ -267,7 +294,7 @@ class MemoryExtractor:
                 # Extraktion nie kippen.
                 try:
                     from memory import conflict
-                    judge = conflict.make_llm_judge(self._client, config.AGENT_MODEL_FAST)
+                    judge = make_judge(self._client, config.AGENT_MODEL_FAST)
                     await conflict.resolve(self._lzg, new_id, text, embedding, judge)
                 except Exception as e:
                     log.debug(f"Konfliktauflösung übersprungen: {e}")
