@@ -198,8 +198,7 @@ class MessageHandler:
             return result, [{"tool": "create_skill", "args": args, "result": result[:500]}]
 
         system = await self.prompt_builder.build(text)
-        allowed = skills.T.select_tools(text)
-        force_tools = bool(allowed) and skills.T.is_action(text)
+        allowed, force_tools = await skills.T.select_tools_async(text)
         try:
             return await agent.run(
                 messages=self.kzg.recent_messages(max_tokens=3000),

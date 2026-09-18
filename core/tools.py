@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
+from core import decisions
 from core.status import BUS
 
 log = logging.getLogger(__name__)
@@ -241,6 +242,32 @@ def select_tools(text: str) -> list[str]:
             names.append(n)
 
     return names
+
+
+async def select_tools_async(text: str) -> tuple[list[str], bool]:
+    """
+    select_tools + Jev. Der Keyword-Pfad bleibt der Boden (er ist byte-identisch zu
+    heute), Jev legt Kategorien obendrauf, die die Keyword-Listen verpassen — das war
+    der gemma-Gotcha: „spiel [Song]" wurde von select_tools gar nicht angeboten.
+    Gibt (erlaubte Tool-Namen, force_tools) zurück.
+    Jev-aktion=True erzwingt Tool-Calls; aktion=False/None ändert nichts, denn ein
+    Aktionswort im Text muss weiter ziehen (Recall vor Precision bei kleinen Modellen).
+    """
+    names = select_tools(text)
+    force = bool(names) and is_action(text)
+    jev = await decisions.tool_categories(text)
+    if jev is None:
+        return names, force
+    cats, aktion = jev
+    extra = [n for n, t in REGISTRY.items() if t.category in cats and n not in names]
+    if extra:
+        # Deckel wie in select_tools: Prefill begrenzen, Skill-Factory-Tools bleiben immer drin
+        factory = [n for n in names if n in ("create_skill", "list_dynamic_skills", "delete_skill")]
+        core_names = [n for n in names if n not in factory]
+        names = (core_names + extra)[:14] + factory
+    if aktion is True and names:
+        force = True
+    return names, force
 
 
 # ── Embedding-basiertes Tool-Routing ──────────────────────────────────────────
