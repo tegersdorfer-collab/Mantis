@@ -515,9 +515,9 @@ def test_claim_supported_state_nennt_sprecher():
 def test_supersedes_state_felder():
     fake = _jev_returning({"supersedes": _noul(0.9)})
     with patch.object(decisions.decide, "decide", fake):
-        assert asyncio.run(decisions.supersedes("wohnt in Nürnberg", "nach Fürth gezogen", _fallback_false)) is True
+        assert asyncio.run(decisions.supersedes("wohnt in Leipzig", "nach Halle gezogen", _fallback_false)) is True
     state, _ = fake.calls[0]
-    assert state == {"alte_aussage": "wohnt in Nürnberg", "neue_aussage": "nach Fürth gezogen"}
+    assert state == {"alte_aussage": "wohnt in Leipzig", "neue_aussage": "nach Halle gezogen"}
 
 
 def test_tool_categories_fanout():
@@ -915,9 +915,9 @@ def test_lokaler_verifier_fallback_parst_ja():
 def test_judge_geht_ueber_jev():
     with patch("memory.extractor.decisions.supersedes", new=AsyncMock(return_value=True)) as jev:
         judge = ex.make_judge(object(), "qwen3.5:9b")
-        assert asyncio.run(judge("wohnt in Nürnberg", "nach Fürth gezogen")) is True
+        assert asyncio.run(judge("wohnt in Leipzig", "nach Halle gezogen")) is True
     old, new, fallback = jev.await_args.args
-    assert (old, new) == ("wohnt in Nürnberg", "nach Fürth gezogen") and callable(fallback)
+    assert (old, new) == ("wohnt in Leipzig", "nach Halle gezogen") and callable(fallback)
 ```
 
 - [x] **Step 2: Run** `python3 -m pytest tests/test_memory_verifier.py -q` → FAIL (`AttributeError: verify_claim`)

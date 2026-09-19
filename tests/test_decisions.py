@@ -64,9 +64,9 @@ def test_claim_supported_state_nennt_sprecher():
 def test_supersedes_state_felder():
     fake = _jev_returning({"supersedes": _noul(0.9)})
     with patch.object(decisions.decide, "decide", fake):
-        assert asyncio.run(decisions.supersedes("wohnt in Nürnberg", "nach Fürth gezogen", _fallback_false)) is True
+        assert asyncio.run(decisions.supersedes("wohnt in Leipzig", "nach Halle gezogen", _fallback_false)) is True
     state, _ = fake.calls[0]
-    assert state == {"alte_aussage": "wohnt in Nürnberg", "neue_aussage": "nach Fürth gezogen"}
+    assert state == {"alte_aussage": "wohnt in Leipzig", "neue_aussage": "nach Halle gezogen"}
 
 
 def test_tool_categories_fanout():

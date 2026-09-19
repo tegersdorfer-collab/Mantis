@@ -5,6 +5,7 @@ Jeder Fall bildet eine Entscheidung nach, die Mantis heute per Prompt trifft
 domains/second_brain.py, memory/extractor.py, memory/conflict.py).
 
 Felder: id, kind, state (str|dict), expected (Label), optional note.
+Alle Personen, Orte, Firmen und Projekte in den Fällen sind fiktiv (Repo ist öffentlich).
 Die Labels sind bewusst auch mit Grenzfällen bestückt — ein Router, der nur
 die einfachen trifft, hilft Mantis nicht.
 """
@@ -88,7 +89,7 @@ PROACTIVE = [   # Generierter Gedanke — JETZT an Timo schicken? (strenge Krite
     ("p02", "Die Bahn nach München um 8:12 morgen ist laut DB gestrichen, die 8:42 fährt.", True,
      "Konkret, neu, handlungsrelevant"),
     ("p03", "Denk daran, genug Wasser zu trinken!", False, "Generisch, Moralappell"),
-    ("p04", "Du hast gestern gesagt du willst Marius wegen dem Umzug anrufen — das steht noch offen.", True,
+    ("p04", "Du hast gestern gesagt du willst Jonas wegen dem Fahrrad anrufen — das steht noch offen.", True,
      "Offene Aktion, konkret"),
     ("p05", "Ich habe bemerkt, dass du in letzter Zeit oft spät ins Bett gehst. Das könnte deine Erholung beeinträchtigen.", False,
      "Verhaltensanalyse/Coaching"),
@@ -96,7 +97,7 @@ PROACTIVE = [   # Generierter Gedanke — JETZT an Timo schicken? (strenge Krite
     ("p07", "Morgen 9:00 Zahnarzt — Praxis hat per Mail nach Versichertenkarte gefragt, liegt die noch im alten Portemonnaie?", True,
      "Neu aus Mail, konkret"),
     ("p08", "Schöner Tag heute! Genieß ihn.", False, "Austauschbar"),
-    ("p09", "Ich habe deine Bewerbung an Siemens abgeschickt.", False,
+    ("p09", "Ich habe deine Kündigung fürs Fitnessstudio abgeschickt.", False,
      "Behauptet Aktion, die so nicht passiert ist (Mantis sendet nichts ohne Freigabe)"),
     ("p10", "Der Flipper meldet seit 20 Minuten keine Verbindung mehr — die Lampe reagiert gerade nicht.", True,
      "Systemzustand, neu, relevant"),
@@ -113,32 +114,32 @@ INBOX_CRITERIA = {
 
 INBOX = [
     ("n01", {"title": "Jev / TypeSafe", "content": "System-One-Modell, drei Primitive Noul/Choice/Score, $0.042/1M, OpenRouter Decisions-Endpoint alpha"}, "resource"),
-    ("n02", {"title": "Bewerbung Siemens", "content": "Bis 30.09. Anschreiben fertig, Zeugnisse hochladen, Portal-Upload hakt bei PDF > 5 MB"}, "project"),
+    ("n02", {"title": "Wohnungssuche", "content": "Bis 30.09. drei Besichtigungen, Unterlagen-Mappe fertig, Portal-Upload hakt bei PDF > 5 MB"}, "project"),
     ("n03", {"title": "Ich schreibe lieber kurz", "content": "Mag keine Floskeln, direkt und locker auf Deutsch, ehrliches Feedback"}, "context"),
-    ("n04", {"title": "Heute", "content": "Vormittag Filmroulette-Redesign fertig, nachmittags Jev-Recherche, abends Lauf 6 km"}, "daily"),
-    ("n05", {"title": "Debian-Laptop", "content": "Läuft als 24/7-Server, WLAN-Killswitch geknackt, SSH debian@192.168.0.237 — regelmäßig Updates einspielen"}, "area"),
-    ("n06", {"title": "Carpet Tycoon v7", "content": "Alle Tiers fertig, Design-Overhaul done, Build v7 veröffentlicht. Abgeschlossen."}, "archive"),
+    ("n04", {"title": "Heute", "content": "Vormittag Website-Redesign fertig, nachmittags Jev-Recherche, abends Lauf 6 km"}, "daily"),
+    ("n05", {"title": "Heimserver", "content": "Alter Laptop läuft als 24/7-Server für Backups und Pi-hole — regelmäßig Updates einspielen"}, "area"),
+    ("n06", {"title": "Spiel-Prototyp v7", "content": "Alle Level fertig, Design-Overhaul done, Build v7 veröffentlicht. Abgeschlossen."}, "archive"),
     ("n07", {"title": "Ollama Modelfile-Gotcha", "content": "Neue Modellversionen verlieren SYSTEM-Prompt der Vorversion; vor Upgrade ollama show --modelfile diffen"}, "resource"),
     ("n08", {"title": "Mantis Accountability", "content": "Modul pflegen: Daily Anchor + Block laufen, Roadmap C–F offen, Prinzip: statische Strings, kein Coaching"}, "area"),
 ]
 
 TASK_CLASSIFY = [   # Übernimmt Mantis die Aufgabe oder muss Timo das selbst (physisch)?
-    ("t01", {"title": "Recherchiere Ausbildungsbetriebe Fachinformatiker Nürnberg", "notes": None}, "mantis"),
+    ("t01", {"title": "Recherchiere Kletterhallen im Umkreis von 30 km", "notes": None}, "mantis"),
     ("t02", {"title": "Paket bei der Post abholen", "notes": "Benachrichtigungskarte liegt im Flur"}, "user"),
     ("t03", {"title": "Trainingsdaten der letzten 4 Wochen auswerten", "notes": None}, "mantis"),
     ("t04", {"title": "Oma anrufen", "notes": "Geburtstag am Sonntag"}, "user"),
-    ("t05", {"title": "Entwurf für Anschreiben Datev schreiben", "notes": None}, "mantis"),
+    ("t05", {"title": "Entwurf für die Kündigung des Handyvertrags schreiben", "notes": None}, "mantis"),
     ("t06", {"title": "Neue Laufschuhe kaufen", "notes": "Größe 44, im Laden anprobieren"}, "user"),
     ("t07", {"title": "Termin Zahnarzt in Kalender eintragen", "notes": "Di 9 Uhr"}, "mantis"),
     ("t08", {"title": "Fahrrad zur Werkstatt bringen", "notes": None}, "user"),
 ]
 
 CONFLICT = [   # Macht die NEUE Aussage die ALTE veraltet? (Zwei gleichzeitig wahre Dinge = NEIN)
-    ("c01", {"old": "Timo wohnt in Nürnberg", "new": "Timo ist letzte Woche nach Fürth gezogen"}, True),
+    ("c01", {"old": "Timo wohnt in Leipzig", "new": "Timo ist letzte Woche nach Halle gezogen"}, True),
     ("c02", {"old": "Timo trinkt gern Kaffee", "new": "Timo trinkt gern Tee"}, False),
     ("c03", {"old": "Timos Hauptmodell für Chat ist qwen3.5:9b", "new": "Timo nutzt seit Juli gemma4:e2b als Haupt-Chatmodell"}, True),
-    ("c04", {"old": "Timo hat ein iPhone 11", "new": "Timo hat einen M4 Mac mini"}, False),
-    ("c05", {"old": "Timo bewirbt sich für eine Ausbildung ab September 2026", "new": "Timo hat den Ausbildungsvertrag bei Siemens unterschrieben"}, True),
+    ("c04", {"old": "Timo hat einen E-Reader", "new": "Timo hat ein Rennrad"}, False),
+    ("c05", {"old": "Timo sucht eine neue Wohnung", "new": "Timo hat den Mietvertrag für die neue Wohnung unterschrieben"}, True),
     ("c06", {"old": "Timo läuft dreimal pro Woche", "new": "Timo hat heute 6 km gelaufen"}, False),
     ("c07", {"old": "Das Projekt heißt Alfred", "new": "Das Projekt heißt jetzt Mantis"}, True),
     ("c08", {"old": "Timo mag keine Pilze", "new": "Timo hat gestern Pizza gegessen"}, False),
@@ -147,10 +148,10 @@ CONFLICT = [   # Macht die NEUE Aussage die ALTE veraltet? (Zwei gleichzeitig wa
 VERIFY = [   # Steht die Behauptung wörtlich/eindeutig im Text? (Extractor-Verifier)
     ("v01", {"text": "Ich war heute beim Zahnarzt, war halb so wild. Danach noch kurz einkaufen.", "claim": "Timo war heute beim Zahnarzt"}, True),
     ("v02", {"text": "Ich war heute beim Zahnarzt, war halb so wild.", "claim": "Timo hat Angst vor Zahnärzten"}, False),
-    ("v03", {"text": "Ab September fange ich die Ausbildung an, hoffentlich bei Siemens.", "claim": "Timo hat eine Ausbildung bei Siemens"}, False),
-    ("v04", {"text": "Ab September fange ich die Ausbildung an, hoffentlich bei Siemens.", "claim": "Timo beginnt im September eine Ausbildung"}, True),
-    ("v05", {"text": "Mein Bruder Marius zieht nächsten Monat nach Berlin.", "claim": "Timo zieht nach Berlin"}, False),
-    ("v06", {"text": "Mein Bruder Marius zieht nächsten Monat nach Berlin.", "claim": "Timos Bruder heißt Marius"}, True),
+    ("v03", {"text": "Ab Oktober fange ich den neuen Job an, hoffentlich in der Buchhaltung.", "claim": "Timo arbeitet in der Buchhaltung"}, False),
+    ("v04", {"text": "Ab Oktober fange ich den neuen Job an, hoffentlich in der Buchhaltung.", "claim": "Timo beginnt im Oktober einen neuen Job"}, True),
+    ("v05", {"text": "Mein Kumpel Jonas zieht nächsten Monat nach Bremen.", "claim": "Timo zieht nach Bremen"}, False),
+    ("v06", {"text": "Mein Kumpel Jonas zieht nächsten Monat nach Bremen.", "claim": "Timos Kumpel heißt Jonas"}, True),
     ("v07", {"text": "Kaffee brauch ich morgens nicht mehr, seit ich Tee trinke.", "claim": "Timo trinkt morgens Tee statt Kaffee"}, True),
     ("v08", {"text": "Kaffee brauch ich morgens nicht mehr, seit ich Tee trinke.", "claim": "Timo mag keinen Kaffee"}, False),
 ]

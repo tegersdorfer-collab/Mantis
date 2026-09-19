@@ -42,6 +42,6 @@ def test_lokaler_verifier_fallback_parst_ja():
 def test_judge_geht_ueber_jev():
     with patch("memory.extractor.decisions.supersedes", new=AsyncMock(return_value=True)) as jev:
         judge = ex.make_judge(object(), "qwen3.5:9b")
-        assert asyncio.run(judge("wohnt in Nürnberg", "nach Fürth gezogen")) is True
+        assert asyncio.run(judge("wohnt in Leipzig", "nach Halle gezogen")) is True
     old, new, fallback = jev.await_args.args
-    assert (old, new) == ("wohnt in Nürnberg", "nach Fürth gezogen") and callable(fallback)
+    assert (old, new) == ("wohnt in Leipzig", "nach Halle gezogen") and callable(fallback)
