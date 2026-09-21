@@ -38,6 +38,7 @@ OPENROUTER_API_KEY       = cfg.OPENROUTER_API_KEY
 JEV_MODEL                = cfg.JEV_MODEL
 JEV_TIMEOUT_S            = cfg.JEV_TIMEOUT_S
 JEV_COOLDOWN_S           = cfg.JEV_COOLDOWN_S
+JEV_LOG_PATH             = cfg.JEV_LOG_PATH
 
 OWNER_NAME               = cfg.OWNER_NAME
 OWNER_EMAIL              = cfg.OWNER_EMAIL

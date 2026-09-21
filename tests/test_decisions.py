@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import asyncio
 from unittest.mock import patch
 
-from core import decisions
+from core import decide, decisions
 from core.decide import Answer, JevUnavailable
 
 
@@ -101,3 +101,33 @@ def test_beschreibungen_decken_registry_kategorien():
     from core.tools import REGISTRY
     fehlt = {t.category for t in REGISTRY.values()} - set(decisions.TOOL_CATEGORY_DESCRIPTIONS) - decisions.TOOL_CATEGORIES_OHNE_ROUTING
     assert not fehlt, f"ohne Beschreibung: {fehlt}"
+
+
+def test_baender_pro_entscheidung_und_act_grenze(monkeypatch):
+    from jevkit import Band, Bands, band
+    from core import decisions
+    assert set(decisions.BANDS) >= {"addressed", "supported", "supersedes"}
+    for b in decisions.BANDS.values():
+        assert isinstance(b, Bands)
+    # p = 0.75 → conf 0.5 → ACT (heutiges Verhalten SURE=0.5 bleibt erhalten)
+    assert band(decide.Answer("noul", True, 0.75, 0.5), decisions.BANDS["addressed"]) is Band.ACT
+    assert band(decide.Answer("noul", True, 0.7, 0.4), decisions.BANDS["addressed"]) is not Band.ACT
+
+
+def test_log_wird_geschrieben_wenn_pfad_gesetzt(monkeypatch, tmp_path):
+    from core import decisions
+    monkeypatch.setattr(decisions.config, "JEV_LOG_PATH", str(tmp_path / "jev.jsonl"))
+    async def fake(state, questions):
+        return {"addressed": decide.Answer("noul", True, 0.95, 0.9)}
+    monkeypatch.setattr(decide, "decide", fake)
+    async def fb():
+        raise AssertionError("Fallback darf bei ACT nicht laufen")
+    assert asyncio.run(decisions.addressed("Mantis, Licht an", fb)) is True
+    lines = (tmp_path / "jev.jsonl").read_text().splitlines()
+    assert len(lines) == 1 and '"qid": "addressed"' in lines[0] and '"band": "act"' in lines[0]
+
+
+def test_kein_log_ohne_pfad(monkeypatch, tmp_path):
+    from core import decisions
+    monkeypatch.setattr(decisions.config, "JEV_LOG_PATH", "")
+    assert decisions.decision_log() is None

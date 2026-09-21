@@ -66,6 +66,8 @@ class MantisSettings(BaseSettings):
     JEV_MODEL: str = "~typesafe/jev-latest"
     JEV_TIMEOUT_S: float = 3.0      # danach lokaler Fallback
     JEV_COOLDOWN_S: float = 120.0   # nach Fehler: so lange kein Jev-Versuch
+    # JSONL-Log aller Jev-Antworten (leer = aus), z.B. data/jev_decisions.jsonl
+    JEV_LOG_PATH: str = ""
     # ── Background-LLM Routing ────────────────────────────────────────────────
     # Default: qwen3.5:9b für Memory, Review, Konsolidierung
     BG_DEFAULT_MODEL: str = ""          # leer = OLLAMA_MODEL

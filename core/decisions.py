@@ -9,12 +9,21 @@ gemessen (bench/jev/results/report.md). Wer sie ändert, misst nach.
 Jeder Wrapper: Jev fragen → wenn nicht verfügbar ODER unter der Schwelle →
 den übergebenen lokalen Fallback ausführen (das heutige Verhalten). Dadurch
 kann kein Aufrufer durch Jev schlechter werden als vorher.
+
+Bänder: `BANDS` je Entscheidung (jevkit). ACT = Jev gilt, sonst lokal.
+Log: `JEV_LOG_PATH` (JSONL, nur Hash des States, nie der Text) — Grundlage
+für `jevkit.calibrate.suggest_bands`.
 """
 from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
+import jevkit
+from jevkit import Band, Bands, band
+
+import config
 from core import decide
 from core.decide import JevUnavailable, Noul
 
@@ -25,6 +34,33 @@ Fallback = Callable[[], Awaitable[bool]]
 SURE = 0.5             # Ja/Nein gilt als sicher ab |p-0.5|*2 >= 0.5, d.h. p <= 0.25 oder p >= 0.75
 TOOL_CATEGORY_P = 0.6  # P(ja) ab der eine Tool-Kategorie als betroffen gilt
 TOOL_ACTION_P = 0.7    # P(ja) ab der Tool-Calls erzwungen werden
+
+# Drei Bänder statt einer Schwelle (jevkit.gate). ACT = Jev-Antwort gilt; CONFIRM/ESCALATE = lokaler
+# Fallback. act=0.5 auf der Confidence entspricht dem bisherigen SURE (p <= 0.25 oder p >= 0.75).
+_DEFAULT = Bands(act=SURE, escalate=0.25)
+BANDS: dict[str, Bands] = {
+    "addressed": _DEFAULT,
+    "supported": _DEFAULT,
+    "supersedes": _DEFAULT,
+}
+
+
+def decision_log() -> jevkit.DecisionLog | None:
+    path = getattr(config, "JEV_LOG_PATH", "")
+    return jevkit.DecisionLog(Path(path)) if path else None
+
+
+def _log(name: str, ans: decide.Answer, b: Band, state) -> None:
+    lg = decision_log()
+    if lg is None:
+        return
+    try:
+        answer = (jevkit.NoulAnswer(ans.p) if ans.kind == "noul"
+                  else jevkit.ChoiceAnswer(str(ans.value), ans.probabilities, ans.confidence))
+        d = jevkit.Decision({name: answer}, "mantis", {}, False, 0.0)
+        lg.write(d, {name: b}, state)
+    except Exception as e:  # Log darf nie eine Entscheidung verhindern
+        log.debug("Jev-Log fehlgeschlagen: %r", e)
 
 # ── Fragen ────────────────────────────────────────────────────────────────────
 
@@ -92,8 +128,10 @@ async def _noul_or_fallback(name: str, state, question: Noul, fallback: Fallback
         ans = (await decide.decide(state, {name: question}))[name]
     except JevUnavailable:
         return await fallback()
-    if not ans.sure(SURE):
-        log.debug("Jev %s: unsicher (p=%.2f) → lokal", name, ans.p)
+    b = band(jevkit.NoulAnswer(ans.p), BANDS.get(name, _DEFAULT))
+    _log(name, ans, b, state)
+    if b is not Band.ACT:
+        log.debug("Jev %s: %s (p=%.2f) → lokal", name, b.value, ans.p)
         return await fallback()
     return bool(ans.value)
 
