@@ -35,17 +35,52 @@ def _ok_response(request):
 
 def _enabled(monkeypatch):
     monkeypatch.setattr(decide.config, "JEV_ENABLED", True)
+    monkeypatch.setattr(decide.config, "JEV_PROVIDER", "openrouter")
     monkeypatch.setattr(decide.config, "OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(decide.config, "TYPESAFE_API_KEY", "")
+    monkeypatch.setattr(decide.config, "JEV_MODEL", "~typesafe/jev-latest")
+    decide.reset_for_tests()
+
+
+def _enabled_typesafe(monkeypatch):
+    monkeypatch.setattr(decide.config, "JEV_ENABLED", True)
+    monkeypatch.setattr(decide.config, "JEV_PROVIDER", "typesafe")
+    monkeypatch.setattr(decide.config, "TYPESAFE_API_KEY", "sk-test")
+    monkeypatch.setattr(decide.config, "OPENROUTER_API_KEY", "")
+    monkeypatch.setattr(decide.config, "JEV_MODEL", "jev-latest")
     decide.reset_for_tests()
 
 
 def test_disabled_ohne_key(monkeypatch):
     monkeypatch.setattr(decide.config, "JEV_ENABLED", True)
+    monkeypatch.setattr(decide.config, "JEV_PROVIDER", "typesafe")
+    monkeypatch.setattr(decide.config, "TYPESAFE_API_KEY", "")
     monkeypatch.setattr(decide.config, "OPENROUTER_API_KEY", "")
     decide.reset_for_tests()
     assert decide.enabled() is False
     with pytest.raises(JevUnavailable):
         asyncio.run(decide.decide("x", {"q": Noul("Ist x?")}))
+
+
+def test_direct_typesafe_backend_sendet_direct_endpoint(monkeypatch):
+    _enabled_typesafe(monkeypatch)
+
+    def h(request):
+        body = json.loads(request.content)
+        assert str(request.url) == "https://api.typesafe.ai/v1/systemone"
+        assert request.headers["authorization"] == "Bearer sk-test"
+        assert body["model"] == "jev-latest"
+        return httpx.Response(200, json={
+            "model": "jev-1.13.0",
+            "answers": {"q": {"type": "noul", "noul": 0.93}},
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        })
+
+    with patch.object(decide, "_transport", _transport(h)):
+        out = asyncio.run(decide.decide("x", {"q": Noul("Ist x?")}))
+
+    assert out["q"].model == "jev-1.13.0"
+    assert out["q"].p == 0.93
 
 
 def test_noul_und_choice_werden_typisiert(monkeypatch):

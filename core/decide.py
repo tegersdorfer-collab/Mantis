@@ -28,10 +28,15 @@ log = logging.getLogger(__name__)
 _transport: httpx.AsyncBaseTransport | None = None
 _down_until: float = 0.0
 
-# Modellpräfix, für das die Bänder in core/decisions.py kalibriert sind. Weicht
-# `Decision.model` davon ab, warnt jevkit.Client selbst (siehe `client()`) —
-# das ist der Hinweis, die Bänder neu zu messen.
-JEV_EXPECTED_MODEL = "typesafe/jev-1.13"
+# Modellpräfixe, für die die Bänder in core/decisions.py kalibriert sind. Der
+# direkte TypeSafe-Endpunkt und OpenRouter geben unterschiedliche IDs zurück.
+JEV_EXPECTED_MODELS = {
+    "typesafe": "jev-1.13",
+    "openrouter": "typesafe/jev-1.13",
+}
+# Kompatibilität für bench/jev/live_path.py und externe Auswertung; der aktive
+# Präfix wird in client() providerabhängig gewählt.
+JEV_EXPECTED_MODEL = JEV_EXPECTED_MODELS["typesafe"]
 
 
 @dataclass
@@ -61,7 +66,9 @@ class Answer:
 
 def enabled() -> bool:
     """Opt-in gesetzt, Key da, kein Cooldown."""
-    return bool(config.JEV_ENABLED and config.OPENROUTER_API_KEY) and time.monotonic() >= _down_until
+    provider = str(config.JEV_PROVIDER).strip().lower()
+    key = config.TYPESAFE_API_KEY if provider == "typesafe" else config.OPENROUTER_API_KEY
+    return bool(config.JEV_ENABLED and provider in JEV_EXPECTED_MODELS and key) and time.monotonic() >= _down_until
 
 
 def reset_for_tests() -> None:
@@ -71,10 +78,22 @@ def reset_for_tests() -> None:
 
 def client() -> jevkit.Client:
     """Frischer Client aus der aktuellen Config; der Breaker-Zustand ist modulweit."""
-    backend = jevkit.OpenRouterBackend(config.OPENROUTER_API_KEY, model=config.JEV_MODEL,
-                                       transport=_transport, retries=0)
-    c = jevkit.Client(backend, model=config.JEV_MODEL, timeout_s=config.JEV_TIMEOUT_S,
-                      cooldown_s=config.JEV_COOLDOWN_S, expected_model=JEV_EXPECTED_MODEL)
+    provider = str(config.JEV_PROVIDER).strip().lower()
+    if provider == "typesafe":
+        model = config.JEV_MODEL.removeprefix("~typesafe/") or "jev-latest"
+        backend = jevkit.TypeSafeBackend(config.TYPESAFE_API_KEY, model=model,
+                                          transport=_transport, retries=0)
+    elif provider == "openrouter":
+        model = config.JEV_MODEL
+        if model == "jev-latest":
+            model = "~typesafe/jev-latest"
+        backend = jevkit.OpenRouterBackend(config.OPENROUTER_API_KEY, model=model,
+                                           transport=_transport, retries=0)
+    else:
+        raise JevUnavailable(f"unbekannter Jev-Provider: {provider}")
+    c = jevkit.Client(backend, model=model, timeout_s=config.JEV_TIMEOUT_S,
+                      cooldown_s=config.JEV_COOLDOWN_S,
+                      expected_model=JEV_EXPECTED_MODELS[provider])
     c._down_until = _down_until
     return c
 

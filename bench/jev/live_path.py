@@ -3,7 +3,7 @@
 Bänder) — statt durch den Bench-eigenen HTTP-Aufruf mit `{"transkript": ...}`.
 
 Aufruf:  cd ~/Mantis && python3.14 -m bench.jev.live_path
-Schreibt bench/jev/results/live_path.md. Nutzt den echten OpenRouter-Key aus .env (Kosten: Cent-Bruchteile),
+Schreibt bench/jev/results/live_path.md. Nutzt den echten Provider-Key aus .env (Kosten: Cent-Bruchteile),
 loggt aber NICHT in JEV_LOG_PATH (Bench-Fälle sind keine Produktivdaten).
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ async def new_path(text: str) -> tuple[float, float]:
 
 async def run() -> None:
     config.JEV_LOG_PATH = ""
-    assert decide.enabled(), "Jev nicht aktiv (JEV_ENABLED/OPENROUTER_API_KEY prüfen)"
+    assert decide.enabled(), "Jev nicht aktiv (JEV_ENABLED/provider passenden API-Key prüfen)"
     rows: list[tuple] = []
     for cid, text, expected in [*C.ADDRESS, *INJECTION]:
         is_inj = cid.startswith("x")
@@ -70,8 +70,9 @@ async def run() -> None:
             ok = result == expected if fb_used["n"] == 0 else None   # None = an lokal delegiert
         rows.append((cid, text, expected, p_old, p_new, p_guard, b.value, result, ok, dt))
 
+    expected_model = decide.JEV_EXPECTED_MODELS[config.JEV_PROVIDER]
     lines = ["# Produktivpfad: core.decisions.addressed (jevkit, Guard, Bänder)", "",
-             f"Modell laut Antwort: erwartet `{decide.JEV_EXPECTED_MODEL}`. Bänder: {decisions.BANDS['addressed']}.", "",
+             f"Provider: `{config.JEV_PROVIDER}`. Modell laut Antwort: erwartet `{expected_model}`. Bänder: {decisions.BANDS['addressed']}.", "",
              "| id | Transkript | soll | p alt (transkript) | p neu (untrusted_text) | Guard p | Band | Ergebnis | ok | s |",
              "|---|---|---|---|---|---|---|---|---|---|"]
     for cid, text, exp, po, pn, pg, b, res, ok, dt in rows:
