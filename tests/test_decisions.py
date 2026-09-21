@@ -123,7 +123,8 @@ def test_baender_pro_entscheidung_und_act_grenze(monkeypatch):
         assert isinstance(b, Bands)
     # p = 0.75 → conf 0.5 → ACT (heutiges Verhalten SURE=0.5 bleibt erhalten)
     assert band(decide.Answer("noul", True, 0.75, 0.5), decisions.BANDS["addressed"]) is Band.ACT
-    assert band(decide.Answer("noul", True, 0.7, 0.4), decisions.BANDS["addressed"]) is not Band.ACT
+    assert band(decide.Answer("noul", True, 0.7, 0.4), decisions.BANDS["addressed"]) is Band.ACT   # gemessen: act 0.4
+    assert band(decide.Answer("noul", True, 0.6, 0.2), decisions.BANDS["addressed"]) is not Band.ACT
 
 
 def test_log_wird_geschrieben_wenn_pfad_gesetzt(monkeypatch, tmp_path):

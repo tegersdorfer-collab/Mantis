@@ -39,7 +39,9 @@ TOOL_ACTION_P = 0.7    # P(ja) ab der Tool-Calls erzwungen werden
 # Fallback. act=0.5 auf der Confidence entspricht dem bisherigen SURE (p <= 0.25 oder p >= 0.75).
 _DEFAULT = Bands(act=SURE, escalate=0.25)
 BANDS: dict[str, Bands] = {
-    "addressed": _DEFAULT,
+    # Gemessen 21.09.2026 (bench/jev, 14 Fälle + live_path): alle Antworten mit conf >= 0.38 richtig,
+    # jevkit.suggest_bands → act 0.38. 0.4 (= p >= 0.70) nimmt 13/14 statt 11/14 selbst, 0 Fehler.
+    "addressed": Bands(act=0.4, escalate=0.2),
     "supported": _DEFAULT,
     "supersedes": _DEFAULT,
 }
