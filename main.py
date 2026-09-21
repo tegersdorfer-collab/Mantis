@@ -13,6 +13,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+# httpx/httpcore log request URLs at INFO. Telegram Bot API URLs contain the
+# bot token, so HTTP client request logging must stay above INFO globally.
+for _http_logger_name in ("httpx", "httpcore"):
+    logging.getLogger(_http_logger_name).setLevel(logging.WARNING)
 log = logging.getLogger("mantis")
 
 
