@@ -7,6 +7,7 @@ import json
 from unittest.mock import patch
 
 import httpx
+import jevkit
 import pytest
 
 from core import decide
@@ -59,6 +60,27 @@ def test_noul_und_choice_werden_typisiert(monkeypatch):
     assert abs(a.confidence - 0.86) < 1e-9 and a.sure() is True
     assert k.kind == "choice" and k.value == "flipper" and k.p == 0.9 and k.confidence == 0.88
     assert k.probabilities == {"flipper": 0.9, "robot": 0.1}
+
+
+def test_from_jevkit_keeps_score_probabilities():
+    score = jevkit.ScoreAnswer(2.0, {"0": "low", "1": "mid", "2": "high"},
+                               {"0": 0.1, "1": 0.2, "2": 0.7}, 0.6)
+
+    answer = decide.Answer.from_jevkit(score, model="jev-1.13")
+
+    assert answer.kind == "score"
+    assert answer.probabilities == {"0": 0.1, "1": 0.2, "2": 0.7}
+
+
+def test_from_jevkit_rejects_unknown_answer_type():
+    class FutureAnswer:
+        kind = "future"
+        value = "x"
+        p = 1.0
+        confidence = 1.0
+
+    with pytest.raises(TypeError, match="unsupported Jev answer type"):
+        decide.Answer.from_jevkit(FutureAnswer())
 
 
 def test_noul_unsicher_nahe_0_5(monkeypatch):

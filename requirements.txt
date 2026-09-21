@@ -1,7 +1,7 @@
 # LLM
 ollama>=0.3.0
 anthropic>=0.40.0
-jevkit @ git+https://github.com/tegersdorfer-collab/jevkit.git@v0.1.1
+jevkit @ git+https://github.com/tegersdorfer-collab/jevkit.git@v0.1.3
 
 # Telegram
 python-telegram-bot>=21.0

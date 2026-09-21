@@ -146,6 +146,26 @@ def test_log_wird_geschrieben_wenn_pfad_gesetzt(monkeypatch, tmp_path):
     assert '"model": "typesafe/jev-1.13"' in lines[0]
 
 
+def test_decision_log_write_runs_off_event_loop(monkeypatch):
+    seen_running_loop = []
+
+    class FakeLog:
+        def write(self, decision, bands, state):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                seen_running_loop.append(False)
+            else:
+                seen_running_loop.append(True)
+
+    monkeypatch.setattr(decisions, "decision_log", lambda: FakeLog())
+    fake = _jev_returning({"addressed": _noul(0.97), jevkit.GUARD_ID: _noul(0.05)})
+    with patch.object(decisions.decide, "decide", fake):
+        assert asyncio.run(decisions.addressed("mach das Licht an", _fallback_false)) is True
+
+    assert seen_running_loop == [False]
+
+
 def test_kein_log_ohne_pfad(monkeypatch, tmp_path):
     from core import decisions
     monkeypatch.setattr(decisions.config, "JEV_LOG_PATH", "")

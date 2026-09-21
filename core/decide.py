@@ -53,7 +53,10 @@ class Answer:
                     model: str = "") -> Answer:
         if isinstance(a, jevkit.NoulAnswer):
             return cls("noul", a.value, a.p, a.confidence, model=model, raw=a)
-        return cls(a.kind, a.value, a.p, a.confidence, dict(a.probabilities), model=model, raw=a)
+        if isinstance(a, (jevkit.ChoiceAnswer, jevkit.ScoreAnswer)):
+            probabilities = dict(a.probabilities)
+            return cls(a.kind, a.value, a.p, a.confidence, probabilities, model=model, raw=a)
+        raise TypeError(f"unsupported Jev answer type: {type(a).__name__}")
 
 
 def enabled() -> bool:

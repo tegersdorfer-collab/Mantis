@@ -16,6 +16,7 @@ für `jevkit.calibrate.suggest_bands`.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -145,7 +146,7 @@ async def _noul_or_fallback(name: str, state, question: Noul, fallback: Fallback
         return await fallback()
     ans = answers[name]
     b = band(jevkit.NoulAnswer(ans.p), BANDS.get(name, _DEFAULT))
-    _log(name, ans, b, state)
+    await asyncio.to_thread(_log, name, ans, b, state)
     if b is not Band.ACT:
         log.debug("Jev %s: %s (p=%.2f) → lokal", name, b.value, ans.p)
         return await fallback()
