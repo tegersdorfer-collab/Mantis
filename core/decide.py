@@ -77,5 +77,9 @@ async def decide(state: str | dict | list, questions: dict[str, Noul | Choice | 
     try:
         d = await c.decide(state, questions)
     finally:
-        _down_until = c._down_until
+        # Nur vorwärts spiegeln: bei parallelen decide()-Calls hat jeder Call seinen
+        # eigenen Client mit dem zu seinem Start gültigen Breaker-Stand. Ein langsamer
+        # erfolgreicher Call darf den Breaker nicht wieder schließen, den ein
+        # inzwischen fertiger, fehlgeschlagener Call geöffnet hat (Lost Update).
+        _down_until = max(_down_until, c._down_until)
     return {qid: Answer.from_jevkit(a) for qid, a in d.answers.items()}

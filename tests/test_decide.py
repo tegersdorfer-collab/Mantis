@@ -184,3 +184,36 @@ def test_unbekannter_antworttyp_oeffnet_breaker(monkeypatch):
         with pytest.raises(JevUnavailable):
             asyncio.run(decide.decide("x", {"q": Noul("?")}))
     assert decide.enabled() is False
+
+
+def test_breaker_ueberlebt_parallelen_erfolg(monkeypatch):
+    """Jeder decide()-Call baut seinen eigenen Client mit dem Breaker-Stand von seinem
+    Start — ein langsamer, aber erfolgreicher Call darf beim Zurückschreiben den Breaker
+    nicht wieder schließen, den ein inzwischen fertiger, fehlgeschlagener Call geöffnet
+    hat (Lost Update ohne max()-Spiegelung)."""
+    _enabled(monkeypatch)
+    monkeypatch.setattr(decide.config, "JEV_COOLDOWN_S", 1000.0)
+
+    async def h(request):
+        body = json.loads(request.content)
+        if body["state"] == "fail":
+            # Kein sleep: dieser Call ist immer fertig, lange bevor "ok" aufwacht.
+            return httpx.Response(503)
+        await asyncio.sleep(0.05)
+        return _ok_response(request)
+
+    async def run():
+        return await asyncio.gather(
+            decide.decide("ok", {"q": Noul("?")}),
+            decide.decide("fail", {"q": Noul("?")}),
+            return_exceptions=True,
+        )
+
+    with patch.object(decide, "_transport", _transport(h)):
+        results = asyncio.run(run())
+
+    ok_result, fail_result = results
+    assert isinstance(fail_result, JevUnavailable)
+    assert not isinstance(ok_result, Exception)
+    # Der Breaker muss offen bleiben, auch nachdem der langsame Erfolg zurückgeschrieben hat.
+    assert decide.enabled() is False
