@@ -33,3 +33,17 @@ Vor einem manuellen `python3.14 -m forge.bot` (z. B. zum Debuggen) erst den
 Agenten stoppen — `launchctl bootout gui/$(id -u)/com.mantis.forge-bot` —
 sonst pollen zwei Prozesse gleichzeitig und Telegram antwortet mit 409
 Conflict.
+
+## TypeSafe-Console-Watcher
+
+Der Watcher prüft `https://console.typesafe.ai` alle 60 Sekunden und meldet
+nur den Wechsel von offline zu online über den vorhandenen Forge-Bot.
+
+```
+launchctl bootout gui/$(id -u)/com.mantis.typesafe-console-watch 2>/dev/null
+cp forge/launchd/com.mantis.typesafe-console-watch.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mantis.typesafe-console-watch.plist
+```
+
+Der letzte Zustand liegt in `/tmp/mantis_typesafe_console_watch.state`.
+Ausgaben stehen in `/tmp/mantis_typesafe_console_watch_{out,err}.log`.

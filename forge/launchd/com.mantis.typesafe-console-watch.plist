@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mantis.typesafe-console-watch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14</string>
+        <string>-u</string>
+        <string>-m</string>
+        <string>forge.console_watch</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/timoegersdorfer/Mantis</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin:/usr/local/bin:/Users/timoegersdorfer/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LC_ALL</key>
+        <string>de_DE.UTF-8</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/mantis_typesafe_console_watch_out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mantis_typesafe_console_watch_err.log</string>
+</dict>
+</plist>
