@@ -55,9 +55,10 @@ def _log(name: str, ans: decide.Answer, b: Band, state) -> None:
     if lg is None:
         return
     try:
-        answer = (jevkit.NoulAnswer(ans.p) if ans.kind == "noul"
-                  else jevkit.ChoiceAnswer(str(ans.value), ans.probabilities, ans.confidence))
-        d = jevkit.Decision({name: answer}, "mantis", {}, False, 0.0)
+        # ans.raw ist die rohe jevkit-Answer (aus decide.decide()); nur wenn sie fehlt
+        # (z.B. in Tests, die Answer von Hand bauen) auf Noul(p) zurückfallen.
+        answer = ans.raw if ans.raw is not None else jevkit.NoulAnswer(ans.p)
+        d = jevkit.Decision({name: answer}, ans.model or "unknown", {}, False, 0.0)
         lg.write(d, {name: b}, state)
     except Exception as e:  # Log darf nie eine Entscheidung verhindern
         log.debug("Jev-Log fehlgeschlagen: %r", e)
@@ -65,6 +66,8 @@ def _log(name: str, ans: decide.Answer, b: Band, state) -> None:
 # ── Fragen ────────────────────────────────────────────────────────────────────
 
 Q_ADDRESSED = Noul(
+    # State-Feld heißt `untrusted_text` (jevkit.untrusted) — das Transkript ist Fremdtext
+    # (Voice-Eingabe) und läuft deshalb zusammen mit dem Guard (siehe `addressed()`).
     "Das Transkript ist eine Anfrage oder ein Befehl an den persönlichen Sprachassistenten im Raum "
     "(auch ohne Namensnennung), nicht Selbstgespräch oder Gespräch mit einer anderen Person.",
     criteria={"true": "Der Sprecher will, dass der Assistent reagiert",
@@ -123,11 +126,22 @@ TOOL_CATEGORIES_OHNE_ROUTING: set[str] = {"general", "uiauto_internal"}
 
 # ── Wrapper ───────────────────────────────────────────────────────────────────
 
-async def _noul_or_fallback(name: str, state, question: Noul, fallback: Fallback) -> bool:
+async def _noul_or_fallback(name: str, state, question: Noul, fallback: Fallback, *,
+                            guard: bool = False) -> bool:
+    """`guard=True` legt jevkit.GUARD in denselben Fan-out (State ist dann Fremdtext, z.B.
+    ein Voice-Transkript): schlägt der Guard an, gilt der State als potenzielle
+    Prompt-Injection und es geht — ohne Band-Logik — direkt in den lokalen Fallback."""
+    questions = {name: question}
+    if guard:
+        questions = jevkit.with_guard(questions)
     try:
-        ans = (await decide.decide(state, {name: question}))[name]
+        answers = await decide.decide(state, questions)
     except JevUnavailable:
         return await fallback()
+    if guard and answers[jevkit.GUARD_ID].p >= 0.5:
+        log.info("Jev %s: Guard hat angeschlagen (p=%.2f) → lokal", name, answers[jevkit.GUARD_ID].p)
+        return await fallback()
+    ans = answers[name]
     b = band(jevkit.NoulAnswer(ans.p), BANDS.get(name, _DEFAULT))
     _log(name, ans, b, state)
     if b is not Band.ACT:
@@ -137,8 +151,11 @@ async def _noul_or_fallback(name: str, state, question: Noul, fallback: Fallback
 
 
 async def addressed(text: str, fallback: Fallback) -> bool:
-    """Voice: Ist das Transkript an Mantis gerichtet? (Benchmark 14/14)"""
-    return await _noul_or_fallback("addressed", {"transkript": text}, Q_ADDRESSED, fallback)
+    """Voice: Ist das Transkript an Mantis gerichtet? (Benchmark 14/14). Das Transkript ist
+    Fremdtext (Mikrofon) — Guard auf `untrusted_text` fängt Prompt-Injection ab, bevor die
+    Band-Logik überhaupt läuft."""
+    return await _noul_or_fallback("addressed", jevkit.untrusted(text), Q_ADDRESSED, fallback,
+                                   guard=True)
 
 
 async def claim_supported(user_text: str, claim: str, fallback: Fallback) -> bool:

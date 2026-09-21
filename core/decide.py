@@ -28,6 +28,11 @@ log = logging.getLogger(__name__)
 _transport: httpx.AsyncBaseTransport | None = None
 _down_until: float = 0.0
 
+# Modellpräfix, für das die Bänder in core/decisions.py kalibriert sind. Weicht
+# `Decision.model` davon ab, warnt jevkit.Client selbst (siehe `client()`) —
+# das ist der Hinweis, die Bänder neu zu messen.
+JEV_EXPECTED_MODEL = "typesafe/jev-1.13"
+
 
 @dataclass
 class Answer:
@@ -37,15 +42,18 @@ class Answer:
     p: float                        # Noul: P(ja); Choice/Score: P(gewählter Wert)
     confidence: float               # Noul: |p-0.5|*2; Choice/Score: API-Wert
     probabilities: dict[str, float] = field(default_factory=dict)
+    model: str = ""                 # Decision.model (welches Modell geantwortet hat)
+    raw: object = None              # die rohe jevkit-Answer, fürs Log (core/decisions.py)
 
     def sure(self, threshold: float = 0.5) -> bool:
         return self.confidence >= threshold
 
     @classmethod
-    def from_jevkit(cls, a: jevkit.NoulAnswer | jevkit.ChoiceAnswer | jevkit.ScoreAnswer) -> Answer:
+    def from_jevkit(cls, a: jevkit.NoulAnswer | jevkit.ChoiceAnswer | jevkit.ScoreAnswer,
+                    model: str = "") -> Answer:
         if isinstance(a, jevkit.NoulAnswer):
-            return cls("noul", a.value, a.p, a.confidence)
-        return cls(a.kind, a.value, a.p, a.confidence, dict(a.probabilities))
+            return cls("noul", a.value, a.p, a.confidence, model=model, raw=a)
+        return cls(a.kind, a.value, a.p, a.confidence, dict(a.probabilities), model=model, raw=a)
 
 
 def enabled() -> bool:
@@ -63,7 +71,7 @@ def client() -> jevkit.Client:
     backend = jevkit.OpenRouterBackend(config.OPENROUTER_API_KEY, model=config.JEV_MODEL,
                                        transport=_transport, retries=0)
     c = jevkit.Client(backend, model=config.JEV_MODEL, timeout_s=config.JEV_TIMEOUT_S,
-                      cooldown_s=config.JEV_COOLDOWN_S)
+                      cooldown_s=config.JEV_COOLDOWN_S, expected_model=JEV_EXPECTED_MODEL)
     c._down_until = _down_until
     return c
 
@@ -82,4 +90,4 @@ async def decide(state: str | dict | list, questions: dict[str, Noul | Choice | 
         # erfolgreicher Call darf den Breaker nicht wieder schließen, den ein
         # inzwischen fertiger, fehlgeschlagener Call geöffnet hat (Lost Update).
         _down_until = max(_down_until, c._down_until)
-    return {qid: Answer.from_jevkit(a) for qid, a in d.answers.items()}
+    return {qid: Answer.from_jevkit(a, model=d.model) for qid, a in d.answers.items()}
