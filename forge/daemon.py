@@ -31,7 +31,7 @@ from pathlib import Path
 
 from core import db
 
-from forge import MANTIS_REPO, gate, journal, melden, pipeline, queue, worktree
+from forge import MANTIS_REPO, gate, journal, jev_gate, melden, pipeline, queue, worktree
 from forge import models as m
 
 log = logging.getLogger(__name__)
@@ -213,6 +213,15 @@ def tick() -> str:
 
         if state == m.GATING:
             return _gate_und_abschliessen(task_id, baum)
+
+        vorpruefung = jev_gate.preflight(task, baum)
+        if vorpruefung.status == "blocked":
+            grund = (f"Jev-Vorprüfung blockiert Task {task_id}: "
+                     f"{vorpruefung.reason or 'manuelle Prüfung erforderlich'}")
+            _park(task_id, state, grund)
+            return "geparkt"
+        if vorpruefung.status == "ready":
+            task = {**task, "_jev_gate": vorpruefung.as_context()}
 
         ergebnis = pipeline.eine_stufe(task, baum)
 

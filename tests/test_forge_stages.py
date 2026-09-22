@@ -230,6 +230,19 @@ class TestPrompts:
             text = stufe.baue_prompt(self._task(), kontext={})
             assert isinstance(text, str) and text
 
+    def test_security_review_profil_wird_in_den_prompt_uebernommen(self):
+        kontext = {"jev_mode": "security_review", "jev_risk": "high"}
+        text = s.fuer_state(m.IMPLEMENTING).baue_prompt(self._task(), kontext=kontext)
+        assert "security_review" in text
+        assert "high" in text
+        assert "Sicherheitsprüfung" in text
+
+    def test_tdd_profil_aendert_nicht_die_deterministische_gate_grenze(self):
+        kontext = {"jev_mode": "tdd", "jev_risk": "routine"}
+        text = s.fuer_state(m.IMPLEMENTING).baue_prompt(self._task(), kontext=kontext)
+        assert "testgetrieben" in text
+        assert "Gate" in text
+
 
 from forge import backends
 from forge.stages import ALLE_STUFEN, STAGES

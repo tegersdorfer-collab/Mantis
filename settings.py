@@ -63,6 +63,9 @@ class MantisSettings(BaseSettings):
     # Der direkte TypeSafe-Endpunkt ist der Produktionspfad; OpenRouter bleibt
     # als explizite Vergleichs-/Fallback-Option konfigurierbar.
     JEV_ENABLED: bool = False
+    # Zusätzliche Forge-Klassifikation ist separat opt-in; der bestehende
+    # Assistant-Jev darf dadurch nicht automatisch Agenten-Tasks beeinflussen.
+    JEV_FORGE_GATE_ENABLED: bool = False
     JEV_PROVIDER: str = "typesafe"
     TYPESAFE_API_KEY: str = ""
     OPENROUTER_API_KEY: str = ""

@@ -270,7 +270,13 @@ def _kontext(task: dict) -> dict:
     """Der Kontext, den Prompts der Folgestufen brauchen — Pfade, keine
     Inhalte. Die Übergabe läuft über Dateien im Worktree, nie über
     Gesprächsverlauf (siehe forge/stages.py)."""
-    return {"spec_path": task.get("spec_path"), "plan_path": task.get("plan_path")}
+    jev = task.get("_jev_gate") or {}
+    return {
+        "spec_path": task.get("spec_path"),
+        "plan_path": task.get("plan_path"),
+        "jev_mode": jev.get("jev_mode"),
+        "jev_risk": jev.get("jev_risk"),
+    }
 
 
 def _hat_negatives_verdikt(worktree: Path) -> bool:
