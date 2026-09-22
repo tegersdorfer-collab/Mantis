@@ -69,6 +69,7 @@ class MantisSettings(BaseSettings):
     JEV_MODEL: str = "jev-latest"
     JEV_TIMEOUT_S: float = 3.0      # danach lokaler Fallback
     JEV_COOLDOWN_S: float = 120.0   # nach Fehler: so lange kein Jev-Versuch
+    JEV_UI_ACT_CONFIDENCE: float = 0.55  # konservative Mindest-Confidence für UI-Aktionen
     # JSONL-Log aller Jev-Antworten (leer = aus), z.B. data/jev_decisions.jsonl
     JEV_LOG_PATH: str = ""
     # ── Background-LLM Routing ────────────────────────────────────────────────

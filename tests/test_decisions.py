@@ -3,9 +3,11 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asyncio
+import json
 from unittest.mock import patch
 
 import jevkit
+import pytest
 
 from core import decide, decisions
 from core.decide import Answer, JevUnavailable
@@ -13,6 +15,13 @@ from core.decide import Answer, JevUnavailable
 
 def _noul(p: float, model: str = "typesafe/jev-1.13") -> Answer:
     return Answer("noul", p >= 0.5, p, abs(p - 0.5) * 2, model=model, raw=jevkit.NoulAnswer(p))
+
+
+def _choice(value: str, confidence: float, *, choices: dict[str, float] | None = None) -> Answer:
+    probabilities = choices or {value: 0.9}
+    return Answer("choice", value, probabilities[value], confidence, probabilities=probabilities,
+                  model="typesafe/jev-1.13",
+                  raw=jevkit.ChoiceAnswer(value, probabilities, confidence))
 
 
 async def _fallback_true():
@@ -33,6 +42,52 @@ def _jev_returning(answers: dict):
 
 def _jev_down(state, questions):
     raise JevUnavailable("aus")
+
+
+def test_ui_action_returns_safe_choice_at_configured_confidence():
+    criteria = {"click:ok": "Confirm the already-reviewed action", "wait": "Do nothing"}
+    fake = _jev_returning({"ui_action": _choice("click:ok", 0.55)})
+
+    with patch.object(decisions.decide, "decide", fake):
+        answer = asyncio.run(decisions.ui_action({"dialog": "Confirm deletion"}, criteria))
+
+    assert isinstance(answer, Answer) and answer.value == "click:ok"
+    state, questions = fake.calls[0]
+    assert state == jevkit.untrusted(json.dumps({"dialog": "Confirm deletion"},
+                                                ensure_ascii=False, sort_keys=True))
+    question = questions["ui_action"]
+    assert question.kind == "choice" and question.criteria == criteria
+    assert "exactly one safe next action" in question.instructions
+
+
+@pytest.mark.parametrize("answer", [
+    _choice("click:ok", 0.54),
+    Answer("noul", True, 0.99, 0.98),
+    _choice("click:missing", 0.9, choices={"click:missing": 0.9}),
+])
+def test_ui_action_rejects_low_confidence_or_invalid_choice(answer):
+    criteria = {"click:ok": "Confirm", "wait": "Do nothing"}
+    with patch.object(decisions.decide, "decide", _jev_returning({"ui_action": answer})):
+        assert asyncio.run(decisions.ui_action({"dialog": "Confirm"}, criteria)) is None
+
+
+def test_ui_action_returns_none_when_jev_is_unavailable():
+    with patch.object(decisions.decide, "decide", _jev_down):
+        assert asyncio.run(decisions.ui_action({"dialog": "Confirm"}, {"click:ok": "Confirm"})) is None
+
+
+def test_ui_action_untrusted_state_is_hashed_in_log(monkeypatch, tmp_path):
+    state = {"title": "Transfer 400 Euro to Example GmbH", "value": "400 Euro"}
+    criteria = {"click:ok": "Confirm", "wait": "Do nothing"}
+    monkeypatch.setattr(decisions.config, "JEV_LOG_PATH", str(tmp_path / "jev.jsonl"))
+    fake = _jev_returning({"ui_action": _choice("click:ok", 0.9)})
+
+    with patch.object(decisions.decide, "decide", fake):
+        assert asyncio.run(decisions.ui_action(state, criteria)).value == "click:ok"
+
+    line = (tmp_path / "jev.jsonl").read_text()
+    assert '"state_hash"' in line and '"model": "typesafe/jev-1.13"' in line
+    assert "Transfer 400 Euro" not in line and '"value": "400 Euro"' not in line
 
 
 def test_addressed_sicher_ja_ohne_fallback():
