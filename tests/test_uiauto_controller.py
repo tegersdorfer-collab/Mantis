@@ -344,3 +344,40 @@ def test_run_falls_back_when_writer_fails(monkeypatch):
 
     assert result.status == "fallback"
     assert engine.actions == []
+
+
+def test_run_aborts_return_for_a_redline_text_target(monkeypatch):
+    field = _element(ref=7, role="AXTextField", title="Send")
+    engine = _FakeEngine([[field]], {7: field})
+    _install_fakes(monkeypatch, engine, iter(["key:return"]))
+
+    result = controller.run("Reply", "Mail")
+
+    assert result.status == "aborted"
+    assert engine.actions == []
+    assert engine.resolved_refs == [7]
+
+
+def test_run_aborts_return_when_snapshot_has_visible_redline_action(monkeypatch):
+    field = _element(ref=7, role="AXTextField", title="Message")
+    send = _element(ref=8, title="Send")
+    engine = _FakeEngine([[field, send]], {7: field, 8: send})
+    _install_fakes(monkeypatch, engine, iter(["key:return"]))
+
+    result = controller.run("Reply", "Mail")
+
+    assert result.status == "aborted"
+    assert engine.actions == []
+    assert engine.resolved_refs == [7]
+
+
+def test_run_allows_return_for_a_safe_current_text_field(monkeypatch):
+    field = _element(ref=7, role="AXTextField", title="Message")
+    engine = _FakeEngine([[field], []], {7: field})
+    _install_fakes(monkeypatch, engine, iter(["key:return", "done"]))
+
+    result = controller.run("Continue", "Notes")
+
+    assert result.status == "completed"
+    assert engine.actions == [("key", "return")]
+    assert engine.resolved_refs == [7]

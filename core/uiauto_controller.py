@@ -178,6 +178,16 @@ def _valid_text_field(ref: int) -> bool:
     )
 
 
+def _visible_redline_reason(elements: Iterable[Mapping[str, object]]) -> str:
+    for element in elements:
+        if not bool(element.get("enabled", False)) or element.get("role") not in ACTIONABLE_ROLES:
+            continue
+        redline, reason = safety.is_redline(dict(element))
+        if redline:
+            return reason
+    return ""
+
+
 def run(
     goal: str,
     app: str | None,
@@ -236,6 +246,23 @@ def run(
                 if not isinstance(text, str) or not text.strip():
                     return _fallback("writer returned invalid text")
                 engine.type_text(text)
+            elif action == "key:return":
+                ref = _current_text_field(elements)
+                element = engine.element(ref) if ref is not None else None
+                if (
+                    element is None
+                    or element.get("role") not in TEXT_ROLES
+                    or not bool(element.get("enabled", False))
+                    or is_secure_field(element)
+                ):
+                    return _fallback("no current non-secure text field")
+                redline, reason = safety.is_redline(element)
+                if redline:
+                    return ControllerResult("aborted", _ABORTED_TEXT, reason)
+                visible_redline = _visible_redline_reason(elements)
+                if visible_redline:
+                    return ControllerResult("aborted", _ABORTED_TEXT, visible_redline)
+                engine.press_key("return")
             else:
                 engine.press_key(action.removeprefix("key:"))
         except Exception:
