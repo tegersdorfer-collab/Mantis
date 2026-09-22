@@ -51,8 +51,28 @@ def test_snapshot_filters_roles_and_assigns_refs():
     _patch(els)
     snap = engine.snapshot("Notizen")
     assert [e["ref"] for e in snap] == [0, 1]
-    assert snap[0] == {"ref": 0, "role": "AXButton", "title": "OK", "value": "", "enabled": True}
+    assert snap[0] == {
+        "ref": 0,
+        "role": "AXButton",
+        "title": "OK",
+        "value": "",
+        "enabled": True,
+        "visible": True,
+    }
     assert snap[1]["role"] == "AXTextField" and snap[1]["value"] == "hallo"
+
+
+def test_snapshot_exposes_visibility_and_treats_unknown_as_visible():
+    visible = FakeEl("AXButton", "Save")
+    visible.AXVisible = True
+    hidden = FakeEl("AXButton", "Send")
+    hidden.AXVisible = False
+    unknown = FakeEl("AXButton", "Publish")
+    _patch([visible, hidden, unknown])
+
+    snapshot = engine.snapshot()
+
+    assert [element["visible"] for element in snapshot] == [True, False, True]
 
 
 def test_act_targets_correct_element():

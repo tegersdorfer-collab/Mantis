@@ -66,6 +66,7 @@ def _serialize_element(element: Mapping[str, object]) -> dict[str, object]:
         "title": _bounded_string(element.get("title")),
         "value": "<redacted>" if secure_or_text else _bounded_string(element.get("value")),
         "enabled": bool(element.get("enabled", False)),
+        "visible": _is_visible(element),
     }
 
 
@@ -96,6 +97,11 @@ def _usable(element: Mapping[str, object]) -> bool:
         and element.get("role") in ACTIONABLE_ROLES
         and not is_secure_field(dict(element))
     )
+
+
+def _is_visible(element: Mapping[str, object]) -> bool:
+    visible = element.get("visible", True)
+    return visible if isinstance(visible, bool) else True
 
 
 def _action_ref(element: Mapping[str, object]) -> str | None:
@@ -180,7 +186,11 @@ def _valid_text_field(ref: int) -> bool:
 
 def _visible_redline_reason(elements: Iterable[Mapping[str, object]]) -> str:
     for element in elements:
-        if not bool(element.get("enabled", False)) or element.get("role") not in ACTIONABLE_ROLES:
+        if (
+            not bool(element.get("enabled", False))
+            or not _is_visible(element)
+            or element.get("role") not in ACTIONABLE_ROLES
+        ):
             continue
         redline, reason = safety.is_redline(dict(element))
         if redline:

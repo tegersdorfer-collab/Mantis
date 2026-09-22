@@ -12,13 +12,14 @@ from core.uiauto_controller import (
 )
 
 
-def _element(ref=1, *, role="AXButton", title="Save", value="", enabled=True):
+def _element(ref=1, *, role="AXButton", title="Save", value="", enabled=True, visible=True):
     return {
         "ref": ref,
         "role": role,
         "title": title,
         "value": value,
         "enabled": enabled,
+        "visible": visible,
     }
 
 
@@ -59,7 +60,9 @@ def test_build_state_serializes_only_bounded_data_and_redacts_text_values():
     assert state["elements"][0]["value"] == "<redacted>"
     assert state["elements"][1]["value"] == "<redacted>"
     assert state["elements"][2]["ref"] == ""
-    assert set(state["elements"][0]) == {"ref", "role", "title", "value", "enabled"}
+    assert set(state["elements"][0]) == {
+        "ref", "role", "title", "value", "enabled", "visible",
+    }
 
 
 def test_build_state_rejects_string_refs_instead_of_sending_unbounded_data_to_jev():
@@ -369,6 +372,31 @@ def test_run_aborts_return_when_snapshot_has_visible_redline_action(monkeypatch)
     assert result.status == "aborted"
     assert engine.actions == []
     assert engine.resolved_refs == [7]
+
+
+def test_run_allows_return_when_snapshot_has_hidden_redline_action(monkeypatch):
+    field = _element(ref=7, role="AXTextField", title="Message")
+    hidden_send = _element(ref=8, title="Send", visible=False)
+    engine = _FakeEngine([[field, hidden_send], []], {7: field, 8: hidden_send})
+    _install_fakes(monkeypatch, engine, iter(["key:return", "done"]))
+
+    result = controller.run("Reply", "Mail")
+
+    assert result.status == "completed"
+    assert engine.actions == [("key", "return")]
+
+
+def test_run_aborts_return_when_redline_visibility_is_unknown(monkeypatch):
+    field = _element(ref=7, role="AXTextField", title="Message")
+    send = _element(ref=8, title="Send")
+    send.pop("visible")
+    engine = _FakeEngine([[field, send]], {7: field, 8: send})
+    _install_fakes(monkeypatch, engine, iter(["key:return"]))
+
+    result = controller.run("Reply", "Mail")
+
+    assert result.status == "aborted"
+    assert engine.actions == []
 
 
 def test_run_allows_return_for_a_safe_current_text_field(monkeypatch):

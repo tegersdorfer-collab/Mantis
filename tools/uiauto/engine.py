@@ -117,7 +117,7 @@ def is_trusted() -> bool:
 def snapshot(app: str | None = None) -> list[dict]:
     """Liste der bedienbaren Elemente der Vordergrund- (oder benannten) App.
 
-    Element = {ref, role, title, value, enabled}. ref = Index; darüber greift
+    Element = {ref, role, title, value, enabled, visible}. ref = Index; darüber greift
     act(ref) das Element später wieder. Nur ACTIONABLE_ROLES.
     """
     if not is_trusted():
@@ -140,6 +140,7 @@ def snapshot(app: str | None = None) -> list[dict]:
             "title": str(_attr(raw, "AXTitle", "") or ""),
             "value": str(_attr(raw, "AXValue", "") or ""),
             "enabled": bool(_attr(raw, "AXEnabled", True)),
+            "visible": bool(_attr(raw, "AXVisible", True)),
         })
         kept.append(raw)
     global _last_elements, _last_dicts
