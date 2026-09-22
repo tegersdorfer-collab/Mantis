@@ -234,6 +234,14 @@ async def ui_action(state: dict | list | str, criteria: dict[str, object]) -> de
         answer = decide.Answer(answer.kind, answer.value, answer.p, answer.confidence,
                                answer.probabilities, answer.model, raw)
 
+    if (not isinstance(raw.probabilities, dict)
+            or raw.choice != answer.value
+            or raw.probabilities != answer.probabilities
+            or raw.confidence != answer.confidence
+            or set(raw.probabilities) != set(criteria)
+            or raw.p != answer.p):
+        return None
+
     action_band = band(raw, BANDS["ui_action"])
     await asyncio.to_thread(_log, "ui_action", answer, action_band, safe_state)
     if action_band is not Band.ACT:

@@ -46,7 +46,8 @@ def _jev_down(state, questions):
 
 def test_ui_action_returns_safe_choice_at_configured_confidence():
     criteria = {"click:ok": "Confirm the already-reviewed action", "wait": "Do nothing"}
-    fake = _jev_returning({"ui_action": _choice("click:ok", 0.55)})
+    fake = _jev_returning({"ui_action": _choice("click:ok", 0.55,
+                                                 choices={"click:ok": 0.9, "wait": 0.1})})
 
     with patch.object(decisions.decide, "decide", fake):
         answer = asyncio.run(decisions.ui_action({"dialog": "Confirm deletion"}, criteria))
@@ -61,7 +62,7 @@ def test_ui_action_returns_safe_choice_at_configured_confidence():
 
 
 @pytest.mark.parametrize("answer", [
-    _choice("click:ok", 0.54),
+    _choice("click:ok", 0.54, choices={"click:ok": 0.9, "wait": 0.1}),
     Answer("noul", True, 0.99, 0.98),
     _choice("click:missing", 0.9, choices={"click:missing": 0.9}),
 ])
@@ -76,11 +77,26 @@ def test_ui_action_returns_none_when_jev_is_unavailable():
         assert asyncio.run(decisions.ui_action({"dialog": "Confirm"}, {"click:ok": "Confirm"})) is None
 
 
+def test_ui_action_rejects_inconsistent_raw_choice_before_logging(monkeypatch, tmp_path):
+    criteria = {"click:ok": "Confirm", "wait": "Do nothing"}
+    probabilities = {"click:ok": 0.9, "wait": 0.1}
+    inconsistent = Answer("choice", "click:ok", 0.9, 0.9, probabilities=probabilities,
+                          raw=jevkit.ChoiceAnswer("wait", probabilities, 0.9))
+    log_path = tmp_path / "jev.jsonl"
+    monkeypatch.setattr(decisions.config, "JEV_LOG_PATH", str(log_path))
+
+    with patch.object(decisions.decide, "decide", _jev_returning({"ui_action": inconsistent})):
+        assert asyncio.run(decisions.ui_action({"dialog": "Confirm"}, criteria)) is None
+
+    assert not log_path.exists()
+
+
 def test_ui_action_untrusted_state_is_hashed_in_log(monkeypatch, tmp_path):
     state = {"title": "Transfer 400 Euro to Example GmbH", "value": "400 Euro"}
     criteria = {"click:ok": "Confirm", "wait": "Do nothing"}
     monkeypatch.setattr(decisions.config, "JEV_LOG_PATH", str(tmp_path / "jev.jsonl"))
-    fake = _jev_returning({"ui_action": _choice("click:ok", 0.9)})
+    fake = _jev_returning({"ui_action": _choice("click:ok", 0.9,
+                                                 choices={"click:ok": 0.9, "wait": 0.1})})
 
     with patch.object(decisions.decide, "decide", fake):
         assert asyncio.run(decisions.ui_action(state, criteria)).value == "click:ok"
