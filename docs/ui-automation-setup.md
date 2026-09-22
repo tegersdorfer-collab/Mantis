@@ -29,8 +29,15 @@ Erwartung: `trusted: True` und eine Liste bedienbarer Elemente.
 curl -s -X POST http://127.0.0.1:7779/api/chat -H "Content-Type: application/json" \
   -d '{"text":"bediene die app notizen und erstelle eine neue notiz mit dem titel test"}'
 ```
-Der qwen-Loop inspiziert, klickt, tippt. Destruktive Elemente (Löschen/Senden/
-Kaufen/Passwortfelder) verweigert Mantis hart — das ist gewollt.
+Bei aktivierten bestehenden Jev-Einstellungen (`JEV_ENABLED=true`) versucht
+`computer_task` zuerst den Jev-UI-Controller. Er wählt ausschließlich aus einer
+geschlossenen, aktuellen Liste sicherer UI-Aktionen; rote Linien
+(Löschen/Senden/Kaufen/Passwortfelder) bleiben eine harte Grenze. Die
+Mindest-Confidence `JEV_UI_ACT_CONFIDENCE` ist standardmäßig konservativ auf
+`0.55` gesetzt. Ist Jev nicht verfügbar, unsicher oder kann die UI nicht sicher
+abbilden, bleibt der bisherige qwen-ReAct-Loop mit denselben Tools und Grenzen
+der Fallback. qwen schreibt außerdem ausschließlich Feldtext für sichere
+Texteingaben und erhält dabei keine UI-Tools.
 
 > Hinweis: Der Loop läuft auf qwen3.5:9b und ist beim ersten echten Einsatz evtl.
 > tuning-bedürftig (Element-Wahl, Schrittzahl). Genau dafür ist dieser erste
