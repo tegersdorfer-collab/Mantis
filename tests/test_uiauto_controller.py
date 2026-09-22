@@ -278,6 +278,8 @@ def test_run_aborts_redline_before_engine_action(monkeypatch):
     result = controller.run("Remove", "Notes")
 
     assert result.status == "aborted"
+    assert result.reason == "destruktiv/riskant: ‚delete'"
+    assert result.reason in result.text
     assert engine.actions == []
 
 

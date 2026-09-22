@@ -154,6 +154,11 @@ def _fallback(reason: str) -> ControllerResult:
     return ControllerResult("fallback", _FALLBACK_TEXT, reason)
 
 
+def _aborted(reason: str = "") -> ControllerResult:
+    text = _ABORTED_TEXT if not reason else f"{_ABORTED_TEXT}: {reason}"
+    return ControllerResult("aborted", text, reason)
+
+
 def _decision_action(state: dict[str, object], plan: ActionPlan) -> object:
     answer = decisions.ui_action(state, dict(plan.criteria))
     if inspect.isawaitable(answer):
@@ -244,7 +249,7 @@ def run(
                     return _fallback("stale or disabled UI reference")
                 redline, reason = safety.is_redline(element)
                 if redline:
-                    return ControllerResult("aborted", _ABORTED_TEXT, reason)
+                    return _aborted(reason)
                 engine.act(ref)
             elif action == "type_text":
                 ref = _current_text_field(elements)
@@ -268,10 +273,10 @@ def run(
                     return _fallback("no current non-secure text field")
                 redline, reason = safety.is_redline(element)
                 if redline:
-                    return ControllerResult("aborted", _ABORTED_TEXT, reason)
+                    return _aborted(reason)
                 visible_redline = _visible_redline_reason(elements)
                 if visible_redline:
-                    return ControllerResult("aborted", _ABORTED_TEXT, visible_redline)
+                    return _aborted(visible_redline)
                 engine.press_key("return")
             else:
                 engine.press_key(action.removeprefix("key:"))
