@@ -12,16 +12,28 @@ import sys
 
 import core.agent
 import core.backends.ollama
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.uiauto import engine
 from core.skills import uiauto
+from core import uiauto_controller as controller
 from core.uiauto_controller import ControllerResult
 
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+@pytest.fixture(autouse=True)
+def _restore_engine_functions():
+    """Keep legacy direct engine doubles from leaking into other test modules."""
+    names = ("is_trusted", "snapshot", "element", "act", "type_text", "press_key")
+    original = {name: getattr(engine, name) for name in names}
+    yield
+    for name, value in original.items():
+        setattr(engine, name, value)
 
 
 # ── ui_inspect ────────────────────────────────────────────────────────────────
@@ -174,6 +186,80 @@ def test_run_ui_agent_uses_existing_qwen_path_after_controller_fallback(monkeypa
         "temperature": 0.3,
         "max_tokens": 1200,
     }]
+
+
+def test_offline_replay_reports_qwen_agent_calls_for_closed_choice_and_fallback(monkeypatch):
+    """A two-step Jev route needs no ReAct Agent; fallback starts it once."""
+    async def direct_to_thread(fn, *args):
+        return fn(*args)
+
+    class ReplayEngine:
+        def __init__(self):
+            self.snapshots = iter([
+                [{"ref": 1, "role": "AXButton", "title": "Open", "value": "", "enabled": True}],
+                [{"ref": 2, "role": "AXButton", "title": "Next", "value": "", "enabled": True}],
+                [],
+            ])
+            self.elements = {
+                1: {"ref": 1, "role": "AXButton", "title": "Open", "value": "", "enabled": True},
+                2: {"ref": 2, "role": "AXButton", "title": "Next", "value": "", "enabled": True},
+            }
+            self.actions = []
+
+        def snapshot(self, app):
+            return next(self.snapshots)
+
+        def element(self, ref):
+            return self.elements.get(ref)
+
+        def act(self, ref):
+            self.actions.append(ref)
+
+    replay_engine = ReplayEngine()
+    decisions = iter(["click:1", "click:2", "done"])
+    qwen_agent_calls = []
+
+    class FakeBackend:
+        def __init__(self, model):
+            self.model = model
+
+    class FakeAgent:
+        def __init__(self, backend, max_steps):
+            qwen_agent_calls.append(max_steps)
+
+        async def run(self, **kwargs):
+            return "qwen fallback", []
+
+    monkeypatch.setattr(uiauto.asyncio, "to_thread", direct_to_thread)
+    monkeypatch.setattr(controller, "engine", replay_engine)
+    monkeypatch.setattr(
+        controller.decisions,
+        "ui_action",
+        lambda state, criteria: type("Answer", (), {"value": next(decisions)})(),
+    )
+    monkeypatch.setattr(core.backends.ollama, "OllamaBackend", FakeBackend)
+    monkeypatch.setattr(core.agent, "Agent", FakeAgent)
+
+    assert _run(uiauto._run_ui_agent("Open then continue", "Notes")) == "UI task completed"
+    assert replay_engine.actions == [1, 2]
+    closed_choice_qwen_calls = len(qwen_agent_calls)
+
+    monkeypatch.setattr(
+        uiauto.controller,
+        "run",
+        lambda *args: ControllerResult("fallback", "Use normal UI", "replay fallback"),
+    )
+    assert _run(uiauto._run_ui_agent("Open then continue", "Notes")) == "qwen fallback"
+    fallback_qwen_calls = len(qwen_agent_calls) - closed_choice_qwen_calls
+
+    replay_counts = {
+        "closed_choice_qwen_agent_calls": closed_choice_qwen_calls,
+        "fallback_qwen_agent_calls": fallback_qwen_calls,
+    }
+    assert replay_counts == {
+        "closed_choice_qwen_agent_calls": 0,
+        "fallback_qwen_agent_calls": 1,
+    }, replay_counts
 
 
 def test_default_writer_uses_one_tool_free_qwen_call(monkeypatch):
