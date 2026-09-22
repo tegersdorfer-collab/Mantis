@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
+import core.uiauto_controller as controller
 from core.uiauto_controller import (
     ActionPlan,
     ControllerResult,
@@ -176,3 +177,170 @@ def test_controller_result_has_stable_status_text_and_reason_fields():
         "text": "Use the normal UI path",
         "reason": "too many UI actions",
     }
+
+
+class _Answer:
+    def __init__(self, value):
+        self.value = value
+
+
+class _FakeEngine:
+    def __init__(self, snapshots, elements=None):
+        self.snapshots = iter(snapshots)
+        self.elements = elements or {}
+        self.actions = []
+        self.resolved_refs = []
+
+    def snapshot(self, app):
+        return next(self.snapshots)
+
+    def element(self, ref):
+        self.resolved_refs.append(ref)
+        return self.elements.get(ref)
+
+    def act(self, ref):
+        self.actions.append(("click", ref))
+
+    def type_text(self, text):
+        self.actions.append(("type", text))
+
+    def press_key(self, key):
+        self.actions.append(("key", key))
+
+
+def _install_fakes(monkeypatch, engine, actions):
+    monkeypatch.setattr(controller, "engine", engine)
+    monkeypatch.setattr(
+        controller.decisions,
+        "ui_action",
+        lambda state, criteria: _Answer(next(actions)),
+    )
+
+
+def test_run_performs_one_click_per_iteration_and_reresolves_ref(monkeypatch):
+    first = [_element(ref=3, title="Open")]
+    second = [_element(ref=4, title="Next")]
+    engine = _FakeEngine([first, second], {3: first[0], 4: second[0]})
+    states = []
+
+    def fake_decision(state, criteria):
+        states.append(state)
+        return _Answer(("click:3", "done")[len(states) - 1])
+
+    monkeypatch.setattr(controller, "engine", engine)
+    monkeypatch.setattr(controller.decisions, "ui_action", fake_decision)
+
+    result = controller.run("Open it", "Notes", max_steps=2)
+
+    assert result.status == "completed"
+    assert engine.actions == [("click", 3)]
+    assert engine.resolved_refs == [3]
+    assert states[1]["history"] == ["click:3"]
+
+
+def test_run_returns_completed_for_done_and_aborted_for_abort(monkeypatch):
+    for action, expected in (("done", "completed"), ("abort", "aborted")):
+        engine = _FakeEngine([[]])
+        _install_fakes(monkeypatch, engine, iter([action]))
+
+        result = controller.run("Stop", "Notes")
+
+        assert result.status == expected
+        assert engine.actions == []
+
+
+def test_run_falls_back_for_low_confidence_invalid_or_failed_decisions(monkeypatch):
+    for decision in (None, _Answer("click:999"), RuntimeError("provider down")):
+        engine = _FakeEngine([[_element()]])
+
+        def fake_decision(state, criteria, decision=decision):
+            if isinstance(decision, Exception):
+                raise decision
+            return decision
+
+        monkeypatch.setattr(controller, "engine", engine)
+        monkeypatch.setattr(controller.decisions, "ui_action", fake_decision)
+
+        result = controller.run("Continue", "Notes")
+
+        assert result.status == "fallback"
+        assert engine.actions == []
+
+
+def test_run_aborts_redline_before_engine_action(monkeypatch):
+    dangerous = _element(ref=2, title="Delete")
+    engine = _FakeEngine([[dangerous]], {2: dangerous})
+    _install_fakes(monkeypatch, engine, iter(["click:2"]))
+
+    result = controller.run("Remove", "Notes")
+
+    assert result.status == "aborted"
+    assert engine.actions == []
+
+
+def test_run_falls_back_for_stale_or_disabled_refs(monkeypatch):
+    for resolved in (None, _element(ref=1, enabled=False)):
+        engine = _FakeEngine([[_element(ref=1)]], {1: resolved} if resolved else {})
+        _install_fakes(monkeypatch, engine, iter(["click:1"]))
+
+        result = controller.run("Continue", "Notes")
+
+        assert result.status == "fallback"
+        assert engine.actions == []
+
+
+def test_run_type_text_calls_writer_once_then_existing_typing_routine(monkeypatch):
+    field = _element(ref=7, role="AXTextField", title="Name")
+    engine = _FakeEngine([[field], []], {7: field})
+    _install_fakes(monkeypatch, engine, iter(["type_text", "done"]))
+    writer_calls = []
+
+    def writer(goal, state):
+        writer_calls.append((goal, state))
+        return "Timo"
+
+    result = controller.run("Enter name", "Notes", writer=writer)
+
+    assert result.status == "completed"
+    assert len(writer_calls) == 1
+    assert writer_calls[0][0] == "Enter name"
+    assert writer_calls[0][1]["elements"][0]["value"] == "<redacted>"
+    assert engine.actions == [("type", "Timo")]
+    assert engine.resolved_refs == [7]
+
+
+def test_run_falls_back_when_typing_or_engine_action_fails(monkeypatch):
+    field = _element(ref=7, role="AXTextField", title="Name")
+    engine = _FakeEngine([[field]], {7: field})
+    _install_fakes(monkeypatch, engine, iter(["type_text"]))
+    engine.type_text = lambda text: (_ for _ in ()).throw(RuntimeError("unavailable"))
+
+    result = controller.run("Enter name", "Notes", writer=lambda goal, state: "Timo")
+
+    assert result.status == "fallback"
+
+
+def test_run_falls_back_without_valid_writer_text(monkeypatch):
+    field = _element(ref=7, role="AXTextField", title="Name")
+    for writer in (None, lambda goal, state: "", lambda goal, state: 42):
+        engine = _FakeEngine([[field]], {7: field})
+        _install_fakes(monkeypatch, engine, iter(["type_text"]))
+
+        result = controller.run("Enter name", "Notes", writer=writer)
+
+        assert result.status == "fallback"
+        assert engine.actions == []
+
+
+def test_run_falls_back_when_writer_fails(monkeypatch):
+    field = _element(ref=7, role="AXTextField", title="Name")
+    engine = _FakeEngine([[field]], {7: field})
+    _install_fakes(monkeypatch, engine, iter(["type_text"]))
+
+    def failing_writer(goal, state):
+        raise RuntimeError("writer unavailable")
+
+    result = controller.run("Enter name", "Notes", writer=failing_writer)
+
+    assert result.status == "fallback"
+    assert engine.actions == []

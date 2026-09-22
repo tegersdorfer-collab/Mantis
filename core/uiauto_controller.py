@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from collections import deque
+import inspect
+import logging
 import re
-from typing import Iterable, Literal, Mapping
+from typing import Callable, Iterable, Literal, Mapping
 
+from core import decisions
+from tools.uiauto import engine, safety
 from tools.uiauto.engine import ACTIONABLE_ROLES
 from tools.uiauto.safety import is_secure_field
 
@@ -15,6 +20,12 @@ MAX_HISTORY = 8
 MAX_STRING_LENGTH = 160
 TEXT_ROLES = frozenset({"AXTextField", "AXTextArea"})
 MAX_CHOICE_OPTIONS = 255
+UI_MAX_STEPS = 12
+_FALLBACK_TEXT = "Use the normal UI path"
+_COMPLETED_TEXT = "UI task completed"
+_ABORTED_TEXT = "UI action aborted"
+
+log = logging.getLogger("core.uiauto_controller")
 
 
 @dataclass(frozen=True)
@@ -130,3 +141,106 @@ def parse_action(action: object, plan: ActionPlan) -> str | None:
     if re.fullmatch(r"click:[0-9]+", action):
         return action
     return None
+
+
+def _fallback(reason: str) -> ControllerResult:
+    log.warning("Jev UI controller fallback: %s", reason)
+    return ControllerResult("fallback", _FALLBACK_TEXT, reason)
+
+
+def _decision_action(state: dict[str, object], plan: ActionPlan) -> object:
+    answer = decisions.ui_action(state, dict(plan.criteria))
+    if inspect.isawaitable(answer):
+        return asyncio.run(answer)
+    return answer
+
+
+def _current_text_field(elements: Iterable[Mapping[str, object]]) -> int | None:
+    for element in elements:
+        ref = _safe_ref(element.get("ref"))
+        if (
+            ref is not None
+            and element.get("role") in TEXT_ROLES
+            and bool(element.get("enabled", False))
+            and not is_secure_field(dict(element))
+        ):
+            return ref
+    return None
+
+
+def _valid_text_field(ref: int) -> bool:
+    element = engine.element(ref)
+    return bool(
+        element
+        and element.get("role") in TEXT_ROLES
+        and element.get("enabled", False)
+        and not is_secure_field(element)
+    )
+
+
+def run(
+    goal: str,
+    app: str | None,
+    max_steps: int = UI_MAX_STEPS,
+    writer: Callable[[str, Mapping[str, object]], str] | None = None,
+) -> ControllerResult:
+    """Execute one closed Jev UI decision per bounded synchronous iteration."""
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps <= 0:
+        return _fallback("invalid step limit")
+
+    history: list[str] = []
+    for step in range(max_steps):
+        try:
+            elements = engine.snapshot(app)
+        except Exception:
+            return _fallback("snapshot failed")
+
+        state = build_state(goal, app, step, elements, history)
+        plan = build_choice(elements)
+        if plan.status != "ready":
+            return _fallback(plan.reason or "no safe UI actions")
+
+        try:
+            answer = _decision_action(state, plan)
+        except Exception:
+            return _fallback("decision provider failed")
+        action = parse_action(getattr(answer, "value", None), plan)
+        if action is None:
+            return _fallback("invalid or low-confidence decision")
+        if action == "done":
+            return ControllerResult("completed", _COMPLETED_TEXT)
+        if action == "abort":
+            return ControllerResult("aborted", _ABORTED_TEXT)
+
+        try:
+            if action.startswith("click:"):
+                ref = int(action.removeprefix("click:"))
+                element = engine.element(ref)
+                if (
+                    element is None
+                    or not _usable(element)
+                    or _action_ref(element) != str(ref)
+                ):
+                    return _fallback("stale or disabled UI reference")
+                redline, reason = safety.is_redline(element)
+                if redline:
+                    return ControllerResult("aborted", _ABORTED_TEXT, reason)
+                engine.act(ref)
+            elif action == "type_text":
+                ref = _current_text_field(elements)
+                if ref is None or not _valid_text_field(ref):
+                    return _fallback("no current non-secure text field")
+                if writer is None:
+                    return _fallback("no text writer")
+                text = writer(goal, state)
+                if not isinstance(text, str) or not text.strip():
+                    return _fallback("writer returned invalid text")
+                engine.type_text(text)
+            else:
+                engine.press_key(action.removeprefix("key:"))
+        except Exception:
+            return _fallback("UI engine action failed")
+
+        history.append(action)
+
+    return _fallback("step limit reached")
