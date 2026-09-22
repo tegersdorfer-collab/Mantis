@@ -61,6 +61,30 @@ def test_build_state_serializes_only_bounded_data_and_redacts_text_values():
     assert set(state["elements"][0]) == {"ref", "role", "title", "value", "enabled"}
 
 
+def test_build_state_rejects_string_refs_instead_of_sending_unbounded_data_to_jev():
+    state = build_state("goal", None, 0, [_element(ref="R" * 10_000)], [])
+
+    assert state["elements"][0]["ref"] == ""
+    assert build_choice([_element(ref="R" * 10_000)]).criteria == {
+        "key:escape": "Select this exact safe controller action.",
+        "done": "Select this exact safe controller action.",
+        "abort": "Select this exact safe controller action.",
+    }
+
+
+def test_build_state_keeps_only_eight_items_without_materializing_history():
+    class StreamingHistory:
+        def __iter__(self):
+            yield from (f"action-{index}" for index in range(10))
+
+        def __len__(self):
+            raise AssertionError("history must be consumed as a stream")
+
+    state = build_state("goal", None, 0, [], StreamingHistory())
+
+    assert state["history"] == [f"action-{index}" for index in range(2, 10)]
+
+
 def test_build_choice_contains_only_safe_generated_actions():
     plan = build_choice([
         _element(ref=1),
@@ -127,6 +151,21 @@ def test_parse_action_rejects_non_strings_and_unrepresentable_plans():
 
     assert parse_action(None, plan) is None
     assert parse_action("click:1", ActionPlan("fallback", {})) is None
+
+
+def test_parse_action_rejects_forged_criteria_even_when_plan_is_ready():
+    forged = ActionPlan(
+        "ready",
+        {
+            "wait": "forged",
+            "ui_click(1)": "forged",
+            "click:1": "forged",
+        },
+    )
+
+    assert parse_action("wait", forged) is None
+    assert parse_action("ui_click(1)", forged) is None
+    assert parse_action("click:1", forged) == "click:1"
 
 
 def test_controller_result_has_stable_status_text_and_reason_fields():

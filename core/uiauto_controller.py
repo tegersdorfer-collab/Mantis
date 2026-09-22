@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
+import re
 from typing import Iterable, Literal, Mapping
 
 from tools.uiauto.engine import ACTIONABLE_ROLES
@@ -35,19 +37,20 @@ def _bounded_string(value: object) -> str:
     return value[:MAX_STRING_LENGTH]
 
 
-def _safe_ref(value: object) -> int | str:
+def _safe_ref(value: object) -> int | None:
     if isinstance(value, bool):
-        return ""
-    if isinstance(value, (int, str)):
+        return None
+    if isinstance(value, int) and value >= 0:
         return value
-    return ""
+    return None
 
 
 def _serialize_element(element: Mapping[str, object]) -> dict[str, object]:
     role = _bounded_string(element.get("role"))
     secure_or_text = role in TEXT_ROLES or is_secure_field({"role": role})
+    ref = _safe_ref(element.get("ref"))
     return {
-        "ref": _safe_ref(element.get("ref")),
+        "ref": ref if ref is not None else "",
         "role": role,
         "title": _bounded_string(element.get("title")),
         "value": "<redacted>" if secure_or_text else _bounded_string(element.get("value")),
@@ -63,12 +66,16 @@ def build_state(
     history: Iterable[str],
 ) -> dict[str, object]:
     """Build the bounded, data-only state passed to the Jev adapter."""
+    bounded_history: deque[str] = deque(maxlen=MAX_HISTORY)
+    for item in history:
+        bounded_history.append(_bounded_string(item))
+
     return {
         "goal": _bounded_string(goal),
         "app": _bounded_string(app),
         "step": step if isinstance(step, int) and not isinstance(step, bool) else 0,
         "elements": [_serialize_element(element) for element in elements],
-        "history": [_bounded_string(item) for item in list(history)[-MAX_HISTORY:]],
+        "history": list(bounded_history),
     }
 
 
@@ -82,7 +89,7 @@ def _usable(element: Mapping[str, object]) -> bool:
 
 def _action_ref(element: Mapping[str, object]) -> str | None:
     ref = _safe_ref(element.get("ref"))
-    if ref == "":
+    if ref is None:
         return None
     return str(ref)
 
@@ -116,4 +123,10 @@ def parse_action(action: object, plan: ActionPlan) -> str | None:
     """Accept only an exact action generated for the current choice plan."""
     if plan.status != "ready" or not isinstance(action, str):
         return None
-    return action if action in plan.criteria else None
+    if action not in plan.criteria:
+        return None
+    if action in {"type_text", "key:return", "key:escape", "done", "abort"}:
+        return action
+    if re.fullmatch(r"click:[0-9]+", action):
+        return action
+    return None
