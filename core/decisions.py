@@ -17,6 +17,7 @@ für `jevkit.calibrate.suggest_bands`.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -45,6 +46,8 @@ BANDS: dict[str, Bands] = {
     "addressed": Bands(act=0.4, escalate=0.2),
     "supported": _DEFAULT,
     "supersedes": _DEFAULT,
+    # UI-Aktionen gelten nur ab der konservativen, explizit konfigurierten Confidence.
+    "ui_action": Bands(act=config.cfg.JEV_UI_ACT_CONFIDENCE, escalate=0.0),
 }
 
 
@@ -197,3 +200,50 @@ async def tool_categories(text: str) -> tuple[set[str], bool | None] | None:
     elif a.sure(SURE):
         aktion = False
     return cats, aktion
+
+
+async def ui_action(state: dict | list | str, criteria: dict[str, object]) -> decide.Answer | None:
+    """Wählt aus bereits begrenztem UI-Zustand genau eine sichere nächste Aktion.
+
+    Task 2 begrenzt State und Kriterien vor diesem Adapter. Der State wird hier nur
+    als Fremddaten gekapselt, nicht gekürzt oder um UI-spezifische Felder ergänzt.
+    """
+    serialized_state = json.dumps(state, ensure_ascii=False, sort_keys=True)
+    safe_state = jevkit.untrusted(serialized_state, max_chars=len(serialized_state))
+    question = jevkit.Choice(
+        "Choose exactly one safe next action from the available criteria. Do not perform an action.",
+        criteria,
+    )
+    try:
+        answers = await decide.decide(safe_state, {"ui_action": question})
+    except JevUnavailable:
+        return None
+
+    answer = answers.get("ui_action") if isinstance(answers, dict) else None
+    if not isinstance(answer, decide.Answer) or answer.kind != "choice":
+        return None
+    if not isinstance(answer.value, str) or answer.value not in criteria:
+        return None
+
+    raw = answer.raw
+    if not isinstance(raw, jevkit.ChoiceAnswer):
+        try:
+            raw = jevkit.ChoiceAnswer(answer.value, answer.probabilities, answer.confidence)
+        except (KeyError, TypeError, ValueError):
+            return None
+        answer = decide.Answer(answer.kind, answer.value, answer.p, answer.confidence,
+                               answer.probabilities, answer.model, raw)
+
+    if (not isinstance(raw.probabilities, dict)
+            or raw.choice != answer.value
+            or raw.probabilities != answer.probabilities
+            or raw.confidence != answer.confidence
+            or set(raw.probabilities) != set(criteria)
+            or raw.p != answer.p):
+        return None
+
+    action_band = band(raw, BANDS["ui_action"])
+    await asyncio.to_thread(_log, "ui_action", answer, action_band, safe_state)
+    if action_band is not Band.ACT:
+        return None
+    return answer

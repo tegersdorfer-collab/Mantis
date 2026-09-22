@@ -12,9 +12,12 @@ Sicherheit: ui_click prüft VOR dem Klick die roten Linien (tools/uiauto/safety.
 das Modell will.
 """
 
+import asyncio
+import json
 import logging
 
 from core import tools as T
+from core import uiauto_controller as controller
 from tools.uiauto import engine, safety
 
 log = logging.getLogger("core.skills")
@@ -42,6 +45,10 @@ REGELN:
 - Manche Klicks werden aus Sicherheitsgründen verweigert (Löschen/Senden/Kaufen/Passwortfelder).
   Das ist gewollt; versuche keinen Umweg, sondern melde es.
 - Kein Smalltalk. Handle."""
+
+_WRITER_SYSTEM = """Du lieferst ausschließlich den Text für das aktuell fokussierte UI-Eingabefeld.
+Antworte nur mit dem Feldtext, ohne Erklärung, Anführungszeichen, Markdown oder Tool-Aufrufe."""
+_WRITER_MAX_TOKENS = 160
 
 
 # ── Low-Level-Tools (für den internen qwen-Loop) ──────────────────────────────
@@ -121,9 +128,47 @@ async def _ui_key(keys: str):
 
 # ── Haupt-Tool (für den gemma-Hauptagenten) ───────────────────────────────────
 
+async def _write_ui_text(goal: str, state: dict[str, object]) -> str:
+    """Erzeugt einmalig Feldtext ohne Zugriff auf UI- oder andere Tools."""
+    from core.agent import Agent
+    from core.backends.ollama import OllamaBackend
+    from settings import cfg
+
+    backend = OllamaBackend(model=cfg.BG_REASONING_MODEL)
+    agent = Agent(backend=backend, max_steps=1)
+    context = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    response, _trace = await agent.run(
+        messages=[{
+            "role": "user",
+            "content": f"Ziel: {goal}\nUI-Kontext: {context}",
+        }],
+        system=_WRITER_SYSTEM,
+        use_tools=False,
+        allowed_tools=[],
+        force_tools=False,
+        temperature=0.2,
+        max_tokens=_WRITER_MAX_TOKENS,
+    )
+    return response.strip()
+
+
+def _default_text_writer(goal: str, state: dict[str, object]) -> str:
+    """Synchroner Writer-Adapter für den im Worker laufenden Controller."""
+    return asyncio.run(_write_ui_text(goal, state))
+
 async def _run_ui_agent(goal: str, app: str) -> str:
-    """Startet den isolierten ReAct-Loop auf qwen3.5:9b mit den ui_*-Tools.
-    (Live; in Tests gemockt.)"""
+    """Versucht Jev zuerst; startet bei Fallback den bisherigen qwen-ReAct-Loop."""
+    result = await asyncio.to_thread(
+        controller.run,
+        goal,
+        app,
+        UI_MAX_STEPS,
+        _default_text_writer,
+    )
+    if result.status in {"completed", "aborted"}:
+        return result.text
+    log.warning("Jev UI controller fallback: %s", result.reason or "unknown reason")
+
     from core.agent import Agent
     from core.backends.ollama import OllamaBackend
     from settings import cfg
