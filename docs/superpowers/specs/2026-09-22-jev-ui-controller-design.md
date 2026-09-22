@@ -1,7 +1,7 @@
 # Jev UI Controller — Design
 
-**Datum:** 2026-09-22  
-**Status:** Entwurf nach Nutzerfreigabe der Richtung  
+**Datum:** 2026-09-22
+**Status:** Entwurf nach Nutzerfreigabe der Richtung
 **Scope:** Mantis' bestehendes `computer_task` für macOS-Accessibility-Apps
 
 ## Ziel
