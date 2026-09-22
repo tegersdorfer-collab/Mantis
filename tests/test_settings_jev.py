@@ -8,6 +8,7 @@ from settings import MantisSettings
 def test_jev_defaults_sind_aus():
     s = MantisSettings(_env_file=None)
     assert s.JEV_ENABLED is False
+    assert s.JEV_FORGE_GATE_ENABLED is False
     assert s.JEV_PROVIDER == "typesafe"
     assert s.TYPESAFE_API_KEY == ""
     assert s.OPENROUTER_API_KEY == ""

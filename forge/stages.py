@@ -113,9 +113,29 @@ def _kopf(task: dict) -> str:
     )
 
 
+def _jev_profil(kontext: dict) -> str:
+    """Gibt nur den validierten, lokalen Jev-Kontext an die Stufe weiter."""
+    mode = kontext.get("jev_mode")
+    risk = kontext.get("jev_risk")
+    if mode not in {"plan", "bugfix", "tdd", "security_review"}:
+        return ""
+    satz = (
+        f"Jev-Vorprofil: Arbeitsmodus {mode}, Risikostufe {risk or 'unknown'}. "
+        "Das ist eine Orientierung, keine Freigabe und ersetzt weder Tests "
+        "noch das deterministische Forge-Gate."
+    )
+    if mode == "security_review":
+        satz += " Führe zusätzlich eine ausdrückliche Sicherheitsprüfung der Vertrauens- und Berechtigungsgrenzen durch."
+    elif mode == "tdd":
+        satz += " Arbeite testgetrieben: zuerst einen fehlschlagenden Test, dann die kleinste Implementierung."
+    elif mode == "bugfix":
+        satz += " Reproduziere den Fehler nachvollziehbar und sichere die Korrektur mit einem Regressionstest ab."
+    return satz + "\n\n"
+
+
 def _spec_prompt(task: dict, kontext: dict) -> str:
     return (
-        _kopf(task) + "\n\n"
+        _kopf(task) + "\n\n" + _jev_profil(kontext) +
         f"Schreibe eine Design-Spec nach {SPEC_VERZEICHNIS}/. Dateiname: "
         f"YYYY-MM-DD-<kurzer-slug>-design.md.\n"
         "Inhalt: Ziel, betroffene Module, Datenfluss, Fehlerbehandlung, was "
@@ -126,7 +146,7 @@ def _spec_prompt(task: dict, kontext: dict) -> str:
 
 def _plan_prompt(task: dict, kontext: dict) -> str:
     return (
-        _kopf(task) + "\n\n"
+        _kopf(task) + "\n\n" + _jev_profil(kontext) +
         f"Die Design-Spec liegt unter: {kontext.get('spec_path', '(unbekannt)')}\n"
         f"Lies sie und schreibe daraus einen Implementierungsplan nach {PLAN_VERZEICHNIS}/. "
         "Dateiname: YYYY-MM-DD-<kurzer-slug>-plan.md.\n"
@@ -163,7 +183,7 @@ def _zonen_satz() -> str:
 
 def _implement_prompt(task: dict, kontext: dict) -> str:
     return (
-        _kopf(task) + "\n\n"
+        _kopf(task) + "\n\n" + _jev_profil(kontext) +
         f"Spec: {kontext.get('spec_path', '(unbekannt)')}\n"
         f"Plan: {kontext.get('plan_path', '(unbekannt)')}\n"
         "Arbeite den Plan testgetrieben ab: erst der fehlschlagende Test, dann "
@@ -178,7 +198,7 @@ def _implement_prompt(task: dict, kontext: dict) -> str:
 
 def _review_prompt(task: dict, kontext: dict) -> str:
     return (
-        _kopf(task) + "\n\n"
+        _kopf(task) + "\n\n" + _jev_profil(kontext) +
         f"Die Spec liegt unter: {kontext.get('spec_path', '(unbekannt)')}\n"
         "Der Diff dieses Branches steht weiter unten in diesem Prompt — er ist "
         "deine einzige verlässliche Sicht auf die Änderung. Erzeuge keinen "
@@ -198,7 +218,7 @@ def _review_prompt(task: dict, kontext: dict) -> str:
 
 def _fix_prompt(task: dict, kontext: dict) -> str:
     return (
-        _kopf(task) + "\n\n"
+        _kopf(task) + "\n\n" + _jev_profil(kontext) +
         f"Ein Review hat Mängel gefunden. Sie stehen in {VERDIKT_DATEI}.\n"
         "Behebe ausschließlich die dort als critical oder important markierten "
         "Befunde. Baue nichts darüber hinaus.\n"
