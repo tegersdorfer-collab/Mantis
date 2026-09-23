@@ -124,8 +124,11 @@ class MantisSettings(BaseSettings):
     # diese Einstellung liefe der Coder auf dem generischen 0.7-Default.
     # Messung 09.09.2026 (Code-Aufgabe des Benchmarks): 0.6 → 8/8, 0.7 → 7/8.
     BG_CODE_TEMPERATURE: float = 0.6
-    # Vision-Modell für Foto-Analyse (Mahlzeiten)
-    VISION_MODEL: str = "qwen3-vl:8b"
+    # Vision-Modell für Foto-Analyse (Mahlzeiten, Screen-Context). Seit 22.09.2026
+    # qwen3.5:9b — kann nativ Bilder (Ollama-Capabilities: vision tools thinking),
+    # ersetzt das ältere qwen3-vl:8b → ein Modell weniger im RAM-Swap.
+    # Vision-Aufrufe MÜSSEN think=False setzen, sonst frisst das Thinking num_predict.
+    VISION_MODEL: str = "qwen3.5:9b"
 
     # ── Telegram ─────────────────────────────────────────────────────────────
     TELEGRAM_BOT_TOKEN: str = ""

@@ -13,7 +13,7 @@ import config
 
 log = logging.getLogger(__name__)
 
-DEFAULT_VISION_MODEL = getattr(config, "VISION_MODEL", "qwen3-vl:8b")
+DEFAULT_VISION_MODEL = getattr(config, "VISION_MODEL", "qwen3.5:9b")
 
 
 async def describe_image(image_bytes: bytes, prompt: str, model: str | None = None) -> str:
@@ -31,6 +31,7 @@ async def describe_image(image_bytes: bytes, prompt: str, model: str | None = No
                 "images": [b64],
             }],
             options={"num_predict": 512},
+            think=False,  # qwen3.5 denkt sonst und verbraucht das Budget im Thinking
             keep_alive=0,
         )
         return (resp.message.content or "").strip()

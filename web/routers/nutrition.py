@@ -64,7 +64,7 @@ async def _run_analysis(meal_id: int, image_bytes: bytes, annotation: str) -> No
         import ollama as _ollama
         b64 = _b64.standard_b64encode(image_bytes).decode()
         _client = _ollama.AsyncClient(host=config.OLLAMA_BASE_URL)
-        vision_model = getattr(config, "VISION_MODEL", "qwen3-vl:8b")
+        vision_model = getattr(config, "VISION_MODEL", "qwen3.5:9b")
         prompt = (
             "Du bist ein Ernährungsexperte. Schätze die Nährwerte dieses Essens/Getränks "
             "so genau wie möglich.\n"
@@ -78,12 +78,14 @@ async def _run_analysis(meal_id: int, image_bytes: bytes, annotation: str) -> No
             '{"items":[{"name":"...","grams":0,"calories":0,"protein":0,"carbs":0,"fat":0}],'
             '"food_name":"Gesamtgericht","portion":"z.B. 1 großer Teller","confidence":0.0}'
         )
-        # KEIN format="json" — das lässt qwen3-vl:8b leer antworten; der Prompt erzwingt JSON,
-        # extract_json holt es robust raus.
+        # KEIN format="json" — das ließ qwen3-vl:8b leer antworten; der Prompt erzwingt JSON,
+        # extract_json holt es robust raus. think=False: qwen3.5 würde sonst das
+        # num_predict-Budget im Thinking verbrauchen und leeren Content liefern.
         resp = await _client.chat(
             model=vision_model,
             messages=[{"role": "user", "content": prompt, "images": [b64]}],
             options={"num_predict": 600, "temperature": 0.2, "num_ctx": 8192},
+            think=False,
             keep_alive=0)
         data = _sum_food_items(extract_json((resp.message.content or "").strip(), default={}))
         if not data or not data.get("calories"):
