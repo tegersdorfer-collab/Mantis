@@ -16,6 +16,8 @@ import asyncio
 import logging
 from typing import Awaitable, Callable
 
+import config
+
 log = logging.getLogger(__name__)
 
 # Distanz-Band (cosine): nah genug fürs selbe Thema, aber nicht ~identisch.
@@ -77,7 +79,9 @@ def make_llm_judge(chat_client, model: str) -> Judge:
             resp = await chat_client.chat(
                 model=model,
                 messages=[{"role": "user", "content": _JUDGE_PROMPT.format(old=old, new=new)}],
-                options={"temperature": 0.0, "num_predict": 3, "keep_alive": "5m"},
+                options=config.ollama_options(
+                    model, temperature=0.0, num_predict=3, keep_alive="5m"
+                ),
                 think=False,
             )
             return (resp.message.content or "").strip().upper().startswith("JA")

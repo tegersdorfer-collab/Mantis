@@ -83,7 +83,9 @@ async def _run_analysis(meal_id: int, image_bytes: bytes, annotation: str) -> No
         resp = await _client.chat(
             model=vision_model,
             messages=[{"role": "user", "content": prompt, "images": [b64]}],
-            options={"num_predict": 600, "temperature": 0.2, "num_ctx": 8192},
+            options=config.ollama_options(
+                vision_model, num_predict=600, temperature=0.2
+            ),
             keep_alive=0)
         data = _sum_food_items(extract_json((resp.message.content or "").strip(), default={}))
         if not data or not data.get("calories"):

@@ -53,7 +53,7 @@ class OllamaProvider(LLMProvider):
                     await self._client.chat(
                         model=name,
                         messages=[{"role": "user", "content": ""}],
-                        options={"num_predict": 1},
+                        options=config.ollama_options(name, num_predict=1),
                         keep_alive=0,
                     )
                     log.info(f"🗑️  Entlade {name} für {self._model}")
@@ -72,17 +72,17 @@ class OllamaProvider(LLMProvider):
     ) -> str:
         if free_ram:
             await self.unload_others()
-        kwargs = dict(
-            model=self._model,
-            messages=self._build_messages(messages, system),
-            options={"temperature": temperature, "num_predict": max_tokens},
-            keep_alive=config.OLLAMA_KEEP_ALIVE,
-            think=think,
-        )
-        if format:
-            kwargs["format"] = format
         async with GATE:
-            response = await self._client.chat(**kwargs)
+            response = await self._client.chat(
+                model=self._model,
+                messages=self._build_messages(messages, system),
+                options=config.ollama_options(
+                    self._model, temperature=temperature, num_predict=max_tokens
+                ),
+                keep_alive=config.OLLAMA_KEEP_ALIVE,
+                think=think,
+                **({"format": format} if format else {}),
+            )
         try:
             from core import llm_usage
             llm_usage.record("ollama", self._model,
@@ -103,7 +103,9 @@ class OllamaProvider(LLMProvider):
         async for chunk in await self._client.chat(
             model=self._model,
             messages=self._build_messages(messages, system),
-            options={"temperature": temperature, "num_predict": max_tokens},
+            options=config.ollama_options(
+                self._model, temperature=temperature, num_predict=max_tokens
+            ),
             stream=True,
         ):
             if chunk.message.content:
@@ -117,6 +119,7 @@ class OllamaProvider(LLMProvider):
             response = await self._client.embed(
                 model=self._embed_model,
                 input=text,
+                options=config.ollama_options(self._embed_model),
             )
         emb = response.embeddings[0]
         if key in self._embed_cache:
@@ -148,6 +151,7 @@ class OllamaProvider(LLMProvider):
                 response = await self._client.embed(
                     model=self._embed_model,
                     input=uncached_texts,
+                    options=config.ollama_options(self._embed_model),
                 )
             for idx, (orig_i, text) in enumerate(zip(uncached_indices, uncached_texts)):
                 emb = response.embeddings[idx]

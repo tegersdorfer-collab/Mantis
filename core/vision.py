@@ -23,14 +23,15 @@ async def describe_image(image_bytes: bytes, prompt: str, model: str | None = No
         import ollama as _ollama
         b64 = base64.standard_b64encode(image_bytes).decode()
         client = _ollama.AsyncClient(host=config.OLLAMA_BASE_URL)
+        active_model = model or DEFAULT_VISION_MODEL
         resp = await client.chat(
-            model=model or DEFAULT_VISION_MODEL,
+            model=active_model,
             messages=[{
                 "role": "user",
                 "content": prompt,
                 "images": [b64],
             }],
-            options={"num_predict": 512},
+            options=config.ollama_options(active_model, num_predict=512),
             keep_alive=0,
         )
         return (resp.message.content or "").strip()

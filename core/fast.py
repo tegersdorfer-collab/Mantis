@@ -16,11 +16,14 @@ _client = _ollama.AsyncClient(host=config.OLLAMA_BASE_URL)
 
 async def ask(prompt: str, max_tokens: int = 20, temperature: float = 0.1, model: str | None = None) -> str:
     try:
+        active_model = model or config.AGENT_MODEL_FAST
         async with GATE:
             resp = await _client.chat(
-                model=model or config.AGENT_MODEL_FAST,
+                model=active_model,
                 messages=[{"role": "user", "content": prompt}],
-                options={"temperature": temperature, "num_predict": max_tokens},
+                options=config.ollama_options(
+                    active_model, temperature=temperature, num_predict=max_tokens
+                ),
                 keep_alive=config.OLLAMA_KEEP_ALIVE,
                 think=False,  # Reasoning-Modelle (z.B. qwen3.5) verbrauchen sonst das
                               # ganze num_predict-Budget für <think>, message.content bleibt leer
@@ -41,7 +44,7 @@ async def warmup() -> None:
         await _client.chat(
             model=config.AGENT_MODEL_FAST,
             messages=[{"role": "user", "content": "ok"}],
-            options={"num_predict": 1},
+            options=config.ollama_options(config.AGENT_MODEL_FAST, num_predict=1),
             keep_alive=config.OLLAMA_KEEP_ALIVE,
         )
         log.info(f"🔥 Schnellmodell {config.AGENT_MODEL_FAST} aufgewärmt")
