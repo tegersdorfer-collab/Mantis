@@ -186,6 +186,9 @@ class MantisSettings(BaseSettings):
     IDLE_EVAL_AFTER_S: int = 600
 
     # ── Proaktiv ─────────────────────────────────────────────────────────────
+    # Autonome Telegram-/Push-Nachrichten sind bewusst aus, bis Timo sie wieder
+    # ausdrücklich nutzen möchte. Direkte Antworten auf eigene Nachrichten bleiben aktiv.
+    AUTONOMOUS_MESSAGES_ENABLED: bool = False
     PROACTIVE_WAIT_AFTER_CONV: int = 600
     PROACTIVE_INTERVAL: int = 5400
 

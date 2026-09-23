@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 
 from core import db, backup
+import config
 
 log = logging.getLogger(__name__)
 
@@ -102,6 +103,8 @@ class IdleLoop:
     # ── Ticks ─────────────────────────────────────────────────────────────────
 
     async def _tick_autopilot(self) -> None:
+        if not config.AUTONOMOUS_MESSAGES_ENABLED:
+            return
         try:
             await self.autopilot.tick()
         except Exception as e:
@@ -112,6 +115,8 @@ class IdleLoop:
         """Accountability & Momentum (Daily Anchor + Der Block). Läuft IMMER —
         auch wenn Timo gerade aktiv ist —, denn die Prompts sind zeitgebunden.
         Sendet über den zentralen Autopilot-Pfad (Telegram + Web-Push)."""
+        if not config.AUTONOMOUS_MESSAGES_ENABLED:
+            return
         try:
             from domains import accountability
             await accountability.tick(self.autopilot._send, self.dashboard)
@@ -198,6 +203,8 @@ class IdleLoop:
             log.info(f"🕐 Forgetting: {stats}")
 
     async def _tick_health(self) -> None:
+        if not config.AUTONOMOUS_MESSAGES_ENABLED:
+            return
         now = datetime.now()
         if _elapsed_since(self._last_health_refresh, now) < 1800:
             return
@@ -268,11 +275,12 @@ class IdleLoop:
                     _failures += 1
                     if _failures >= 2:
                         msg = f"⚠️ Mantis Health-Check: {', '.join(unhealthy)} fehlerhaft"
-                        try:
-                            from core.push import send_push
-                            await asyncio.to_thread(send_push, "Mantis Health Alert", msg)
-                        except Exception:
-                            pass
+                        if config.AUTONOMOUS_MESSAGES_ENABLED:
+                            try:
+                                from core.push import send_push
+                                await asyncio.to_thread(send_push, "Mantis Health Alert", msg)
+                            except Exception:
+                                pass
                         log.warning(msg)
                 else:
                     _failures = 0

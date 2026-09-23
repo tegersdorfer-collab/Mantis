@@ -213,7 +213,7 @@ def intercept(text: str) -> str | None:
       None → keine offene Accountability-Frage bzw. keine passende Antwort → normal
              an den Agenten.
     """
-    if not config.ACCOUNTABILITY_ENABLED:
+    if not config.ACCOUNTABILITY_ENABLED or not config.AUTONOMOUS_MESSAGES_ENABLED:
         return None
     text = (text or "").strip()
     if not text:

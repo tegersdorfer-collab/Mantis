@@ -19,6 +19,7 @@ from core import db
 from core.db import log_event
 from core.status import BUS
 from domains import habits, fitness, nutrition, goals, weather
+import config
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +81,9 @@ class Autopilot:
     # ── Senden + Persistenz ──────────────────────────────────────────────────
 
     async def _send(self, text: str, kind: str = "proactive") -> None:
+        if not config.AUTONOMOUS_MESSAGES_ENABLED:
+            log.info("Autonome Nachricht unterdrückt (deaktiviert): %s", kind)
+            return
         if not text:
             return
         if _content_len(text) < _MIN_CONTENT_CHARS:
