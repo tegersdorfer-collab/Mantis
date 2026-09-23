@@ -28,6 +28,7 @@ from jevkit import Band, Bands, band
 import config
 from core import decide
 from core.decide import JevUnavailable, Noul
+from core import local_decide
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +52,18 @@ BANDS: dict[str, Bands] = {
 }
 
 
+class _LoggedAnswer:
+    """Ergänzt lokale Diagnosefelder, ohne JevKit-Logleser zu verändern."""
+    def __init__(self, answer, metadata: dict[str, object]) -> None:
+        self.answer = answer
+        self.metadata = metadata
+
+    def to_dict(self) -> dict:
+        payload = self.answer.to_dict()
+        payload["metadata"] = self.metadata
+        return payload
+
+
 def decision_log() -> jevkit.DecisionLog | None:
     path = getattr(config, "JEV_LOG_PATH", "")
     return jevkit.DecisionLog(Path(path)) if path else None
@@ -64,10 +77,37 @@ def _log(name: str, ans: decide.Answer, b: Band, state) -> None:
         # ans.raw ist die rohe jevkit-Answer (aus decide.decide()); nur wenn sie fehlt
         # (z.B. in Tests, die Answer von Hand bauen) auf Noul(p) zurückfallen.
         answer = ans.raw if ans.raw is not None else jevkit.NoulAnswer(ans.p)
+        missing_labels = ans.metadata.get("missing_labels")
+        if missing_labels:
+            answer = _LoggedAnswer(answer, {"missing_labels": list(missing_labels)})
         d = jevkit.Decision({name: answer}, ans.model or "unknown", {}, False, 0.0)
         lg.write(d, {name: b}, state)
     except Exception as e:  # Log darf nie eine Entscheidung verhindern
         log.debug("Jev-Log fehlgeschlagen: %r", e)
+
+
+def _jev_answer(ans: decide.Answer):
+    """Gibt die JevKit-Rohantwort fürs Band und DecisionLog zurück."""
+    if isinstance(ans.raw, (jevkit.NoulAnswer, jevkit.ChoiceAnswer, jevkit.ScoreAnswer)):
+        return ans.raw
+    if ans.kind == "noul":
+        return jevkit.NoulAnswer(ans.p)
+    if ans.kind == "choice":
+        return jevkit.ChoiceAnswer(str(ans.value), dict(ans.probabilities), ans.confidence)
+    if ans.kind == "score":
+        return jevkit.ScoreAnswer(float(ans.value), {}, dict(ans.probabilities), ans.confidence)
+    raise TypeError(f"unbekannter Entscheidungstyp: {ans.kind}")
+
+
+async def _local_answers(state, questions: dict[str, object]) -> dict[str, decide.Answer] | None:
+    """Ruft Logits nur nach Jev-Ausfall und bei explizitem Opt-in auf."""
+    if not config.LOCAL_LOGITS_ENABLED:
+        return None
+    try:
+        return await local_decide.score(state, questions)
+    except local_decide.LocalDecisionUnavailable as e:
+        log.debug("Lokales Logit-Scoring nicht verfügbar: %r", e)
+        return None
 
 # ── Fragen ────────────────────────────────────────────────────────────────────
 
@@ -143,6 +183,20 @@ async def _noul_or_fallback(name: str, state, question: Noul, fallback: Fallback
     try:
         answers = await decide.decide(state, questions)
     except JevUnavailable:
+        local = await _local_answers(state, questions)
+        if local is None or set(local) != set(questions):
+            return await fallback()
+        if guard and local[jevkit.GUARD_ID].p >= 0.5:
+            log.info("Lokaler Logit-Guard %s: Treffer (p=%.2f) → Fallback",
+                     name, local[jevkit.GUARD_ID].p)
+            return await fallback()
+        ans = local.get(name)
+        if isinstance(ans, decide.Answer) and ans.kind == "noul":
+            b = band(_jev_answer(ans), BANDS.get(name, _DEFAULT))
+            await asyncio.to_thread(_log, name, ans, b, state)
+            if b is Band.ACT:
+                return bool(ans.value)
+            log.debug("Lokales Logit-Scoring %s: %s (p=%.2f) → Fallback", name, b.value, ans.p)
         return await fallback()
     if guard and answers[jevkit.GUARD_ID].p >= 0.5:
         log.info("Jev %s: Guard hat angeschlagen (p=%.2f) → lokal", name, answers[jevkit.GUARD_ID].p)
@@ -191,7 +245,16 @@ async def tool_categories(text: str) -> tuple[set[str], bool | None] | None:
     try:
         answers = await decide.decide(text, questions)
     except JevUnavailable:
-        return None
+        answers = await _local_answers(text, questions)
+        if answers is None or set(answers) != set(questions):
+            return None
+        for name, ans in answers.items():
+            if not isinstance(ans, decide.Answer) or ans.kind != "noul":
+                return None
+            b = band(_jev_answer(ans), BANDS.get(name, _DEFAULT))
+            await asyncio.to_thread(_log, name, ans, b, text)
+            if b is not Band.ACT:
+                return None
     cats = {cat for cat in TOOL_CATEGORY_DESCRIPTIONS if answers[f"cat:{cat}"].p >= TOOL_CATEGORY_P}
     a = answers["aktion"]
     aktion: bool | None = None
@@ -217,7 +280,9 @@ async def ui_action(state: dict | list | str, criteria: dict[str, object]) -> de
     try:
         answers = await decide.decide(safe_state, {"ui_action": question})
     except JevUnavailable:
-        return None
+        answers = await _local_answers(safe_state, {"ui_action": question})
+        if not answers:
+            return None
 
     answer = answers.get("ui_action") if isinstance(answers, dict) else None
     if not isinstance(answer, decide.Answer) or answer.kind != "choice":
@@ -242,7 +307,8 @@ async def ui_action(state: dict | list | str, criteria: dict[str, object]) -> de
             or raw.p != answer.p):
         return None
 
-    action_band = band(raw, BANDS["ui_action"])
+    action_band = band(raw if isinstance(raw, jevkit.ChoiceAnswer) else _jev_answer(answer),
+                       BANDS["ui_action"])
     await asyncio.to_thread(_log, "ui_action", answer, action_band, safe_state)
     if action_band is not Band.ACT:
         return None

@@ -1,7 +1,7 @@
 """Jev (TypeSafe via OpenRouter) gegen die lokalen Mantis-Modelle auf den Fällen in cases.py.
 
-Aufruf:  cd ~/Mantis && python -m bench.jev.run [--local gemma4:e2b,qwen3.5:9b] [--no-local]
-Ergebnis: bench/jev/results/raw.jsonl + report.md
+Aufruf:  python -m bench.jev.run [--local MODELLE] [--local-logits MODELLE --tag NAME] [--no-local]
+Ergebnis: bench/jev/results/raw[-TAG].jsonl + report[-TAG].md
 
 Jev bekommt pro Fall EINEN Call mit der/den passenden Frage(n). Lokal bekommt jedes
 Modell den Prompt-Stil, den Mantis heute an der jeweiligen Stelle verwendet
@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import statistics
 import sys
 import time
@@ -22,13 +23,19 @@ import urllib.request
 from pathlib import Path
 
 import ollama
+import jevkit
 
 from bench.jev import cases as C
+from core import local_decide
+from core.decide import Answer, Choice, Noul, Score
+import config
 
 HERE = Path(__file__).parent
 RESULTS = HERE / "results"
 OR_URL = "https://openrouter.ai/api/alpha/decisions"
 JEV_MODEL = "~typesafe/jev-latest"
+# Puffer über der Modellgröße für den RAM-Guard (frei+inaktiv aus vm_stat).
+RAM_MARGIN_MB = int(os.environ.get("BENCH_RAM_MARGIN_MB", "2048"))
 
 
 def _load_env_key() -> str:
@@ -123,6 +130,65 @@ def jev_decide(kind: str, answer: dict):
     raise ValueError(answer["type"])
 
 
+def questions_for_local(questions: dict) -> dict[str, Noul | Choice | Score]:
+    """Überführt denselben Jev-Fragekatalog in die lokalen JevKit-Typen."""
+    converted = {}
+    for qid, question in questions.items():
+        kind = question["type"]
+        if kind == "noul":
+            converted[qid] = Noul(question["instructions"], question.get("criteria"))
+        elif kind == "choice":
+            converted[qid] = Choice(question["instructions"], question["criteria"])
+        elif kind == "score":
+            converted[qid] = Score(question["instructions"], question["criteria"])
+        else:
+            raise ValueError(f"unbekannter Fragetyp: {kind}")
+    return converted
+
+
+def local_logits_row(case: dict, answer, *, model: str, latency: float,
+                     missing_labels: list[str] | None = None) -> dict:
+    """Baut eine Rohzeile im gleichen Format wie die Jev-Ergebnisse."""
+    typed = answer.raw if isinstance(answer, Answer) else answer
+    label = answer.value
+    if isinstance(typed, jevkit.NoulAnswer):
+        raw = {"noul": typed.p}
+    elif isinstance(typed, (jevkit.ChoiceAnswer, jevkit.ScoreAnswer)):
+        raw = dict(typed.probabilities)
+    else:
+        raise TypeError(f"unerwarteter lokaler Antworttyp: {type(typed).__name__}")
+    confidence = answer.confidence
+    if isinstance(answer, Answer):
+        missing_labels = list(answer.metadata.get("missing_labels", missing_labels or []))
+    return {
+        **case,
+        "backend": f"local-logits:{model}",
+        "system": "local-logits",
+        "model": model,
+        "label": label,
+        "correct": label == case["expected"],
+        "confidence": confidence,
+        "raw": raw,
+        "missing_labels": list(missing_labels or []),
+        "latency": latency,
+    }
+
+
+def result_paths(tag: str | None = None) -> tuple[Path, Path]:
+    """Ergebnisdateien; Tags sind absichtlich auf sichere Dateinamen beschränkt."""
+    if tag is None:
+        return RESULTS / "raw.jsonl", RESULTS / "report.md"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", tag):
+        raise ValueError("tag darf nur Buchstaben, Zahlen, Bindestriche und Unterstriche enthalten")
+    return RESULTS / f"raw-{tag}.jsonl", RESULTS / f"report-{tag}.md"
+
+
+def ensure_output_paths_are_new(raw: Path, report: Path) -> None:
+    existing = [path.name for path in (raw, report) if path.exists()]
+    if existing:
+        raise FileExistsError("Ergebnisdatei existiert bereits: " + ", ".join(existing))
+
+
 # ── Lokal (Mantis-Prompt-Stil) ────────────────────────────────────────────────
 
 def local_prompt(kind: str, state) -> tuple[str, callable]:
@@ -214,8 +280,13 @@ async def local_call(client: ollama.AsyncClient, model: str, prompt: str) -> tup
     t = time.perf_counter()
     # keep_alive kurz: das Modell lebt nur solange der Benchmark es braucht, dann ist es weg
     resp = await client.chat(model=model, messages=[{"role": "user", "content": prompt}],
-                             options={"temperature": 0.0, "num_predict": 8}, keep_alive="60s", think=False)
+                             options={"temperature": 0.0, "num_predict": 8, "num_ctx": 4096}, keep_alive="60s", think=False)
     return (resp.message.content or ""), time.perf_counter() - t
+
+
+def ollama_client() -> ollama.AsyncClient:
+    """Nutzt dieselbe Ollama-URL wie der Produktivpfad und der RAM-Guard."""
+    return ollama.AsyncClient(host=config.OLLAMA_BASE_URL)
 
 
 # ── Fälle einsammeln ──────────────────────────────────────────────────────────
@@ -236,12 +307,30 @@ def all_cases() -> list[dict]:
 async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--local", default="gemma4:e2b,qwen3.5:9b")
+    ap.add_argument("--local-logits", metavar="MODELL[,MODELL]",
+                    help="zusätzliche Logit-Bewertung mit diesen Ollama-Modellen")
     ap.add_argument("--no-local", action="store_true")
     ap.add_argument("--no-jev", action="store_true")
+    ap.add_argument("--tag", help="schreibt raw-<tag>.jsonl und report-<tag>.md ohne bestehende Dateien zu ersetzen")
     args = ap.parse_args()
 
-    RESULTS.mkdir(exist_ok=True)
-    raw = RESULTS / "raw.jsonl"
+    if args.local_logits is not None and not args.tag:
+        ap.error("--local-logits benötigt --tag, damit vorhandene Ergebnisse erhalten bleiben")
+    logits_models = None
+    if args.local_logits is not None:
+        logits_models = [m.strip() for m in args.local_logits.split(",") if m.strip()]
+        if not logits_models:
+            ap.error("--local-logits braucht mindestens einen Modellnamen")
+    try:
+        raw, report = result_paths(args.tag)
+    except ValueError as e:
+        ap.error(str(e))
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    if args.tag:
+        try:
+            ensure_output_paths_are_new(raw, report)
+        except FileExistsError as e:
+            ap.error(str(e))
     raw.write_text("")
     cases = all_cases()
     rows: list[dict] = []
@@ -267,20 +356,24 @@ async def main() -> None:
                 print(f"  ! {c['id']}: {e}", flush=True)
         print("Jev fertig.", flush=True)
 
+    client = None
+    if not args.no_local or args.local_logits is not None:
+        client = ollama_client()
+
     if not args.no_local:
-        client = ollama.AsyncClient(host=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"))
+        assert client is not None
         models = [m for m in args.local.split(",") if m]
         # der Verifier läuft heute auf qwen2.5:0.5b — der gehört als Ist-Zustand mit rein
         for m in models + ["qwen2.5:0.5b"]:
             kinds_for_model = ("verify",) if m == "qwen2.5:0.5b" else None
             subset = [c for c in cases if kinds_for_model is None or c["kind"] in kinds_for_model]
             await unload_all(client)
-            need = await model_size_mb(client, m) + 2048
+            need = await model_size_mb(client, m) + RAM_MARGIN_MB
             have = _ram_available_mb()
             if have < need:
                 print(f"  ! {m} übersprungen: {have:.0f} MB frei, brauche ~{need:.0f} MB", flush=True)
                 continue
-            print(f"lokal {m}: {len(subset)} Fälle … ({have:.0f} MB frei, Modell ~{need-2048:.0f} MB)", flush=True)
+            print(f"lokal {m}: {len(subset)} Fälle … ({have:.0f} MB frei, Modell ~{need-RAM_MARGIN_MB:.0f} MB)", flush=True)
             # Warmup, damit Ladezeit nicht als Latenz zählt
             try:
                 await local_call(client, m, "ok")
@@ -299,10 +392,45 @@ async def main() -> None:
         await unload_all(client)
         print("lokal fertig, alle Modelle entladen.", flush=True)
 
-    write_report(rows)
+    if args.local_logits is not None:
+        assert client is not None
+        try:
+            for model in logits_models:
+                await unload_all(client)
+                need = await model_size_mb(client, model) + RAM_MARGIN_MB
+                have = _ram_available_mb()
+                if have < need:
+                    print(f"  ! local-logits {model} übersprungen: {have:.0f} MB frei, brauche ~{need:.0f} MB", flush=True)
+                    continue
+                print(f"local-logits {model}: {len(cases)} Fälle … ({have:.0f} MB frei, Modell ~{need-RAM_MARGIN_MB:.0f} MB)", flush=True)
+                try:
+                    await client.generate(model=model, prompt="ok", options={"num_predict": 1}, keep_alive="60s")
+                except Exception as e:
+                    print(f"  ! {model} nicht ladbar: {e}", flush=True)
+                    continue
+                for case in cases:
+                    state, wire_questions = jev_questions(case["kind"], case["state"])
+                    questions = questions_for_local(wire_questions)
+                    started = time.perf_counter()
+                    try:
+                        # Warm halten: Produktiv-KEEP_ALIVE=0 würde pro Frage neu laden (Latenz ≠ Modellqualität).
+                        answers = await local_decide.score(state, questions, model=model,
+                                                           keep_alive="120s", timeout_s=60)
+                        answer = answers["q"]
+                        latency = time.perf_counter() - started
+                        emit(local_logits_row(case, answer, model=model, latency=latency))
+                    except Exception as e:
+                        emit({**case, "backend": f"local-logits:{model}", "system": "local-logits",
+                              "model": model, "error": str(e)[:200], "correct": False, "latency": None})
+                        print(f"  ! {case['id']}: {e}", flush=True)
+        finally:
+            await unload_all(client)
+            print("local-logits fertig, alle Modelle entladen.", flush=True)
+
+    write_report(rows, tag=args.tag)
 
 
-def write_report(rows: list[dict]) -> None:
+def write_report(rows: list[dict], tag: str | None = None) -> None:
     backends = sorted({r["backend"] for r in rows}, key=lambda b: (b != "jev", b))
     kinds = ["intent", "address", "gate", "proactive", "inbox", "task", "conflict", "verify"]
     L = ["# Jev vs. lokal — Mantis-Entscheidungen", "",
@@ -348,6 +476,30 @@ def write_report(rows: list[dict]) -> None:
             brier = statistics.mean((r["raw"]["noul"] - (1.0 if r["expected"] else 0.0)) ** 2 for r in nouls)
             L.append(f"\nBrier-Score der {len(nouls)} Ja/Nein-Fragen: {brier:.3f} (0 = perfekt, 0.25 = Münzwurf).")
 
+    logits_backends = sorted({r["backend"] for r in rows if r.get("system") == "local-logits"})
+    if logits_backends:
+        L += ["", "## Lokales Logit-Scoring", "",
+              "Confidence ist Noul-Abstand zu 0,5 bzw. Peakedness für Choice und Score. Abdeckung zählt Antworten mit Confidence ≥ 0,5.", "",
+              "| Backend | Accuracy | Noul-Brier | Median (s) | Accuracy conf≥0,5 | Abdeckung |",
+              "|---|---:|---:|---:|---:|---:|"]
+        for backend in logits_backends:
+            rs = [r for r in rows if r["backend"] == backend]
+            correct = sum(bool(r.get("correct")) for r in rs)
+            accuracy = f"{correct}/{len(rs)} ({100 * correct / len(rs):.0f}%)" if rs else "—"
+            nouls = [r for r in rs if isinstance(r.get("raw"), dict) and "noul" in r["raw"]]
+            brier = (statistics.mean((r["raw"]["noul"] - (1.0 if r["expected"] else 0.0)) ** 2
+                                      for r in nouls) if nouls else None)
+            latencies = [r["latency"] for r in rs if r.get("latency") is not None]
+            median = f"{statistics.median(latencies):.2f}" if latencies else "—"
+            confident = [r for r in rs if r.get("confidence") is not None and r["confidence"] >= 0.5]
+            selective = (f"{sum(bool(r.get('correct')) for r in confident)}/{len(confident)} "
+                         f"({100 * sum(bool(r.get('correct')) for r in confident) / len(confident):.0f}%)"
+                         if confident else "—")
+            coverage = f"{len(confident)}/{len(rs)} ({100 * len(confident) / len(rs):.0f}%)" if rs else "—"
+            L.append(f"| {backend} | {accuracy} | {brier:.3f} | {median} | {selective} | {coverage} |"
+                     if brier is not None else
+                     f"| {backend} | {accuracy} | — | {median} | {selective} | {coverage} |")
+
     L += ["", "## Fehler im Detail", ""]
     for b in backends:
         wrong = [r for r in rows if r["backend"] == b and not r["correct"]]
@@ -358,7 +510,10 @@ def write_report(rows: list[dict]) -> None:
             L.append(f"- `{r['id']}` [{r['kind']}] erwartet **{r['expected']}**, bekam **{got}**{extra} — "
                      f"{json.dumps(r['state'], ensure_ascii=False)[:90]}" + (f" _{r['note']}_" if r.get("note") else ""))
         L.append("")
-    (RESULTS / "report.md").write_text("\n".join(L))
+    _, report_path = result_paths(tag)
+    if tag and report_path.exists():
+        raise FileExistsError(f"Ergebnisdatei existiert bereits: {report_path.name}")
+    report_path.write_text("\n".join(L))
     print("\n".join(L))
 
 
