@@ -44,10 +44,13 @@ def verify_prompt(user_text: str, claim: str) -> str:
 async def verify_claim(client, user_text: str, claim: str) -> bool:
     """Steht die Behauptung wirklich im Text? Jev zuerst, lokal (qwen2.5:0.5b) als Fallback."""
     async def _lokal() -> bool:
+        model = "qwen2.5:0.5b"
         vresp = await client.chat(
-            model="qwen2.5:0.5b",
+            model=model,
             messages=[{"role": "user", "content": verify_prompt(user_text, claim)}],
-            options={"temperature": 0.0, "num_predict": 5, "keep_alive": "5m"},
+            options=config.ollama_options(
+                model, temperature=0.0, num_predict=5, keep_alive="5m"
+            ),
             think=False,
         )
         return (vresp.message.content or "").strip().upper().startswith("JA")
@@ -195,11 +198,12 @@ class MemoryExtractor:
                 resp = await self._client.chat(
                     model=config.AGENT_MODEL_FAST,
                     messages=[{"role": "user", "content": _EXTRACT_PROMPT + exchange}],
-                    options={
-                        "temperature": 0.1,
-                        "num_predict": 300,
-                        "keep_alive": config.OLLAMA_KEEP_ALIVE,
-                    },
+                    options=config.ollama_options(
+                        config.AGENT_MODEL_FAST,
+                        temperature=0.1,
+                        num_predict=300,
+                        keep_alive=config.OLLAMA_KEEP_ALIVE,
+                    ),
                     format="json",
                     think=False,
                 )
@@ -335,8 +339,12 @@ Nachricht: """ + user_text + "\n\nJSON:"
             resp = await self._client.chat(
                 model=config.AGENT_MODEL_FAST,
                 messages=[{"role": "user", "content": _KG_PROMPT}],
-                options={"temperature": 0.1, "num_predict": 200,
-                         "keep_alive": config.OLLAMA_KEEP_ALIVE},
+                options=config.ollama_options(
+                    config.AGENT_MODEL_FAST,
+                    temperature=0.1,
+                    num_predict=200,
+                    keep_alive=config.OLLAMA_KEEP_ALIVE,
+                ),
                 format="json",
                 think=False,
             )

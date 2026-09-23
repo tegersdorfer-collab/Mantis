@@ -29,6 +29,10 @@ class MantisSettings(BaseSettings):
     OLLAMA_MODEL: str = "qwen3.5:9b"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_KEEP_ALIVE: str = "0"
+    # num_ctx pro Modell festlegen: wechselnde Werte würden Reloads bzw. Doppel-Loads auslösen;
+    # 8k deckt auch die zusätzlichen Vision-Tokens ab.
+    OLLAMA_NUM_CTX: int = 8192
+    OLLAMA_NUM_CTX_OVERRIDES: str = "gemma4:e2b=16384"  # Modell-Tag=Kontext, kommasepariert
     AGENT_MODEL_FAST: str = "qwen3.5:9b"
     # Interaktiver Haupt-Agent (Telegram/Dashboard-Chat). Benchmark 2026-07-09:
     # gemma4:e2b erreicht ~gleiche Chat-Qualität wie die 9B-Modelle, ist aber 3×
@@ -220,6 +224,43 @@ class MantisSettings(BaseSettings):
         return self.VAPID_CLAIM_EMAIL or self.OWNER_EMAIL or "admin@localhost"
 
     # ── Validation ───────────────────────────────────────────────────────────
+
+    @field_validator("OLLAMA_NUM_CTX")
+    @classmethod
+    def positive_ollama_num_ctx(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("OLLAMA_NUM_CTX muss positiv sein")
+        return v
+
+    @field_validator("OLLAMA_NUM_CTX_OVERRIDES")
+    @classmethod
+    def valid_ollama_num_ctx_overrides(cls, v: str) -> str:
+        parsed: dict[str, int] = {}
+        for raw_entry in v.split(","):
+            entry = raw_entry.strip()
+            if not entry:
+                continue
+            if entry.count("=") != 1:
+                raise ValueError(
+                    f"Ungültiger OLLAMA_NUM_CTX_OVERRIDES-Eintrag '{entry}' – erwartet Modell=Kontext"
+                )
+            model, raw_ctx = (part.strip() for part in entry.split("=", 1))
+            if not model or not raw_ctx:
+                raise ValueError(
+                    f"Ungültiger OLLAMA_NUM_CTX_OVERRIDES-Eintrag '{entry}' – Modell und Kontext sind erforderlich"
+                )
+            try:
+                num_ctx = int(raw_ctx)
+            except ValueError as e:
+                raise ValueError(
+                    f"Ungültiger Kontext '{raw_ctx}' für Modell '{model}' – erwartet eine positive Ganzzahl"
+                ) from e
+            if num_ctx <= 0:
+                raise ValueError(f"Kontext für Modell '{model}' muss positiv sein")
+            if model in parsed:
+                raise ValueError(f"Doppelter Modell-Override für '{model}'")
+            parsed[model] = num_ctx
+        return ",".join(f"{model}={num_ctx}" for model, num_ctx in parsed.items())
 
     @field_validator("OWNER_NAME")
     @classmethod

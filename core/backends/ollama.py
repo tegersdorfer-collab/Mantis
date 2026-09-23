@@ -63,11 +63,7 @@ class OllamaBackend(AgentBackend):
         think: bool = False,
         force_tool_call: bool = False,
     ) -> tuple[str, list[dict]]:
-        options = {
-            "temperature": temperature,
-            "num_predict": max_tokens,
-        }
-        kwargs = dict(model=self._model, messages=messages, options=options, think=think,
+        kwargs = dict(model=self._model, messages=messages, think=think,
                      keep_alive=self._keep_alive)
         if tools:
             kwargs["tools"] = tools
@@ -78,7 +74,13 @@ class OllamaBackend(AgentBackend):
             last_len = 0
             last_chunk = None
             async with GATE:
-                async for chunk in await self._client.chat(**kwargs, stream=True):
+                async for chunk in await self._client.chat(
+                    **kwargs,
+                    options=config.ollama_options(
+                        self._model, temperature=temperature, num_predict=max_tokens
+                    ),
+                    stream=True,
+                ):
                     last_chunk = chunk
                     m = chunk.message
                     if m.content:
@@ -103,7 +105,12 @@ class OllamaBackend(AgentBackend):
             return full, tool_calls
 
         async with GATE:
-            resp = await self._client.chat(**kwargs)
+            resp = await self._client.chat(
+                **kwargs,
+                options=config.ollama_options(
+                    self._model, temperature=temperature, num_predict=max_tokens
+                ),
+            )
         self._record_usage(resp)
         return resp.message.content or "", self._extract_tool_calls(resp.message)
 
@@ -124,7 +131,7 @@ class OllamaBackend(AgentBackend):
                 await self._client.chat(
                     model=self._model,
                     messages=[{"role": "user", "content": "ok"}],
-                    options={"num_predict": 1},
+                    options=config.ollama_options(self._model, num_predict=1),
                     keep_alive=self._keep_alive,
                 )
             log.info(f"🔥 Modell {self._model} aufgewärmt")

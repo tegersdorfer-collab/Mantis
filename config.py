@@ -13,6 +13,25 @@ DASHBOARD_PORT           = cfg.DASHBOARD_PORT
 OLLAMA_MODEL             = cfg.OLLAMA_MODEL
 OLLAMA_BASE_URL          = cfg.OLLAMA_BASE_URL
 OLLAMA_KEEP_ALIVE        = cfg.OLLAMA_KEEP_ALIVE
+OLLAMA_NUM_CTX           = cfg.OLLAMA_NUM_CTX
+_OLLAMA_NUM_CTX_OVERRIDES = {
+    model.strip(): int(num_ctx.strip())
+    for entry in cfg.OLLAMA_NUM_CTX_OVERRIDES.split(",")
+    if entry.strip()
+    for model, num_ctx in [entry.split("=", 1)]
+}
+
+
+def num_ctx_for(model: str) -> int:
+    """Liefert die konfigurierte Kontextlänge für einen exakten Modell-Tag."""
+    return _OLLAMA_NUM_CTX_OVERRIDES.get(model, OLLAMA_NUM_CTX)
+
+
+def ollama_options(model: str, **opts) -> dict:
+    """Ergänzt Ollama-Optionen um die für dieses Modell konfigurierte Kontextlänge."""
+    return {**opts, "num_ctx": num_ctx_for(model)}
+
+
 AGENT_MODEL_FAST         = cfg.AGENT_MODEL_FAST
 AGENT_MODEL_STRONG       = cfg.AGENT_MODEL_STRONG
 ADDRESS_CHECK_MODEL      = cfg.ADDRESS_CHECK_MODEL
