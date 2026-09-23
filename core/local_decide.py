@@ -17,7 +17,6 @@ from core.llm_gate import GATE
 
 # Für Tests austauschbar (httpx.MockTransport). Produktion: None = echtes Netz.
 _transport: httpx.AsyncBaseTransport | None = None
-NUM_CTX = 4096  # reicht für State + Frage; die Bench-States sind < 1k Tokens
 _LABELS = string.ascii_uppercase + string.digits + string.ascii_lowercase
 
 
@@ -166,8 +165,8 @@ async def _generate(model: str, prompt: str, *, keep_alive: str | int | None = N
         "top_logprobs": 20,
         "keep_alive": config.OLLAMA_KEEP_ALIVE if keep_alive is None else keep_alive,
         # Deterministische Ausgabe; die konfigurierbare Temperatur skaliert nur die Logprobs.
-        # num_ctx klein: Ollamas Default (64k) reserviert bei qwen3.5:9b ~2 GB KV-Cache.
-        "options": {"num_predict": 1, "temperature": 0, "num_ctx": NUM_CTX},
+        # num_ctx pro Modell wie alle anderen Calls: ein abweichender Wert erzwingt einen Reload.
+        "options": config.ollama_options(model, num_predict=1, temperature=0),
     }
     url = f"{config.OLLAMA_BASE_URL.rstrip('/')}/api/generate"
     try:
