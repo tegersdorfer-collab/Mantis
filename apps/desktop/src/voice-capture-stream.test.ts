@@ -66,7 +66,12 @@ describe('startVoiceCaptureStream', () => {
       const ws = FakeWebSocket.instances[0];
       const payload = { text: 'hallo', addressed: true, reply: 'hi', audio_b64: 'BASE64AUDIO' };
       ws.onmessage?.({ data: JSON.stringify(payload) });
-      expect(ws.sent).toEqual([JSON.stringify({ type: 'mute', value: true })]);
+      // Seit dem Streaming-Umbau meldet der Client zuerst an, dass er Tonblöcke
+      // verarbeiten kann; danach folgt wie bisher die Stummschaltung.
+      expect(ws.sent).toEqual([
+        JSON.stringify({ type: 'hello', audio: 'stream' }),
+        JSON.stringify({ type: 'mute', value: true }),
+      ]);
     } finally {
       globalThis.Audio = originalAudio;
     }

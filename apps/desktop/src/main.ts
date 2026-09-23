@@ -33,12 +33,18 @@ const LAYOUT_SLOTS: Record<string, string[]> = {
   split2: ['main', 'side'],
 };
 
-function renderHud(): void {
-  const ring = document.getElementById('hud-ring')!;
-  const label = document.getElementById('hud-label')!;
-  const status = document.getElementById('hud-status')!;
+export function renderHud(): Promise<void> {
+  // Ohne die Null-Prüfung schlug das erst im .then() fehl — also als unbehandelte
+  // Promise-Rejection, die kein try/catch am Aufrufer mehr sieht. Auftreten kann das
+  // überall, wo main.ts ohne das HUD-Template geladen wird (Tests, künftige Views).
+  const ring = document.getElementById('hud-ring');
+  const label = document.getElementById('hud-label');
+  const status = document.getElementById('hud-status');
+  if (!ring || !label || !status) return Promise.resolve();
 
-  checkBackendHealth(getBaseUrl()).then((health) => {
+  // Gibt das Promise zurück, damit Tests den asynchronen Teil prüfen können —
+  // ein Fehler im .then() ist sonst nur als unbehandelte Rejection sichtbar.
+  return checkBackendHealth(getBaseUrl()).then((health) => {
     const state = deriveHudState(health, new Date());
     ring.style.color = state.ringColor;
     label.textContent = state.label;
@@ -354,8 +360,11 @@ function renderWidget(container: HTMLElement, slot: WidgetSlot): void {
 }
 
 function applyUiEvent(evt: UiEvent): void {
-  const hud = document.getElementById('hud')!;
-  const widgetArea = document.getElementById('widget-area')!;
+  // Gleiche Absicherung wie in renderHud(): die Funktion hängt als Callback an
+  // subscribeUiState() und kann feuern, bevor das Template steht.
+  const hud = document.getElementById('hud');
+  const widgetArea = document.getElementById('widget-area');
+  if (!hud || !widgetArea) return;
 
   if (!evt.layout) {
     hud.style.display = 'flex';

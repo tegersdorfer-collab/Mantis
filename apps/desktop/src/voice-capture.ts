@@ -4,6 +4,8 @@ export type VoiceSegmentResult = {
   addressed: boolean;
   reply?: string | null;
   audio_b64?: string | null;
+  /** true: der Ton folgt als einzelne audio_chunk-Nachrichten statt in audio_b64. */
+  audio_streaming?: boolean;
 };
 
 const SILENCE_MS_TO_STOP = 800;   // so lange Stille beendet ein Sprachsegment

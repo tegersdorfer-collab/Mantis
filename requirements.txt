@@ -28,6 +28,9 @@ websockets>=13.0
 pydantic-settings>=2.0
 
 # TTS (Text-to-Speech, lokal)
+# TTS: Kokoro ist seit 22.09.2026 Default, Piper der Fallback.
+# Kokoro braucht zusätzlich espeak-ng als SYSTEM-Paket: brew install espeak-ng
+kokoro-onnx>=0.4.7
 piper-tts>=1.4.0
 
 # Utilities
@@ -35,6 +38,8 @@ python-dotenv>=1.0
 asyncio-throttle>=1.0
 psutil>=5.9
 httpx>=0.27
+# STT: Parakeet ist seit 22.09.2026 Default-Engine, whisper.cpp der Fallback
+parakeet-mlx>=0.5.2
 pywhispercpp>=1.5.0
 numpy>=1.26
 onnxruntime>=1.17

@@ -1,13 +1,22 @@
 """
-Sprach-Verarbeitung — gemeinsame Whisper-Transkription + schneller Adress-Check.
+Sprach-Verarbeitung — gemeinsame Transkription + schneller Adress-Check.
 
-Nutzt whisper.cpp (via pywhispercpp) statt des reinen PyTorch-openai-whisper —
-auf Apple Silicon läuft das über Metal statt nur CPU und ist damit deutlich
-schneller bei gleicher Modellqualität (siehe docs/superpowers/plans, Phase 5a-
-Nachbesserung). Whisper-Teil ist identisch zu dem, was communication/telegram.py
-bisher exklusiv für Telegram-Sprachnachrichten nutzte — jetzt hier zentralisiert,
-damit Phase 5 (Desktop-Sprachsteuerung) dieselbe Logik wiederverwendet statt sie
-zu duplizieren.
+Seit 22.09.2026 läuft die Transkription standardmäßig über Parakeet-TDT-0.6b-v3
+(NVIDIA, 25 europäische Sprachen) auf Apple MLX statt über whisper.cpp medium.
+Ausschlaggebend war ein Benchmark auf den 36 ECHTEN Aufnahmen aus
+data/wakeword/samples (Timos Stimme, echtes Mikrofon) — nicht die WER auf
+synthetischem Audio, sondern die Frage, ob der Weckname ankommt:
+
+    Parakeet v3      Weckname 72 %   0,17 s/Clip   2,7 GB Peak
+    whisper medium   Weckname 28 %   0,78 s/Clip   1,9 GB Peak
+    whisper turbo    Weckname 22 %   1,06 s/Clip   2,3 GB Peak
+
+whisper machte aus "Mantis" reihenweise "Mentos", "Mentis", "Ventus". Ganze Sätze
+transkribieren beide fehlerfrei — der Unterschied liegt bei kurzen Äußerungen und
+Eigennamen, also genau im Voice-Alltag. Report: bench/STT-2026-09-22.md.
+
+whisper.cpp bleibt als Fallback erhalten (STT_ENGINE="whisper", oder automatisch,
+wenn parakeet-mlx nicht installiert ist).
 """
 import asyncio
 import logging
@@ -19,7 +28,15 @@ from core import decisions, fast
 log = logging.getLogger(__name__)
 
 _whisper_model = None
+_parakeet_model = None
+# Beide Engines teilen sich EINEN Lock: whisper.cpp/ggml crasht bei parallelen
+# transcribe()-Aufrufen (s.u.), und zwei gleichzeitig geladene STT-Modelle wären auf
+# dem 16-GB-Mac ohnehin verschwenderisch.
 _whisper_lock = asyncio.Lock()
+# Wird auf True gesetzt, sobald Parakeet nachweislich nicht verfügbar ist (fehlendes
+# Paket oder fehlgeschlagener Modell-Download). Dann geht es dauerhaft über whisper,
+# statt bei jeder Äußerung erneut in denselben Fehler zu laufen.
+_parakeet_unavailable = False
 
 # Nach jeder Mantis-Antwort bleibt für dieses Fenster jede Folge-Äußerung automatisch
 # "adressiert" — ohne das würde is_addressed_to_mantis() kurze Antworten wie "ja",
@@ -40,7 +57,56 @@ def _conversation_active() -> bool:
 
 
 async def transcribe_audio(audio_path: str) -> str:
-    """Transkribiert eine Audiodatei lokal mit whisper.cpp. Gibt leeren String bei Fehler zurück."""
+    """Transkribiert eine Audiodatei lokal. Gibt leeren String bei Fehler zurück.
+
+    Engine nach config.STT_ENGINE ("parakeet" oder "whisper"); ist Parakeet nicht
+    verfügbar, übernimmt whisper.cpp dauerhaft."""
+    global _parakeet_unavailable
+    engine = getattr(config, "STT_ENGINE", "parakeet")
+
+    if engine == "parakeet" and not _parakeet_unavailable:
+        async with _whisper_lock:
+            if not _parakeet_unavailable:  # kann sich gesetzt haben, während wir warteten
+                text = await _transcribe_parakeet(audio_path)
+                if not _parakeet_unavailable:
+                    return text
+        log.warning("Parakeet nicht verfügbar – ab jetzt whisper.cpp")
+
+    return await _transcribe_whisper(audio_path)
+
+
+async def _transcribe_parakeet(audio_path: str) -> str:
+    """Parakeet-TDT über MLX. Setzt bei fehlendem Paket/Modell _parakeet_unavailable,
+    damit der Aufrufer einmalig auf whisper umschaltet. Nur unter _whisper_lock aufrufen."""
+    global _parakeet_model, _parakeet_unavailable
+    if _parakeet_model is None:
+        try:
+            from parakeet_mlx import from_pretrained
+        except ImportError:
+            log.warning("parakeet-mlx nicht installiert")
+            _parakeet_unavailable = True
+            return ""
+        model_id = getattr(config, "STT_PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
+        log.info(f"🔊 Lade Parakeet-Modell '{model_id}' …")
+        try:
+            _parakeet_model = await asyncio.to_thread(from_pretrained, model_id)
+        except Exception as e:
+            # Typisch: kein Netz beim allerersten Start (Modell noch nicht im HF-Cache).
+            log.error(f"Parakeet-Modell konnte nicht geladen werden: {e}")
+            _parakeet_unavailable = True
+            return ""
+
+    try:
+        result = await asyncio.to_thread(_parakeet_model.transcribe, audio_path)
+        return (result.text or "").strip()
+    except Exception as e:
+        # Laufzeitfehler (kaputte Datei o.ä.) — kein Grund, die Engine zu wechseln.
+        log.error(f"Parakeet-Transkription fehlgeschlagen: {e}")
+        return ""
+
+
+async def _transcribe_whisper(audio_path: str) -> str:
+    """whisper.cpp medium — der Stand vor dem 22.09.2026, jetzt Fallback."""
     global _whisper_model
     try:
         from pywhispercpp.model import Model

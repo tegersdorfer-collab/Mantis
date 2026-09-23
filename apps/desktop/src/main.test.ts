@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { renderGauge, renderList, triggerSpeakingState } from './main';
+import { renderGauge, renderList, triggerSpeakingState, renderHud } from './main';
 
 describe('renderGauge', () => {
   it('rendert ein SVG mit einem Kreis pro Metrik', () => {
@@ -70,5 +70,26 @@ describe('triggerSpeakingState', () => {
   it('tut nichts wenn #hud-ring nicht existiert', () => {
     document.body.innerHTML = '';
     expect(() => triggerSpeakingState()).not.toThrow();
+  });
+});
+
+
+describe('renderHud', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('läuft durch wenn die HUD-Elemente fehlen', async () => {
+    document.body.innerHTML = '';
+    // Vorher standen hier non-null-Assertions: der Zugriff schlug erst im .then()
+    // fehl, also als unbehandelte Promise-Rejection. Deshalb muss das PROMISE
+    // geprüft werden — ein rein synchrones expect(...).not.toThrow() wäre hier
+    // auch mit dem defekten Stand grün gewesen.
+    await expect(renderHud()).resolves.toBeUndefined();
+  });
+
+  it('läuft durch wenn nur ein Teil der HUD-Elemente da ist', async () => {
+    document.body.innerHTML = '<div id="hud-ring"></div>';  // label + status fehlen
+    await expect(renderHud()).resolves.toBeUndefined();
   });
 });

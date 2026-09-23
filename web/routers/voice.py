@@ -18,9 +18,57 @@ from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 from core import db
 from core.voice import transcribe_audio, is_addressed_to_mantis, mark_conversation_active, _conversation_active
 from core.voice_stream import VoiceStreamSession
-from core.tts import synthesize
+from core.tts import synthesize, synthesize_stream
 
 log = logging.getLogger("mantis.api")
+
+
+async def sende_antwort(websocket, text: str, reply: str | None, audio_streaming: bool) -> None:
+    """Schickt die Antwort — als Tonblöcke (audio_streaming) oder als ein audio_b64.
+
+    Blockweise beginnt die Wiedergabe nach dem ersten Satz statt nach der ganzen
+    Antwort (bei vier Sätzen ~0,6 s statt ~4,5 s). Der Client hält das Mikrofon
+    stummgeschaltet, bis audio_end kommt — deshalb MUSS audio_end auch im
+    Fehlerfall gesendet werden, sonst bleibt er dauerhaft stumm.
+    """
+    if not (audio_streaming and reply):
+        audio_b64 = None
+        if reply is not None:
+            try:
+                ogg = await synthesize(reply)
+            except Exception as e:
+                log.error(f"TTS für Voice-Antwort fehlgeschlagen: {e}")
+                ogg = b""
+            if ogg:
+                audio_b64 = base64.b64encode(ogg).decode("ascii")
+        await websocket.send_json(
+            {"text": text, "addressed": True, "reply": reply, "audio_b64": audio_b64})
+        return
+
+    await websocket.send_json({
+        "text": text, "addressed": True, "reply": reply,
+        "audio_b64": None, "audio_streaming": True,
+    })
+    # Erzeugen und Senden werden getrennt behandelt: Starlette meldet einen toten
+    # Client je nach ASGI-Server als RuntimeError — genau das kann aber auch aus der
+    # Synthese kommen. Ein TTS-Fehler beendet nur den Ton (audio_end folgt trotzdem),
+    # ein Sendefehler fliegt nach oben und beendet die Verbindung.
+    seq = 0
+    bloecke = synthesize_stream(reply)
+    while True:
+        try:
+            ogg = await anext(bloecke)
+        except StopAsyncIteration:
+            break
+        except Exception as e:
+            log.error(f"TTS-Streaming fehlgeschlagen: {e}")
+            break
+        await websocket.send_json({
+            "type": "audio_chunk", "seq": seq,
+            "b64": base64.b64encode(ogg).decode("ascii"),
+        })
+        seq += 1
+    await websocket.send_json({"type": "audio_end", "count": seq})
 
 
 def build_router(orch=None) -> APIRouter:
@@ -78,6 +126,11 @@ def build_router(orch=None) -> APIRouter:
         )
 
         muted = False
+        # Streaming der Antwort-Audio ist OPT-IN: Der Client meldet sich nach dem
+        # Connect mit {"type":"hello","audio":"stream"}. Ohne das bleibt es beim
+        # bisherigen Verhalten (ein audio_b64 im Ergebnis-JSON) — die iOS-Apps und
+        # der POST-Endpoint /api/voice/segment kennen das neue Protokoll nicht.
+        audio_streaming = False
         try:
             while True:
                 message = await websocket.receive()
@@ -89,6 +142,8 @@ def build_router(orch=None) -> APIRouter:
                     control = json.loads(message["text"])
                     if control.get("type") == "mute":
                         muted = bool(control.get("value", True))
+                    elif control.get("type") == "hello":
+                        audio_streaming = control.get("audio") == "stream"
                     continue
                 else:
                     continue
@@ -98,22 +153,12 @@ def build_router(orch=None) -> APIRouter:
 
                 text = result["text"]
                 reply = None
-                audio_b64 = None
                 if orch is not None:
                     reply, _trace = await orch.voice_respond(text)
                     mark_conversation_active()
-                    try:
-                        ogg = await synthesize(reply)
-                    except Exception as e:
-                        log.error(f"TTS für Voice-Antwort fehlgeschlagen: {e}")
-                        ogg = b""
-                    if ogg:
-                        audio_b64 = base64.b64encode(ogg).decode("ascii")
 
                 try:
-                    await websocket.send_json({
-                        "text": text, "addressed": True, "reply": reply, "audio_b64": audio_b64,
-                    })
+                    await sende_antwort(websocket, text, reply, audio_streaming)
                 except (WebSocketDisconnect, RuntimeError) as e:
                     # Client kann zwischen Antwortberechnung und send_json getrennt haben —
                     # Starlette meldet das je nach ASGI-Server als WebSocketDisconnect oder

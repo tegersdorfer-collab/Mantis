@@ -48,6 +48,22 @@ class MantisSettings(BaseSettings):
     # Call sofort wieder zu entladen (OLLAMA_KEEP_ALIVE="0").
     VOICE_AGENT_MODEL: str = "gemma4:e2b"
     VOICE_AGENT_KEEP_ALIVE: str = "-1"
+    # ── STT (Sprache → Text) ─────────────────────────────────────────────────
+    # "parakeet" (Default seit 22.09.2026) oder "whisper" (whisper.cpp medium, der
+    # vorherige Stand — bleibt als Fallback, wenn parakeet-mlx fehlt).
+    # Benchmark 22.09.2026 auf den 36 ECHTEN Aufnahmen aus data/wakeword/samples
+    # (Timos Stimme, echtes Mikro) — entscheidend war der Weckname, nicht der WER:
+    #   Parakeet v3   Weckname 72 %, 0,17 s/Clip
+    #   whisper medium  ... 28 %, 0,78 s/Clip   ("Mentos", "Mentis", "Ventus")
+    #   whisper turbo   ... 22 %, 1,06 s/Clip
+    # Ganze Sätze transkribieren alle drei fehlerfrei; der Unterschied liegt bei
+    # kurzen Äußerungen und Eigennamen — genau dem Voice-Alltag.
+    # TTS: "kokoro" (Default seit 22.09.2026, deutsche Stimme Martin) oder "piper".
+    # Kokoro braucht espeak-ng (brew install espeak-ng); fehlt es, greift Piper.
+    TTS_ENGINE: str = "kokoro"
+    TTS_KOKORO_VOICE: str = "dm_martin"
+    STT_ENGINE: str = "parakeet"
+    STT_PARAKEET_MODEL: str = "mlx-community/parakeet-tdt-0.6b-v3"
     ANTHROPIC_API_KEY: str = ""
     CLAUDE_CHAT_MODEL: str = "claude-haiku-4-5-20251001"
     # Voll-lokaler Betrieb: ignoriert den ANTHROPIC_API_KEY und nutzt überall Ollama
