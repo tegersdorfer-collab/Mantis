@@ -93,6 +93,9 @@ Mantis ist ein Eigenprojekt, das ich vollständig allein konzipiert, entwickelt 
 - **MCP-Server**: Mantis als Tool-Provider für Claude Code (`/mcp/` Endpunkte)
 - **LLM-Usage-Tracking**: Token + Kosten pro Call, Kosten-Dashboard in Analytics
 - **Generatives UI**: Tool-Aufrufe triggern automatisch passende Widgets
+- **God's Eye View**: Lokaler 3D-Globus als eigene Dashboard-Ansicht. Mantis kann
+  Orte, Datenebenen und Darstellungen über Chat oder seine Sprachsteuerung ändern.
+  Einrichtung und lokale Sicherheitsgrenze: [GEV-Integration](integrations/gev/README.md).
 
 ### Desktop und Forge
 - **Desktop**: Tauri + TypeScript, HUD, Text-Chat, Sprache, Live-Widgets und Verbindungseinstellungen. Siehe [Desktop-README](apps/desktop/README.md).

@@ -343,7 +343,7 @@ const NAV=[['home','⌂','Home'],['chat','◎','Chat'],['body','♡','Health'],[
   ['tasks','◻','Tasks'],['calendar','⊟','Kalender'],['nutrition','⊕','Ernährung'],
   ['journal','▤','Journal'],['goals','◈','Ziele'],['brain','⬡','Brain'],
   ['memory','◈','Memory'],['mind','◬','A.I. Mind'],['analytics','⌇','Analytics'],
-  ['globe','🌍','Globus'],['map','🗺','Karte'],['settings','⚙','Settings']];
+  ['globe','🌍','Globus'],['gev','🛰','God’s Eye View'],['map','🗺','Karte'],['settings','⚙','Settings']];
 
 const $=(s,r=document)=>r.querySelector(s);
 const el=(h)=>{const d=document.createElement('div');d.innerHTML=h.trim();return d.firstChild;};
@@ -2122,6 +2122,73 @@ VIEWS.globe=async(root)=>{
   root._cleanup=()=>{ try{ g.pauseAnimation(); g._destructor&&g._destructor(); }catch(e){} };
 };
 
+// God's Eye View läuft als lokaler Sidecar. Der authentifizierte Mantis-Kanal
+// liefert Agent-Befehle; nur der eingebettete GEV-Origin erhält sie.
+const GEV_ORIGIN='http://127.0.0.1:4173';
+let gevFrame=null, gevReady=false;
+const gevPending=new Map();
+function gevStatus(message){
+  const target=document.getElementById('gevStatus');
+  if(target)target.textContent=message;
+}
+function gevAck(id,result){
+  const pending=gevPending.get(id);
+  if(!pending)return;
+  clearTimeout(pending.timer);
+  gevPending.delete(id);
+  post('/api/gev/ack',{id,result}).catch(()=>{});
+}
+function gevSendPending(){
+  if(!gevReady||!gevFrame)return;
+  for(const [id,pending] of gevPending){
+    if(pending.sent)continue;
+    pending.sent=true;
+    gevFrame.contentWindow.postMessage({source:'mantis',...pending.command},GEV_ORIGIN);
+  }
+}
+window.addEventListener('message',event=>{
+  if(event.origin!==GEV_ORIGIN||event.source!==gevFrame?.contentWindow||event.data?.source!=='gev')return;
+  if(event.data.ready){gevReady=true;gevStatus('verbunden');gevSendPending();return;}
+  if(typeof event.data.id==='string'&&event.data.result&&typeof event.data.result.ok==='boolean'){
+    gevAck(event.data.id,event.data.result);
+  }
+});
+function gevCommand(command){
+  if(!['127.0.0.1','localhost'].includes(location.hostname)){
+    post('/api/gev/ack',{id:command.id,result:{ok:false,error:'God’s Eye View ist derzeit nur auf dem lokalen Mac verfügbar.'}}).catch(()=>{});
+    return;
+  }
+  if(CUR!=='gev')go('gev');
+  const timer=setTimeout(()=>{
+    gevAck(command.id,{ok:false,error:'God’s Eye View antwortet nicht. Lokalen Sidecar auf Port 4173 starten.'});
+  },10000);
+  gevPending.set(command.id,{command,timer,sent:false});
+  gevSendPending();
+}
+function startGevStream(){
+  const stream=new EventSource(`${API}/api/gev/stream`);
+  stream.onmessage=event=>{
+    try{const command=JSON.parse(event.data);if(command.id&&command.action)gevCommand(command);}catch(e){}
+  };
+}
+VIEWS.gev=async(root)=>{
+  root.innerHTML=`<div class="sec-hdr"><span class="sec-title">🛰 God’s Eye View</span><span id="gevStatus" style="font-size:12px;color:var(--t2)">verbinde…</span></div>
+    <div id="gevHost" style="height:75vh;min-height:420px;margin-top:10px;border:1px solid var(--bd);border-radius:12px;overflow:hidden;background:#000"></div>`;
+  if(!['127.0.0.1','localhost'].includes(location.hostname)){
+    $('#gevHost',root).innerHTML='<div style="padding:20px;color:var(--t2)">God’s Eye View ist derzeit nur auf dem Mac verfügbar, auf dem Mantis läuft.</div>';
+    gevStatus('lokal verfügbar');
+    return;
+  }
+  const frame=document.createElement('iframe');
+  frame.src=GEV_ORIGIN;
+  frame.title='God’s Eye View';
+  frame.style.cssText='width:100%;height:100%;border:0';
+  frame.setAttribute('allow','fullscreen');
+  $('#gevHost',root).appendChild(frame);
+  gevFrame=frame;gevReady=false;
+  root._cleanup=()=>{if(gevFrame===frame){gevFrame=null;gevReady=false;}};
+};
+
 VIEWS.map=async(root)=>{
   root.innerHTML=`
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
@@ -2498,7 +2565,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catc
   },{passive:true});
 })();
 
-api('/api/status').then(()=>{status();startStatusStream();go('home');}).catch(()=>{});
+api('/api/status').then(()=>{status();startStatusStream();startGevStream();go('home');}).catch(()=>{});
 </script>
 </body>
 </html>

@@ -33,6 +33,7 @@ from . import (
     spotify,
     uiauto,
     geo,
+    gev,
     email,
 )
 
