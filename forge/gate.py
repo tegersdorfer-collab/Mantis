@@ -90,6 +90,9 @@ GATE_DATABASE_URL = "postgresql://localhost:1/forge-gate-ohne-db"
 class GateErgebnis:
     ok: bool
     gruende: list[str] = field(default_factory=list)
+    diff: str = ""
+    tests_output: str = ""
+    lint_output: str = ""
 
 
 def _normalisiere_pfad(pfad: str) -> str:
@@ -263,7 +266,18 @@ _PYTEST_ARGV = [sys.executable, "-m", "pytest", "-q"]
 _RUFF_ARGV = [sys.executable, "-m", "ruff", "check", "."]
 
 
-def _tests_pruefen(worktree: Path) -> str | None:
+def _ausgabe_text(stdout: str | bytes | None, stderr: str | bytes | None = None) -> str:
+    """Vereinheitlicht auch TimeoutExpired-Ausgaben für optionale Traces."""
+    teile = []
+    for wert in (stdout, stderr):
+        if isinstance(wert, bytes):
+            wert = wert.decode("utf-8", errors="replace")
+        if wert:
+            teile.append(str(wert))
+    return "\n".join(teile)
+
+
+def _tests_ausfuehren(worktree: Path) -> tuple[str | None, str]:
     """Führt die Suite aus. Timeout oder ein fehlendes Interpreter-Binary
     dürfen niemals als Exception aus pruefe() herausschlagen — pruefe() läuft
     im Daemon-Tick, und unter launchd ist PATH nicht die interaktive Shell."""
@@ -275,17 +289,24 @@ def _tests_pruefen(worktree: Path) -> str | None:
             _PYTEST_ARGV, cwd=str(worktree), env=umgebung,
             capture_output=True, text=True, timeout=_TEST_TIMEOUT_SEKUNDEN,
         )
-    except subprocess.TimeoutExpired:
-        return f"Tests rot: Zeitüberschreitung nach {_TEST_TIMEOUT_SEKUNDEN}s"
+    except subprocess.TimeoutExpired as exc:
+        return (f"Tests rot: Zeitüberschreitung nach {_TEST_TIMEOUT_SEKUNDEN}s",
+                _ausgabe_text(exc.stdout, exc.stderr))
     except OSError as exc:
-        return f"Tests rot: Aufruf fehlgeschlagen ({exc})"
+        return f"Tests rot: Aufruf fehlgeschlagen ({exc})", str(exc)
+    output = _ausgabe_text(ergebnis.stdout, ergebnis.stderr)
     if ergebnis.returncode != 0:
         letzte_zeile = ergebnis.stdout.strip().splitlines()[-1] if ergebnis.stdout else "ohne Ausgabe"
-        return f"Tests rot: {letzte_zeile}"
-    return None
+        return f"Tests rot: {letzte_zeile}", output
+    return None, output
 
 
-def _lint_pruefen(worktree: Path) -> str | None:
+def _tests_pruefen(worktree: Path) -> str | None:
+    """Kompatibler Wrapper für Aufrufer, die nur den Fehlergrund brauchen."""
+    return _tests_ausfuehren(worktree)[0]
+
+
+def _lint_ausfuehren(worktree: Path) -> tuple[str | None, str]:
     """Wie _tests_pruefen: Timeout und fehlendes Binary werden zu einem Grund,
     nicht zu einer Exception."""
     try:
@@ -293,14 +314,21 @@ def _lint_pruefen(worktree: Path) -> str | None:
             _RUFF_ARGV, cwd=str(worktree),
             capture_output=True, text=True, timeout=_LINT_TIMEOUT_SEKUNDEN,
         )
-    except subprocess.TimeoutExpired:
-        return f"ruff meldet Befunde: Zeitüberschreitung nach {_LINT_TIMEOUT_SEKUNDEN}s"
+    except subprocess.TimeoutExpired as exc:
+        return (f"ruff meldet Befunde: Zeitüberschreitung nach {_LINT_TIMEOUT_SEKUNDEN}s",
+                _ausgabe_text(exc.stdout, exc.stderr))
     except OSError as exc:
-        return f"ruff meldet Befunde: Aufruf fehlgeschlagen ({exc})"
+        return f"ruff meldet Befunde: Aufruf fehlgeschlagen ({exc})", str(exc)
+    output = _ausgabe_text(ergebnis.stdout, ergebnis.stderr)
     if ergebnis.returncode != 0:
         letzte_zeile = ergebnis.stdout.strip().splitlines()[-1] if ergebnis.stdout else "ohne Ausgabe"
-        return f"ruff meldet Befunde: {letzte_zeile}"
-    return None
+        return f"ruff meldet Befunde: {letzte_zeile}", output
+    return None, output
+
+
+def _lint_pruefen(worktree: Path) -> str | None:
+    """Kompatibler Wrapper für Aufrufer, die nur den Fehlergrund brauchen."""
+    return _lint_ausfuehren(worktree)[0]
 
 
 def pruefe(worktree: Path, basis: str = "main") -> GateErgebnis:
@@ -339,6 +367,9 @@ def pruefe(worktree: Path, basis: str = "main") -> GateErgebnis:
     if not verdikt_ok:
         gruende.append(f"Review-Verdikt negativ: {len(befunde)} harte Befunde")
 
+    diff_ergebnis = gitctl.run("diff", "--no-ext-diff", f"{basis}...HEAD", cwd=baum)
+    diff = (diff_ergebnis.stdout or "") if diff_ergebnis.returncode == 0 else ""
+
     # Abschluss-Review 2c, I1: ein Diff, der eine Sperrzone berührt oder die
     # erlaubten Zonen verlässt, ist durch nichts mergefähig, was die Tests
     # beweisen könnten. Die billigen Gründe oben stehen trotzdem alle im
@@ -346,14 +377,20 @@ def pruefe(worktree: Path, basis: str = "main") -> GateErgebnis:
     # entfallen — und mit ihnen ein Lauf agentengeschriebener Tests für einen
     # ohnehin verlorenen Task.
     if verboten or draussen:
-        return GateErgebnis(ok=False, gruende=gruende)
+        return GateErgebnis(ok=False, gruende=gruende, diff=diff)
 
-    tests_grund = _tests_pruefen(baum)
+    tests_grund, tests_output = _tests_ausfuehren(baum)
     if tests_grund:
         gruende.append(tests_grund)
 
-    lint_grund = _lint_pruefen(baum)
+    lint_grund, lint_output = _lint_ausfuehren(baum)
     if lint_grund:
         gruende.append(lint_grund)
 
-    return GateErgebnis(ok=not gruende, gruende=gruende)
+    return GateErgebnis(
+        ok=not gruende,
+        gruende=gruende,
+        diff=diff,
+        tests_output=tests_output,
+        lint_output=lint_output,
+    )

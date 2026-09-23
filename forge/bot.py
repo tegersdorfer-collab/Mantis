@@ -21,7 +21,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, Messag
 
 from core import db
 
-from forge import bericht, daemon, freigabe, journal, melden, queue
+from forge import bericht, daemon, freigabe, journal, melden, queue, spuren
 from forge import models as m
 
 log = logging.getLogger(__name__)
@@ -124,6 +124,7 @@ def _verwerfen(task_id: int) -> Antwort:
     if not queue.park(task_id, m.QUEUED, "verworfen via Telegram"):
         return Antwort(f"#{task_id} ist inzwischen aktiv — nichts getan")
     journal.log(task_id, "parked", "Verworfen via Telegram")
+    spuren.verdict(task_id, "verworfen", note="Verworfen via Telegram")
     return Antwort(f"#{task_id} verworfen (geparkt)", [[("Zurückholen", f"requeue:{task_id}")]])
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from jevkit import Choice, Noul, Score
 
 import config
 from core import decide
+from forge import spuren
 
 log = logging.getLogger(__name__)
 
@@ -113,7 +115,7 @@ def _log_answers(answers: dict[str, decide.Answer], state: dict[str, str]) -> No
         log.debug("Forge-Jev-Log fehlgeschlagen: %r", exc)
 
 
-async def entscheide(task: dict) -> PreflightResult:
+async def _entscheide(task: dict) -> PreflightResult:
     """Klassifiziert einen Task oder liefert einen sicheren No-op-Fallback."""
     if not getattr(config, "JEV_FORGE_GATE_ENABLED", False):
         return PreflightResult(status="disabled")
@@ -162,6 +164,31 @@ async def entscheide(task: dict) -> PreflightResult:
             reason="; ".join(reasons),
         )
     return PreflightResult(status="ready", mode=mode, risk=risk, external=external)
+
+
+async def entscheide(task: dict) -> PreflightResult:
+    """Führt die Vorprüfung aus und hängt ihr Ergebnis an die Task-Trace-Kette."""
+    start = time.monotonic()
+    result = await _entscheide(task)
+    status = "ok" if result.status == "ready" else "fail" if result.status == "blocked" else "error"
+    score = 1.0 if result.status == "ready" else 0.0 if result.status == "blocked" else None
+    try:
+        spuren.record(
+            task.get("id"),
+            "gate",
+            input={"phase": "jev", "gate_status": result.status},
+            output={
+                "mode": result.mode,
+                "risk": result.risk,
+                "external": result.external,
+                "reason": result.reason,
+            },
+            cost={"seconds": max(0.0, time.monotonic() - start), "usd": None},
+            result={"status": status, "score": score, "metrics": {"external": result.external}},
+        )
+    except Exception as exc:
+        log.debug("Forge-Spuren-Jev-Gate fehlgeschlagen (%s)", type(exc).__name__)
+    return result
 
 
 def _aus_dict(payload: object) -> PreflightResult | None:
