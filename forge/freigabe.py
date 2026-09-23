@@ -9,7 +9,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from forge import MANTIS_REPO, daemon, gitctl, journal, queue, worktree
+from forge import MANTIS_REPO, daemon, gitctl, journal, queue, spuren, worktree
 from forge import models as m
 from forge.pipeline import BASIS_BRANCH
 
@@ -77,7 +77,8 @@ def freigeben(task_id: int, repo: Path | None = None) -> str:
             gitctl.run("merge", "--abort", cwd=baum)
             grund = (f"main hat sich bewegt und {zweig} lässt sich nicht konfliktfrei nachziehen: "
                      f"{(nachziehen.stderr or '').strip()[:300]}")
-            queue.park(task_id, current=m.AWAITING_APPROVAL, reason=grund)
+            if queue.park(task_id, current=m.AWAITING_APPROVAL, reason=grund):
+                spuren.verdict(task_id, "geparkt", note=grund)
             journal.log(task_id, "parked", grund)
             return "konflikt"
 
@@ -87,7 +88,8 @@ def freigeben(task_id: int, repo: Path | None = None) -> str:
     if merge.returncode != 0:
         gitctl.run("merge", "--abort", cwd=quelle)
         grund = f"Merge von {zweig} nach main fehlgeschlagen: {(merge.stderr or '').strip()[:300]}"
-        queue.park(task_id, current=m.AWAITING_APPROVAL, reason=grund)
+        if queue.park(task_id, current=m.AWAITING_APPROVAL, reason=grund):
+            spuren.verdict(task_id, "geparkt", note=grund)
         journal.log(task_id, "parked", grund)
         return "konflikt"
 
@@ -95,6 +97,7 @@ def freigeben(task_id: int, repo: Path | None = None) -> str:
         # Gemerged ist gemerged — den Zustand nicht zurückdrehen, aber laut sein.
         log.error(f"Forge-Freigabe: Task {task_id} ist gemerged, aber der Zustandswechsel schlug fehl")
     journal.log(task_id, "merged", f"{zweig} nach {BASIS_BRANCH} gemerged (Freigabe)")
+    spuren.verdict(task_id, "gemerged", note=f"{zweig} nach {BASIS_BRANCH} gemerged")
     worktree.remove(task_id, repo=quelle)
     gitctl.run("branch", "-d", zweig, cwd=quelle)
     return "gemerged"
@@ -105,6 +108,7 @@ def ablehnen(task_id: int, grund: str) -> bool:
     ok = queue.park(task_id, current=m.AWAITING_APPROVAL, reason=f"Abgelehnt: {grund}")
     if ok:
         journal.log(task_id, "parked", f"Abgelehnt: {grund}")
+        spuren.verdict(task_id, "verworfen", note=grund)
     return ok
 
 

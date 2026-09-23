@@ -32,7 +32,7 @@ import re
 import time
 from pathlib import Path
 
-from forge import backends, budget, gate, gitctl, journal, ketten, models as m, queue, runner, stages
+from forge import backends, budget, gate, gitctl, journal, ketten, models as m, queue, runner, spuren, stages
 
 log = logging.getLogger(__name__)
 
@@ -587,6 +587,7 @@ def _park(task_id: int, state: str, grund: str) -> None:
         # Grund bleibt sichtbar; ein zweiter park()-Aufruf hier würde nur noch
         # an dem inzwischen falschen Ausgangszustand scheitern (CAS) und einen
         # irreführenden 'nicht angenommen'-Eintrag erzeugen.
+        spuren.verdict(task_id, "geparkt", note=grund)
         return
     # Wie forge.daemon.tick(): ein verworfener park()-Aufruf darf nicht
     # spurlos bleiben, sonst hält ein Task, den weder set_state noch park
@@ -594,6 +595,114 @@ def _park(task_id: int, state: str, grund: str) -> None:
     if not queue.park(task_id, current=state, reason=grund):
         journal.log(task_id, "stage_failed",
                      f"park() hat Task {task_id} nicht angenommen (Zustand '{state}')")
+    else:
+        spuren.verdict(task_id, "geparkt", note=grund)
+
+
+def _trace_basis_commit(worktree: Path) -> str | None:
+    """Liefert den HEAD vor einem Lauf; Trace-Metadaten dürfen nie blockieren."""
+    if not spuren.bereit():
+        return None
+    try:
+        result = gitctl.run("rev-parse", "HEAD", cwd=worktree)
+        if result.returncode == 0:
+            return (result.stdout or "").strip() or None
+    except Exception as exc:
+        log.debug("Forge-Spuren: Basis-Commit nicht lesbar (%s)", type(exc).__name__)
+    return None
+
+
+def _trace_stufe(task_id: int, stufe: stages.Stage, backend: str, modell: str,
+                 worktree: Path, basis_commit: str | None, prompt: str,
+                 ergebnis: runner.RunResult, start: float) -> None:
+    """Hängt einen Agentenlauf an die Task-Kette, ohne den Lauf zu beeinflussen."""
+    if not spuren.bereit():
+        return
+    status = (
+        "quota" if ergebnis.rate_limited else
+        "timeout" if _ist_timeout(ergebnis) else
+        "ok" if ergebnis.ok else "fail"
+    )
+    text = ergebnis.text or ""
+    ausgabe = text or (ergebnis.error or "")
+    blobs: dict[str, str] = {"prompt": prompt, "ausgabe": ausgabe}
+    if ergebnis.raw:
+        try:
+            blobs["stream"] = json.dumps(ergebnis.raw, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            pass
+    eingabe = {
+        "stufe": stufe.name,
+        "backend": backend,
+        "modell": modell,
+        "profil": {
+            "allowed": list(getattr(stufe.profile, "allowed", ())),
+            "mode": getattr(stufe.profile, "mode", None),
+        },
+        "worktree": str(worktree),
+        "basis_commit": basis_commit,
+    }
+    try:
+        spuren.record(
+            task_id,
+            "stage",
+            input=eingabe,
+            output={
+                "text_length": len(text),
+                "error": ergebnis.error or "",
+                "denials": ergebnis.denials or [],
+            },
+            blobs=blobs,
+            cost={
+                "seconds": max(0.0, time.monotonic() - start),
+                "tokens_in": ergebnis.tokens_in,
+                "tokens_out": ergebnis.tokens_out,
+                "cache_read": ergebnis.cache_read,
+                "usd": None,
+            },
+            result={
+                "status": status,
+                "score": None,
+                "metrics": {"denials": len(ergebnis.denials or [])},
+            },
+        )
+    except Exception as exc:
+        log.debug("Forge-Spuren-Stufe fehlgeschlagen (%s)", type(exc).__name__)
+
+
+def _trace_review(task_id: int, stufe: stages.Stage, backend: str, modell: str,
+                  worktree: Path) -> None:
+    """Speichert das LLM-Review als Gate-Entscheidung mit dem beurteilten Diff."""
+    if not spuren.bereit():
+        return
+    review_path = Path(worktree) / stages.VERDIKT_DATEI
+    try:
+        review_text = review_path.read_text(encoding="utf-8") if review_path.is_file() else ""
+        try:
+            daten = json.loads(review_text) if review_text else {}
+        except (TypeError, ValueError):
+            daten = {}
+        if not isinstance(daten, dict):
+            daten = {}
+        negativ = _hat_negatives_verdikt(worktree)
+        score = 0.0 if negativ else (1.0 if daten.get("verdict") == "pass" else None)
+        status = "fail" if negativ else ("ok" if score == 1.0 else "error")
+        findings = daten.get("findings", [])
+        anzahl_befunde = len(findings) if isinstance(findings, list) else 0
+        diff_path = Path(worktree) / stages.DIFF_DATEI
+        blobs = {"review": review_text}
+        if diff_path.is_file():
+            blobs["diff"] = diff_path.read_text(encoding="utf-8", errors="replace")
+        spuren.record(
+            task_id,
+            "gate",
+            input={"phase": "review", "stufe": stufe.name, "backend": backend, "modell": modell},
+            output={"verdict": daten.get("verdict"), "findings": daten.get("findings", [])},
+            blobs=blobs,
+            result={"status": status, "score": score, "metrics": {"findings": anzahl_befunde}},
+        )
+    except Exception as exc:
+        log.debug("Forge-Spuren-Review fehlgeschlagen (%s)", type(exc).__name__)
 
 
 def eine_stufe(task: dict, worktree: Path) -> str:
@@ -618,7 +727,9 @@ def eine_stufe(task: dict, worktree: Path) -> str:
         except Exception:
             pass
         try:
-            queue.park(task_id, current=state, reason=grund)
+            geparkt = queue.park(task_id, current=state, reason=grund)
+            if geparkt:
+                spuren.verdict(task_id, "geparkt", note=grund)
         except Exception:
             pass
         return "geparkt"
@@ -700,6 +811,7 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path,
                      f"Nacht raus; Task {task_id} bleibt liegen (kein Park)")
             log.warning(f"Forge-Pipeline: {grund}")
             journal.log(task_id, "kontingent", grund)
+            spuren.verdict(task_id, "kontingent", note=grund)
             return "kontingent"
         # Reviewer-Kollision: übrig bliebe nur das Modell, das implementiert
         # hat. Hier verlangt die Spec (Zeile 183) ausdrücklich Parken — ein
@@ -736,7 +848,8 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path,
     start = time.time()
     # Vorher: ergebnis = runner.run(prompt, cwd=worktree, profile=stufe.profile,
     #                               timeout=stufe.timeout)
-
+    basis_commit = _trace_basis_commit(worktree)
+    trace_start = time.monotonic()
     ergebnis = backends.hole(backend_name)(
         prompt, cwd=worktree, timeout=stufe.timeout,
         agent=stufe.name, model=modell,
@@ -762,6 +875,11 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path,
     zeitueberschreitung_geliefert = False
     if not ergebnis.ok and not ergebnis.rate_limited and _ist_timeout(ergebnis):
         zeitueberschreitung_geliefert, zeitueberschreitung_pfad = _timeout_produkt(stufe, task, worktree, start)
+
+    _trace_stufe(task_id, stufe, backend_name, modell, worktree, basis_commit,
+                 prompt, ergebnis, trace_start)
+    if stufe.name == "review":
+        _trace_review(task_id, stufe, backend_name, modell, worktree)
 
     if ergebnis.ok:
         journal.log(
@@ -795,6 +913,7 @@ def _eine_stufe_intern(task: dict, task_id: int, state: str, worktree: Path,
             journal.log(task_id, "kontingent",
                         f"Rate-Limit hat die Kette für Stufe '{stufe.name}' geleert — "
                         f"Task {task_id} bleibt liegen")
+            spuren.verdict(task_id, "kontingent", note=f"Rate-Limit hat die Kette für Stufe '{stufe.name}' geleert")
             return "kontingent"
         return "fehler"
 

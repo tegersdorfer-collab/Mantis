@@ -31,7 +31,7 @@ from pathlib import Path
 
 from core import db
 
-from forge import MANTIS_REPO, gate, journal, jev_gate, melden, pipeline, queue, worktree
+from forge import MANTIS_REPO, gate, journal, jev_gate, melden, pipeline, queue, spuren, worktree
 from forge import models as m
 
 log = logging.getLogger(__name__)
@@ -99,6 +99,17 @@ def halt_angefordert() -> bool:
     return HALT_FILE.exists()
 
 
+def _trace_stop_aktiven_task() -> None:
+    """Hängt ein Stop-Urteil an den aktiven Task, sofern einer weiterläuft."""
+    try:
+        task = queue.active()
+    except Exception as exc:
+        log.debug("Forge-Spuren: aktiver Task für Stop-Urteil nicht lesbar (%s)", type(exc).__name__)
+        return
+    if task is not None:
+        spuren.verdict(task["id"], "gestoppt", note="Weicher Stop angefordert")
+
+
 def lade_api_schluessel(datei: Path = API_SCHLUESSEL_DATEI, nur: frozenset[str] | None = None) -> list[str]:
     """Lädt `KEY=WERT`-Zeilen (auch mit `export`, auch in Anführungszeichen)
     in os.environ — nur Variablen, die dort noch fehlen. Rückgabe: die Namen
@@ -143,10 +154,13 @@ def _park(task_id: int, current: str, reason: str) -> None:
         # Schwelle bereits erreicht — queue.zaehle_fehlschlag hat den Task
         # automatisch geparkt. Ein zweiter park()-Aufruf mit dem spezifischeren
         # Grund würde nur noch am inzwischen falschen Ausgangszustand scheitern.
+        spuren.verdict(task_id, "geparkt", note=reason)
         return
     if not queue.park(task_id, current=current, reason=reason):
         journal.log(task_id, "stage_failed",
                      f"park() hat Task {task_id} nicht angenommen (Zustand '{current}')")
+    else:
+        spuren.verdict(task_id, "geparkt", note=reason)
 
 
 def _gate_und_abschliessen(task_id: int, baum: Path) -> str:
@@ -158,7 +172,29 @@ def _gate_und_abschliessen(task_id: int, baum: Path) -> str:
     Rückgabe: 'fertig' bei grünem Gate, 'geparkt' bei rotem oder wenn der
     Zustandswechsel selbst scheitert (CAS verloren).
     """
+    start = time.monotonic()
     ergebnis = gate.pruefe(baum)
+    gate_blobs = {}
+    for name, value in (
+        ("diff", getattr(ergebnis, "diff", "")),
+        ("tests", getattr(ergebnis, "tests_output", "")),
+        ("lint", getattr(ergebnis, "lint_output", "")),
+    ):
+        if value:
+            gate_blobs[name] = value
+    spuren.record(
+        task_id,
+        "gate",
+        input={"phase": "deterministisch", "worktree": str(baum)},
+        output={"ok": bool(ergebnis.ok), "gruende": list(ergebnis.gruende)},
+        blobs=gate_blobs,
+        cost={"seconds": max(0.0, time.monotonic() - start), "usd": None},
+        result={
+            "status": "ok" if ergebnis.ok else "fail",
+            "score": 1.0 if ergebnis.ok else 0.0,
+            "metrics": {"gruende": len(ergebnis.gruende)},
+        },
+    )
     if ergebnis.ok:
         journal.log(task_id, "gate_pass", "Gate bestanden — wartet auf Freigabe (forge.cli approve)")
         if not queue.set_state(task_id, m.AWAITING_APPROVAL, current=m.GATING):
@@ -246,6 +282,8 @@ def tick() -> str:
             geparkt = queue.park(task_id, current=state, reason=f"Tick-Absturz: {exc}")
             if not geparkt:
                 log.error(f"Forge: Task {task_id} nach Absturz nicht parkbar — bleibt aktiv")
+            else:
+                spuren.verdict(task_id, "geparkt", note="Tick-Absturz")
         except Exception:
             # Das Parken selbst darf die ursprüngliche Ausnahme nicht verdecken.
             log.exception(f"Forge: Parken nach Absturz für Task {task_id} selbst gescheitert")
@@ -306,6 +344,7 @@ def main() -> None:
     failures = 0
     while True:
         if halt_angefordert():
+            _trace_stop_aktiven_task()
             journal.log(None, "daemon_stop", "Weicher Stop angefordert (forge.cli stop) — Daemon beendet sich")
             log.info("Forge: weicher Stop")
             HALT_FILE.unlink(missing_ok=True)
