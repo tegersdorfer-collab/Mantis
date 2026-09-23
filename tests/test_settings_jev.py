@@ -23,3 +23,9 @@ def test_jev_aus_env(monkeypatch):
     monkeypatch.setenv("TYPESAFE_API_KEY", "sk-test")
     s = MantisSettings(_env_file=None)
     assert s.JEV_ENABLED is True and s.TYPESAFE_API_KEY == "sk-test"
+
+
+def test_local_logits_sind_standardmaessig_aus_und_timeout_ist_kurz():
+    s = MantisSettings(_env_file=None)
+    assert s.LOCAL_LOGITS_ENABLED is False
+    assert s.LOCAL_LOGITS_TIMEOUT_S == 8.0

@@ -49,6 +49,7 @@ class Answer:
     probabilities: dict[str, float] = field(default_factory=dict)
     model: str = ""                 # Decision.model (welches Modell geantwortet hat)
     raw: object = None              # die rohe jevkit-Answer, fürs Log (core/decisions.py)
+    metadata: dict[str, object] = field(default_factory=dict)  # lokale Hinweise, z.B. fehlende Logit-Labels
 
     def sure(self, threshold: float = 0.5) -> bool:
         return self.confidence >= threshold

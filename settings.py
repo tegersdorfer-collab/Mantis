@@ -67,6 +67,9 @@ class MantisSettings(BaseSettings):
     # Der direkte TypeSafe-Endpunkt ist der Produktionspfad; OpenRouter bleibt
     # als explizite Vergleichs-/Fallback-Option konfigurierbar.
     JEV_ENABLED: bool = False
+    # Lokale Label-Logits sind nur der kalibrierbare Fallback bei Jev-Ausfall.
+    LOCAL_LOGITS_ENABLED: bool = False
+    LOCAL_LOGITS_TIMEOUT_S: float = 8.0
     # Zusätzliche Forge-Klassifikation ist separat opt-in; der bestehende
     # Assistant-Jev darf dadurch nicht automatisch Agenten-Tasks beeinflussen.
     JEV_FORGE_GATE_ENABLED: bool = False
