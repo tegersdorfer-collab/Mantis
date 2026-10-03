@@ -90,9 +90,14 @@ class MantisSettings(BaseSettings):
     # Assistant-Jev darf dadurch nicht automatisch Agenten-Tasks beeinflussen.
     JEV_FORGE_GATE_ENABLED: bool = False
     JEV_PROVIDER: str = "typesafe"
+    # Leer = kompatibler Einzel-Provider aus JEV_PROVIDER; sonst Reihenfolge wie angegeben.
+    JEV_PROVIDER_CHAIN: str = ""
     TYPESAFE_API_KEY: str = ""
     OPENROUTER_API_KEY: str = ""
     JEV_MODEL: str = "jev-latest"
+    CLEF_MODEL: str = "clef-flash"
+    CLOUDFLARE_ACCOUNT_ID: str = ""
+    CLOUDFLARE_AUTH_TOKEN: str = ""
     JEV_TIMEOUT_S: float = 3.0      # danach lokaler Fallback
     JEV_COOLDOWN_S: float = 120.0   # nach Fehler: so lange kein Jev-Versuch
     JEV_UI_ACT_CONFIDENCE: float = 0.55  # konservative Mindest-Confidence für UI-Aktionen

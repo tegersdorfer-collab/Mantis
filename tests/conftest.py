@@ -11,5 +11,6 @@ from core import decide
 @pytest.fixture(autouse=True)
 def _jev_aus(monkeypatch):
     monkeypatch.setattr(decide.config, "JEV_ENABLED", False)
+    monkeypatch.setattr(decide.config, "JEV_PROVIDER_CHAIN", "")
     monkeypatch.setenv("FORGE_SPUREN", "0")
     decide.reset_for_tests()

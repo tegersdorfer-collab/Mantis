@@ -1,36 +1,48 @@
-"""
-Jev-Entscheidungs-Engine für Mantis — dünne Schicht über `jevkit`.
+"""Provider-Kette für Mantis-Entscheidungen, mit lokalem Fallback bei Ausfällen.
 
-Warum nicht das Ollama-Modell: Jev liefert kalibrierte Wahrscheinlichkeiten statt
-`startswith("JA")`, braucht ~0.4 s und hält den globalen Ollama-GATE nicht.
-Benchmark 2026-09-18 in bench/jev/ (86/92, Brier 0.048).
-
-Vertrag (unverändert): `decide()` liefert entweder vollständige Antworten oder wirft
-JevUnavailable — die Aufrufer (core/decisions.py) fallen dann auf den lokalen Pfad
-zurück. Circuit-Breaker, Zeitbudget, Typ-Prüfung und Cache leben in jevkit.Client;
-hier bleibt nur die Mantis-Config-Anbindung und der alte `Answer`-Typ für die Aufrufer.
+Cloudflare Clef wird zuerst versucht, danach die konfigurierten Jev-Provider. Eine
+leere ``JEV_PROVIDER_CHAIN`` verwendet aus Rückwärtskompatibilität ausschließlich
+``JEV_PROVIDER``. ``decide()`` liefert vollständige Antworten oder wirft
+``JevUnavailable``; die Aufrufer in ``core/decisions.py`` fallen dann lokal zurück.
+Jeder Provider hat einen eigenen Circuit-Breaker. Pro Versuch gilt
+``JEV_TIMEOUT_S``, über alle Versuche zusammen höchstens das Doppelte.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import jevkit
 from jevkit import Choice, JevUnavailable, Noul, Score  # noqa: F401  (re-export für Aufrufer)
 
 import config
+from core.decide_cloudflare import CloudflareBackend, CloudflareQuotaError
 
 log = logging.getLogger(__name__)
 
 # Nur für Tests austauschbar (httpx.MockTransport). Produktion: None = echtes Netz.
 _transport: httpx.AsyncBaseTransport | None = None
-_down_until: float = 0.0
+_down_until: dict[str, float] = {}
+_active_provider: str | None = None
+
+
+def _monotonic() -> float:
+    """Wrappbarer Zeitgeber für Gesamtbudget und Circuit-Breaker."""
+    return time.monotonic()
+
+
+def _utcnow() -> datetime:
+    """Wrappbarer UTC-Zeitgeber für Cloudflares Tageskontingent."""
+    return datetime.now(timezone.utc)
 
 # Modellpräfixe, für die die Bänder in core/decisions.py kalibriert sind. Der
 # direkte TypeSafe-Endpunkt und OpenRouter geben unterschiedliche IDs zurück.
 JEV_EXPECTED_MODELS = {
+    "cloudflare": str(config.CLEF_MODEL).strip() or "clef-flash",
     "typesafe": "jev-1.13",
     "openrouter": "typesafe/jev-1.13",
 }
@@ -66,20 +78,54 @@ class Answer:
 
 
 def enabled() -> bool:
-    """Opt-in gesetzt, Key da, kein Cooldown."""
-    provider = str(config.JEV_PROVIDER).strip().lower()
-    key = config.TYPESAFE_API_KEY if provider == "typesafe" else config.OPENROUTER_API_KEY
-    return bool(config.JEV_ENABLED and provider in JEV_EXPECTED_MODELS and key) and time.monotonic() >= _down_until
+    """True, wenn mindestens ein aktivierter Provider Credentials hat und verfügbar ist."""
+    if not config.JEV_ENABLED:
+        return False
+    now = _monotonic()
+    return any(
+        provider in JEV_EXPECTED_MODELS
+        and _provider_has_credentials(provider)
+        and now >= _down_until.get(provider, 0.0)
+        for provider in provider_chain()
+    )
+
+
+def provider_chain() -> list[str]:
+    """Gibt die konfigurierte Kette oder den kompatiblen Einzel-Provider zurück."""
+    configured = str(getattr(config, "JEV_PROVIDER_CHAIN", "") or "")
+    providers = list(dict.fromkeys(part.strip().lower() for part in configured.split(",") if part.strip()))
+    if providers:
+        return providers
+    legacy = str(config.JEV_PROVIDER).strip().lower()
+    return [legacy] if legacy else []
+
+
+def expected_model(provider: str) -> str:
+    """Präfix, das jevkit für den gewählten Provider erwarten soll."""
+    if provider == "cloudflare":
+        return str(config.CLEF_MODEL).strip() or "clef-flash"
+    return JEV_EXPECTED_MODELS[provider]
+
+
+def _provider_has_credentials(provider: str) -> bool:
+    if provider == "cloudflare":
+        return bool(str(config.CLOUDFLARE_ACCOUNT_ID).strip() and str(config.CLOUDFLARE_AUTH_TOKEN).strip())
+    if provider == "openrouter":
+        return bool(str(config.OPENROUTER_API_KEY).strip())
+    if provider == "typesafe":
+        return bool(str(config.TYPESAFE_API_KEY).strip())
+    return False
 
 
 def reset_for_tests() -> None:
-    global _down_until
-    _down_until = 0.0
+    global _active_provider
+    _down_until.clear()
+    _active_provider = None
 
 
-def client() -> jevkit.Client:
-    """Frischer Client aus der aktuellen Config; der Breaker-Zustand ist modulweit."""
-    provider = str(config.JEV_PROVIDER).strip().lower()
+def client(provider: str | None = None, *, timeout_s: float | None = None) -> jevkit.Client:
+    """Frischer Client für einen Provider; dessen Breaker-Zustand ist modulweit."""
+    provider = (provider or (provider_chain() or [""])[0]).strip().lower()
     if provider == "typesafe":
         model = config.JEV_MODEL.removeprefix("~typesafe/") or "jev-latest"
         backend = jevkit.TypeSafeBackend(config.TYPESAFE_API_KEY, model=model,
@@ -90,27 +136,91 @@ def client() -> jevkit.Client:
             model = "~typesafe/jev-latest"
         backend = jevkit.OpenRouterBackend(config.OPENROUTER_API_KEY, model=model,
                                            transport=_transport, retries=0)
+    elif provider == "cloudflare":
+        model = str(config.CLEF_MODEL).strip() or "clef-flash"
+        backend = CloudflareBackend(
+            config.CLOUDFLARE_ACCOUNT_ID,
+            config.CLOUDFLARE_AUTH_TOKEN,
+            model=model,
+            transport=_transport,
+        )
     else:
         raise JevUnavailable(f"unbekannter Jev-Provider: {provider}")
-    c = jevkit.Client(backend, model=model, timeout_s=config.JEV_TIMEOUT_S,
+    c = jevkit.Client(backend, model=model, timeout_s=timeout_s or config.JEV_TIMEOUT_S,
                       cooldown_s=config.JEV_COOLDOWN_S,
-                      expected_model=JEV_EXPECTED_MODELS[provider])
-    c._down_until = _down_until
+                      expected_model=expected_model(provider), clock=_monotonic)
+    c._down_until = _down_until.get(provider, 0.0)
     return c
 
 
 async def decide(state: str | dict | list, questions: dict[str, Noul | Choice | Score]) -> dict[str, Answer]:
-    """Ein Call, alle Fragen parallel gegen denselben State. Wirft JevUnavailable."""
-    global _down_until
+    """Fragt Provider der Reihe nach; wirft JevUnavailable, wenn keiner antwortet."""
     if not enabled():
-        raise JevUnavailable("Jev aus, kein Key oder im Cooldown")
-    c = client()
-    try:
-        d = await c.decide(state, questions)
-    finally:
-        # Nur vorwärts spiegeln: bei parallelen decide()-Calls hat jeder Call seinen
-        # eigenen Client mit dem zu seinem Start gültigen Breaker-Stand. Ein langsamer
-        # erfolgreicher Call darf den Breaker nicht wieder schließen, den ein
-        # inzwischen fertiger, fehlgeschlagener Call geöffnet hat (Lost Update).
-        _down_until = max(_down_until, c._down_until)
-    return {qid: Answer.from_jevkit(a, model=d.model) for qid, a in d.answers.items()}
+        raise JevUnavailable("Jev aus, kein Provider mit Credentials oder alle im Cooldown")
+
+    providers = provider_chain()
+    configured_timeout = max(0.0, float(config.JEV_TIMEOUT_S))
+    started = _monotonic()
+    deadline = started + 2 * configured_timeout
+    attempted = False
+    last_provider = ""
+    switch_reason = "Fallback in der konfigurierten Provider-Kette"
+
+    global _active_provider
+    if _active_provider is None and providers:
+        _active_provider = providers[0]
+
+    for provider in providers:
+        if provider not in JEV_EXPECTED_MODELS or not _provider_has_credentials(provider):
+            switch_reason = f"{provider} ohne Credentials oder unbekannt"
+            continue
+        now = _monotonic()
+        if now < _down_until.get(provider, 0.0):
+            switch_reason = f"{provider} im Cooldown"
+            continue
+        remaining = deadline - now
+        if remaining <= 0 or configured_timeout <= 0:
+            break
+        attempt_timeout = min(configured_timeout, remaining)
+
+        if _active_provider != provider:
+            log.info("Jev-Providerwechsel: %s → %s (%s)", _active_provider, provider, switch_reason)
+            _active_provider = provider
+
+        c = client(provider, timeout_s=attempt_timeout)
+        attempted = True
+        last_provider = provider
+        try:
+            total_remaining = max(0.0, deadline - _monotonic())
+            async with asyncio.timeout(total_remaining):
+                d = await c.decide(state, questions)
+        except TimeoutError:
+            c._down_until = max(c._down_until, _monotonic() + config.JEV_COOLDOWN_S)
+            switch_reason = f"{provider} Zeitbudget überschritten"
+            continue
+        except JevUnavailable as exc:
+            cause = exc.__cause__
+            if provider == "cloudflare" and isinstance(cause, CloudflareQuotaError):
+                reset_at = _next_utc_midnight()
+                seconds_until_reset = max(0.0, (reset_at - _utcnow()).total_seconds())
+                c._down_until = _monotonic() + seconds_until_reset
+                switch_reason = f"Cloudflare-Tageskontingent bis {reset_at:%Y-%m-%d %H:%M UTC}"
+            else:
+                switch_reason = f"{provider} nicht verfügbar"
+            continue
+        finally:
+            # Nur vorwärts spiegeln: parallele Calls dürfen einen geöffneten
+            # Breaker nicht mit einem älteren Stand überschreiben (Lost Update).
+            _down_until[provider] = max(_down_until.get(provider, 0.0), c._down_until)
+
+        return {qid: Answer.from_jevkit(a, model=d.model) for qid, a in d.answers.items()}
+
+    if attempted:
+        log.info("Jev-Providerwechsel: %s → lokaler Fallback (%s)", last_provider, switch_reason)
+        _active_provider = "local"
+    raise JevUnavailable("Alle Jev-Provider sind fehlgeschlagen oder nicht verfügbar")
+
+
+def _next_utc_midnight() -> datetime:
+    now = _utcnow().astimezone(timezone.utc)
+    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)

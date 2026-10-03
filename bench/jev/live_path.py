@@ -70,9 +70,13 @@ async def run() -> None:
             ok = result == expected if fb_used["n"] == 0 else None   # None = an lokal delegiert
         rows.append((cid, text, expected, p_old, p_new, p_guard, b.value, result, ok, dt))
 
-    expected_model = decide.JEV_EXPECTED_MODELS[config.JEV_PROVIDER]
+    providers = decide.provider_chain()
+    expected_models = ", ".join(
+        f"{provider}: `{decide.expected_model(provider)}`"
+        for provider in providers if provider in decide.JEV_EXPECTED_MODELS
+    )
     lines = ["# Produktivpfad: core.decisions.addressed (jevkit, Guard, Bänder)", "",
-             f"Provider: `{config.JEV_PROVIDER}`. Modell laut Antwort: erwartet `{expected_model}`. Bänder: {decisions.BANDS['addressed']}.", "",
+             f"Provider-Kette: `{', '.join(providers)}`. Erwartete Modellpräfixe: {expected_models}. Bänder: {decisions.BANDS['addressed']}.", "",
              "| id | Transkript | soll | p alt (transkript) | p neu (untrusted_text) | Guard p | Band | Ergebnis | ok | s |",
              "|---|---|---|---|---|---|---|---|---|---|"]
     for cid, text, exp, po, pn, pg, b, res, ok, dt in rows:
