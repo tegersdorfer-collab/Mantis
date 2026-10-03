@@ -1,6 +1,6 @@
-"""Jev (TypeSafe via OpenRouter) gegen die lokalen Mantis-Modelle auf den Fällen in cases.py.
+"""Jev (TypeSafe via OpenRouter oder Cloudflare) gegen lokale Mantis-Modelle.
 
-Aufruf:  python -m bench.jev.run [--local MODELLE] [--local-logits MODELLE --tag NAME] [--no-local]
+Aufruf:  python -m bench.jev.run [--jev-backend BACKEND] [--local MODELLE] [--local-logits MODELLE --tag NAME] [--no-local]
 Ergebnis: bench/jev/results/raw[-TAG].jsonl + report[-TAG].md
 
 Jev bekommt pro Fall EINEN Call mit der/den passenden Frage(n). Lokal bekommt jedes
@@ -34,27 +34,39 @@ HERE = Path(__file__).parent
 RESULTS = HERE / "results"
 OR_URL = "https://openrouter.ai/api/alpha/decisions"
 JEV_MODEL = "~typesafe/jev-latest"
+CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts"
 # Puffer über der Modellgröße für den RAM-Guard (frei+inaktiv aus vm_stat).
 RAM_MARGIN_MB = int(os.environ.get("BENCH_RAM_MARGIN_MB", "2048"))
 
 
+def _env_file_path() -> Path:
+    return Path(os.environ.get("MANTIS_ENV_FILE", HERE.parent.parent / ".env"))
+
+
+def _load_env_value(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        for line in _env_file_path().read_text().splitlines():
+            if line.startswith(f"{name}="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+    if not value:
+        sys.exit(f"{name} fehlt")
+    return value
+
+
 def _load_env_key() -> str:
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if not key:
-        for line in (HERE.parent.parent / ".env").read_text().splitlines():
-            if line.startswith("OPENROUTER_API_KEY="):
-                key = line.split("=", 1)[1].strip().strip('"').strip("'")
-    if not key:
-        sys.exit("OPENROUTER_API_KEY fehlt")
-    return key
+    return _load_env_value("OPENROUTER_API_KEY")
+
+
+def _load_cloudflare_credentials() -> tuple[str, str]:
+    return _load_env_value("CLOUDFLARE_ACCOUNT_ID"), _load_env_value("CLOUDFLARE_AUTH_TOKEN")
 
 
 # ── Jev ───────────────────────────────────────────────────────────────────────
 
-def jev_call(key: str, state, questions: dict) -> tuple[dict, float]:
-    body = {"model": JEV_MODEL, "state": state, "questions": questions}
-    req = urllib.request.Request(OR_URL, data=json.dumps(body, ensure_ascii=False).encode(),
-                                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+def _post_json(url: str, token: str, body: dict) -> tuple[dict, float]:
+    req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode(),
+                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     t = time.perf_counter()
     for attempt in range(3):
         try:
@@ -67,6 +79,21 @@ def jev_call(key: str, state, questions: dict) -> tuple[dict, float]:
                 continue
             raise RuntimeError(f"HTTP {e.code}: {body_txt}") from e
     raise RuntimeError("unreachable")
+
+
+def jev_call(key: str, state, questions: dict) -> tuple[dict, float]:
+    body = {"model": JEV_MODEL, "state": state, "questions": questions}
+    return _post_json(OR_URL, key, body)
+
+
+def cloudflare_call(account_id: str, token: str, model: str, state, questions: dict) -> tuple[dict, float]:
+    body = {"model": model, "state": state, "questions": questions}
+    url = f"{CLOUDFLARE_AI_URL}/{account_id}/ai/run/@cf/cloudflare/{model}"
+    envelope, latency = _post_json(url, token, body)
+    if envelope.get("success") is False:
+        errors = json.dumps(envelope.get("errors", []), ensure_ascii=False)
+        raise RuntimeError(f"Cloudflare Workers AI fehlgeschlagen: {errors}")
+    return envelope["result"], latency
 
 
 def jev_questions(kind: str, state) -> tuple[object, dict]:
@@ -306,6 +333,8 @@ def all_cases() -> list[dict]:
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--jev-backend", choices=("openrouter", "clef", "clef-flash"), default="openrouter",
+                    help="Decision-Backend für Jev; Cloudflare-Backends benötigen --tag")
     ap.add_argument("--local", default="gemma4:e2b,qwen3.5:9b")
     ap.add_argument("--local-logits", metavar="MODELL[,MODELL]",
                     help="zusätzliche Logit-Bewertung mit diesen Ollama-Modellen")
@@ -314,6 +343,8 @@ async def main() -> None:
     ap.add_argument("--tag", help="schreibt raw-<tag>.jsonl und report-<tag>.md ohne bestehende Dateien zu ersetzen")
     args = ap.parse_args()
 
+    if args.jev_backend != "openrouter" and not args.tag:
+        ap.error("--jev-backend clef/clef-flash benötigt --tag, damit report.md nicht überschrieben wird")
     if args.local_logits is not None and not args.tag:
         ap.error("--local-logits benötigt --tag, damit vorhandene Ergebnisse erhalten bleiben")
     logits_models = None
@@ -341,20 +372,36 @@ async def main() -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     if not args.no_jev:
-        key = _load_env_key()
-        print(f"Jev: {len(cases)} Fälle …", flush=True)
+        if args.jev_backend == "openrouter":
+            key = _load_env_key()
+            backend_name = "jev"
+            decision_call = lambda state, questions: jev_call(key, state, questions)
+            display_name = "Jev"
+        else:
+            account_id, token = _load_cloudflare_credentials()
+            backend_name = f"{args.jev_backend} (Cloudflare)"
+            decision_call = lambda state, questions: cloudflare_call(
+                account_id, token, args.jev_backend, state, questions)
+            display_name = backend_name
+        print(f"{display_name}: {len(cases)} Fälle …", flush=True)
         for c in cases:
             state, qs = jev_questions(c["kind"], c["state"])
             try:
-                resp, lat = jev_call(key, state, qs)
+                resp, lat = decision_call(state, qs)
                 label, conf, rawans = jev_decide(c["kind"], resp["answers"]["q"])
-                emit({**c, "backend": "jev", "label": label, "correct": label == c["expected"],
-                      "confidence": conf, "raw": rawans, "latency": lat,
-                      "tokens": resp["usage"]["input_tokens"], "cost": resp["usage"].get("cost")})
+                row = {**c, "backend": backend_name, "label": label, "correct": label == c["expected"],
+                       "confidence": conf, "raw": rawans, "latency": lat,
+                       "tokens": resp["usage"]["input_tokens"], "cost": resp["usage"].get("cost")}
+                if args.jev_backend != "openrouter":
+                    row.update({"system": "cloudflare", "model": args.jev_backend})
+                emit(row)
             except Exception as e:
-                emit({**c, "backend": "jev", "error": str(e)[:200], "correct": False, "latency": None})
+                row = {**c, "backend": backend_name, "error": str(e)[:200], "correct": False, "latency": None}
+                if args.jev_backend != "openrouter":
+                    row.update({"system": "cloudflare", "model": args.jev_backend})
+                emit(row)
                 print(f"  ! {c['id']}: {e}", flush=True)
-        print("Jev fertig.", flush=True)
+        print(f"{display_name} fertig.", flush=True)
 
     client = None
     if not args.no_local or args.local_logits is not None:
