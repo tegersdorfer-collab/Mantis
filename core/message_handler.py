@@ -13,6 +13,7 @@ from core.background_review import run_background_review
 from core.status import BUS
 from core import skills, db, ui_state, fast_commands, skill_request
 from core.error_redaction import redact_error_text
+from domains.gym.coach import GymCoach, GymResult
 import config
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ class MessageHandler:
     def __init__(self, kzg, lzg, agent, prompt_builder, channel,
                  proactive_tracker, forgetting, extractor, bg_llm,
                  alphaprogression, on_user_active, on_idle_ready=None,
-                 channels=None):
+                 channels=None, gym_coach=None):
         self.kzg               = kzg
         self.lzg               = lzg
         self.agent             = agent
@@ -52,6 +53,7 @@ class MessageHandler:
         self.on_user_active    = on_user_active   # callback: () → None
         self.on_idle_ready     = on_idle_ready    # callback: () → None
         self.channels          = channels or {}
+        self.gym_coach         = gym_coach or GymCoach()
         self._turn_lock        = threading.Lock()
         self._active_turns     = 0
 
@@ -139,6 +141,42 @@ class MessageHandler:
         BUS.emit("thinking", "Nachricht empfangen…", detail=msg.text[:60])
         log.info(f"Eingehend: {msg.text[:60]}")
 
+        # Gym-Nachrichten bleiben außerhalb von KZG/LZG und des Agenten-Kontexts.
+        try:
+            gym_intent = self.gym_coach.classify(msg.text, now=msg.timestamp)
+        except Exception as exc:
+            log.warning("Gym-Intent konnte nicht geprüft werden (%s)", type(exc).__name__)
+            gym_intent = None
+        if gym_intent:
+            try:
+                gym_result = await self.gym_coach.process(
+                    gym_intent,
+                    llm_fallback=self._gym_llm_fallback,
+                    now=msg.timestamp,
+                )
+            except Exception as exc:
+                log.error("Gym-Fast-Path fehlgeschlagen (%s)", type(exc).__name__)
+                gym_result = GymResult(
+                    "❌ Das Training konnte gerade nicht verarbeitet werden. Bitte sende die Nachricht erneut.",
+                    gym_intent.action,
+                )
+            gym_meta = {"use_case": "gym", "action": gym_result.action}
+            self._persist_msg(
+                "user", msg.text, channel=channel_name, meta=gym_meta, save_lzg=False,
+            )
+            assistant_meta = dict(gym_meta)
+            if gym_result.pending:
+                assistant_meta["gym_pending"] = gym_result.pending
+            else:
+                assistant_meta["gym_pending"] = {"resolved": True}
+            self._persist_msg(
+                "assistant", gym_result.text, channel=channel_name,
+                meta=assistant_meta, save_lzg=False,
+            )
+            BUS.emit("response", gym_result.text)
+            await response_channel.send(gym_result.text)
+            return
+
         self.kzg.add("user", msg.text)
         self._persist_msg("user", msg.text, channel=channel_name)
         self._check_verification_bump(msg.text)
@@ -208,6 +246,28 @@ class MessageHandler:
         elapsed = time.time() - t0
         log.info(f"Antwort in {elapsed:.1f}s ({len(trace)} Tools, {self.agent.model_name})")
         BUS.emit("idle", "Bereit", detail=f"{elapsed:.1f}s · {self.agent.model_name}")
+
+    async def _gym_llm_fallback(self, text: str, aliases: dict[str, list[str]]) -> str:
+        """Ein einzelner Chat-Ketten-Aufruf, ohne PromptBuilder oder gespeicherte Historie."""
+        alias_list = sorted(
+            f"{alias} → {' / '.join(names)}" for alias, names in aliases.items()
+        )
+        system = (
+            "Interpretiere ausschließlich den aktuellen Krafttrainings-Satz. "
+            "Gib nur JSON mit exercise und sets zurück: "
+            '{"exercise":"Name","sets":[{"weight_kg":80,"reps":8}]}. '
+            "Erfinde keine Wiederholungen oder Gewichte; wenn unklar, gib {} zurück. "
+            "Aliasliste:\n" + "\n".join(alias_list)
+        )
+        response, _trace = await self.agent.run(
+            messages=[{"role": "user", "content": text}],
+            system=system,
+            temperature=0.1,
+            max_tokens=500,
+            use_tools=False,
+            allowed_tools=[],
+        )
+        return response
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
 
@@ -344,11 +404,12 @@ class MessageHandler:
     # ── Persistenz ────────────────────────────────────────────────────────────
 
     def _persist_msg(self, role: str, content: str, channel: str = "telegram",
-                     meta: dict | None = None) -> None:
-        try:
-            self.lzg.save_kzg_turn(role, content)
-        except Exception as e:
-            log.error(f"KZG-Turn nicht gespeichert: {e}")
+                     meta: dict | None = None, save_lzg: bool = True) -> None:
+        if save_lzg:
+            try:
+                self.lzg.save_kzg_turn(role, content)
+            except Exception as e:
+                log.error(f"KZG-Turn nicht gespeichert: {e}")
         try:
             db.execute(
                 "INSERT INTO chat_messages (role, content, channel, meta) VALUES (%s,%s,%s,%s)",

@@ -552,6 +552,56 @@ MIGRATIONS = [
     "ALTER TABLE workout_sets ADD COLUMN IF NOT EXISTS rpe INT;",
     "ALTER TABLE workout_sets ADD COLUMN IF NOT EXISTS is_warmup BOOLEAN DEFAULT FALSE;",
     "ALTER TABLE workout_sets ADD COLUMN IF NOT EXISTS is_failure BOOLEAN DEFAULT FALSE;",
+    # Gym-Coach: optionale Übungsmetadaten lassen bestehende Übungen unangetastet.
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS exercise_type TEXT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS equipment TEXT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS rep_min INT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS rep_max INT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS rep_start INT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS load_mode TEXT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS weight_increment_kg DOUBLE PRECISION;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS dumbbell_pair BOOLEAN;",
+    "ALTER TABLE workouts ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ;",
+    "ALTER TABLE workouts ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;",
+    "UPDATE workouts SET last_activity_at=created_at WHERE last_activity_at IS NULL;",
+    "UPDATE workouts SET ended_at=created_at WHERE ended_at IS NULL AND type IS DISTINCT FROM 'gym';",
+    """CREATE TABLE IF NOT EXISTS exercise_aliases (
+        id              SERIAL PRIMARY KEY,
+        alias           TEXT NOT NULL,
+        normalized_alias TEXT NOT NULL UNIQUE,
+        exercise_id     INT REFERENCES exercises(id) ON DELETE CASCADE,
+        equipment_prefix TEXT,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS gym_single_open_idx ON workouts(type)
+       WHERE type='gym' AND ended_at IS NULL;""",
+    """INSERT INTO exercise_aliases (alias, normalized_alias, exercise_id)
+       SELECT MIN(name), LOWER(REGEXP_REPLACE(name, '[-[:space:]]+', ' ', 'g')), MIN(id)
+       FROM exercises
+       GROUP BY LOWER(REGEXP_REPLACE(name, '[-[:space:]]+', ' ', 'g'))
+       HAVING COUNT(*)=1
+       ON CONFLICT (normalized_alias) DO NOTHING;""",
+    """WITH groups(canonical, aliases) AS (
+           VALUES
+             ('Bankdrücken', ARRAY['Bankdrücken','Bank','BD','Bench','Bench Press']::TEXT[]),
+             ('Kniebeuge', ARRAY['Kniebeuge','Kniebeugen','Squat','Squats']::TEXT[]),
+             ('Beinpresse', ARRAY['Beinpresse','Leg Press']::TEXT[]),
+             ('Schulterdrücken', ARRAY['Schulterdrücken','Shoulder Press','Overhead Press','OHP']::TEXT[]),
+             ('Klimmzüge', ARRAY['Klimmzüge','Klimmzug','Pull-up','Pullups']::TEXT[]),
+             ('Bizepscurls', ARRAY['Bizepscurls','Bizepscurl','Biceps Curl','Bicep Curl']::TEXT[])
+       ), resolved AS (
+           SELECT g.canonical, MIN(e.id) AS exercise_id, g.aliases
+           FROM groups g
+           JOIN exercises e ON LOWER(e.name)=ANY(
+               SELECT LOWER(candidate) FROM UNNEST(g.aliases) AS candidates(candidate)
+           )
+           GROUP BY g.canonical, g.aliases
+           HAVING COUNT(DISTINCT e.id)=1
+       )
+       INSERT INTO exercise_aliases (alias, normalized_alias, exercise_id)
+       SELECT alias, LOWER(REGEXP_REPLACE(alias, '[-[:space:]]+', ' ', 'g')), exercise_id
+       FROM resolved CROSS JOIN LATERAL UNNEST(aliases) AS aliases_out(alias)
+       ON CONFLICT (normalized_alias) DO NOTHING;""",
     "ALTER TABLE meals ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'done';",
 
     # LLM-Usage-Tracking (Token-Verbrauch + API-Kosten pro Call)
