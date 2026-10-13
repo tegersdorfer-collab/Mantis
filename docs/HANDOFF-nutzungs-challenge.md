@@ -91,3 +91,4 @@ und das auch **nach 4 Wochen** noch.
 - In Arbeit: Chat-Kette v2 (OpenRouter-Luna → Anthropic Haiku 5.5 → ChatGPT-Abo-Luna via „ChatGPT plan usage“ → lokal), Branch feat/chat-chain-v2.
 - Ideen-Parkplatz: Küche (Rezept→Einkaufsliste, Schimmel), Mantis anrufen (Discord-Sprachkanal), OpenRouter-Guthaben-Warnung.
 - Nächster Schritt Challenge: 1 Woche nutzen, dann `/api/usage/daily` + Timo fragen, was genervt hat.
+2026-10-13 23:39 — Kette v2 live: OpenRouter-Luna → Anthropic Haiku 5.5 → ChatGPT-Abo-Luna (Login erfolgt) → lokal. Test-Suite isoliert gegen mantis_test. Start-Warnungen behoben (COROS querySleepOverview, Discord-Intent, Skill-Entwürfe archiviert, Telegram-Shutdown, Jev-422-Fallback).
