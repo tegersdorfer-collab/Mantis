@@ -122,11 +122,18 @@ async def main():
     lzg     = LZG()
     thermal = ThermalMonitor()
     channel = TelegramChannel()
+    additional_channels = {}
+    if cfg.DISCORD_ENABLED:
+        from communication.discord import DiscordChannel
+        additional_channels["discord"] = DiscordChannel()
+    else:
+        log.info("Discord-Kanal inaktiv (DISCORD_ENABLED=False)")
     orchestrator = Orchestrator(
         chat_llm=chat_llm, bg_llm=bg_llm, embed_llm=embed_llm,
         agent_backend=agent_backend, voice_agent_backend=voice_agent_backend,
         chat_task_llm=chat_task_llm,
         channel=channel, lzg=lzg, thermal=thermal,
+        additional_channels=additional_channels,
     )
 
     # Default is loopback; remote access must use an explicit Tailnet address.

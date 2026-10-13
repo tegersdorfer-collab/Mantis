@@ -244,3 +244,47 @@ def test_due_reminders_still_send_when_autonomous_messages_are_off(monkeypatch):
 
     assert asyncio.run(autopilot.tick()) is True
     assert sent == ["⏰ Erinnerung: Lang genug für den Test"]
+
+
+def test_only_due_reminders_use_configured_notification_channel(monkeypatch):
+    from core.autopilot import Autopilot
+
+    sent = {"telegram": [], "discord": []}
+
+    async def send_telegram(text):
+        sent["telegram"].append(text)
+
+    async def send_discord(text):
+        sent["discord"].append(text)
+
+    class Tracker:
+        def record_sent(self):
+            pass
+
+    autopilot = Autopilot(
+        llm=None,
+        lzg=SimpleNamespace(save_kzg_turn=lambda *_: None),
+        dashboard=None,
+        reminders=None,
+        channel=SimpleNamespace(send=send_telegram),
+        reminder_channel=SimpleNamespace(send=send_discord),
+        proactive=None,
+        tracker=Tracker(),
+        identity="",
+    )
+    monkeypatch.setattr("core.autopilot.db.execute", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("core.autopilot.db.log_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("core.autopilot.BUS.emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("core.push.send_push", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(config, "AUTONOMOUS_MESSAGES_ENABLED", True)
+
+    async def send_messages():
+        await autopilot._send("⏰ Erinnerung: Termin", kind="reminder")
+        await autopilot._send("Das ist eine ausreichend lange proaktive Nachricht.")
+
+    asyncio.run(send_messages())
+
+    assert sent == {
+        "telegram": ["Das ist eine ausreichend lange proaktive Nachricht."],
+        "discord": ["⏰ Erinnerung: Termin"],
+    }

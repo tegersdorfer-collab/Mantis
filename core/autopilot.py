@@ -56,12 +56,14 @@ def _content_len(text: str) -> int:
 
 class Autopilot:
     def __init__(self, llm, lzg, dashboard, reminders, channel, proactive, tracker,
-                 identity: str, lock=None, is_user_active=None, search=None):
+                 identity: str, lock=None, is_user_active=None, search=None,
+                 reminder_channel=None):
         self.llm = llm
         self.lzg = lzg
         self.dashboard = dashboard
         self.reminders = reminders
         self.channel = channel
+        self.reminder_channel = reminder_channel or channel
         self.proactive = proactive
         self.tracker = tracker
         self.identity = identity
@@ -89,7 +91,8 @@ class Autopilot:
         if kind != "reminder" and _content_len(text) < _MIN_CONTENT_CHARS:
             log.warning(f"Proaktive Nachricht ({kind}) verworfen — zu kurz/kaputt: {text!r}")
             return
-        await self.channel.send(text)
+        destination = self.reminder_channel if kind == "reminder" else self.channel
+        await destination.send(text)
         try:
             from core import push
             import asyncio as _asyncio

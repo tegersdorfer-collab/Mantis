@@ -150,6 +150,13 @@ class MantisSettings(BaseSettings):
     TELEGRAM_CHAT_ID: str = ""
     TELEGRAM_ALLOWED_IDS_RAW: str = Field("", alias="TELEGRAM_ALLOWED_IDS")
 
+    # ── Discord ─────────────────────────────────────────────────────────────
+    DISCORD_ENABLED: bool = False
+    DISCORD_BOT_TOKEN: str = ""
+    DISCORD_ALLOWED_USER_IDS_RAW: str = Field("", alias="DISCORD_ALLOWED_USER_IDS")
+    DISCORD_CHANNEL_ID: str = ""
+    NOTIFY_CHANNEL: str = "telegram"
+
     # Shared-Secret für externe Trigger (Not-Stopp, Automationen) über /api/trigger/*.
     # Leer = Trigger-API deaktiviert (sicherer Default).
     TRIGGER_TOKEN: str = ""
@@ -242,6 +249,14 @@ class MantisSettings(BaseSettings):
         return raw
 
     @property
+    def DISCORD_ALLOWED_USER_IDS(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            value.strip()
+            for value in self.DISCORD_ALLOWED_USER_IDS_RAW.split(",")
+            if value.strip()
+        ))
+
+    @property
     def VAPID_CLAIM_EMAIL_RESOLVED(self) -> str:
         return self.VAPID_CLAIM_EMAIL or self.OWNER_EMAIL or "admin@localhost"
 
@@ -304,6 +319,24 @@ class MantisSettings(BaseSettings):
         except Exception:
             raise ValueError(f"Ungültige Uhrzeit '{v}' – erwartet HH:MM (z.B. 08:00)")
         return v.strip()
+
+    @field_validator("DISCORD_BOT_TOKEN")
+    @classmethod
+    def strip_discord_token(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("DISCORD_CHANNEL_ID")
+    @classmethod
+    def strip_discord_channel_id(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("NOTIFY_CHANNEL")
+    @classmethod
+    def valid_notify_channel(cls, v: str) -> str:
+        channel = v.strip().lower()
+        if channel not in {"telegram", "discord"}:
+            raise ValueError("NOTIFY_CHANNEL muss 'telegram' oder 'discord' sein")
+        return channel
 
     @field_validator("THERMAL_TARGET_CELSIUS", "THERMAL_MAX_CELSIUS")
     @classmethod
