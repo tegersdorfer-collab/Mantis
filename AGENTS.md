@@ -27,6 +27,12 @@ Wichtige Bereiche:
 
 Nach Codeänderungen zuerst passende Tests ausführen, danach bei größeren Änderungen die vollständige relevante Suite und Ruff. Nur erfolgreiche, tatsächlich ausgeführte Prüfungen als bestanden melden.
 
+### Tests
+
+- `tests/conftest.py` setzt `DATABASE_URL` vor Projektimports auf `TEST_DATABASE_URL`; Standard ist `postgresql://localhost:5432/mantis_test`.
+- Die Suite bricht ab, wenn die Test-URL auf die Produktionsdatenbank zeigt. Tests mit `@pytest.mark.db` dürfen gezielt DB-Funktionen oder die erreichbare Testdatenbank verwenden; Forge-DB-Tests überspringen sich ohne PostgreSQL.
+- Lokale Testdatenbank samt Produktionsschema bei Bedarf mit `bash scripts/create_test_db.sh` anlegen. Eine bereits existierende `mantis_test` bleibt dabei unverändert.
+
 ## Arbeitsregeln
 
 - Vor Änderungen README, relevante Architektur und bestehende Tests prüfen.

@@ -1,5 +1,6 @@
 import config
 from core.error_redaction import redact_error_text
+import pytest
 
 
 def test_redacts_bot_tokens(monkeypatch):
@@ -10,6 +11,7 @@ def test_redacts_bot_tokens(monkeypatch):
     assert "discord-secret-token" not in text
 
 
+@pytest.mark.db
 def test_db_log_error_redacts_synthetic_api_key_in_summary_and_detail(monkeypatch):
     from core import db
 

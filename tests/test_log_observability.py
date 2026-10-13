@@ -7,10 +7,14 @@ import logging
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import log_observability
 from core.log_observability import DBLogHandler
+
+pytestmark = pytest.mark.db
 
 
 def _record(name="mantis.test", level=logging.WARNING, msg="etwas kaputt"):

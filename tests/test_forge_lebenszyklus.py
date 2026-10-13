@@ -34,8 +34,11 @@ def _db_erreichbar() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _db_erreichbar(), reason="PostgreSQL nicht erreichbar — Lebenszyklus-Test übersprungen")
+pytestmark = [
+    pytest.mark.db,
+    pytest.mark.skipif(
+        not _db_erreichbar(), reason="PostgreSQL nicht erreichbar — Lebenszyklus-Test übersprungen"),
+]
 
 
 @pytest.fixture

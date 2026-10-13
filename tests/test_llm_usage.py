@@ -2,6 +2,7 @@
 import sys, os
 import asyncio
 import httpx
+import pytest
 from datetime import date
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -51,6 +52,7 @@ class TestCostUsd:
         assert _fallback_cost("local", "unknown:variant", 500_000, 500_000) is None
 
 
+@pytest.mark.db
 class TestRecord:
     def test_zero_tokens_is_noop(self):
         # Darf keinen DB-Zugriff versuchen (early return)
