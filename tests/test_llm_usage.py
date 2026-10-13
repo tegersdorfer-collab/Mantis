@@ -59,6 +59,18 @@ class TestRecord:
             assert params[4] == 500
             assert abs(params[5] - 0.0045) < 1e-9
 
+    def test_record_uses_actual_provider_cost_when_available(self):
+        with patch("core.db.execute") as mock_exec:
+            record(
+                "openrouter", "openai/gpt-6-luna", 2000, 500,
+                purpose="chat-agent", actual_cost=0.001237,
+            )
+
+            mock_exec.assert_called_once()
+            _, params = mock_exec.call_args[0]
+            assert params[:5] == ("openrouter", "openai/gpt-6-luna", "chat-agent", 2000, 500)
+            assert params[5] == 0.001237
+
     def test_record_swallows_db_errors(self):
         with patch("core.db.execute", side_effect=RuntimeError("db down")):
             # Darf keine Exception nach außen werfen

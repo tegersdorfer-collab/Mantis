@@ -67,9 +67,11 @@ IDENTITY = _load_identity()
 class Orchestrator:
     def __init__(self, channel: CommunicationChannel, lzg: LZG, thermal: ThermalMonitor,
                  chat_llm: LLMProvider, bg_llm: LLMProvider, embed_llm: LLMProvider,
-                 agent_backend: AgentBackend, voice_agent_backend: AgentBackend | None = None):
+                 agent_backend: AgentBackend, voice_agent_backend: AgentBackend | None = None,
+                 chat_task_llm: LLMProvider | None = None):
         self.chat_llm  = chat_llm
         self.bg_llm    = bg_llm
+        self.chat_task_llm = chat_task_llm or bg_llm
         self.embed_llm = embed_llm
         self.channel   = channel
         self.lzg       = lzg
@@ -80,7 +82,12 @@ class Orchestrator:
         self.kg           = KnowledgeGraph()
         self.consolidator = Consolidator(llm=bg_llm, lzg=lzg)
         self.forgetting   = ForgettingCurve()
-        self.extractor    = MemoryExtractor(llm_provider=embed_llm, lzg=lzg, kg=self.kg)
+        self.extractor    = MemoryExtractor(
+            llm_provider=embed_llm,
+            lzg=lzg,
+            kg=self.kg,
+            fact_llm=chat_task_llm,
+        )
         self.reflection   = Reflection(llm=bg_llm, lzg=lzg)
         self.agent        = Agent(backend=agent_backend, max_steps=8)
         # Eigener, leichtgewichtiger Agent für Voice-Antworten (kleines, dauerhaft
@@ -136,6 +143,7 @@ class Orchestrator:
             is_user_active=self._user_active,
             pattern_detector_mod=pattern_detector,
             generate_insight_task=generate_insight_task,
+            chat_task_llm=chat_task_llm,
         )
 
     # ── User-Active State ─────────────────────────────────────────────────────

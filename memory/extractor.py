@@ -162,11 +162,49 @@ class MemoryExtractor:
         asyncio.create_task(extractor.extract_from_exchange(user_text, response))
     """
 
-    def __init__(self, llm_provider, lzg: LZG, kg: KnowledgeGraph | None = None):
+    def __init__(
+        self,
+        llm_provider,
+        lzg: LZG,
+        kg: KnowledgeGraph | None = None,
+        fact_llm=None,
+    ):
         self._llm = llm_provider   # nur für embed()
         self._lzg = lzg
         self._kg  = kg
+        self._fact_llm = fact_llm
         self._client = _ollama.AsyncClient(host=config.OLLAMA_BASE_URL)
+
+    async def _ask_json(self, prompt: str, max_tokens: int, gate_timeout_s: float) -> str | None:
+        """Nutzt den Chat-Aufgaben-Provider oder bleibt beim bisherigen lokalen Modell."""
+        if self._fact_llm is not None:
+            return await self._fact_llm.complete(
+                prompt,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                format="json",
+            )
+
+        try:
+            await asyncio.wait_for(GATE.acquire(), timeout=gate_timeout_s)
+        except asyncio.TimeoutError:
+            return None
+        try:
+            response = await self._client.chat(
+                model=config.AGENT_MODEL_FAST,
+                messages=[{"role": "user", "content": prompt}],
+                options=config.ollama_options(
+                    config.AGENT_MODEL_FAST,
+                    temperature=0.1,
+                    num_predict=max_tokens,
+                    keep_alive=config.OLLAMA_KEEP_ALIVE,
+                ),
+                format="json",
+                think=False,
+            )
+            return response.message.content or "[]"
+        finally:
+            GATE.release()
 
     async def extract_from_exchange(
         self,
@@ -188,28 +226,10 @@ class MemoryExtractor:
         # ── 1. LLM-Extraktion (Fast-Modell) ───────────────────────────────
         facts: list[dict] = []
         try:
-            # Timeout damit ein blockierter GATE die nächste User-Antwort nicht verzögert
-            try:
-                await asyncio.wait_for(GATE.acquire(), timeout=8.0)
-            except asyncio.TimeoutError:
+            raw = await self._ask_json(_EXTRACT_PROMPT + exchange, 300, 8.0)
+            if raw is None:
                 log.debug("Extraktor: GATE-Timeout, überspringe diesen Turn")
                 return 0
-            try:
-                resp = await self._client.chat(
-                    model=config.AGENT_MODEL_FAST,
-                    messages=[{"role": "user", "content": _EXTRACT_PROMPT + exchange}],
-                    options=config.ollama_options(
-                        config.AGENT_MODEL_FAST,
-                        temperature=0.1,
-                        num_predict=300,
-                        keep_alive=config.OLLAMA_KEEP_ALIVE,
-                    ),
-                    format="json",
-                    think=False,
-                )
-            finally:
-                GATE.release()
-            raw = resp.message.content or "[]"
             parsed = extract_json(raw, default=[])
             if isinstance(parsed, list):
                 facts = [f for f in parsed if isinstance(f, dict)]
@@ -332,26 +352,12 @@ direction: "subject" = Timo ist Subjekt (Timo → predicate → entity)
 Nachricht: """ + user_text + "\n\nJSON:"
 
         try:
-            await asyncio.wait_for(GATE.acquire(), timeout=6.0)
-        except asyncio.TimeoutError:
+            raw = await self._ask_json(_KG_PROMPT, 200, 6.0)
+            if raw is None:
+                return
+        except Exception as e:
+            log.debug(f"KG-Entity-Extraktion fehlgeschlagen: {e}")
             return
-        try:
-            resp = await self._client.chat(
-                model=config.AGENT_MODEL_FAST,
-                messages=[{"role": "user", "content": _KG_PROMPT}],
-                options=config.ollama_options(
-                    config.AGENT_MODEL_FAST,
-                    temperature=0.1,
-                    num_predict=200,
-                    keep_alive=config.OLLAMA_KEEP_ALIVE,
-                ),
-                format="json",
-                think=False,
-            )
-        finally:
-            GATE.release()
-
-        raw = resp.message.content or "[]"
         entries = extract_json(raw, default=[])
         if not isinstance(entries, list):
             return

@@ -8,7 +8,7 @@ import config
 from core.idle_loop import IdleLoop, log_background_job_status
 
 
-def _loop():
+def _loop(chat_task_llm=None, bg_llm=None):
     async def noop(*args, **kwargs):
         return None
 
@@ -27,12 +27,13 @@ def _loop():
         reminders=SimpleNamespace(),
         proactive_engine=SimpleNamespace(),
         proactive_tracker=SimpleNamespace(),
-        bg_llm=None,
+        bg_llm=bg_llm,
         chat_llm=None,
         suggest_one=noop,
         is_user_active=lambda: False,
         pattern_detector_mod=SimpleNamespace(update_memories=no_memories),
         generate_insight_task=noop,
+        chat_task_llm=chat_task_llm,
     )
 
 
@@ -177,6 +178,36 @@ def test_task_deep_execution_has_its_own_flag_while_autonomous_messages_are_off(
 
     assert result is enabled
     assert executed == ([True] if enabled else [])
+
+
+@pytest.mark.parametrize("use_cloud", [False, True])
+def test_kzg_checkpoint_uses_chat_task_provider_when_configured(use_cloud):
+    calls = []
+
+    class FakeLLM:
+        async def complete(self, prompt, max_tokens):
+            calls.append((self, prompt, max_tokens))
+            return "Zusammenfassung"
+
+    local_llm = FakeLLM()
+    cloud_llm = FakeLLM()
+    kzg = SimpleNamespace(
+        should_checkpoint=lambda: True,
+        get_turns_for_summary=lambda: [SimpleNamespace(role="user", content="hallo")],
+        apply_checkpoint=lambda summary, count: calls.append(("checkpoint", summary, count)),
+    )
+    loop = _loop(
+        chat_task_llm=cloud_llm if use_cloud else None,
+        bg_llm=local_llm,
+    )
+    loop.kzg = kzg
+
+    asyncio.run(loop._maybe_kzg_checkpoint())
+
+    selected = cloud_llm if use_cloud else local_llm
+    assert calls[0][0] is selected
+    assert calls[0][2] == 300
+    assert calls[1] == ("checkpoint", "Zusammenfassung", 1)
 
 
 def test_due_reminders_still_send_when_autonomous_messages_are_off(monkeypatch):

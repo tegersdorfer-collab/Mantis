@@ -70,8 +70,14 @@ class MantisSettings(BaseSettings):
     STT_PARAKEET_MODEL: str = "mlx-community/parakeet-tdt-0.6b-v3"
     ANTHROPIC_API_KEY: str = ""
     CLAUDE_CHAT_MODEL: str = "claude-haiku-4-5-20251001"
-    # Voll-lokaler Betrieb: ignoriert den ANTHROPIC_API_KEY und nutzt überall Ollama
-    # (kein Cloud-Call, keine Claude-Fallbacks). Der Key bleibt für Tools/Benchmarks nutzbar.
+    CHAT_CLOUD_MODEL: str = "openai/gpt-6-luna"
+    CHAT_CLOUD_FALLBACK_MODEL: str = "google/gemini-3.1-flash-lite"
+    CHAT_CLOUD_REASONING_EFFORT: str = "low"
+    CHAT_CLOUD_TIMEOUT_S: float = 30.0
+    # Nur Chat-nahe Aufgaben (Fact-Extraction und KZG-Checkpoint) dürfen den
+    # Chat-Cloud-Fallback nutzen. Andere Background-Jobs bleiben bei bg_llm.
+    BG_CHAT_TASKS_USE_CLOUD: bool = True
+    # Voll-lokaler Betrieb: ignoriert Cloud-Keys und nutzt für den Agenten Ollama.
     LLM_LOCAL_ONLY: bool = False
     # ── Jev (TypeSafe System-One-Modell) ─────────────────────────────────────
     # Kleine Ja/Nein- und Kategorie-Entscheidungen (Voice-Adress-Check, Tool-

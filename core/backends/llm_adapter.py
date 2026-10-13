@@ -1,0 +1,79 @@
+"""Adapter, der ein Agent-Backend als einfachen LLM-Provider nutzbar macht."""
+from typing import AsyncIterator
+
+from core.backends.base import AgentBackend
+from llm.base import LLMProvider, Message
+
+
+class BackendLLMAdapter(LLMProvider):
+    """Leitet Chat-Aufgaben ohne Tools durch dieselbe Backend-Fallback-Kette."""
+
+    def __init__(self, backend: AgentBackend):
+        self.backend = backend
+
+    @property
+    def model_name(self) -> str:
+        return self.backend.model_name
+
+    def _messages(self, messages: list[Message], system: str | None, format) -> list[dict]:
+        result = []
+        system_text = system or ""
+        if format == "json":
+            system_text = "\n\n".join(filter(None, (
+                system_text,
+                "Antworte ausschließlich mit validem JSON, ohne Text drumherum.",
+            )))
+        elif isinstance(format, dict):
+            system_text = "\n\n".join(filter(None, (
+                system_text,
+                "Antworte als JSON gemäß diesem Schema: " + str(format),
+            )))
+        if system_text:
+            result.append({"role": "system", "content": system_text})
+        for message in messages:
+            if isinstance(message, dict):
+                result.append({"role": message["role"], "content": message["content"]})
+            else:
+                result.append({"role": message.role, "content": message.content})
+        return result
+
+    async def chat(
+        self,
+        messages: list[Message],
+        system: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        format: str | dict | None = None,
+    ) -> str:
+        text, _ = await self.backend.call(
+            messages=self._messages(messages, system, format),
+            tools=None,
+            stream_cb=None,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return text
+
+    async def stream(
+        self,
+        messages: list[Message],
+        system: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+    ) -> AsyncIterator[str]:
+        latest = [""]
+
+        async def on_progress(text: str) -> None:
+            latest[0] = text
+
+        text, _ = await self.backend.call(
+            messages=self._messages(messages, system, None),
+            tools=None,
+            stream_cb=on_progress,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        yield text or latest[0]
+
+    async def embed(self, text: str) -> list[float]:
+        raise NotImplementedError("Agent-Backends unterstützen keine Embeddings")

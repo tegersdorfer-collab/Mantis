@@ -67,7 +67,8 @@ class IdleLoop:
                  proactive_engine, proactive_tracker,
                  bg_llm, chat_llm, suggest_one,
                  is_user_active,
-                 pattern_detector_mod, generate_insight_task):
+                 pattern_detector_mod, generate_insight_task,
+                 chat_task_llm=None):
         self.autopilot           = autopilot
         self.reflection          = reflection
         self.consolidator        = consolidator
@@ -80,6 +81,7 @@ class IdleLoop:
         self.proactive_engine    = proactive_engine
         self.proactive_tracker   = proactive_tracker
         self.bg_llm              = bg_llm
+        self.chat_task_llm       = chat_task_llm or bg_llm
         self.chat_llm            = chat_llm
         self.suggest_one         = suggest_one
         self.is_user_active      = is_user_active
@@ -233,7 +235,7 @@ class IdleLoop:
             "Behalte wichtige Fakten, Entscheidungen und Aufgaben.\n\n" + lines
         )
         try:
-            summary = await self.bg_llm.complete(prompt, max_tokens=300)
+            summary = await self.chat_task_llm.complete(prompt, max_tokens=300)
             self.kzg.apply_checkpoint(summary, len(turns))
             log.info(f"📝 KZG-Checkpoint: {len(turns)} Turns komprimiert")
         except Exception as e:

@@ -138,3 +138,51 @@ class TestWarmup:
         asyncio.run(fb.warmup())
         assert primary.warmups == 1
         assert fallback.warmups == 1
+
+
+def test_three_stage_chain_falls_through_timeout_and_http_error_then_cools_down(caplog):
+    import httpx
+    import logging
+
+    primary = FakeBackend("openrouter-primary", delay=0.05)
+    secondary = FakeBackend(
+        "openrouter-fallback",
+        error=httpx.HTTPStatusError(
+            "bad request",
+            request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+            response=httpx.Response(400),
+        ),
+    )
+    local = FakeBackend("ollama", result=("lokal", []))
+    backend = FallbackBackend(
+        backends=[primary, secondary, local],
+        stage_timeouts=[0.005, 0.005, None],
+        cooldown_s=60,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="core.backends.fallback"):
+        assert _call(backend) == ("lokal", [])
+        assert _call(backend) == ("lokal", [])
+
+    assert primary.calls == 1
+    assert secondary.calls == 1
+    assert local.calls == 2
+    assert "TimeoutError" in caplog.text
+    assert "HTTPStatusError" in caplog.text
+
+
+def test_chain_uses_next_available_cloud_stage_during_primary_cooldown():
+    primary = FakeBackend("openrouter-primary", error=ConnectionError("offline"))
+    secondary = FakeBackend("openrouter-fallback", result=("cloud fallback", []))
+    local = FakeBackend("ollama")
+    backend = FallbackBackend(
+        backends=[primary, secondary, local],
+        stage_timeouts=[0.1, 0.1, None],
+        cooldown_s=60,
+    )
+
+    assert _call(backend) == ("cloud fallback", [])
+    assert _call(backend) == ("cloud fallback", [])
+    assert primary.calls == 1
+    assert secondary.calls == 2
+    assert local.calls == 0

@@ -71,7 +71,7 @@ async def main():
     # Voll-lokaler Betrieb (LLM_LOCAL_ONLY) ignoriert den API-Key komplett.
     use_claude = bool(cfg.ANTHROPIC_API_KEY) and not cfg.LLM_LOCAL_ONLY
     if cfg.LLM_LOCAL_ONLY:
-        log.info("🔒 LLM_LOCAL_ONLY: alle LLMs laufen lokal (Claude deaktiviert)")
+        log.info("🔒 LLM_LOCAL_ONLY: Cloud-LLMs deaktiviert")
 
     # ── Chat-LLM ────────────────────────────────────────────────────────────
     if use_claude:
@@ -83,23 +83,16 @@ async def main():
         log.info(f"💬 Chat-LLM: Ollama {cfg.OLLAMA_MODEL} (lokal)")
 
     # ── Agent-Backend: interaktiver Haupt-Agent (Telegram/Dashboard-Chat) ────────
-    # Lokal: gemma4:e2b (AGENT_MODEL_STRONG) — laut Benchmark ~9B-Chatqualität bei 3×
-    # Speed. keep_alive="-1" hält es dauerhaft im RAM; da der Voice-Agent dasselbe
-    # Modell nutzt, ist gemma immer warm → keine Cold-Reload-Latenz mehr.
-    from core.backends.ollama import OllamaBackend
-    if use_claude:
-        from core.backends.claude import ClaudeBackend
-        from core.backends.fallback import FallbackBackend
-        agent_backend = FallbackBackend(
-            primary=ClaudeBackend(model=cfg.CLAUDE_CHAT_MODEL),
-            fallback=OllamaBackend(),
-        )
-        log.info(f"🔧 Agent-Backend: Claude {cfg.CLAUDE_CHAT_MODEL} → Fallback Ollama {cfg.AGENT_MODEL_STRONG} (lokal)")
-    else:
-        agent_backend = OllamaBackend(model=cfg.AGENT_MODEL_STRONG, keep_alive="-1")
-        log.info(f"🔧 Agent-Backend: Ollama {cfg.AGENT_MODEL_STRONG} (lokal, dauerhaft geladen)")
+    from core.backends.factory import (
+        build_chat_backend,
+        build_chat_task_provider,
+        describe_backend_chain,
+    )
+    agent_backend = build_chat_backend(cfg)
+    log.info(f"💬 Chat-Kette: {describe_backend_chain(agent_backend)}")
 
     # ── Voice-Agent-Backend: kleines, dauerhaft geladenes Modell ────────────────
+    from core.backends.ollama import OllamaBackend
     if use_claude:
         from core.backends.fallback import FallbackBackend
         from core.backends.claude import ClaudeBackend
@@ -117,6 +110,12 @@ async def main():
     bg_llm = RoutedLLMProvider()
     log.info(f"🧠 Background-LLM: Routed (default={cfg.BG_DEFAULT_MODEL} | reasoning={cfg.BG_REASONING_MODEL} | code={cfg.BG_CODE_MODEL})")
 
+    # Diese beiden chat-nahen Analysen können dieselbe Cloud-Kette nutzen;
+    # alle übrigen Background-Jobs behalten den RoutedLLMProvider.
+    chat_task_llm = build_chat_task_provider(cfg)
+    if chat_task_llm:
+        log.info("🧠 Fact-Extraction und KZG-Checkpoint nutzen die Chat-Kette")
+
     # ── Embed-LLM: immer Ollama (kein Embedding via Claude) ───────────────────
     embed_llm = OllamaProvider()
 
@@ -126,6 +125,7 @@ async def main():
     orchestrator = Orchestrator(
         chat_llm=chat_llm, bg_llm=bg_llm, embed_llm=embed_llm,
         agent_backend=agent_backend, voice_agent_backend=voice_agent_backend,
+        chat_task_llm=chat_task_llm,
         channel=channel, lzg=lzg, thermal=thermal,
     )
 

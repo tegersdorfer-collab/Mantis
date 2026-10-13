@@ -29,14 +29,15 @@ def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
 
 
 def record(provider: str, model: str, input_tokens: int, output_tokens: int,
-           purpose: str = "chat") -> None:
+           purpose: str = "chat", actual_cost: float | None = None) -> None:
     """Schreibt einen Usage-Eintrag. Läuft im Event-Loop asynchron (nicht blockierend),
     außerhalb davon synchron. Fehler werden nur geloggt."""
     if not input_tokens and not output_tokens:
         return
     try:
         from core import db
-        cost = cost_usd(model, input_tokens or 0, output_tokens or 0)
+        cost = (actual_cost if actual_cost is not None
+                else cost_usd(model, input_tokens or 0, output_tokens or 0))
         sql = ("INSERT INTO llm_usage (provider, model, purpose, input_tokens, "
                "output_tokens, cost_usd) VALUES (%s,%s,%s,%s,%s,%s)")
         params = (provider, model, purpose, input_tokens or 0, output_tokens or 0, cost)

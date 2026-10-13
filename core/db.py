@@ -556,7 +556,7 @@ MIGRATIONS = [
     """
     CREATE TABLE IF NOT EXISTS llm_usage (
         id            SERIAL PRIMARY KEY,
-        provider      TEXT NOT NULL,           -- claude | ollama
+        provider      TEXT NOT NULL,           -- claude | ollama | openrouter
         model         TEXT NOT NULL,
         purpose       TEXT DEFAULT 'chat',     -- chat-agent | background
         input_tokens  INT DEFAULT 0,

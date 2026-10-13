@@ -13,12 +13,16 @@ log = logging.getLogger("core.skills")
 @T.register(
     "git_history_import",
     "Importiert Git-Commit-History eines Repos als Wissens-Notizen ins Second Brain.",
-    [
-        {"name": "repos", "type": "string",
-         "description": "Kommagetrennte Pfade oder 'auto' für automatische Suche in ~/Documents, ~/Developer etc."},
-        {"name": "limit", "type": "integer",
-         "description": "Max. Commits pro Repo (default 100)"},
-    ],
+    {
+        "repos": {
+            "type": "string",
+            "description": "Kommagetrennte Pfade oder 'auto' für automatische Suche in ~/Documents, ~/Developer etc.",
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Max. Commits pro Repo (default 100)",
+        },
+    },
 )
 def _git_history_import(repos: str = "auto", limit: int = 100) -> str:
     import subprocess, os
