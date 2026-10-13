@@ -1,7 +1,10 @@
+import asyncio
 import re
 from contextlib import nullcontext
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
+from core.autopilot import Autopilot
 from tools.reminders import ReminderStore
 
 
@@ -263,3 +266,59 @@ def test_next_due_seconds_includes_a_retry_backoff_deadline(monkeypatch):
     )
 
     assert ReminderStore().next_due_seconds() == 60.0
+
+
+def test_autopilot_retries_delivery_confirmation_without_resending_after_lease(monkeypatch):
+    database = ReminderMemoryDB()
+    _install_fake_db(monkeypatch, database)
+    store = ReminderStore()
+    store.setup()
+
+    mark_sent_calls = []
+    original_execute = database.execute
+
+    def execute(sql, params=()):
+        if sql.lower().startswith("update reminders set sent = true, claimed_at"):
+            mark_sent_calls.append(params[0])
+            if len(mark_sent_calls) == 1:
+                raise RuntimeError("temporary database failure")
+        return original_execute(sql, params)
+
+    monkeypatch.setattr("tools.reminders._db.execute", execute)
+    sends = []
+
+    async def send_plain(text):
+        sends.append(text)
+
+    autopilot = Autopilot(
+        llm=None,
+        lzg=None,
+        dashboard=None,
+        reminders=store,
+        channel=SimpleNamespace(send=send_plain, send_plain=send_plain),
+        proactive=None,
+        tracker=SimpleNamespace(record_sent=lambda: None),
+        identity="",
+    )
+
+    async def after_send(_text, _kind):
+        pass
+
+    async def deep_execution():
+        return False
+
+    autopilot._after_send = after_send
+    autopilot._tick_deep_execution = deep_execution
+    monkeypatch.setattr("config.AUTONOMOUS_MESSAGES_ENABLED", False)
+
+    assert asyncio.run(autopilot.tick()) is True
+    assert mark_sent_calls == [17]
+    assert database.rows[0]["sent"] is False
+
+    database.now += timedelta(minutes=2)
+
+    assert asyncio.run(autopilot.tick()) is False
+    assert sends == ["⏰ Erinnerung: Offener Altbestand"]
+    assert mark_sent_calls == [17, 17]
+    assert database.rows[0]["sent"] is True
+    assert database.rows[0]["claimed_at"] is None
