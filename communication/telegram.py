@@ -234,6 +234,7 @@ class TelegramChannel(CommunicationChannel):
             sender_id=str(update.message.from_user.id),
             timestamp=datetime.now(),
             raw=update,
+            channel="telegram",
         )
 
         if self._handler:
@@ -283,6 +284,7 @@ class TelegramChannel(CommunicationChannel):
             sender_id=str(update.message.from_user.id),
             timestamp=datetime.now(),
             raw=update,
+            channel="telegram",
         )
         if self._handler:
             await self._handler(msg)
@@ -330,6 +332,7 @@ class TelegramChannel(CommunicationChannel):
                 sender_id=str(update.message.from_user.id),
                 timestamp=datetime.now(),
                 raw=update,
+                channel="telegram",
             )
             if self._handler:
                 await self._handler(msg)
@@ -342,6 +345,7 @@ class TelegramChannel(CommunicationChannel):
                     sender_id=str(update.message.from_user.id),
                     timestamp=datetime.now(),
                     raw=update,
+                    channel="telegram",
                 )
                 await self.send(description)
                 if self._handler:
@@ -404,6 +408,7 @@ class TelegramChannel(CommunicationChannel):
                         sender_id=str(query.from_user.id) if query.from_user else "",
                         timestamp=datetime.now(),
                         raw=update,
+                        channel="telegram",
                     )
                     await query.edit_message_reply_markup(reply_markup=None)
                     await self._handler(msg)

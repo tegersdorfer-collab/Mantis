@@ -45,7 +45,7 @@ def create_app(orch=None) -> FastAPI:
 
     # ── System Health-Check ──────────────────────────────────────────────────
     @app.get("/health")
-    async def system_health():
+    async def system_health(request: Request):
         """Schnell-Check: DB, Ollama, Telegram — für Monitoring und Aufwach-Diagnose."""
         import httpx as _httpx
         checks = {}
@@ -72,7 +72,13 @@ def create_app(orch=None) -> FastAPI:
         checks["orchestrator"] = "ok" if orch is not None else "not attached"
 
         ok = all(v == "ok" for v in checks.values())
-        return JSONResponse({"ok": ok, "checks": checks}, status_code=200 if ok else 503)
+        status_code = 200 if ok else 503
+        if request.scope.get("state", {}).get("dashboard_authenticated"):
+            return JSONResponse({"ok": ok, "checks": checks}, status_code=status_code)
+        return JSONResponse(
+            {"status": "ok" if ok else "degraded"},
+            status_code=status_code,
+        )
 
     # ── Domänen-Router einbinden ──────────────────────────────────────────────
     from web import routers

@@ -65,9 +65,11 @@ class FallbackBackend(AgentBackend):
                 )
             except Exception as e:
                 self._primary_down_until = time.time() + self._cooldown_s
+                detail = str(e).strip()
+                failure = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
                 log.warning(
                     f"Primär-Backend {self._primary.model_name} ausgefallen "
-                    f"({type(e).__name__}: {e}) — Fallback auf "
+                    f"({failure}) — Fallback auf "
                     f"{self._fallback.model_name} für {self._cooldown_s:.0f}s"
                 )
                 self._report_failover(e)
@@ -78,7 +80,9 @@ class FallbackBackend(AgentBackend):
         """Ausfall sichtbar machen: Fehler-Widget + Status-Feed."""
         try:
             from core.db import log_error
-            log_error("agent_fallback", exc)
+            message = str(exc).strip() or type(exc).__name__
+            recorded_exc = exc if str(exc).strip() else RuntimeError(message)
+            log_error("agent_fallback", recorded_exc)
         except Exception:
             pass
         try:

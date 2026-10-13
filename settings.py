@@ -193,6 +193,17 @@ class MantisSettings(BaseSettings):
     IDLE_MIN_SLEEP_S: int = 2
     IDLE_MAX_SLEEP_S: int = 60
     IDLE_EVAL_AFTER_S: int = 600
+    CHAT_TTL_DAYS: int = 365
+
+    # ── Hintergrundjobs ──────────────────────────────────────────────────────
+    INSIGHTS_ENABLED: bool = False
+    PATTERN_DETECTION_ENABLED: bool = False
+    TRAINING_PLAN_AUTOGEN_ENABLED: bool = False
+    NEWS_REFRESH_ENABLED: bool = False
+    DAILY_REFLECTION_ENABLED: bool = False
+    MEMORY_CONSOLIDATION_ENABLED: bool = False
+    TASK_DEEP_EXECUTION_ENABLED: bool = False
+    BACKGROUND_REVIEW_ENABLED: bool = False
 
     # ── Proaktiv ─────────────────────────────────────────────────────────────
     # Autonome Telegram-/Push-Nachrichten sind bewusst aus, bis Timo sie wieder
@@ -205,7 +216,7 @@ class MantisSettings(BaseSettings):
     # Ein Nutzer (Timo), Config als simple ENV-Werte. Uhrzeiten im Format "HH:MM"
     # in lokaler Serverzeit (= OWNER_TIMEZONE). Der Block ist EIN Deep-Work-Fenster
     # pro Tag; das Blockende ergibt sich aus Start + Dauer.
-    ACCOUNTABILITY_ENABLED: bool = True
+    ACCOUNTABILITY_ENABLED: bool = False
     ACCOUNTABILITY_ANCHOR_TIME: str = "08:00"    # Morgen-Anker ("Was ist das EINE Ding?")
     ACCOUNTABILITY_BLOCK_START: str = "10:00"    # Blockstart ("Handy weg.")
     ACCOUNTABILITY_BLOCK_MINUTES: int = 90       # Blockdauer (60–90 min sinnvoll)

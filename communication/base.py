@@ -14,6 +14,7 @@ class IncomingMessage:
     sender_id: str
     timestamp: datetime
     raw: object | None = None   # Original Message-Objekt falls gebraucht
+    channel: str = "telegram"
 
 
 MessageHandler = Callable[[IncomingMessage], Awaitable[None]]

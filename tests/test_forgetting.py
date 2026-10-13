@@ -5,6 +5,7 @@ Reine Funktionen, kein DB.
 import math
 import os
 import sys
+import asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -54,3 +55,22 @@ def test_threshold_boundary():
     days_at_threshold = -s * math.log(DELETE_THRESHOLD)
     assert should_forget(0.5, 0, days=days_at_threshold + 0.01) is True
     assert should_forget(0.5, 0, days=days_at_threshold - 0.01) is False
+
+
+def test_chat_pruning_uses_configured_ttl_as_a_query_parameter(monkeypatch):
+    from memory import forgetting
+    import config
+
+    calls = []
+    monkeypatch.setattr(config, "CHAT_TTL_DAYS", 42, raising=False)
+    monkeypatch.setattr(
+        forgetting._db,
+        "query_one",
+        lambda sql, params=(): calls.append((sql, params)) or {"n": 0},
+    )
+
+    pruned = asyncio.run(forgetting.ForgettingCurve()._prune_chat())
+
+    assert pruned == 0
+    assert calls[0][1] == (42,)
+    assert "make_interval(days => %s)" in calls[0][0]

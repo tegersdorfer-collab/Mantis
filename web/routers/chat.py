@@ -32,7 +32,10 @@ def build_router(orch=None) -> APIRouter:
         d = await req.json()
         if not orch:
             return {"response": "Mantis-Kern nicht verbunden."}
-        resp, trace = await orch.dashboard_respond(d["text"])
+        channel_name = d.get("channel", "web")
+        if not isinstance(channel_name, str) or channel_name not in {"web", "ios", "mcp"}:
+            channel_name = "web"
+        resp, trace = await orch.dashboard_respond(d["text"], channel_name=channel_name)
         return {"response": resp, "tools": [t["tool"] for t in trace]}
 
     @router.get("/api/chat/stream")
@@ -46,7 +49,7 @@ def build_router(orch=None) -> APIRouter:
 
         async def run():
             try:
-                resp, trace = await orch.dashboard_respond(text, stream_cb=cb)
+                resp, trace = await orch.dashboard_respond(text, stream_cb=cb, channel_name="web")
                 await q.put({"done": resp, "tools": [t["tool"] for t in trace]})
             except Exception as e:
                 await q.put({"done": f"Fehler: {e}", "tools": []})

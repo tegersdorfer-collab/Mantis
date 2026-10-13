@@ -76,6 +76,20 @@ class DashboardAuth:
         status, error = 401, 'Authentication required'
         if origin and origin != same_origin and origin not in origins():
             status, error = 403, 'Origin not allowed'
+        elif (scope['type'] == 'http' and path == '/health'
+              and scope['method'] in ('GET', 'HEAD')):
+            # /health darf ohne Zugangsdaten nur den minimalen Status ausgeben.
+            # Die Route selbst filtert anhand dieses Markers ihre Antwort; der
+            # vollständige Handler wird nicht über PUBLIC_PATHS freigegeben.
+            auth = connection.headers.get('authorization', '')
+            bearer = auth[7:] if auth.lower().startswith('bearer ') else ''
+            valid = False
+            if config.DASHBOARD_TOKEN:
+                valid = token_ok(bearer)
+                if not auth:
+                    valid = valid or session_ok(connection.cookies.get(COOKIE, ''))
+            scope.setdefault('state', {})['dashboard_authenticated'] = valid
+            return await self.app(scope, receive, send)
         elif scope['type'] == 'http' and path in TRIGGER_PATHS:
             return await self.app(scope, receive, send)  # Router validates TRIGGER_TOKEN.
         elif not config.DASHBOARD_TOKEN:

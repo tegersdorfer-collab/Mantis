@@ -14,6 +14,8 @@ import re
 import time
 from pathlib import Path
 
+import config
+
 log = logging.getLogger(__name__)
 
 SKILLS_MD_DIR = Path(__file__).resolve().parent.parent / "skills"
@@ -76,6 +78,8 @@ async def run_background_review(
     bg_llm: das Background-LLM (Ollama lokal)
     lzg: Long-Term Memory für Save-Memory
     """
+    if not config.BACKGROUND_REVIEW_ENABLED:
+        return
     t0 = time.time()
     try:
         context = f"""USER: {user_text}

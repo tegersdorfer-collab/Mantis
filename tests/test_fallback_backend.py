@@ -110,6 +110,25 @@ class TestFailover:
         except RuntimeError:
             pass
 
+    def test_empty_timeout_message_is_recorded_with_exception_type(self, monkeypatch, caplog):
+        import logging
+
+        events = []
+        monkeypatch.setattr(
+            "core.db.log_error",
+            lambda source, exc: events.append((source, str(exc))),
+        )
+        fb = FallbackBackend(
+            FakeBackend("claude", error=asyncio.TimeoutError()),
+            FakeBackend("qwen"),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="core.backends.fallback"):
+            _call(fb)
+
+        assert events == [("agent_fallback", "TimeoutError")]
+        assert "TimeoutError" in caplog.text
+
 
 class TestWarmup:
     def test_warms_both(self):

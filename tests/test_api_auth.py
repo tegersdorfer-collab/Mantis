@@ -36,8 +36,58 @@ def client(monkeypatch):
 def test_private_requires_auth(client):
     assert client.get('/api/private').status_code == 401
     assert client.get('/api/private?token=' + TOKEN).status_code == 401
-    assert client.get('/health').status_code == 401
     assert client.post('/api/upload', files={'image': ('x.jpg', b'x')}).status_code == 401
+
+
+@pytest.fixture
+def health_client(monkeypatch):
+    import httpx
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url):
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(config, 'DASHBOARD_TOKEN', TOKEN, raising=False)
+    monkeypatch.setattr(config, 'DASHBOARD_ALLOWED_ORIGINS', 'http://localhost:1420', raising=False)
+    monkeypatch.setattr(config, 'TELEGRAM_BOT_TOKEN', 'configured', raising=False)
+    monkeypatch.setattr('web.api.db.query_one', lambda *_: {'ok': 1})
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **_kwargs: FakeAsyncClient())
+    return TestClient(create_app(orch=object()))
+
+
+def test_health_without_auth_returns_only_minimal_status(health_client):
+    response = health_client.get('/health')
+
+    assert response.status_code == 200
+    assert response.json() == {'status': 'ok'}
+
+
+def test_health_with_auth_keeps_full_health_details(health_client):
+    response = health_client.get('/health', headers={'Authorization': 'Bearer ' + TOKEN})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        'ok': True,
+        'checks': {'db': 'ok', 'ollama': 'ok', 'telegram': 'ok', 'orchestrator': 'ok'},
+    }
+
+
+def test_unauthed_health_reports_degraded_without_check_details(health_client, monkeypatch):
+    def db_unavailable(*_args):
+        raise ConnectionError('database unavailable')
+
+    monkeypatch.setattr('web.api.db.query_one', db_unavailable)
+
+    response = health_client.get('/health')
+
+    assert response.status_code == 503
+    assert response.json() == {'status': 'degraded'}
 
 def test_bearer_and_invalid_token(client):
     assert client.get('/api/private', headers={'Authorization': 'Bearer ' + TOKEN}).status_code == 200

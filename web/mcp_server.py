@@ -84,7 +84,12 @@ def _handle_mcp_call(tool: str, args: dict) -> str:
 
     try:
         if tool == "mantis_chat":
-            r = httpx.post(f"{base}/api/chat", headers=headers, json={"message": args["message"]}, timeout=30)
+            r = httpx.post(
+                f"{base}/api/chat",
+                headers=headers,
+                json={"text": args["message"], "channel": "mcp"},
+                timeout=30,
+            )
             return r.json().get("response", r.text)
 
         elif tool == "mantis_memory_search":

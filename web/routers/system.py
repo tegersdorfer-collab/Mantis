@@ -5,10 +5,12 @@ Endpoints sind Closures über `orch`; build_router(orch) liefert den APIRouter.
 import asyncio
 import logging
 import os
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 import config
@@ -21,6 +23,42 @@ from web.routers._helpers import _jsonable, _health_dict, _event_dict
 
 log = logging.getLogger("mantis.api")
 WEB_DIR = Path(__file__).parent.parent
+
+
+def _daily_usage_window(
+    days: int, now: datetime, timezone_name: str
+) -> tuple[datetime, datetime]:
+    """Gibt das lokale Tagesfenster als UTC-Grenzen zurück, DST-sicher."""
+    owner_tz = ZoneInfo(timezone_name)
+    local_now = now.astimezone(owner_tz) if now.tzinfo else now.replace(tzinfo=owner_tz)
+    first_day = local_now.date() - timedelta(days=days - 1)
+    after_last_day = local_now.date() + timedelta(days=1)
+    start_local = datetime.combine(first_day, dt_time.min, tzinfo=owner_tz)
+    end_local = datetime.combine(after_last_day, dt_time.min, tzinfo=owner_tz)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def _aggregate_daily_usage(
+    rows: list[dict], start: datetime, end: datetime, timezone_name: str
+) -> list[dict]:
+    """Aggregiert einzelne Nachrichten nach Besitzer-Tag und Kanal."""
+    owner_tz = ZoneInfo(timezone_name)
+    counts = Counter()
+    for row in rows:
+        if row.get("role") != "user":
+            continue
+        created_at = row["created_at"]
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        created_at_utc = created_at.astimezone(timezone.utc)
+        if not start <= created_at_utc < end:
+            continue
+        counts[(created_at_utc.astimezone(owner_tz).date(), row["channel"])] += 1
+
+    return [
+        {"date": day.isoformat(), "channel": channel, "user_messages": count}
+        for (day, channel), count in sorted(counts.items())
+    ]
 
 
 def build_router(orch=None) -> APIRouter:
@@ -44,6 +82,25 @@ def build_router(orch=None) -> APIRouter:
         return {"running": running or orch is not None, "pid": pid,
                 "model": active_model, "tools": len(T.REGISTRY),
                 "time": datetime.now().strftime("%H:%M:%S")}
+
+    @router.get("/api/usage/daily")
+    def daily_usage(days: int = Query(default=56, ge=1)):
+        owner_timezone = getattr(config, "OWNER_TIMEZONE", "Europe/Berlin")
+        start, end = _daily_usage_window(
+            days, datetime.now(ZoneInfo(owner_timezone)), owner_timezone
+        )
+        rows = db.query(
+            """
+            SELECT role, channel, created_at
+            FROM chat_messages
+            WHERE role = 'user'
+              AND created_at >= %s
+              AND created_at < %s
+            ORDER BY created_at, channel
+            """,
+            (start, end),
+        )
+        return {"days": _aggregate_daily_usage(rows, start, end, owner_timezone)}
 
     @router.get("/api/overview")
     def overview():

@@ -11,6 +11,41 @@ import config
 
 log = logging.getLogger(__name__)
 
+_BACKGROUND_JOB_FLAGS = (
+    ("Insight Engine", "INSIGHTS_ENABLED"),
+    ("Pattern Detection", "PATTERN_DETECTION_ENABLED"),
+    ("Trainingsplan-Autogenerierung", "TRAINING_PLAN_AUTOGEN_ENABLED"),
+    ("News-Globus-Refresh", "NEWS_REFRESH_ENABLED"),
+    ("Tages-Reflexion", "DAILY_REFLECTION_ENABLED"),
+    ("Memory-Consolidator", "MEMORY_CONSOLIDATION_ENABLED"),
+    ("Task Deep Execution", "TASK_DEEP_EXECUTION_ENABLED"),
+    ("Post-Turn Background Review", "BACKGROUND_REVIEW_ENABLED"),
+    ("Accountability", "ACCOUNTABILITY_ENABLED"),
+    ("Autonome Nachrichten", "AUTONOMOUS_MESSAGES_ENABLED"),
+)
+_ALWAYS_ON_BACKGROUND_JOBS = (
+    "Telegram-Polling",
+    "DB-Backup und Verifikation",
+    "Forgetting und Chat-Pruning",
+    "KZG-Checkpoint",
+    "Fact-Extraction nach dem Turn",
+    "Monitoring-Loop",
+    "fällige Reminder",
+)
+
+
+def log_background_job_status() -> None:
+    """Protokolliert beim Start einmal die aktiven und inaktiven Hintergrundjobs."""
+    active = list(_ALWAYS_ON_BACKGROUND_JOBS)
+    inactive = []
+    for label, flag in _BACKGROUND_JOB_FLAGS:
+        (active if getattr(config, flag) else inactive).append(label)
+    log.info(
+        "Hintergrundjobs aktiv: %s; inaktiv: %s",
+        ", ".join(active),
+        ", ".join(inactive) or "keine",
+    )
+
 
 def _elapsed_since(last: "datetime | None", now: datetime, default: float = float("inf")) -> float:
     return (now - last).total_seconds() if last else default
@@ -103,8 +138,6 @@ class IdleLoop:
     # ── Ticks ─────────────────────────────────────────────────────────────────
 
     async def _tick_autopilot(self) -> None:
-        if not config.AUTONOMOUS_MESSAGES_ENABLED:
-            return
         try:
             await self.autopilot.tick()
         except Exception as e:
@@ -115,7 +148,7 @@ class IdleLoop:
         """Accountability & Momentum (Daily Anchor + Der Block). Läuft IMMER —
         auch wenn Timo gerade aktiv ist —, denn die Prompts sind zeitgebunden.
         Sendet über den zentralen Autopilot-Pfad (Telegram + Web-Push)."""
-        if not config.AUTONOMOUS_MESSAGES_ENABLED:
+        if not config.ACCOUNTABILITY_ENABLED or not config.AUTONOMOUS_MESSAGES_ENABLED:
             return
         try:
             from domains import accountability
@@ -125,6 +158,8 @@ class IdleLoop:
             db.log_error("Accountability-Tick", e)
 
     async def _tick_reflection(self) -> None:
+        if not config.DAILY_REFLECTION_ENABLED:
+            return
         try:
             await self.reflection.daily_reflection()
         except Exception as e:
@@ -133,6 +168,8 @@ class IdleLoop:
 
     async def _tick_news(self) -> None:
         """Stündlich den News-Globus aktualisieren (Feeds → geolokalisieren → Cache)."""
+        if not config.NEWS_REFRESH_ENABLED:
+            return
         now = datetime.now()
         if _elapsed_since(self._last_news_refresh, now) < 3600:
             return
@@ -146,6 +183,8 @@ class IdleLoop:
 
     async def _tick_plan(self) -> None:
         """Alle 6h prüfen, ob ein neuer Trainingsplan fällig ist (≥42 Tage / keiner)."""
+        if not config.TRAINING_PLAN_AUTOGEN_ENABLED:
+            return
         now = datetime.now()
         if _elapsed_since(self._last_plan_check, now) < 21600:
             return
@@ -164,12 +203,15 @@ class IdleLoop:
             await self._maybe_kzg_checkpoint()
             return
         self._last_consolidation = now
-        for coro, label in [
-            (self.consolidator.consolidate_silent(), "Memory-Consolidator"),
+        jobs = []
+        if config.MEMORY_CONSOLIDATION_ENABLED:
+            jobs.append((self.consolidator.consolidate_silent(), "Memory-Consolidator"))
+        jobs.extend([
             (self._run_forgetting(), "ForgettingCurve"),
             (asyncio.to_thread(backup.maybe_run_daily), "DB-Backup"),
             (asyncio.to_thread(backup.maybe_verify_weekly), "Backup-Restore-Check"),
-        ]:
+        ])
+        for coro, label in jobs:
             try:
                 await coro
             except Exception as e:
@@ -229,6 +271,8 @@ class IdleLoop:
             db.log_error("Health-Refresh", e)
 
     async def _tick_patterns(self) -> None:
+        if not config.PATTERN_DETECTION_ENABLED:
+            return
         now = datetime.now()
         if _elapsed_since(self._last_pattern_run, now) < 86400:
             return
@@ -242,6 +286,8 @@ class IdleLoop:
             db.log_error("Pattern-Detector", e)
 
     async def _tick_insights(self) -> None:
+        if not config.INSIGHTS_ENABLED:
+            return
         now = datetime.now()
         if _elapsed_since(self._last_insight_run, now) < 14400:
             return

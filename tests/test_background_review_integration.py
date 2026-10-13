@@ -5,6 +5,7 @@ import time
 import pytest
 
 from core import background_review, skill_md
+import config
 
 
 @pytest.fixture
@@ -14,6 +15,7 @@ def skills_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(skill_md, '_INDEX', {})
     # Keep the automatic scan interval closed: writes must refresh recall directly.
     monkeypatch.setattr(skill_md, '_LAST_SCAN', time.time())
+    monkeypatch.setattr(config, 'BACKGROUND_REVIEW_ENABLED', True, raising=False)
     return tmp_path
 
 
@@ -81,3 +83,53 @@ def test_learning_update_replaces_cached_body_and_trigger_immediately(skills_dir
     assert 'Old procedure.' not in context
     assert len(list(skills_dir.glob('*.md'))) == 1
     assert 'New procedure.' in (skills_dir / 'planning.md').read_text()
+
+
+def test_disabled_background_review_does_not_call_llm(monkeypatch):
+    class MustNotRun:
+        calls = 0
+
+        async def chat(self, **_kwargs):
+            self.calls += 1
+            return 'SKIP'
+
+    monkeypatch.setattr(config, 'BACKGROUND_REVIEW_ENABLED', False, raising=False)
+    llm = MustNotRun()
+
+    asyncio.run(background_review.run_background_review(
+        'input', 'response', [], llm, NoMemory(),
+    ))
+
+    assert llm.calls == 0
+
+
+def test_message_handler_skips_review_task_but_keeps_fact_extraction(monkeypatch):
+    from types import SimpleNamespace
+
+    from core import message_handler
+    from core.message_handler import MessageHandler
+
+    extracted = []
+    scheduled = []
+
+    class Extractor:
+        async def extract_from_exchange(self, user_text, response):
+            extracted.append((user_text, response))
+            return 1
+
+    handler = object.__new__(MessageHandler)
+    handler.extractor = Extractor()
+    handler.bg_llm = SimpleNamespace()
+    handler.lzg = SimpleNamespace()
+    monkeypatch.setattr(config, 'BACKGROUND_REVIEW_ENABLED', False, raising=False)
+    monkeypatch.setattr(message_handler.BUS, 'emit', lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        message_handler,
+        '_safe_task',
+        lambda coro, label: scheduled.append(label),
+    )
+
+    asyncio.run(handler._post_turn('user fact', 'answer', []))
+
+    assert extracted == [('user fact', 'answer')]
+    assert scheduled == []

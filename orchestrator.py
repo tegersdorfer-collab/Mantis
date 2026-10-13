@@ -38,7 +38,7 @@ from core.db import log_event
 from core.skill_factory import load_all_on_startup
 from core.prompt_builder import PromptBuilder
 from core.message_handler import MessageHandler
-from core.idle_loop import IdleLoop
+from core.idle_loop import IdleLoop, log_background_job_status
 
 from tools.search import WebSearch
 from tools.dashboard import DashboardReader
@@ -122,6 +122,7 @@ class Orchestrator:
             forgetting=self.forgetting, extractor=self.extractor,
             bg_llm=bg_llm, alphaprogression=alphaprogression,
             on_user_active=self._mark_user_active,
+            on_idle_ready=lambda: self.idle_loop.resume(),
         )
 
         self.idle_loop = IdleLoop(
@@ -151,13 +152,21 @@ class Orchestrator:
     async def handle_message(self, msg: IncomingMessage) -> None:
         await self.msg_handler.handle(msg, resume_idle_cb=self.idle_loop.resume)
 
-    async def dashboard_respond(self, text: str, stream_cb=None) -> tuple[str, list]:
-        return await self.msg_handler.dashboard_respond(text, stream_cb)
+    async def dashboard_respond(
+        self, text: str, stream_cb=None, channel_name: str = "web"
+    ) -> tuple[str, list]:
+        return await self.msg_handler.dashboard_respond(
+            text, stream_cb, channel_name=channel_name,
+            resume_idle_cb=self.idle_loop.resume,
+        )
 
     async def voice_respond(self, text: str, stream_cb=None) -> tuple[str, list]:
         """Wie dashboard_respond, aber über das kleine, dauerhaft geladene
         Voice-Agent-Backend statt des großen Dashboard-Agenten (Latenz)."""
-        return await self.msg_handler.dashboard_respond(text, stream_cb, agent=self.voice_agent)
+        return await self.msg_handler.dashboard_respond(
+            text, stream_cb, agent=self.voice_agent, channel_name="voice",
+            resume_idle_cb=self.idle_loop.resume,
+        )
 
     def lzg_embed(self, text: str) -> list[float]:
         """Synchroner Embedding-Wrapper für API-Endpoints.
@@ -203,6 +212,7 @@ class Orchestrator:
         await self._restore_memory()
         await self._warmup()
         self.channel.on_message(self.handle_message)
+        log_background_job_status()
         self.idle_loop.resume()
         self._bg_tasks.append(asyncio.create_task(self.idle_loop.monitoring_loop()))
         await self.channel.start()

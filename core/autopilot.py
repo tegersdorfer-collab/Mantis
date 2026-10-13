@@ -81,12 +81,12 @@ class Autopilot:
     # ── Senden + Persistenz ──────────────────────────────────────────────────
 
     async def _send(self, text: str, kind: str = "proactive") -> None:
-        if not config.AUTONOMOUS_MESSAGES_ENABLED:
+        if not config.AUTONOMOUS_MESSAGES_ENABLED and kind != "reminder":
             log.info("Autonome Nachricht unterdrückt (deaktiviert): %s", kind)
             return
         if not text:
             return
-        if _content_len(text) < _MIN_CONTENT_CHARS:
+        if kind != "reminder" and _content_len(text) < _MIN_CONTENT_CHARS:
             log.warning(f"Proaktive Nachricht ({kind}) verworfen — zu kurz/kaputt: {text!r}")
             return
         await self.channel.send(text)
@@ -134,6 +134,12 @@ class Autopilot:
         # Wenn Timo gerade aktiv ist: Modell für ihn freihalten, keine proaktive Last
         if self.is_user_active():
             return False
+
+        # Reminder laufen immer. Alle übrigen Autopilot-Aufgaben bleiben aus,
+        # solange autonome Nachrichten deaktiviert sind. Deep Execution hat
+        # zusätzlich einen eigenen Opt-in-Schalter.
+        if not config.AUTONOMOUS_MESSAGES_ENABLED:
+            return await self._tick_deep_execution()
 
         hour = datetime.now().hour
 
@@ -240,6 +246,28 @@ class Autopilot:
                 log.debug(f"Health-Anomalie: {e}")
 
         # 5. Mantis-Tasks abarbeiten (Deep Execution)
+        if await self._tick_deep_execution():
+            return True
+
+        # 7. Kontextueller proaktiver Gedanke (mit Mindestabstand + Selbstbewertung)
+        if not self.tracker.can_send():
+            return False
+        async with self._guard():
+            if self.is_user_active():
+                return False
+            thought = await self.proactive.generate()
+            if not thought:
+                return False
+            if await self.proactive.evaluate(thought):
+                await self._send(thought, kind="thought")
+                return True
+            log_event("thought", f"verworfen: {thought[:80]}")
+            return False
+
+    async def _tick_deep_execution(self) -> bool:
+        """Führt genau dann einen Task-Tick aus, wenn der Opt-in-Schalter aktiv ist."""
+        if not config.TASK_DEEP_EXECUTION_ENABLED:
+            return False
         try:
             active = db.query(
                 """SELECT * FROM tasks WHERE assigned_to='mantis'
@@ -263,21 +291,7 @@ class Autopilot:
                 return True
         except Exception as e:
             log.warning(f"Task-Executor: {e}")
-
-        # 7. Kontextueller proaktiver Gedanke (mit Mindestabstand + Selbstbewertung)
-        if not self.tracker.can_send():
-            return False
-        async with self._guard():
-            if self.is_user_active():
-                return False
-            thought = await self.proactive.generate()
-            if not thought:
-                return False
-            if await self.proactive.evaluate(thought):
-                await self._send(thought, kind="thought")
-                return True
-            log_event("thought", f"verworfen: {thought[:80]}")
-            return False
+        return False
 
     async def _deep_execute_tick(self, task: dict) -> None:
         """Ein Tick der Deep-Execution: Planning → Clarification → Subtask → Finalize."""

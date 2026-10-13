@@ -11,6 +11,7 @@ from communication.base import IncomingMessage
 from core.background_review import run_background_review
 from core.status import BUS
 from core import skills, db, ui_state, fast_commands, skill_request
+import config
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ def _safe_task(coro, label: str):
 class MessageHandler:
     def __init__(self, kzg, lzg, agent, prompt_builder, channel,
                  proactive_tracker, forgetting, extractor, bg_llm,
-                 alphaprogression, on_user_active):
+                 alphaprogression, on_user_active, on_idle_ready=None):
         self.kzg               = kzg
         self.lzg               = lzg
         self.agent             = agent
@@ -46,6 +47,12 @@ class MessageHandler:
         self.bg_llm            = bg_llm
         self.alphaprogression  = alphaprogression
         self.on_user_active    = on_user_active   # callback: () → None
+        self.on_idle_ready     = on_idle_ready    # callback: () → None
+
+    def _resume_idle_loop(self, callback=None) -> None:
+        callback = callback or self.on_idle_ready
+        if callback is not None:
+            callback()
 
     # ── Verification Bump ─────────────────────────────────────────────────────
 
@@ -80,12 +87,19 @@ class MessageHandler:
     # ── Telegram ──────────────────────────────────────────────────────────────
 
     async def handle(self, msg: IncomingMessage, resume_idle_cb) -> None:
+        try:
+            await self._handle_incoming(msg)
+        finally:
+            self._resume_idle_loop(resume_idle_cb)
+
+    async def _handle_incoming(self, msg: IncomingMessage) -> None:
         t0 = time.time()
+        channel_name = getattr(msg, "channel", "telegram")
         BUS.emit("thinking", "Nachricht empfangen…", detail=msg.text[:60])
         log.info(f"Eingehend: {msg.text[:60]}")
 
         self.kzg.add("user", msg.text)
-        self._persist_msg("user", msg.text, channel="telegram")
+        self._persist_msg("user", msg.text, channel=channel_name)
         self._check_verification_bump(msg.text)
         self.on_user_active()
 
@@ -110,9 +124,8 @@ class MessageHandler:
             )
             response = "Danke! Ich mache mit deiner Antwort weiter an der Aufgabe. 👍"
             self.kzg.add("assistant", response)
-            self._persist_msg("assistant", response)
+            self._persist_msg("assistant", response, channel=channel_name)
             BUS.emit("response", response)
-            resume_idle_cb()
             return
 
         # Accountability & Momentum: eingehende Antwort auf einen offenen
@@ -123,45 +136,48 @@ class MessageHandler:
         acc_reply = accountability.intercept(msg.text)
         if acc_reply is not None:
             self.kzg.add("assistant", acc_reply)
-            self._persist_msg("assistant", acc_reply)
+            self._persist_msg("assistant", acc_reply, channel=channel_name)
             BUS.emit("response", acc_reply)
             await self.channel.send(acc_reply)
-            resume_idle_cb()
             return
 
         # Alpha Progression
-        if await self._handle_alpha_progression(msg.text, "telegram"):
-            resume_idle_cb()
+        if await self._handle_alpha_progression(msg.text, channel_name):
             return
 
         # Agent-Loop
         stream_cb, finalize = await self._make_stream()
-        response, trace = await self._agent_turn(msg.text, channel_name="telegram",
+        response, trace = await self._agent_turn(msg.text, channel_name=channel_name,
                                                  stream_cb=stream_cb)
         if not response:
             response = "…"
         await finalize(response)
-        self._finish_turn(msg.text, response, trace, channel_name="telegram")
+        self._finish_turn(msg.text, response, trace, channel_name=channel_name)
 
         elapsed = time.time() - t0
         log.info(f"Antwort in {elapsed:.1f}s ({len(trace)} Tools, {self.agent.model_name})")
         BUS.emit("idle", "Bereit", detail=f"{elapsed:.1f}s · {self.agent.model_name}")
-        resume_idle_cb()
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
 
-    async def dashboard_respond(self, text: str, stream_cb=None, agent=None) -> tuple[str, list]:
-        self.on_user_active()
-        self.kzg.add("user", text)
-        self._persist_msg("user", text, channel="dashboard")
+    async def dashboard_respond(
+        self, text: str, stream_cb=None, agent=None, channel_name: str = "web",
+        resume_idle_cb=None,
+    ) -> tuple[str, list]:
+        try:
+            self.on_user_active()
+            self.kzg.add("user", text)
+            self._persist_msg("user", text, channel=channel_name)
 
-        if await self._handle_alpha_progression(text, "dashboard"):
-            return "", []
+            if await self._handle_alpha_progression(text, channel_name):
+                return "", []
 
-        response, trace = await self._agent_turn(text, channel_name="dashboard",
-                                                 stream_cb=stream_cb, agent=agent)
-        self._finish_turn(text, response, trace, channel_name="dashboard", agent=agent)
-        return response, trace
+            response, trace = await self._agent_turn(text, channel_name=channel_name,
+                                                     stream_cb=stream_cb, agent=agent)
+            self._finish_turn(text, response, trace, channel_name=channel_name, agent=agent)
+            return response, trace
+        finally:
+            self._resume_idle_loop(resume_idle_cb)
 
     # ── Gemeinsamer Agent-Turn (Telegram + Dashboard) ─────────────────────────
 
@@ -237,16 +253,17 @@ class MessageHandler:
         else:
             BUS.emit("idle", "Bereit")
 
-        _safe_task(
-            run_background_review(
-                user_text=user_text,
-                assistant_response=response,
-                tools_used=tools_used or [],
-                bg_llm=self.bg_llm,
-                lzg=self.lzg,
-            ),
-            "background_review"
-        )
+        if config.BACKGROUND_REVIEW_ENABLED:
+            _safe_task(
+                run_background_review(
+                    user_text=user_text,
+                    assistant_response=response,
+                    tools_used=tools_used or [],
+                    bg_llm=self.bg_llm,
+                    lzg=self.lzg,
+                ),
+                "background_review"
+            )
 
     # ── Streaming ─────────────────────────────────────────────────────────────
 
@@ -279,11 +296,11 @@ class MessageHandler:
         try:
             self.lzg.save_kzg_turn(role, content)
         except Exception as e:
-            log.warning(f"KZG-Turn nicht gespeichert: {e}")
+            log.error(f"KZG-Turn nicht gespeichert: {e}")
         try:
             db.execute(
                 "INSERT INTO chat_messages (role, content, channel, meta) VALUES (%s,%s,%s,%s)",
                 (role, content, channel, json.dumps(meta or {})),
             )
         except Exception as e:
-            log.warning(f"Chat-Nachricht nicht persistiert: {e}")
+            log.error(f"Chat-Nachricht nicht persistiert: {e}")

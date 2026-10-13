@@ -21,11 +21,11 @@ import math
 from datetime import datetime, timezone
 
 from core import db as _db
+import config
 
 log = logging.getLogger(__name__)
 
 DELETE_THRESHOLD = 0.10   # Retention unter 10% → vergessen
-CHAT_TTL_DAYS    = 3      # Einfache Chat-Nachrichten nach 3 Tagen löschen
 
 
 def compute_retention(importance: float, recall_count: int, days: float) -> float:
@@ -119,20 +119,22 @@ class ForgettingCurve:
     async def _prune_chat(self) -> int:
         """Löscht alte Chat-Nachrichten (einfaches TTL)."""
         import asyncio
+        ttl_days = config.CHAT_TTL_DAYS
         result = await asyncio.to_thread(
             _db.query_one,
-            f"""
+            """
             WITH deleted AS (
                 DELETE FROM chat_messages
-                WHERE created_at < NOW() - INTERVAL '{CHAT_TTL_DAYS} days'
+                WHERE created_at < NOW() - make_interval(days => %s)
                 RETURNING id
             )
             SELECT count(*) AS n FROM deleted
             """,
+            (ttl_days,),
         )
         n = int((result or {}).get("n", 0))
         if n:
-            log.info(f"🗑️ {n} alte Chat-Nachrichten gelöscht (>{CHAT_TTL_DAYS}d)")
+            log.info(f"🗑️ {n} alte Chat-Nachrichten gelöscht (>{ttl_days}d)")
         return n
 
     def bump_recall(self, memory_id: int) -> None:
