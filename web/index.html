@@ -16,6 +16,7 @@
 <script src="https://cdn.jsdelivr.net/npm/globe.gl@2.46.1/dist/globe.gl.min.js"></script>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/usage_costs.js"></script>
 <style>
 /* ── Design Tokens ──────────────────────────────────── */
 :root{
@@ -1838,7 +1839,7 @@ async function loadUsage(){
       <div><div style="font-size:10px;color:var(--t3);text-transform:uppercase">Heute</div><b>${fmt(t.today)}</b></div>
       <div><div style="font-size:10px;color:var(--t3);text-transform:uppercase">7 Tage</div><b>${fmt(t.week)}</b></div>
       <div><div style="font-size:10px;color:var(--t3);text-transform:uppercase">30 Tage</div><b>${fmt(t.month)}</b></div>
-    </div>`+((u.by_model||[]).map(m=>`<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;border-top:1px solid var(--bd)"><span style="color:var(--t2)">${esc(m.model)}</span><span>${Math.round((m.input_tokens||0)/1000)}k→${Math.round((m.output_tokens||0)/1000)}k · <b>${m.cost_usd?fmt(m.cost_usd):'lokal'}</b></span></div>`).join('')||'<span style="color:var(--t3);font-size:13px">Noch keine Daten.</span>');
+    </div><div style="font-size:10px;color:var(--t3);margin:-2px 0 8px">${MantisUsageCosts.totalsNote}</div>`+((u.by_model||[]).map(m=>`<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;border-top:1px solid var(--bd)"><span style="color:var(--t2)">${esc(m.model)}</span><span>${Math.round((m.input_tokens||0)/1000)}k→${Math.round((m.output_tokens||0)/1000)}k · <b>${MantisUsageCosts.formatCost(m.cost_usd,m.provider,fmt)}</b></span></div>`).join('')||'<span style="color:var(--t3);font-size:13px">Noch keine Daten.</span>');
   }catch(e){el.innerHTML='<span style="color:var(--t3);font-size:13px">Noch keine Daten.</span>'}
 }
 function _trend(cur,prev){

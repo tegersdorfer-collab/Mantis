@@ -304,6 +304,8 @@ class Orchestrator:
         self.idle_loop.pause()
         for t in getattr(self, "_bg_tasks", []):
             t.cancel()
+        from core import llm_usage
+        await llm_usage.shutdown_pending_generation_lookups()
         for closer, label in [
             (self.lzg.close, "LZG"),
             (self._dashboard.close, "Dashboard"),

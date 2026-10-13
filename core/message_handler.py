@@ -12,6 +12,7 @@ from communication.base import IncomingMessage
 from core.background_review import run_background_review
 from core.status import BUS
 from core import skills, db, ui_state, fast_commands, skill_request
+from core.error_redaction import redact_error_text
 import config
 
 log = logging.getLogger(__name__)
@@ -249,7 +250,7 @@ class MessageHandler:
                 temperature=0.75, max_tokens=1500,
             )
         except Exception as e:
-            log.error(f"Agent-Fehler ({channel_name}): {e}")
+            log.error("Agent-Fehler (%s): %s", channel_name, redact_error_text(e))
             db.log_error(f"agent_turn/{channel_name}", e)
             return "⚠️ Technisches Problem, versuch es nochmal.", []
 

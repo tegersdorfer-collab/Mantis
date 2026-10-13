@@ -52,7 +52,7 @@ def build_router(orch=None) -> APIRouter:
             f"Kontext:\n{ctx}\n\n"
             f"Antworte NUR mit den 3 Fragen, eine pro Zeile, ohne Nummerierung oder Formatierung."
         )
-        resp = await orch.chat_llm.chat(
+        resp = await orch.bg_llm.chat(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.9, max_tokens=200,
         )

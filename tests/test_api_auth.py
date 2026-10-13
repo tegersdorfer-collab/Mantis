@@ -19,6 +19,9 @@ def client(monkeypatch):
     @router.post('/api/upload')
     async def upload():
         return {'ok': True}
+    @router.get('/usage_costs.js')
+    def usage_costs_script():
+        return {'ok': True}
     @router.websocket('/ws/test')
     async def websocket(ws: WebSocket):
         await ws.accept()
@@ -37,6 +40,12 @@ def test_private_requires_auth(client):
     assert client.get('/api/private').status_code == 401
     assert client.get('/api/private?token=' + TOKEN).status_code == 401
     assert client.post('/api/upload', files={'image': ('x.jpg', b'x')}).status_code == 401
+
+
+def test_dashboard_usage_script_is_public_shell_asset(client):
+    response = client.get('/usage_costs.js')
+
+    assert response.status_code == 200
 
 
 @pytest.fixture

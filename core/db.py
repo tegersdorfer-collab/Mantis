@@ -16,6 +16,8 @@ import psycopg2.extras
 import psycopg2.pool
 from pgvector.psycopg2 import register_vector
 
+from core.error_redaction import redact_error_text
+
 import config
 
 log = logging.getLogger(__name__)
@@ -753,4 +755,9 @@ def log_error(source: str, exc: Exception) -> None:
     """Protokolliert einen Fehler fürs Dashboard-Widget 'Was ist heute schiefgelaufen'.
     Bewusst nur an den wichtigsten Stellen genutzt (nicht jeder der ~200 try/except-Blöcke
     im Code), damit das Widget auf echte Feature-Ausfälle zeigt statt auf Rauschen."""
-    log_event("error", f"{source}: {exc}", {"source": source, "error": str(exc)})
+    safe_source = redact_error_text(source)
+    safe_error = redact_error_text(exc)
+    log_event("error", f"{safe_source}: {safe_error}", {
+        "source": safe_source,
+        "error": safe_error,
+    })

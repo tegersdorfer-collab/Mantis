@@ -14,6 +14,8 @@ from core.error_redaction import redact_error_text
 
 log = logging.getLogger(__name__)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+GENERATION_LOOKUP_TIMEOUT_S = 10
+_pending_generation_lookups: set[asyncio.Task] = set()
 
 # USD pro 1M Tokens (input, output) — Substring-Match auf den Modellnamen.
 # Reihenfolge zählt: spezifischere Muster zuerst.
@@ -30,8 +32,6 @@ PRICES: list[tuple[str, float, float]] = [
 def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
     """Schätzt bekannte Modellkosten; unbekannte Modelle bleiben unbekannt."""
     m = (model or "").lower()
-    if ":" in m or m.startswith(("ollama/", "local/")):
-        return 0.0
     for pattern, in_price, out_price in PRICES:
         if pattern in m:
             return (input_tokens * in_price + output_tokens * out_price) / 1_000_000
@@ -39,7 +39,7 @@ def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
 
 
 def _fallback_cost(provider: str, model: str, input_tokens: int, output_tokens: int) -> float | None:
-    if (provider or "").lower() in {"ollama", "local"}:
+    if (provider or "").lower() == "ollama":
         return 0.0
     return cost_usd(model, input_tokens, output_tokens)
 
@@ -78,9 +78,11 @@ def record(provider: str, model: str, input_tokens: int, output_tokens: int,
                     provider, model, purpose, input_count, output_count,
                     generation_id, api_key, generation_client,
                 ))
+                _pending_generation_lookups.add(task)
+                task.add_done_callback(_generation_lookup_done)
             else:
                 task = loop.create_task(db.aexecute(sql, params))
-            task.add_done_callback(_log_task_error)
+                task.add_done_callback(_log_task_error)
         else:
             if needs_generation_lookup:
                 params = (
@@ -119,7 +121,10 @@ async def _record_with_generation_cost(
         return
 
     try:
-        cost = await _fetch_openrouter_generation_cost(generation_id, api_key, client)
+        cost = await asyncio.wait_for(
+            _fetch_openrouter_generation_cost(generation_id, api_key, client),
+            timeout=GENERATION_LOOKUP_TIMEOUT_S,
+        )
     except Exception as exc:
         log.debug("OpenRouter-Usage-Lookup fehlgeschlagen: %s", type(exc).__name__)
         cost = None
@@ -131,6 +136,20 @@ async def _record_with_generation_cost(
         await db.aexecute("UPDATE llm_usage SET cost_usd = %s WHERE id = %s", (cost, row_id))
     except Exception as exc:
         log.debug("llm_usage.cost-backfill fehlgeschlagen: %s", type(exc).__name__)
+
+
+def _generation_lookup_done(task: asyncio.Task) -> None:
+    _pending_generation_lookups.discard(task)
+    _log_task_error(task)
+
+
+async def shutdown_pending_generation_lookups() -> None:
+    """Bricht laufende Kosten-Nachfragen vor dem Schließen der DB sauber ab."""
+    tasks = tuple(_pending_generation_lookups)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _fetch_openrouter_generation_cost(

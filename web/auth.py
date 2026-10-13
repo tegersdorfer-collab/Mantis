@@ -9,7 +9,7 @@ import config
 
 COOKIE = 'mantis_session'
 SESSION_SECONDS = 7 * 24 * 60 * 60
-PUBLIC_PATHS = {'/', '/index.html', '/sw.js', '/manifest.json', '/favicon.ico'}
+PUBLIC_PATHS = {'/', '/index.html', '/sw.js', '/manifest.json', '/favicon.ico', '/usage_costs.js'}
 TRIGGER_PATHS = {'/api/trigger/ping', '/api/trigger/estop', '/api/trigger/tool'}
 
 

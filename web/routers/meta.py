@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 
 
@@ -23,6 +23,14 @@ def build_router(orch=None) -> APIRouter:
         return HTMLResponse(
             (WEB_DIR / "index.html").read_text(),
             headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+        )
+
+    @router.get("/usage_costs.js")
+    def usage_costs_script():
+        return Response(
+            (WEB_DIR / "usage_costs.js").read_text(),
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-store"},
         )
 
     @router.get("/mcp/tools")

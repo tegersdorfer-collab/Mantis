@@ -215,7 +215,7 @@ def build_router(orch=None) -> APIRouter:
             '"distance_km":null,"exercises":[{"name":"...","sets":[{"reps":10,"weight_kg":60}]}]}\n'
             "Nur JSON, kein Text drumherum.\n\nDump:\n" + dump + "\n\nJSON:"
         )
-        raw = await orch.chat_llm.chat(messages=[{"role": "user", "content": prompt}],
+        raw = await orch.bg_llm.chat(messages=[{"role": "user", "content": prompt}],
                                   temperature=0.2, max_tokens=900, format="json")
         data = extract_json(raw, default=None)
         if not isinstance(data, dict):
@@ -298,7 +298,7 @@ def build_router(orch=None) -> APIRouter:
     async def generate_plan(req: Request):
         if not orch:
             return JSONResponse({"error": "kein Kern"}, 503)
-        plan = await plan_generator.generate_and_save(orch.chat_llm, orch.bg_llm)
+        plan = await plan_generator.generate_and_save(None, orch.bg_llm)
         if not plan:
             return JSONResponse({"ok": False, "error": "Generierung fehlgeschlagen"}, 502)
         return {"ok": True, "plan": plan}

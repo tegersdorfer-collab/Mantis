@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from unittest.mock import patch
 
-from core.llm_usage import cost_usd, record
+from core.llm_usage import cost_usd, record, _fallback_cost
 
 
 class TestCostUsd:
@@ -29,7 +29,7 @@ class TestCostUsd:
         assert cost_usd("Claude-HAIKU-4-5", 1_000_000, 0) == 1.00
 
     def test_local_model_is_free(self):
-        assert cost_usd("qwen3.5:9b", 500_000, 500_000) == 0.0
+        assert _fallback_cost("ollama", "qwen3.5:9b", 500_000, 500_000) == 0.0
 
     def test_unknown_model_cost_is_unknown(self):
         assert cost_usd("mystery-model", 1000, 1000) is None
@@ -44,6 +44,11 @@ class TestCostUsd:
     def test_openrouter_models_have_estimates_as_last_fallback(self):
         assert cost_usd("openai/gpt-6-luna", 1_000_000, 1_000_000) == 0.50
         assert cost_usd("google/gemini-3.1-flash-lite", 1_000_000, 1_000_000) == 0.375
+
+    def test_cloud_model_variant_suffix_is_not_mistaken_for_a_local_model(self):
+        assert cost_usd("openai/gpt-6-luna:nitro", 1_000_000, 1_000_000) == 0.50
+        assert _fallback_cost("openrouter", "qwen3.5:9b", 500_000, 500_000) is None
+        assert _fallback_cost("local", "unknown:variant", 500_000, 500_000) is None
 
 
 class TestRecord:
@@ -192,6 +197,63 @@ class TestRecord:
         assert inserted[0][5] is None
         assert updates[0][0] == 0.50
 
+    def test_generation_lookup_has_an_overall_timeout(self, monkeypatch):
+        from core import db
+        import core.llm_usage as llm_usage
+
+        cancelled = []
+        monkeypatch.setattr(llm_usage, "GENERATION_LOOKUP_TIMEOUT_S", 0.02)
+        monkeypatch.setattr(db, "ainsert_returning", lambda *_: _async_value(61))
+        monkeypatch.setattr(db, "aexecute", lambda *_: _async_value(1))
+
+        async def hanging_fetch(*args, **kwargs):
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.append(True)
+
+        monkeypatch.setattr(llm_usage, "_fetch_openrouter_generation_cost", hanging_fetch)
+
+        async def run():
+            await asyncio.wait_for(llm_usage._record_with_generation_cost(
+                "openrouter", "vendor/unknown", "chat-agent", 12, 5,
+                "gen-slow", "synthetic-key", None,
+            ), timeout=0.5)
+
+        asyncio.run(run())
+
+        assert cancelled == [True]
+
+    def test_shutdown_cancels_pending_generation_lookup_tasks(self, monkeypatch):
+        from core import db
+        import core.llm_usage as llm_usage
+
+        started = asyncio.Event()
+        cancelled = []
+        monkeypatch.setattr(db, "ainsert_returning", lambda *_: _async_value(62))
+
+        async def hanging_fetch(*args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.append(True)
+
+        monkeypatch.setattr(llm_usage, "_fetch_openrouter_generation_cost", hanging_fetch)
+
+        async def run():
+            llm_usage.record(
+                "openrouter", "vendor/unknown", 12, 5,
+                generation_id="gen-shutdown", api_key="synthetic-key",
+            )
+            await asyncio.wait_for(started.wait(), timeout=0.5)
+            await llm_usage.shutdown_pending_generation_lookups()
+            assert not llm_usage._pending_generation_lookups
+
+        asyncio.run(run())
+
+        assert cancelled == [True]
+
     def test_summary_keeps_unknown_model_cost_null(self, monkeypatch):
         from core import db
         from core.llm_usage import summary
@@ -247,3 +309,7 @@ class TestRecord:
             _, params = mock_exec.call_args[0]
             assert params[3] == 0
             assert params[4] == 300
+
+
+async def _async_value(value):
+    return value

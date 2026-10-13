@@ -75,12 +75,26 @@ def _msgs_to_openai(messages: list[dict]) -> list[dict]:
     return result
 
 
-def _extract_tool_calls(message: dict) -> list[dict]:
+def _extract_tool_calls(message: dict, tools: list[dict] | None = None) -> list[dict]:
     """OpenAI-Tool-Calls → einheitliches Backend-Format (Argumente als dict)."""
+    required_by_name = {}
+    for tool in tools or []:
+        fn_schema = tool.get("function") or {}
+        params = fn_schema.get("parameters") or {}
+        required_by_name[fn_schema.get("name", "")] = params.get("required") or []
+
     calls = []
     for tc in message.get("tool_calls") or []:
         fn = tc.get("function", {})
-        args = fn.get("arguments", {})
+        if "arguments" not in fn:
+            required = required_by_name.get(fn.get("name", ""), [])
+            if required:
+                raise ValueError(
+                    f"OpenRouter Tool-Argumente fehlen für Pflichtargumente: {', '.join(required)}"
+                )
+            args = {}
+        else:
+            args = fn["arguments"]
         if isinstance(args, str):
             if not args.strip():
                 raise ValueError("OpenRouter Tool-Argumente enthalten ungültiges JSON")
@@ -165,7 +179,7 @@ class OpenRouterBackend(AgentBackend):
         data = resp.json()
         self._record_usage(data.get("usage"), data.get("id"))
         message = (data.get("choices") or [{}])[0].get("message") or {}
-        return message.get("content") or "", _extract_tool_calls(message)
+        return message.get("content") or "", _extract_tool_calls(message, tools)
 
     async def _call_streaming(self, payload: dict, stream_cb: StreamCb) -> tuple[str, list[dict]]:
         payload = {**payload, "stream": True}
@@ -176,6 +190,7 @@ class OpenRouterBackend(AgentBackend):
         generation_id = None
         last_len = 0
         completed = False
+        finish_reason = None
 
         try:
             async with self._client.stream("POST", "/chat/completions", json=payload,
@@ -197,12 +212,17 @@ class OpenRouterBackend(AgentBackend):
                     if not isinstance(chunk, dict):
                         raise RuntimeError("OpenRouter-Stream enthält ein ungültiges Ereignis")
                     generation_id = chunk.get("id") or generation_id
-                    if "usage" in chunk:
+                    if chunk.get("usage") is not None:
                         if not isinstance(chunk["usage"], dict):
                             raise RuntimeError("OpenRouter-Stream enthält ungültige Usage-Daten")
                         usage = chunk["usage"]
                     if "error" in chunk:
                         raise RuntimeError("OpenRouter-Stream meldet einen API-Fehler")
+
+                    # Nach dem Abschluss können weitere Events die Usage-Trailer
+                    # enthalten. Deren Choices beeinflussen die Antwort nicht mehr.
+                    if finish_reason is not None:
+                        continue
 
                     choices = chunk.get("choices") or []
                     if not isinstance(choices, list):
@@ -233,17 +253,24 @@ class OpenRouterBackend(AgentBackend):
                         if fn.get("arguments"):
                             slot["arguments"] += fn["arguments"]
                     if choice.get("finish_reason") is not None:
+                        finish_reason = choice["finish_reason"]
                         completed = True
-                        break
 
             if not completed:
                 raise RuntimeError("OpenRouter-Stream endete ohne Abschluss")
+            if finish_reason is not None and finish_reason not in {"stop", "tool_calls"}:
+                # `length` bedeutet, dass die Antwort am Tokenlimit abgeschnitten
+                # wurde. Wie andere unvollständige Endgründe geht sie in den
+                # Backend-Fallback, statt als verwendbare Antwort zurückzukommen.
+                raise RuntimeError(f"OpenRouter-Stream mit finish_reason {finish_reason!r} beendet")
             full = "".join(parts)
             message = {"tool_calls": [
-                {"id": slot["id"], "function": {"name": slot["name"], "arguments": slot["arguments"]}}
+                {"id": slot["id"], "function": {
+                    "name": slot["name"], "arguments": slot["arguments"] or None,
+                }}
                 for _, slot in sorted(calls_by_index.items())
             ]}
-            tool_calls = _extract_tool_calls(message)
+            tool_calls = _extract_tool_calls(message, payload.get("tools"))
         except BaseException:
             # wait_for() cancels the stream on timeout; preserve any usage that
             # arrived before cancellation so the generation can still be billed.

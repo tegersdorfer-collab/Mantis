@@ -162,13 +162,35 @@ class TelegramChannel(CommunicationChannel):
     async def edit_message(self, message_id: int, text: str, markdown: bool = False) -> None:
         if not (self._app and self._chat_id and message_id):
             return
+        bot = self._app.bot
+        content = text[:4096]
         try:
-            await self._app.bot.edit_message_text(
-                chat_id=self._chat_id, message_id=message_id, text=text[:4096],
+            await bot.edit_message_text(
+                chat_id=self._chat_id, message_id=message_id, text=content,
                 parse_mode="Markdown" if markdown else None,
             )
         except Exception:
-            pass  # "message is not modified" o.ä. ignorieren
+            if not markdown:
+                return  # Bei Zwischenständen ist ein fehlgeschlagener Edit nicht final.
+            try:
+                await bot.edit_message_text(
+                    chat_id=self._chat_id, message_id=message_id, text=content,
+                    parse_mode=None,
+                )
+                return
+            except Exception:
+                pass
+
+            try:
+                await bot.send_message(chat_id=self._chat_id, text=content)
+            except Exception:
+                log.error("Telegram-Finalantwort konnte nicht editiert oder neu gesendet werden")
+                return
+
+            try:
+                await bot.delete_message(chat_id=self._chat_id, message_id=message_id)
+            except Exception:
+                log.debug("Telegram-Teilantwort konnte nach Ersatz nicht gelöscht werden")
 
     def _authorized(self, update: Update) -> bool:
         """Darf dieser Absender mit Mantis reden?

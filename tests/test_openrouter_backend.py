@@ -102,6 +102,48 @@ def test_extract_tool_calls_parses_json_arguments():
     assert calls == [{"id": "call_9", "function": {"name": "start_route", "arguments": {"destination": "Bahnhof"}}}]
 
 
+def test_missing_tool_arguments_rejects_registered_tool_with_required_field(monkeypatch):
+    from core import tools as T
+
+    monkeypatch.setattr(T, "REGISTRY", dict(T.REGISTRY))
+    @T.register(
+        "openrouter_required_probe", "Probe mit Pflichtfeld.",
+        {"destination": {"type": "string"}}, ["destination"], "general",
+    )
+    async def openrouter_required_probe(destination: str) -> str:
+        return destination
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_completion(tool_calls=[{
+            "id": "call-required",
+            "type": "function",
+            "function": {"name": "openrouter_required_probe"},
+        }]))
+
+    with pytest.raises(ValueError, match="Pflichtargumente"):
+        asyncio.run(_backend(handler).call(
+            [{"role": "user", "content": "Los"}],
+            tools=T.ollama_schemas(only=["openrouter_required_probe"]),
+            stream_cb=None, temperature=0.2, max_tokens=30,
+        ))
+
+
+def test_missing_tool_arguments_defaults_to_empty_object_when_no_fields_required():
+    message = {"tool_calls": [{
+        "id": "call-optional",
+        "function": {"name": "optional_tool"},
+    }]}
+    tools = [{"type": "function", "function": {
+        "name": "optional_tool",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }}]
+
+    assert _extract_tool_calls(message, tools) == [{
+        "id": "call-optional",
+        "function": {"name": "optional_tool", "arguments": {}},
+    }]
+
+
 @pytest.mark.parametrize("arguments", ["{not json", "", "[]", "null", '"text"', "42"])
 def test_extract_tool_calls_rejects_invalid_or_non_object_arguments(arguments):
     message = {"tool_calls": [{"id": "x", "function": {"name": "noop", "arguments": arguments}}]}
@@ -268,6 +310,68 @@ def test_streaming_collects_deltas_and_reports_progress():
     assert text == "Route gestartet."
     assert calls == []
     assert progress[-1] == "Route gestartet."
+
+
+def test_streaming_tolerates_null_usage_and_reads_usage_after_finish_reason(monkeypatch):
+    from core import llm_usage
+
+    records = []
+    monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: records.append((args, kwargs)))
+    chunks = [
+        {"id": "gen-usage-tail", "choices": [{"delta": {"content": "Antwort"}}], "usage": None},
+        {"id": "gen-usage-tail", "choices": [{"delta": {}, "finish_reason": "stop"}]},
+        {"id": "gen-usage-tail", "choices": [], "usage": {
+            "prompt_tokens": 120, "completion_tokens": 45, "cost": 0.035,
+        }},
+    ]
+    body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+    backend = _backend(handler)
+    text, calls = asyncio.run(backend.call(
+        [{"role": "user", "content": "hi"}], tools=None,
+        stream_cb=lambda _: asyncio.sleep(0), temperature=0.5, max_tokens=50,
+    ))
+
+    assert text == "Antwort"
+    assert calls == []
+    assert records == [(('openrouter', 'z-ai/glm-5.3', 120, 45), {
+        "purpose": "chat-agent", "actual_cost": 0.035,
+        "generation_id": "gen-usage-tail", "api_key": "sk-or-test",
+        "generation_client": backend._client,
+    })]
+
+
+@pytest.mark.parametrize("finish_reason", ["error", "content_filter", "length"])
+def test_streaming_rejects_non_success_finish_reason_after_reading_usage(monkeypatch, finish_reason):
+    from core import llm_usage
+
+    records = []
+    monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: records.append((args, kwargs)))
+    chunks = [
+        {"id": "gen-failed-finish", "choices": [{
+            "delta": {"content": "unfertig"}, "finish_reason": finish_reason,
+        }]},
+        {"id": "gen-failed-finish", "choices": [], "usage": {
+            "prompt_tokens": 120, "completion_tokens": 45, "cost": 0.035,
+        }},
+    ]
+    body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+    backend = _backend(handler)
+    with pytest.raises(RuntimeError, match="finish_reason"):
+        asyncio.run(backend.call(
+            [{"role": "user", "content": "hi"}], tools=None,
+            stream_cb=lambda _: asyncio.sleep(0), temperature=0.5, max_tokens=50,
+        ))
+
+    assert records[0][0] == ("openrouter", "z-ai/glm-5.3", 120, 45)
+    assert records[0][1]["actual_cost"] == 0.035
 
 
 def test_streaming_stops_at_done_and_ignores_later_events():
