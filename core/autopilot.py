@@ -45,6 +45,7 @@ STYLE = (
 # Mindestlänge an echtem Text (ohne Emoji/Whitespace), damit eine Nachricht
 # gesendet wird — fängt kaputte Modell-Fragmente wie "Liebe Zeit" ab.
 _MIN_CONTENT_CHARS = 20
+# Mantis läuft genau einmal (launchd + pidfile in main.py); die Lease ist nur Crash-Recovery.
 _MAX_REMINDER_MESSAGE_LENGTH = 2000
 
 
@@ -95,6 +96,10 @@ class Autopilot:
             return
         destination = self.reminder_channel if kind == "reminder" else self.channel
         await destination.send(text)
+        await self._after_send(text, kind)
+
+    async def _after_send(self, text: str, kind: str) -> None:
+        """Optionale Nacharbeit nach einer bereits zugestellten Nachricht."""
         try:
             from core import push
             import asyncio as _asyncio
@@ -128,18 +133,18 @@ class Autopilot:
         # 1. Fällige Reminder (zeitkritisch, immer – auch wenn User gerade aktiv)
         sent_reminder = False
         due_reminders = []
+        confirmed_delivery_ids = set()
         try:
             due_reminders = self.reminders.get_due()
             for r in due_reminders:
+                reminder_text = f"⏰ Erinnerung: {r.text}"
+                if len(reminder_text) > _MAX_REMINDER_MESSAGE_LENGTH:
+                    reminder_text = (
+                        reminder_text[:_MAX_REMINDER_MESSAGE_LENGTH - 1].rstrip() + "…"
+                    )
+                claimed_at = getattr(r, "claimed_at", None)
                 try:
-                    reminder_text = f"⏰ Erinnerung: {r.text}"
-                    if len(reminder_text) > _MAX_REMINDER_MESSAGE_LENGTH:
-                        reminder_text = (
-                            reminder_text[:_MAX_REMINDER_MESSAGE_LENGTH - 1].rstrip() + "…"
-                        )
-                    await self._send(reminder_text, kind="reminder")
-                    self.reminders.mark_sent(r.id)
-                    sent_reminder = True
+                    await self.reminder_channel.send_plain(reminder_text)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -148,18 +153,48 @@ class Autopilot:
                         r.id, type(e).__name__,
                     )
                     try:
-                        self.reminders.mark_delivery_failed(r.id)
+                        self.reminders.mark_delivery_failed(r.id, claimed_at)
                     except Exception as mark_error:
                         log.error(
                             "Reminder %s konnte nicht für einen erneuten Versuch markiert werden (%s)",
                             r.id, type(mark_error).__name__,
                         )
+                    continue
+
+                sent_reminder = True
+                confirmed_delivery_ids.add(r.id)
+                try:
+                    async def mark_sent() -> None:
+                        self.reminders.mark_sent(r.id)
+
+                    await asyncio.shield(asyncio.create_task(mark_sent()))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as mark_error:
+                    log.error(
+                        "Reminder %s wurde gesendet, Zustellstatus konnte nicht bestätigt werden (%s)",
+                        r.id, type(mark_error).__name__,
+                    )
+
+                try:
+                    await self._after_send(reminder_text, "reminder")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as post_error:
+                    log.warning(
+                        "Reminder %s wurde gesendet, Nacharbeit fehlgeschlagen (%s)",
+                        r.id, type(post_error).__name__,
+                    )
         except Exception as e:
             log.debug("Reminder-Check fehlgeschlagen (%s)", type(e).__name__)
         finally:
             for reminder in due_reminders:
+                if reminder.id in confirmed_delivery_ids:
+                    continue
                 try:
-                    self.reminders.release_claim(reminder.id)
+                    self.reminders.release_claim(
+                        reminder.id, getattr(reminder, "claimed_at", None)
+                    )
                 except Exception as release_error:
                     log.error(
                         "Reminder %s konnte nicht freigegeben werden (%s)",

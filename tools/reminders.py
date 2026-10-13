@@ -12,6 +12,7 @@ from core import db as _db
 log = logging.getLogger(__name__)
 
 _MAX_DELIVERY_ATTEMPTS = 3
+# Mantis läuft genau einmal (launchd + pidfile in main.py); die Lease dient nur der Crash-Recovery.
 _CLAIM_LEASE_MINUTES = 2
 
 
@@ -21,6 +22,7 @@ class Reminder:
     text: str
     remind_at: datetime
     sent: bool
+    claimed_at: datetime | None = None
 
 
 class ReminderStore:
@@ -72,11 +74,13 @@ class ReminderStore:
             "ORDER BY remind_at ASC FOR UPDATE SKIP LOCKED"
             ") UPDATE reminders AS reminder SET claimed_at = NOW() "
             "FROM due WHERE reminder.id = due.id "
-            "RETURNING reminder.id, reminder.text, reminder.remind_at, reminder.sent"
+            "RETURNING reminder.id, reminder.text, reminder.remind_at, reminder.sent, "
+            "reminder.claimed_at"
         )
         rows.sort(key=lambda row: row["remind_at"])
         return [Reminder(id=r["id"], text=r["text"],
-                         remind_at=r["remind_at"], sent=r["sent"]) for r in rows]
+                         remind_at=r["remind_at"], sent=r["sent"],
+                         claimed_at=r["claimed_at"]) for r in rows]
 
     def mark_sent(self, reminder_id: int) -> None:
         """Bestätigt einen vollständig zugestellten Reminder."""
@@ -86,14 +90,15 @@ class ReminderStore:
             (reminder_id,),
         )
 
-    def release_claim(self, reminder_id: int) -> None:
+    def release_claim(self, reminder_id: int, claimed_at: datetime | None) -> None:
         """Gibt einen ungesendeten Reminder nach Abbruch oder Fehler wieder frei."""
         _db.execute(
-            "UPDATE reminders SET claimed_at = NULL WHERE id = %s AND sent = FALSE",
-            (reminder_id,),
+            "UPDATE reminders SET claimed_at = NULL "
+            "WHERE id = %s AND sent = FALSE AND claimed_at = %s",
+            (reminder_id, claimed_at),
         )
 
-    def mark_delivery_failed(self, reminder_id: int) -> None:
+    def mark_delivery_failed(self, reminder_id: int, claimed_at: datetime | None) -> None:
         """Gibt einen fehlgeschlagenen Versand mit Backoff wieder frei.
 
         Nach drei fehlgeschlagenen Versuchen wird der Reminder beendet, damit
@@ -108,8 +113,8 @@ class ReminderStore:
             "WHEN delivery_attempts + 1 >= %s THEN NULL "
             "WHEN delivery_attempts = 0 THEN NOW() + INTERVAL '1 minute' "
             "ELSE NOW() + INTERVAL '5 minutes' END "
-            "WHERE id = %s",
-            (_MAX_DELIVERY_ATTEMPTS, _MAX_DELIVERY_ATTEMPTS, reminder_id),
+            "WHERE id = %s AND sent = FALSE AND claimed_at = %s",
+            (_MAX_DELIVERY_ATTEMPTS, _MAX_DELIVERY_ATTEMPTS, reminder_id, claimed_at),
         )
 
     def next_due_seconds(self) -> float | None:

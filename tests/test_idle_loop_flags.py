@@ -252,10 +252,10 @@ def test_due_reminders_still_send_when_autonomous_messages_are_off(monkeypatch):
         reminders=SimpleNamespace(
             get_due=lambda: [SimpleNamespace(id=1, text="Lang genug für den Test")],
             mark_sent=lambda _reminder_id: None,
-            mark_delivery_failed=lambda _reminder_id: None,
-            release_claim=lambda _reminder_id: None,
+            mark_delivery_failed=lambda _reminder_id, _claimed_at=None: None,
+            release_claim=lambda _reminder_id, _claimed_at=None: None,
         ),
-        channel=SimpleNamespace(send=send),
+        channel=SimpleNamespace(send=send, send_plain=send),
         proactive=None,
         tracker=Tracker(),
         identity="",
