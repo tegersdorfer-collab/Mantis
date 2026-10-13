@@ -525,6 +525,35 @@ MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS brain_notes_category_idx ON brain_notes (category);",
     "CREATE INDEX IF NOT EXISTS brain_notes_embedding_idx ON brain_notes USING hnsw (embedding vector_cosine_ops) WHERE embedding IS NOT NULL;",
+    """CREATE TABLE IF NOT EXISTS merk_inbox_items (
+        id                  BIGSERIAL PRIMARY KEY,
+        title               TEXT NOT NULL,
+        user_note           TEXT NOT NULL DEFAULT '',
+        source_kind         TEXT NOT NULL DEFAULT 'text'
+                            CHECK (source_kind IN ('link', 'image', 'text', 'mixed')),
+        source_urls         TEXT[] NOT NULL DEFAULT '{}',
+        normalized_urls     TEXT[] NOT NULL DEFAULT '{}',
+        dedupe_key          TEXT,
+        platform            TEXT NOT NULL DEFAULT 'unknown',
+        source_metadata     JSONB NOT NULL DEFAULT '{}'::jsonb,
+        image_description   TEXT NOT NULL DEFAULT '',
+        category            TEXT NOT NULL DEFAULT 'sonstiges'
+                            CHECK (category IN ('anschauen', 'lesen', 'film-serie', 'kaufen',
+                                                'idee', 'ort', 'zitat', 'sonstiges')),
+        tags                TEXT[] NOT NULL DEFAULT '{}',
+        status              TEXT NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open', 'done')),
+        embedding           vector(1024),
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at        TIMESTAMPTZ,
+        source_message_id   TEXT UNIQUE
+    );""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS merk_inbox_open_dedupe_idx ON merk_inbox_items (dedupe_key) WHERE status='open' AND dedupe_key IS NOT NULL;",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_status_created_idx ON merk_inbox_items (status, created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_category_idx ON merk_inbox_items (category, status, created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_urls_gin_idx ON merk_inbox_items USING gin (normalized_urls);",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_embedding_idx ON merk_inbox_items USING hnsw (embedding vector_cosine_ops) WHERE embedding IS NOT NULL;",
     "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS today_focus BOOLEAN DEFAULT FALSE;",
     """CREATE TABLE IF NOT EXISTS body_measurements (
         id          SERIAL PRIMARY KEY,

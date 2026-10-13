@@ -13,6 +13,10 @@ from core.background_review import run_background_review
 from core.status import BUS
 from core import skills, db, ui_state, fast_commands, skill_request
 from core.error_redaction import redact_error_text
+from domains.inbox import service as inbox_service
+from domains.inbox.capture import CaptureDecision, classify_capture
+from domains.inbox.query import is_inbox_request
+from domains.inbox.vision import SUPPORTED_IMAGE_TYPES
 import config
 
 log = logging.getLogger(__name__)
@@ -136,12 +140,72 @@ class MessageHandler:
         channel_name = getattr(msg, "channel", "telegram")
         if response_channel is None:
             response_channel = self._channel_for(msg)
-        BUS.emit("thinking", "Nachricht empfangen…", detail=msg.text[:60])
-        log.info(f"Eingehend: {msg.text[:60]}")
+        is_discord = channel_name == "discord"
+        attachments = tuple(getattr(msg, "attachments", ()) or ())
+        has_image = any(
+            str(getattr(attachment, "content_type", "") or "").split(";", 1)[0].casefold()
+            in SUPPORTED_IMAGE_TYPES
+            for attachment in attachments
+        )
+        capture_decision = classify_capture(msg.text, has_image=has_image) if is_discord else None
+        inbox_management = is_discord and is_inbox_request(
+            msg.text, has_reference=bool(getattr(msg, "reply_to_message_id", None))
+        )
+        inbox_turn = bool(capture_decision and capture_decision.capture) or inbox_management
+        alpha_link = self.alphaprogression.extract_link(msg.text) if is_discord else None
+        if alpha_link and capture_decision and capture_decision.reason == "bare_link":
+            # Bestehender Domain-Import ist eine eindeutige Aktion und bleibt vor
+            # der generischen Regel "nackter Link = merken" priorisiert.
+            capture_decision = CaptureDecision(False, "alpha_progression_import", capture_decision.urls)
+            inbox_turn = inbox_management
+        if inbox_turn:
+            reason = capture_decision.reason if capture_decision and capture_decision.capture else "management"
+            BUS.emit("thinking", "Merk-Inbox…", detail=reason)
+            log.info("Discord Merk-Inbox-Nachricht (%s)", reason)
+        else:
+            BUS.emit("thinking", "Nachricht empfangen…", detail=msg.text[:60])
+            log.info(f"Eingehend: {msg.text[:60]}")
 
         self.kzg.add("user", msg.text)
-        self._persist_msg("user", msg.text, channel=channel_name)
+        self._persist_msg(
+            "user", msg.text, channel=channel_name,
+            meta={"use_case": "inbox"} if inbox_turn else None,
+        )
         self._check_verification_bump(msg.text)
+
+        if capture_decision and capture_decision.capture:
+            result = await inbox_service.capture_discord_message(
+                msg,
+                response_channel,
+                vision_backend=getattr(self.agent, "_backend", None),
+                embedding_provider=getattr(self.prompt_builder, "embed_llm", None),
+            )
+            response = result.get("response") or "📥 Gemerkt."
+            self.kzg.add("assistant", response)
+            self._persist_msg(
+                "assistant", response, channel=channel_name,
+                meta={"use_case": "inbox", "tools": [], "model": self.agent.model_name},
+            )
+            BUS.emit("response", response)
+            return
+
+        if inbox_management:
+            stream_cb, finalize = await self._make_stream(response_channel)
+            response, trace = await self._agent_turn(
+                msg.text, channel_name=channel_name, stream_cb=stream_cb,
+            )
+            if not response:
+                response = "…"
+            self._finish_turn(
+                msg.text, response, trace, channel_name=channel_name,
+                meta={"use_case": "inbox"},
+            )
+            try:
+                await finalize(response)
+            except Exception as exc:
+                log.warning("Inbox-Antwort über Discord fehlgeschlagen (%s)", type(exc).__name__)
+            BUS.emit("idle", "Bereit", detail=f"{time.time() - t0:.1f}s · Merk-Inbox")
+            return
 
         # Engagement Decay
         try:
@@ -283,15 +347,18 @@ class MessageHandler:
             return "⚠️ Technisches Problem, versuch es nochmal.", []
 
     def _finish_turn(self, user_text: str, response: str, trace: list,
-                     channel_name: str, agent=None) -> None:
+                     channel_name: str, agent=None, meta: dict | None = None) -> None:
         """Antwort in KZG/DB persistieren, UI aktualisieren, Post-Turn-Learning starten."""
         agent = agent or self.agent
         self.kzg.add("assistant", response)
         tools_used = [t["tool"] for t in trace]
         _safe_task(ui_state.maybe_update_ui(tools_used), "ui_update")
-        self._persist_msg("assistant", response, channel=channel_name,
-                          meta={"tools": tools_used, "model": agent.model_name})
-        _safe_task(self._post_turn(user_text, response, tools_used), "post_turn")
+        message_meta = {"tools": tools_used, "model": agent.model_name}
+        if meta:
+            message_meta.update(meta)
+        self._persist_msg("assistant", response, channel=channel_name, meta=message_meta)
+        if message_meta.get("use_case") != "inbox":
+            _safe_task(self._post_turn(user_text, response, tools_used), "post_turn")
 
     # ── Post-Turn Learning ────────────────────────────────────────────────────
 

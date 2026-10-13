@@ -161,7 +161,11 @@ class Agent:
                     result = await toolreg.execute(name, args)
                 trace.append({"tool": name, "args": args, "result": result[:500]})
                 if not dry_run_tools:
-                    log_event("tool", f"{name}({_short(args)})", {"result": result[:300]})
+                    if name.startswith("inbox_"):
+                        status = "error" if result.startswith(("FEHLER", "⚠️")) else "completed"
+                        log_event("tool", name, {"status": status})
+                    else:
+                        log_event("tool", f"{name}({_short(args)})", {"result": result[:300]})
                 msgs.append({
                     "role": "tool",
                     "content": result,
