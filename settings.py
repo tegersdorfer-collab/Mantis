@@ -162,6 +162,14 @@ class MantisSettings(BaseSettings):
     DISCORD_CHANNEL_ID: str = ""
     NOTIFY_CHANNEL: str = "telegram"
 
+    # Modellfreier Discord-DM-Fast-Path für abgekoppelte codex-task-Prozesse.
+    # Leere/ungültige JSON-Allowlist und Feature aus bleiben fail closed.
+    AGENT_REMOTE_ENABLED: bool = False
+    AGENT_REMOTE_REPOS_RAW: str = Field('{"mantis":"~/Mantis"}', alias="AGENT_REMOTE_REPOS")
+    AGENT_REMOTE_TEST_ARGS_RAW: str = Field("{}", alias="AGENT_REMOTE_TEST_ARGS")
+    CODEX_TASK_MODEL: str = "gpt-6-luna"
+    CODEX_TASK_EFFORT: str = "max"
+
     # Shared-Secret für externe Trigger (Not-Stopp, Automationen) über /api/trigger/*.
     # Leer = Trigger-API deaktiviert (sicherer Default).
     TRIGGER_TOKEN: str = ""
@@ -260,6 +268,14 @@ class MantisSettings(BaseSettings):
             for value in self.DISCORD_ALLOWED_USER_IDS_RAW.split(",")
             if value.strip()
         ))
+
+    @property
+    def AGENT_REMOTE_REPOS(self) -> str:
+        return self.AGENT_REMOTE_REPOS_RAW
+
+    @property
+    def AGENT_REMOTE_TEST_ARGS(self) -> str:
+        return self.AGENT_REMOTE_TEST_ARGS_RAW
 
     @property
     def VAPID_CLAIM_EMAIL_RESOLVED(self) -> str:

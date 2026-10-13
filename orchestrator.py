@@ -39,6 +39,7 @@ from core.skill_factory import load_all_on_startup
 from core.prompt_builder import PromptBuilder
 from core.message_handler import MessageHandler
 from core.idle_loop import IdleLoop, log_background_job_status
+from domains.agent_remote import AgentRemoteService
 
 from tools.search import WebSearch
 from tools.dashboard import DashboardReader
@@ -157,6 +158,15 @@ class Orchestrator:
             on_idle_ready=lambda: self.idle_loop.resume(),
             channels=self.message_channels,
         )
+        discord_channel = self.additional_channels.get("discord")
+        self.agent_remote = (
+            AgentRemoteService.from_settings(
+                discord_channel=discord_channel,
+                persist=getattr(self.msg_handler, "_persist_msg", None),
+            )
+            if discord_channel is not None
+            else None
+        )
 
         self.idle_loop = IdleLoop(
             autopilot=self.autopilot, reflection=self.reflection,
@@ -184,6 +194,10 @@ class Orchestrator:
     # ── Öffentliche API (delegiert an Teilmodule) ─────────────────────────────
 
     async def handle_message(self, msg: IncomingMessage) -> None:
+        remote = getattr(self, "agent_remote", None)
+        if remote is not None and getattr(msg, "channel", None) == "discord":
+            if await remote.handle(msg, self.msg_handler._channel_for(msg)):
+                return
         await self.msg_handler.handle(msg, resume_idle_cb=self.idle_loop.resume)
 
     async def dashboard_respond(
@@ -260,6 +274,9 @@ class Orchestrator:
                     "Zusatzkanal %s konnte nicht gestartet werden (%s)",
                     name, type(e).__name__,
                 )
+        remote = getattr(self, "agent_remote", None)
+        if remote is not None:
+            await remote.start()
         log_event("system", "Mantis gestartet")
         log.info("Mantis bereit ✅")
 
@@ -338,6 +355,9 @@ class Orchestrator:
 
     async def stop(self) -> None:
         self.idle_loop.pause()
+        remote = getattr(self, "agent_remote", None)
+        if remote is not None:
+            await remote.stop()
         for t in getattr(self, "_bg_tasks", []):
             t.cancel()
         from core import llm_usage

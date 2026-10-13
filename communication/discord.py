@@ -235,6 +235,10 @@ class DiscordChannel(CommunicationChannel):
     def for_message(self, message):
         return _DiscordRoute(self, destination=message.channel)
 
+    def for_user(self, user_id: str):
+        """DM-Antwortziel für bestätigte Hintergrundläufe dieses Users."""
+        return _DiscordRoute(self, user_id=user_id)
+
     def for_first_allowed_user(self):
         user_id = self._allowed_user_ids[0] if self._allowed_user_ids else None
         return _DiscordRoute(self, user_id=user_id)
@@ -382,8 +386,9 @@ class _DiscordRoute:
         if destination is None:
             log.warning("Discord-Nachricht nicht gesendet: kein erlaubter Empfänger oder keine Verbindung")
             raise ConnectionError("Discord nicht verbunden oder kein erlaubter Empfänger")
+        kwargs = self._safe_mention_kwargs()
         for chunk in split_discord_message(text):
-            await destination.send(chunk)
+            await destination.send(chunk, **kwargs)
 
     async def send_plain(self, text: str) -> None:
         """Sendet einen einzelnen Text unverändert, ohne Markdown-Verarbeitung."""
@@ -392,7 +397,16 @@ class _DiscordRoute:
         if destination is None:
             log.warning("Discord-Nachricht nicht gesendet: kein erlaubter Empfänger oder keine Verbindung")
             raise ConnectionError("Discord nicht verbunden oder kein erlaubter Empfänger")
-        await destination.send(text)
+        await destination.send(text, **self._safe_mention_kwargs())
+
+    def _safe_mention_kwargs(self) -> dict:
+        mentions = getattr(self._channel._discord_module, "AllowedMentions", None)
+        if mentions is None:
+            return {}
+        try:
+            return {"allowed_mentions": mentions.none()}
+        except Exception:
+            return {}
 
     async def send_typing(self) -> None:
         destination = await self._resolve_destination()
