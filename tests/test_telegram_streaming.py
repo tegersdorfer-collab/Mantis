@@ -1,6 +1,8 @@
 """Finale Telegram-Edits dürfen keine unvollständige Antwort stehen lassen."""
 import asyncio
+import logging
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from communication.telegram import TelegramChannel
 
@@ -51,3 +53,31 @@ def test_final_answer_is_sent_as_new_message_when_both_edits_fail():
     assert len(bot.edits) == 2
     assert bot.sent == [{"chat_id": "42", "text": "Finale Antwort"}]
     assert bot.deleted == [{"chat_id": "42", "message_id": 7}]
+
+
+def test_stop_skips_updater_when_polling_is_not_running():
+    channel = TelegramChannel(token="test-token")
+    updater = SimpleNamespace(running=False, stop=AsyncMock())
+    app = SimpleNamespace(updater=updater, stop=AsyncMock(), shutdown=AsyncMock())
+    channel._app = app
+
+    asyncio.run(channel.stop())
+
+    updater.stop.assert_not_awaited()
+    app.stop.assert_awaited_once()
+    app.shutdown.assert_awaited_once()
+
+
+def test_stop_continues_application_shutdown_when_updater_stop_fails(caplog):
+    channel = TelegramChannel(token="test-token")
+    updater = SimpleNamespace(running=True, stop=AsyncMock(side_effect=RuntimeError("not running")))
+    app = SimpleNamespace(updater=updater, stop=AsyncMock(), shutdown=AsyncMock())
+    channel._app = app
+
+    with caplog.at_level(logging.WARNING, logger="communication.telegram"):
+        asyncio.run(channel.stop())
+
+    updater.stop.assert_awaited_once()
+    app.stop.assert_awaited_once()
+    app.shutdown.assert_awaited_once()
+    assert "Updater" in caplog.text and "RuntimeError" in caplog.text

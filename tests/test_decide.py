@@ -4,12 +4,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from unittest.mock import patch
 
 import httpx
 import jevkit
 import pytest
+from jevkit.backends import BackendError
 
 from core import decide
 from core.decide import Noul, Choice, JevUnavailable
@@ -100,6 +102,82 @@ def test_cloudflare_entpackt_antwort_und_modell(monkeypatch):
 
     assert answer.p == 0.86
     assert answer.model == "clef-flash"
+
+
+def test_cloudflare_bereinigt_leere_zu_lange_und_strukturierte_fragen():
+    seen = []
+
+    def h(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "success": True,
+            "result": {"model": "clef-flash", "answers": {}, "usage": {}},
+            "errors": [],
+        })
+
+    backend = decide.CloudflareBackend("account-test", "cf-secret", transport=_transport(h))
+    asyncio.run(backend.ask("x", {
+        "empty": {"type": "noul", "instructions": "   "},
+        "long": {
+            "type": "choice",
+            "instructions": "q" * 5000,
+            "criteria": {"option": "c" * 5000},
+        },
+        "structured": {"type": "noul", "instructions": ["first", "second"]},
+    }))
+
+    questions = seen[0]["questions"]
+    assert set(questions) == {"long", "structured"}
+    assert questions["long"]["instructions"] == "q" * 4096
+    assert questions["long"]["criteria"]["option"] == "c" * 4096
+    assert questions["structured"]["instructions"] == '["first","second"]'
+
+
+def test_cloudflare_422_logs_full_field_errors_and_falls_back_to_openrouter(monkeypatch, caplog):
+    _enabled_chain(monkeypatch)
+    seen = []
+
+    def h(request):
+        seen.append(request.url.host)
+        if request.url.host == "api.cloudflare.com":
+            return httpx.Response(422, json={
+                "success": False,
+                "message": "request validation failed; token cf-test",
+                "errors": [{
+                    "message": (
+                        "AiError invalid_request: Request body failed validation; "
+                        "fieldErrors: {questions: [String must contain at most 4096 characters; token cf-test]}"
+                    ),
+                }],
+            })
+        return httpx.Response(200, json={
+            "model": "typesafe/jev-1.13",
+            "answers": {"q": {"type": "noul", "noul": 0.91}},
+            "usage": {},
+        })
+
+    with caplog.at_level(logging.WARNING, logger="jevkit.client"):
+        with patch.object(decide, "_transport", _transport(h)):
+            answer = asyncio.run(decide.decide("x", {"q": Noul("Ist x?")}))["q"]
+
+    assert seen == ["api.cloudflare.com", "openrouter.ai"]
+    assert answer.model == "typesafe/jev-1.13"
+    assert "String must contain at most 4096 characters" in caplog.text
+    assert "cf-test" not in caplog.text
+
+
+def test_cloudflare_redacts_tokens_beyond_the_error_text_limit():
+    secret = "cf-secret-token"
+    response_text = "x" * 190 + secret + " trailing response text"
+    backend = decide.CloudflareBackend(
+        "account-test", secret, transport=_transport(lambda _: httpx.Response(400, text=response_text))
+    )
+
+    with pytest.raises(BackendError) as error:
+        asyncio.run(backend.ask("state", {"q": {"type": "noul", "instructions": "question"}}))
+
+    assert secret not in str(error.value)
+    assert "cf-secret" not in str(error.value)
 
 
 def test_cloudflare_fehler_faellt_auf_openrouter_zurueck(monkeypatch):

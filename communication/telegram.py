@@ -508,6 +508,14 @@ class TelegramChannel(CommunicationChannel):
 
     async def stop(self) -> None:
         if self._app:
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
+            updater = self._app.updater
+            if updater and updater.running:
+                try:
+                    await updater.stop()
+                except Exception as exc:
+                    log.warning("Telegram-Updater nicht sauber gestoppt (%s)", type(exc).__name__)
+            for stop, label in ((self._app.stop, "Application"), (self._app.shutdown, "Shutdown")):
+                try:
+                    await stop()
+                except Exception as exc:
+                    log.warning("Telegram-%s nicht sauber beendet (%s)", label, type(exc).__name__)

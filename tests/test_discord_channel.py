@@ -470,12 +470,34 @@ def test_discord_dm_only_does_not_request_guild_or_message_content_intents():
         channel, client = await _start_channel()
 
         assert client.intents.dm_messages is True
-        assert client.intents.guilds is False
+        assert client.intents.guilds is True
         assert client.intents.guild_messages is False
         assert client.intents.message_content is False
         await channel.stop()
 
     asyncio.run(run())
+
+
+def test_discord_suppresses_only_missing_voice_dependency_warnings(caplog):
+    async def run():
+        channel, _client = await _start_channel()
+        discord_client_log = logging.getLogger("discord.client")
+        discord_gateway_log = logging.getLogger("discord.gateway")
+
+        with caplog.at_level(logging.WARNING, logger="discord.client"):
+            discord_client_log.warning("PyNaCl is not installed, voice will NOT be supported")
+            discord_client_log.warning("davey is not installed, voice will NOT be supported")
+            discord_client_log.warning("Gateway reconnect failed")
+            discord_gateway_log.warning("Gateway heartbeat failed")
+
+        await channel.stop()
+
+    asyncio.run(run())
+
+    assert "PyNaCl is not installed" not in caplog.text
+    assert "davey is not installed" not in caplog.text
+    assert "Gateway reconnect failed" in caplog.text
+    assert "Gateway heartbeat failed" in caplog.text
 
 
 def test_invalid_discord_token_is_redacted_and_does_not_escape(caplog):

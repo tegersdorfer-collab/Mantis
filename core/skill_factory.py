@@ -194,7 +194,10 @@ def delete_skill(skill_name: str) -> dict:
 
 
 def list_dynamic_skills() -> list[str]:
-    """List inactive drafts and legacy files; presence does not mean activation."""
+    """List inactive drafts and legacy files; presence does not mean activation.
+
+    The non-recursive glob leaves archived files under ``_inaktiv/`` untouched.
+    """
     names = {p.stem for p in SKILLS_DIR.glob("*.py") if p.stem != "__init__"}
     names.update(p.name.removesuffix(".py.pending") for p in SKILLS_DIR.glob("*.py.pending"))
     return sorted(names)

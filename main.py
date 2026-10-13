@@ -47,6 +47,15 @@ def validate_dashboard_host(host: str) -> str:
     return str(address)
 
 
+async def _stop_components(components) -> None:
+    """Stoppt Komponenten einzeln, damit ein Fehler den Rest nicht blockiert."""
+    for name, component in components:
+        try:
+            await component.stop()
+        except Exception as exc:
+            log.warning("%s konnte nicht sauber beendet werden (%s)", name, type(exc).__name__)
+
+
 async def main():
     ensure_single_instance()
 
@@ -157,9 +166,10 @@ async def main():
 
     async def shutdown():
         log.info("Fährt herunter...")
-        await orchestrator.stop()
-        await channel.stop()
-        stop_event.set()
+        try:
+            await _stop_components((("Orchestrator", orchestrator), ("Telegram-Kanal", channel)))
+        finally:
+            stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))

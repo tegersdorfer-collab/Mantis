@@ -18,7 +18,7 @@ FIX = Path(__file__).parent / "fixtures" / "coros"
 
 RESPONSES = {
     "queryDailyHealthData":           "daily_health.txt",
-    "querySleepData":                 "sleep_data.txt",
+    "querySleepOverview":             "sleep_overview_synthetic.txt",
     "querySleepHrv":                  "sleep_hrv.txt",
     "queryRestingHeartRate":          "resting_hr.txt",
     "queryAvgHeartRate":              "avg_hr.txt",
@@ -79,7 +79,7 @@ def test_collect_merges_sources_into_one_day():
     days = importer.collect(FakeClient(), days=14)
     d = days["2026-08-11"]
     assert d["steps"] == 12500          # queryDailyHealthData
-    assert d["sleep_score"] == 38       # querySleepData
+    assert d["sleep_score"] == 78       # querySleepOverview
     assert d["hrv"] == 39               # querySleepHrv
     assert d["resting_hr"] == 47        # queryRestingHeartRate
     assert d["hr_avg"] == 85            # queryAvgHeartRate
@@ -95,6 +95,33 @@ def test_collect_sends_yyyymmdd_dates_not_iso():
                 assert args[key].isdigit() and len(args[key]) == 8, f"{name}.{key}={args[key]}"
 
 
+def test_sleep_overview_uses_new_tool_and_imports_wakeup_day_values():
+    client = FakeClient()
+
+    days = importer.collect(client, days=14)
+
+    assert "querySleepOverview" in [name for name, _args in client.calls]
+    assert "querySleepData" not in [name for name, _args in client.calls]
+    sleep = days["2026-08-10"]
+    assert sleep["sleep_score"] == 82
+
+
+def test_sleep_overview_parser_uses_wakeup_day_and_daily_scope_ratios():
+    text = (FIX / "sleep_overview_synthetic.txt").read_text(encoding="utf-8")
+    days = importer.mapping.parse_sleep(text)
+    sleep = days["2026-08-10"]
+
+    assert sleep["sleep_duration"] == 7.47
+    assert sleep["sleep_deep"] == 1.56
+    assert sleep["sleep_core"] == 3.9
+    assert sleep["sleep_rem"] == 2.34
+    assert sleep["sleep_awake"] == 0.3
+    assert sleep["sleep_awake_count"] == 3
+    assert sleep["sleep_start"] == "23:12"
+    assert sleep["sleep_end"] == "07:08"
+    assert sleep["nap_duration"] == 0.33
+
+
 def test_one_broken_tool_does_not_lose_the_others():
     days = importer.collect(FakeClient(broken={"querySleepHrv"}), days=14)
     assert days["2026-08-11"]["steps"] == 12500
@@ -107,7 +134,7 @@ def test_error_text_from_a_tool_is_treated_as_failure(monkeypatch):
     real = c.call_tool
 
     def call(name, arguments):
-        if name == "querySleepData":
+        if name == "querySleepOverview":
             return {"content": [{"type": "text", "text": err}]}
         return real(name, arguments)
 
@@ -133,14 +160,14 @@ def test_collect_logs_zero_days_when_a_source_yields_nothing(caplog):
     real = c.call_tool
 
     def call(name, arguments):
-        if name == "querySleepData":
+        if name == "querySleepOverview":
             return {"content": [{"type": "text", "text": "2026-08-10\nSleep Score: No data\n"}]}
         return real(name, arguments)
 
     c.call_tool = call
     with caplog.at_level("INFO", logger="mantis.coros"):
         importer.collect(c, days=14)
-    lines = [r.message for r in caplog.records if "querySleepData" in r.message]
+    lines = [r.message for r in caplog.records if "querySleepOverview" in r.message]
     assert len(lines) == 1
     assert "0" in lines[0]
 
@@ -265,18 +292,18 @@ def stored(monkeypatch):
 
 def test_exact_durations_win_over_ratios_derived_from_percentages():
     # Beide Quellen liefern 2026-08-10: queryDailyHealthData exakt (Deep 1h30),
-    # querySleepData gerechnet (22 % von 7h5 = 1.56). Die exakte muss gewinnen.
+    # querySleepOverview gerechnet (20 % von 7h28 = 1.49). Die exakte muss gewinnen.
     days = importer.collect(FakeClient(), days=14)
     assert days["2026-08-10"]["sleep_deep"] == 1.5
 
 
 def test_derived_stages_fill_days_the_exact_source_does_not_cover(monkeypatch):
-    # queryDailyHealthData kennt 2026-08-20 ohne Sleep-Block, querySleepData
+    # queryDailyHealthData kennt 2026-08-20 ohne Sleep-Block, querySleepOverview
     # liefert dort Anteile — die gerechneten Phasen müssen die Lücke füllen.
     texts = {
-        "querySleepData": (
-            "Sleep Data\n====\n\n2026-08-20\nSleep Score: 70\n"
-            "Main Sleep: 8h 0min\nDeep Sleep Ratio: 25%\n"
+        "querySleepOverview": (
+            "Sleep Overview\n====\n\n2026-08-20\nSleep Score: 70\n"
+            "Main Sleep (asleep): 8h 0min\nDeep Sleep Ratio: 25%\n"
         ),
         "queryDailyHealthData": "--- 20260820 ---\nSteps: 1,000 | Calories: 100 kcal\n",
     }
