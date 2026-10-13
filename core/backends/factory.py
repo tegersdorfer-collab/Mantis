@@ -1,9 +1,10 @@
 """Konfiguration und Aufbau der Chat-Backend-Ketten.
 
-Datenschutzgrenze: Cloud ist nur für interaktive Chat-Turns sowie deren direkte
-Fact-Extraction und KZG-Summary vorgesehen. Persistierte private Daten aus
-Journal-, Aufgaben-, Gesundheits- und anderen Dashboard-/Background-Routen
-verwenden ausschließlich bg_llm.
+Datenschutzgrenze (Entscheidung Timo, 13.10.2026): Der Chat-Turn darf den vollen
+Kontext an die Cloud senden, inkl. System-Prompt mit LZG, Aufgaben, Profil und
+Health/COROS sowie wiederhergestellter KZG-Historie. Dashboard-/Background-Routen
+(Journal, Aufgaben, Gesundheit, Fitness) verarbeiten gespeicherte Daten dagegen
+ausschließlich lokal über bg_llm.
 """
 from core.backends.claude import ClaudeBackend
 from core.backends.fallback import FallbackBackend
