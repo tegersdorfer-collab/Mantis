@@ -90,11 +90,24 @@ def _ollama_msgs_to_anthropic(messages: list[dict]) -> tuple[str | None, list[di
     return system, result
 
 
-def _extract_tool_calls(response) -> list[dict]:
+def _extract_tool_calls(response, tools: list[dict] | None = None) -> list[dict]:
     """Extrahiert Tool-Calls aus Anthropic-Response ins einheitliche Format."""
+    required_by_name = {}
+    for tool in tools or []:
+        function = tool.get("function") or tool
+        parameters = function.get("parameters") or {}
+        required_by_name[function.get("name", "")] = parameters.get("required") or []
+
     calls = []
     for block in response.content:
         if block.type == "tool_use":
+            if not isinstance(block.input, dict):
+                raise ValueError(f"Anthropic Tool-Argumente für {block.name} müssen ein JSON-Objekt sein")
+            missing = [name for name in required_by_name.get(block.name, []) if name not in block.input]
+            if missing:
+                raise ValueError(
+                    f"Anthropic Tool-Argumente fehlen für Pflichtargumente: {', '.join(missing)}",
+                )
             calls.append({
                 "id": block.id,
                 "function": {
@@ -111,8 +124,11 @@ def _extract_text(response) -> str:
 
 
 class ClaudeBackend(AgentBackend):
-    def __init__(self, model: str | None = None):
+    provider_name = "Anthropic"
+
+    def __init__(self, model: str | None = None, purpose: str = "chat-agent"):
         self._model = model or config.CLAUDE_CHAT_MODEL
+        self._purpose = purpose
         self._client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
     @property
@@ -146,21 +162,33 @@ class ClaudeBackend(AgentBackend):
 
         if stream_cb:
             collected = ""
+            received_message_stop = False
             async with self._client.messages.stream(**kwargs) as stream:
-                async for text in stream.text_stream:
-                    collected += text
-                    try:
-                        await stream_cb(collected)
-                    except Exception:
-                        pass
+                async for event in stream:
+                    if event.type == "message_stop":
+                        received_message_stop = True
+                    elif (
+                        event.type == "content_block_delta"
+                        and event.delta.type == "text_delta"
+                    ):
+                        collected += event.delta.text
+                        try:
+                            await stream_cb(collected)
+                        except Exception:
+                            pass
             final = await stream.get_final_message()
+            if not received_message_stop:
+                raise RuntimeError("Anthropic-Stream endete ohne message_stop")
+            stop_reason = getattr(final, "stop_reason", None)
+            if not isinstance(stop_reason, str) or not stop_reason:
+                raise RuntimeError("Anthropic-Stream endete ohne Abschluss")
             self._record_usage(final)
-            tool_calls = _extract_tool_calls(final)
+            tool_calls = _extract_tool_calls(final, tools)
             return _extract_text(final) or collected, tool_calls
 
         response = await self._client.messages.create(**kwargs)
         self._record_usage(response)
-        tool_calls = _extract_tool_calls(response)
+        tool_calls = _extract_tool_calls(response, tools)
 
         # Tool-Result-Messages brauchen tool_use_id → rückwärts befüllen
         # (wird beim nächsten Call aus dem trace rekonstruiert)
@@ -177,7 +205,7 @@ class ClaudeBackend(AgentBackend):
                 llm_usage.record("claude", self._model,
                                  getattr(u, "input_tokens", 0) or 0,
                                  getattr(u, "output_tokens", 0) or 0,
-                                 purpose="chat-agent")
+                             purpose=self._purpose)
         except Exception:
             pass
 

@@ -32,6 +32,12 @@ class TestCostUsd:
     def test_local_model_is_free(self):
         assert _fallback_cost("ollama", "qwen3.5:9b", 500_000, 500_000) == 0.0
 
+    def test_chatgpt_plan_is_free(self):
+        assert _fallback_cost("chatgpt-plan", "gpt-6-luna", 500_000, 500_000) == 0.0
+
+    def test_haiku_55_price_is_explicitly_estimated(self):
+        assert cost_usd("claude-haiku-5-5", 1_000_000, 1_000_000) == 6.0
+
     def test_unknown_model_cost_is_unknown(self):
         assert cost_usd("mystery-model", 1000, 1000) is None
 

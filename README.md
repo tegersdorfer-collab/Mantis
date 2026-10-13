@@ -20,7 +20,7 @@ Mantis ist ein Eigenprojekt, das ich vollständig allein konzipiert, entwickelt 
 | Agent-Tools | Tool-Registry mit semantischem Routing und geprüften Ausführungsrechten |
 | Tests | 1.100+ Python-Tests und 130+ Desktop-Tests; externe Dienste in Tests ersetzt |
 | Laufzeit | 24/7 auf MacBook Air M4 via launchd |
-| LLM-Backends | Ollama lokal · Claude API (Haiku/Sonnet) |
+| LLM-Backends | OpenRouter · Anthropic API (Haiku 5.5) · ChatGPT-Abo · Ollama lokal |
 | DB | PostgreSQL 16 + pgvector (Vektorsuche) |
 | iOS-Apps | 3 SwiftUI-Apps gegen dieselbe FastAPI |
 
@@ -30,9 +30,9 @@ Mantis ist ein Eigenprojekt, das ich vollständig allein konzipiert, entwickelt 
 
 ### Agent-Kern
 - **ReAct-Loop** mit Tool-Registry, mehrstufiger Ausführung und sequenziellen Tool-Aufrufen; erlaubte Tools werden bei jedem Aufruf geprüft
-- **LLM-Backends**: Ollama (qwen3.5:9b lokal) · Claude API (Haiku für Chat, Sonnet für komplexe Tasks)
+- **LLM-Backends**: Chat über OpenRouter, Anthropic Haiku 5.5, optional ChatGPT-Abo und lokales Ollama; Sonnet bleibt für komplexe Tasks verfügbar
 - **Subagent-Delegation**: `delegate_task` startet Kind-Agenten mit eigenem Gesprächskontext und eingeschränkten Tools; bis zu drei gleichzeitige Delegationen, keine rekursive Delegation. Die Agents teilen denselben Prozess
-- **LLM-Fallback**: Claude-Ausfall → lokales Ollama übernimmt transparent (90s-Timeout, 180s-Cooldown)
+- **LLM-Fallback**: OpenRouter → Anthropic → ChatGPT-Abo → Ollama, mit Timeout und Cooldown je Cloud-Stufe
 - **Token-Streaming** an Telegram + Dashboard (SSE)
 
 ### Gedächtnis-Architektur
@@ -117,7 +117,7 @@ Drei fokussierte Apps gegen dieselbe FastAPI (`:7779`), erreichbar über Tailsca
 | Schicht | Technologie |
 |---------|------------|
 | Sprache | Python 3.14 (asyncio) · Swift (SwiftUI) · JavaScript |
-| LLM | Ollama (qwen3.5:9b) · Claude API (Haiku/Sonnet) · MLX |
+| LLM | OpenRouter · Anthropic API · ChatGPT-Abo · Ollama (qwen3.5:9b) · MLX |
 | DB | PostgreSQL 16 + pgvector |
 | Backend | FastAPI + uvicorn |
 | Frontend | Vanilla JS PWA (Chart.js, vis.js, marked.js, globe.gl, Leaflet) |
@@ -140,6 +140,20 @@ cp .env.example .env       # Nur bei Ersteinrichtung; bestehende .env erhalten
 createdb mantis            # PostgreSQL + pgvector Extension
 python3 main.py            # Mantis + Dashboard starten (Port 7779)
 ```
+
+### ChatGPT-Abo als Chat-Fallback
+
+Die Abo-Stufe ist standardmäßig aktiviert und wird nur mit einer gültigen lokalen Anmeldung
+verwendet. Einmalig im Terminal ausführen:
+
+```bash
+python3.14 -m core.auth.chatgpt_login
+```
+
+Mantis öffnet den Browser und wartet bis zu fünf Minuten auf den lokalen Callback unter
+`127.0.0.1:1456`. Die Tokens liegen danach mit Dateirechten `0600` in
+`~/.config/mantis/chatgpt_auth.json`. Anschließend Mantis neu starten. Der Pfad ist über
+`CHATGPT_AUTH_FILE`, der Callback-Port über `CHATGPT_AUTH_CALLBACK_PORT` änderbar.
 
 ---
 
@@ -249,7 +263,7 @@ Mantis/
 
 ## Architektur-Prinzipien
 
-1. **Lokal first** — Daten verlassen den Mac nicht (außer explizite Cloud-Tools wie Claude API)
+1. **Datenrouting** — Der interaktive Chat darf gemäß expliziter Konfiguration den Gesprächskontext an seine Cloud-Kette senden. Dashboard- und Hintergrundrouten mit gespeicherten Privatdaten bleiben lokal.
 2. **Modulare Backends** — LLM, DB, Kommunikation sind austauschbar
 3. **Kein Over-Engineering** — einfacher Code > komplexe Abstraktionen
 4. **Mantis soll lernen** — jede Interaktion macht ihn besser, nicht nur reaktiver

@@ -431,3 +431,31 @@ def test_stream_failover_replaces_partial_message_instead_of_appending():
     assert result == ("complete local answer", [])
     assert edits[-1] == (77, "complete local answer")
     assert all(message_id == 77 for message_id, _ in edits)
+
+
+def test_backend_error_can_set_a_longer_fallback_pause():
+    class PausedError(RuntimeError):
+        fallback_cooldown_s = 1800
+        disable_backend = False
+
+    primary = FakeBackend("chatgpt-plan", error=PausedError("limit"))
+    chain = FallbackBackend(primary, FakeBackend("local"), cooldown_s=1)
+
+    assert _call(chain) == ("antwort", [])
+    assert chain._down_until[0] > __import__("time").time() + 1700
+
+
+def test_backend_error_can_disable_a_stage_until_chain_is_rebuilt():
+    class PermanentError(RuntimeError):
+        fallback_cooldown_s = None
+        disable_backend = True
+
+    primary = FakeBackend("chatgpt-plan", error=PermanentError("re-login"))
+    local = FakeBackend("local")
+    chain = FallbackBackend(primary, local, cooldown_s=1)
+
+    assert _call(chain) == ("antwort", [])
+    assert chain._down_until[0] == float("inf")
+    assert _call(chain) == ("antwort", [])
+    assert primary.calls == 1
+    assert local.calls == 2
