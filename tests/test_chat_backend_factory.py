@@ -145,6 +145,18 @@ def test_local_only_ignores_openrouter_and_claude_keys(monkeypatch):
     assert describe_backend_chain(backend) == "Ollama local-agent"
 
 
+def test_local_only_also_disables_background_cloud_when_flag_is_enabled(monkeypatch):
+    created = _install_fake_backends(monkeypatch)
+
+    provider = build_chat_task_provider(_cfg(
+        LLM_LOCAL_ONLY=True,
+        BG_CHAT_TASKS_USE_CLOUD=True,
+    ))
+
+    assert provider is None
+    assert created == []
+
+
 def test_missing_openrouter_key_preserves_claude_fallback(monkeypatch):
     _install_fake_backends(monkeypatch)
 

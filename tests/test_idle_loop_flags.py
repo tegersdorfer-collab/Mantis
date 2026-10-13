@@ -109,6 +109,28 @@ def test_idle_job_flag_controls_its_tick(monkeypatch, flag, tick_name, enabled):
     assert len(calls) == int(enabled)
 
 
+def test_training_plan_autogeneration_uses_only_local_background_llm(monkeypatch):
+    from domains import fitness, plan_generator
+
+    local_llm = object()
+    cloud_chat_llm = object()
+    selected = []
+
+    async def generate(chat_llm, bg_llm):
+        selected.append((chat_llm, bg_llm))
+
+    loop = _loop(bg_llm=local_llm)
+    loop.chat_llm = cloud_chat_llm
+    monkeypatch.setattr(config, "TRAINING_PLAN_AUTOGEN_ENABLED", True)
+    monkeypatch.setattr(fitness, "active_plan", lambda: None)
+    monkeypatch.setattr(plan_generator, "needs_regen", lambda *_: True)
+    monkeypatch.setattr(plan_generator, "generate_and_save", generate)
+
+    asyncio.run(loop._tick_plan())
+
+    assert selected == [(None, local_llm)]
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_memory_consolidation_flag_keeps_forgetting_and_backups_running(monkeypatch, enabled):
     import core.idle_loop as idle_loop_module

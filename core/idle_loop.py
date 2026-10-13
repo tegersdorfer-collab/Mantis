@@ -195,7 +195,7 @@ class IdleLoop:
             from datetime import date as _date
             from domains import fitness, plan_generator
             if plan_generator.needs_regen(fitness.active_plan(), _date.today()):
-                await plan_generator.generate_and_save(self.chat_llm, self.bg_llm)
+                await plan_generator.generate_and_save(None, self.bg_llm)
         except Exception:
             log.exception("Plan-Auto-Generierung fehlgeschlagen")
 

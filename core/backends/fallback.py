@@ -15,6 +15,7 @@ import logging
 import time
 
 from core.backends.base import AgentBackend, StreamCb
+from core.error_redaction import redact_error_text
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ class FallbackBackend(AgentBackend):
                 self._down_until[index] = time.time() + self._cooldown_s
                 if index == 0:
                     self._primary_down_until = self._down_until[index]
-                detail = str(e).strip()
+                detail = redact_error_text(e).strip()
                 failure = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
                 next_backend = self._next_available_backend(index + 1)
                 log.warning(
@@ -138,10 +139,12 @@ class FallbackBackend(AgentBackend):
     ) -> None:
         """Ausfall sichtbar machen: Fehler-Widget + Status-Feed."""
         try:
-            from core.db import log_error
-            message = str(exc).strip() or type(exc).__name__
-            recorded_exc = exc if str(exc).strip() else RuntimeError(message)
-            log_error("agent_fallback", recorded_exc)
+            detail = redact_error_text(exc).strip()
+            message = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+            recorded_exc = RuntimeError(message)
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(None, _record_failover_error, recorded_exc)
+            future.add_done_callback(_log_failover_task_error)
         except Exception:
             pass
         try:
@@ -161,4 +164,26 @@ class FallbackBackend(AgentBackend):
             try:
                 await backend.warmup()
             except Exception as e:
-                log.debug(f"Fallback-Warmup für {backend.model_name}: {e}")
+                log.debug(
+                    "Fallback-Warmup für %s: %s",
+                    backend.model_name,
+                    redact_error_text(e),
+                )
+
+
+def _record_failover_error(exc: Exception) -> None:
+    try:
+        from core.db import log_error
+        log_error("agent_fallback", exc)
+    except Exception as error:
+        log.debug("Fallback-Fehler konnte nicht persistiert werden: %s", redact_error_text(error))
+
+
+def _log_failover_task_error(future: asyncio.Future) -> None:
+    try:
+        error = future.exception()
+    except Exception as exc:
+        log.debug("Fallback-Loggingtask fehlgeschlagen: %s", redact_error_text(exc))
+        return
+    if error:
+        log.debug("Fallback-Loggingtask fehlgeschlagen: %s", redact_error_text(error))

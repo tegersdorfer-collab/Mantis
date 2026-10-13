@@ -82,11 +82,15 @@ def _extract_tool_calls(message: dict) -> list[dict]:
         fn = tc.get("function", {})
         args = fn.get("arguments", {})
         if isinstance(args, str):
+            if not args.strip():
+                raise ValueError("OpenRouter Tool-Argumente enthalten ungültiges JSON")
             try:
-                args = json.loads(args) if args.strip() else {}
-            except (TypeError, ValueError):
-                args = {}
-        calls.append({"id": tc.get("id", ""), "function": {"name": fn.get("name", ""), "arguments": args or {}}})
+                args = json.loads(args)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("OpenRouter Tool-Argumente enthalten ungültiges JSON") from exc
+        if not isinstance(args, dict):
+            raise ValueError("OpenRouter Tool-Argumente müssen ein JSON-Objekt sein")
+        calls.append({"id": tc.get("id", ""), "function": {"name": fn.get("name", ""), "arguments": args}})
     return calls
 
 
@@ -104,9 +108,13 @@ class OpenRouterBackend(AgentBackend):
         self._reasoning_effort = (reasoning_effort if reasoning_effort is not None
                                   else config.CHAT_CLOUD_REASONING_EFFORT)
         self._purpose = purpose
-        key = api_key if api_key is not None else config.OPENROUTER_API_KEY
+        raw_key = api_key if api_key is not None else config.OPENROUTER_API_KEY
+        key = str(raw_key or "").strip()
         if not key:
             raise ValueError("OpenRouterBackend braucht OPENROUTER_API_KEY")
+        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in key):
+            raise ValueError("OpenRouter API-Key ist ungültig")
+        self._api_key = key
         self._client = client or httpx.AsyncClient(base_url=BASE_URL, timeout=TIMEOUT_S)
         self._headers = {
             "Authorization": f"Bearer {key}",
@@ -155,7 +163,7 @@ class OpenRouterBackend(AgentBackend):
         resp = await self._client.post("/chat/completions", json=payload, headers=self._headers)
         resp.raise_for_status()
         data = resp.json()
-        self._record_usage(data.get("usage"))
+        self._record_usage(data.get("usage"), data.get("id"))
         message = (data.get("choices") or [{}])[0].get("message") or {}
         return message.get("content") or "", _extract_tool_calls(message)
 
@@ -165,51 +173,84 @@ class OpenRouterBackend(AgentBackend):
         # Tool-Call-Fragmente kommen pro `index` verteilt über mehrere Deltas.
         calls_by_index: dict[int, dict] = {}
         usage = None
+        generation_id = None
         last_len = 0
+        completed = False
 
-        async with self._client.stream("POST", "/chat/completions", json=payload,
-                                       headers=self._headers) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue  # SSE-Kommentare (": OPENROUTER PROCESSING") u.ä.
-                raw = line[5:].strip()
-                if not raw or raw == "[DONE]":
-                    continue
-                try:
-                    chunk = json.loads(raw)
-                except ValueError:
-                    continue
-                if chunk.get("usage"):
-                    usage = chunk["usage"]
-                delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
-                if delta.get("content"):
-                    parts.append(delta["content"])
-                    full = "".join(parts)
-                    if len(full) - last_len >= 50:
-                        last_len = len(full)
-                        try:
-                            await stream_cb(full)
-                        except Exception:
-                            pass
-                for frag in delta.get("tool_calls") or []:
-                    idx = frag.get("index", 0)
-                    slot = calls_by_index.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                    if frag.get("id"):
-                        slot["id"] = frag["id"]
-                    fn = frag.get("function") or {}
-                    if fn.get("name"):
-                        slot["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        slot["arguments"] += fn["arguments"]
+        try:
+            async with self._client.stream("POST", "/chat/completions", json=payload,
+                                           headers=self._headers) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue  # SSE-Kommentare (": OPENROUTER PROCESSING") u.ä.
+                    raw = line[5:].strip()
+                    if not raw:
+                        continue
+                    if raw == "[DONE]":
+                        completed = True
+                        break
+                    try:
+                        chunk = json.loads(raw)
+                    except ValueError as exc:
+                        raise RuntimeError("OpenRouter-Stream enthält ungültiges JSON") from exc
+                    if not isinstance(chunk, dict):
+                        raise RuntimeError("OpenRouter-Stream enthält ein ungültiges Ereignis")
+                    generation_id = chunk.get("id") or generation_id
+                    if "usage" in chunk:
+                        if not isinstance(chunk["usage"], dict):
+                            raise RuntimeError("OpenRouter-Stream enthält ungültige Usage-Daten")
+                        usage = chunk["usage"]
+                    if "error" in chunk:
+                        raise RuntimeError("OpenRouter-Stream meldet einen API-Fehler")
 
-        self._record_usage(usage)
-        full = "".join(parts)
-        message = {"tool_calls": [
-            {"id": slot["id"], "function": {"name": slot["name"], "arguments": slot["arguments"]}}
-            for _, slot in sorted(calls_by_index.items())
-        ]}
-        tool_calls = _extract_tool_calls(message)
+                    choices = chunk.get("choices") or []
+                    if not isinstance(choices, list):
+                        raise RuntimeError("OpenRouter-Stream enthält ungültige Choices")
+                    choice = choices[0] if choices else {}
+                    if not isinstance(choice, dict):
+                        raise RuntimeError("OpenRouter-Stream enthält eine ungültige Choice")
+                    delta = choice.get("delta") or {}
+                    if not isinstance(delta, dict):
+                        raise RuntimeError("OpenRouter-Stream enthält ein ungültiges Delta")
+                    if delta.get("content"):
+                        parts.append(delta["content"])
+                        full = "".join(parts)
+                        if len(full) - last_len >= 50:
+                            last_len = len(full)
+                            try:
+                                await stream_cb(full)
+                            except Exception:
+                                pass
+                    for frag in delta.get("tool_calls") or []:
+                        idx = frag.get("index", 0)
+                        slot = calls_by_index.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                        if frag.get("id"):
+                            slot["id"] = frag["id"]
+                        fn = frag.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            slot["arguments"] += fn["arguments"]
+                    if choice.get("finish_reason") is not None:
+                        completed = True
+                        break
+
+            if not completed:
+                raise RuntimeError("OpenRouter-Stream endete ohne Abschluss")
+            full = "".join(parts)
+            message = {"tool_calls": [
+                {"id": slot["id"], "function": {"name": slot["name"], "arguments": slot["arguments"]}}
+                for _, slot in sorted(calls_by_index.items())
+            ]}
+            tool_calls = _extract_tool_calls(message)
+        except BaseException:
+            # wait_for() cancels the stream on timeout; preserve any usage that
+            # arrived before cancellation so the generation can still be billed.
+            self._record_usage(usage, generation_id)
+            raise
+
+        self._record_usage(usage, generation_id)
         if full and not tool_calls:
             try:
                 await stream_cb(full)
@@ -217,14 +258,26 @@ class OpenRouterBackend(AgentBackend):
                 pass
         return full, tool_calls
 
-    def _record_usage(self, usage: dict | None) -> None:
+    def _record_usage(self, usage: dict | None, generation_id: str | None = None) -> None:
         try:
             from core import llm_usage
-            if usage:
-                llm_usage.record("openrouter", self._model,
-                                 int(usage.get("prompt_tokens") or 0),
-                                 int(usage.get("completion_tokens") or 0),
-                                 purpose=self._purpose,
-                                 actual_cost=(float(usage["cost"]) if usage.get("cost") is not None else None))
+            if not usage and not generation_id:
+                return
+            actual_cost = None
+            if usage and usage.get("cost") is not None:
+                try:
+                    actual_cost = float(usage["cost"])
+                except (TypeError, ValueError):
+                    actual_cost = None
+            llm_usage.record(
+                "openrouter", self._model,
+                int((usage or {}).get("prompt_tokens") or 0),
+                int((usage or {}).get("completion_tokens") or 0),
+                purpose=self._purpose,
+                actual_cost=actual_cost,
+                generation_id=generation_id,
+                api_key=self._api_key,
+                generation_client=self._client,
+            )
         except Exception:
             pass

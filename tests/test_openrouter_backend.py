@@ -22,6 +22,12 @@ from core.backends.openrouter import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def _avoid_usage_database_writes(monkeypatch):
+    from core import llm_usage
+    monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: None)
+
+
 def _backend(handler) -> OpenRouterBackend:
     transport = httpx.MockTransport(handler)
     return OpenRouterBackend(
@@ -96,10 +102,12 @@ def test_extract_tool_calls_parses_json_arguments():
     assert calls == [{"id": "call_9", "function": {"name": "start_route", "arguments": {"destination": "Bahnhof"}}}]
 
 
-def test_extract_tool_calls_tolerates_broken_arguments():
-    message = {"tool_calls": [{"id": "x", "function": {"name": "noop", "arguments": "{not json"}}]}
+@pytest.mark.parametrize("arguments", ["{not json", "", "[]", "null", '"text"', "42"])
+def test_extract_tool_calls_rejects_invalid_or_non_object_arguments(arguments):
+    message = {"tool_calls": [{"id": "x", "function": {"name": "noop", "arguments": arguments}}]}
 
-    assert _extract_tool_calls(message)[0]["function"]["arguments"] == {}
+    with pytest.raises(ValueError, match="Tool-Argumente"):
+        _extract_tool_calls(message)
 
 
 # ── HTTP-Aufruf ────────────────────────────────────────────────────────────
@@ -149,7 +157,8 @@ def test_usage_cost_is_requested_and_recorded_as_actual_openrouter_cost(monkeypa
         ))
 
     monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: records.append((args, kwargs)))
-    asyncio.run(_backend(handler).call(
+    backend = _backend(handler)
+    asyncio.run(backend.call(
         [{"role": "user", "content": "hi"}], tools=None, stream_cb=None,
         temperature=0.5, max_tokens=10,
     ))
@@ -157,6 +166,32 @@ def test_usage_cost_is_requested_and_recorded_as_actual_openrouter_cost(monkeypa
     assert seen["body"]["usage"] == {"include": True}
     assert records == [(("openrouter", "z-ai/glm-5.3", 12, 5), {
         "purpose": "chat-agent", "actual_cost": 0.001237,
+        "generation_id": "gen-1", "api_key": "sk-or-test",
+        "generation_client": backend._client,
+    })]
+
+
+def test_usage_cost_is_recorded_when_zero_tokens_have_actual_cost(monkeypatch):
+    from core import llm_usage
+
+    records = []
+    monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: records.append((args, kwargs)))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_completion(
+            content="ok", usage={"prompt_tokens": 0, "completion_tokens": 0, "cost": 0},
+        ))
+
+    backend = _backend(handler)
+    asyncio.run(backend.call(
+        [{"role": "user", "content": "hi"}], tools=None, stream_cb=None,
+        temperature=0.5, max_tokens=10,
+    ))
+
+    assert records == [(('openrouter', 'z-ai/glm-5.3', 0, 0), {
+        "purpose": "chat-agent", "actual_cost": 0.0,
+        "generation_id": "gen-1", "api_key": "sk-or-test",
+        "generation_client": backend._client,
     })]
 
 
@@ -235,6 +270,144 @@ def test_streaming_collects_deltas_and_reports_progress():
     assert progress[-1] == "Route gestartet."
 
 
+def test_streaming_stops_at_done_and_ignores_later_events():
+    chunks = [
+        {"choices": [{"delta": {"content": "fertig"}}]},
+    ]
+    body = (
+        "".join(f"data: {json.dumps(c)}\n\n" for c in chunks)
+        + "data: [DONE]\n\n"
+        + f'data: {json.dumps({"choices": [{"delta": {"content": " zu spät"}}]})}\n\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+    text, _ = asyncio.run(_backend(handler).call(
+        [{"role": "user", "content": "hi"}], tools=None, stream_cb=lambda _: asyncio.sleep(0),
+        temperature=0.5, max_tokens=50,
+    ))
+
+    assert text == "fertig"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'data: {"error":{"message":"provider failed"}}\n\n',
+        "data: {not json}\n\n",
+        'data: {"choices":[{"delta":{"content":"unfertig"}}]}\n\n',
+    ],
+    ids=["http-200-error-object", "broken-json", "eof-before-finish"],
+)
+def test_streaming_rejects_error_malformed_and_unfinished_responses(body):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+    with pytest.raises((RuntimeError, ValueError)):
+        asyncio.run(_backend(handler).call(
+            [{"role": "user", "content": "hi"}], tools=None,
+            stream_cb=lambda _: asyncio.sleep(0), temperature=0.5, max_tokens=50,
+        ))
+
+
+def test_streaming_accepts_finish_reason_without_done():
+    chunk = {"choices": [{"delta": {"content": "vollständig"}, "finish_reason": "stop"}]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=f"data: {json.dumps(chunk)}\n\n".encode(),
+                              headers={"content-type": "text/event-stream"})
+
+    text, calls = asyncio.run(_backend(handler).call(
+        [{"role": "user", "content": "hi"}], tools=None,
+        stream_cb=lambda _: asyncio.sleep(0), temperature=0.5, max_tokens=50,
+    ))
+
+    assert text == "vollständig"
+    assert calls == []
+
+
+def test_stream_abort_records_usage_received_before_transport_error(monkeypatch):
+    from core import llm_usage
+
+    records = []
+    monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: records.append((args, kwargs)))
+    chunk = {
+        "id": "gen-partial",
+        "choices": [{"delta": {"content": "partial"}}],
+        "usage": {"prompt_tokens": 17, "completion_tokens": 4},
+    }
+
+    class AbortedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield f"data: {json.dumps(chunk)}\n\n".encode()
+            raise httpx.ReadError("connection dropped")
+
+        async def aclose(self):
+            pass
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=AbortedStream(), headers={"content-type": "text/event-stream"})
+
+    backend = _backend(handler)
+    with pytest.raises(httpx.ReadError):
+        asyncio.run(backend.call(
+            [{"role": "user", "content": "hi"}], tools=None,
+            stream_cb=lambda _: asyncio.sleep(0), temperature=0.5, max_tokens=50,
+        ))
+
+    assert records == [(('openrouter', 'z-ai/glm-5.3', 17, 4), {
+        "purpose": "chat-agent", "actual_cost": None,
+        "generation_id": "gen-partial", "api_key": "sk-or-test",
+        "generation_client": backend._client,
+    })]
+
+
+def test_stream_cancellation_records_usage_received_before_timeout(monkeypatch):
+    from core import llm_usage
+
+    records = []
+    monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: records.append((args, kwargs)))
+    chunk = {
+        "id": "gen-timeout",
+        "choices": [{"delta": {"content": "partial"}}],
+        "usage": {"prompt_tokens": 8, "completion_tokens": 2},
+    }
+    chunk_consumed = asyncio.Event()
+
+    class HangingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield f"data: {json.dumps(chunk)}\n\n".encode()
+            chunk_consumed.set()
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            pass
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=HangingStream(), headers={"content-type": "text/event-stream"})
+
+    backend = _backend(handler)
+
+    async def cancel_call():
+        task = asyncio.create_task(backend.call(
+            [{"role": "user", "content": "hi"}], tools=None,
+            stream_cb=lambda _: asyncio.sleep(0), temperature=0.5, max_tokens=50,
+        ))
+        await asyncio.wait_for(chunk_consumed.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_call())
+
+    assert records == [(('openrouter', 'z-ai/glm-5.3', 8, 2), {
+        "purpose": "chat-agent", "actual_cost": None,
+        "generation_id": "gen-timeout", "api_key": "sk-or-test",
+        "generation_client": backend._client,
+    })]
+
+
 def test_streaming_merges_tool_call_argument_fragments():
     chunks = [
         {"choices": [{"delta": {"tool_calls": [
@@ -305,3 +478,27 @@ def test_model_name_and_requires_api_key():
     assert backend.model_name == "z-ai/glm-5.3"
     with pytest.raises(ValueError):
         OpenRouterBackend(model="z-ai/glm-5.3", api_key="")
+
+
+def test_api_key_is_trimmed_and_rejects_embedded_line_breaks():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers["authorization"]
+        return httpx.Response(200, json=_completion(content="ok"))
+
+    backend = OpenRouterBackend(
+        model="z-ai/glm-5.3", api_key=" \tsynthetic-key\n ",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="https://openrouter.ai/api/v1",
+        ),
+    )
+    asyncio.run(backend.call(
+        [{"role": "user", "content": "hi"}], tools=None, stream_cb=None,
+        temperature=0.5, max_tokens=10,
+    ))
+
+    assert seen["authorization"] == "Bearer synthetic-key"
+    with pytest.raises(ValueError, match="API-Key ist ungültig") as exc_info:
+        OpenRouterBackend(model="z-ai/glm-5.3", api_key="synthetic\nkey")
+    assert "synthetic" not in str(exc_info.value)

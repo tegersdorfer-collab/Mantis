@@ -109,7 +109,12 @@ async def _api_costs(days: int = 30):
     t = s["totals"]
     lines = [f"API-Kosten: heute ${t['today']:.2f} · 7 Tage ${t['week']:.2f} · 30 Tage ${t['month']:.2f}"]
     for m in s["by_model"][:8]:
-        cost = f"${m['cost_usd']:.2f}" if m["cost_usd"] else "kostenlos (lokal)"
+        if m["cost_usd"] is None:
+            cost = "unbekannt"
+        elif m["provider"] == "ollama":
+            cost = "kostenlos (lokal)"
+        else:
+            cost = f"${m['cost_usd']:.2f}"
         lines.append(
             f"- {m['model']}: {m['calls']} Calls, "
             f"{(m['input_tokens'] or 0) // 1000}k in / {(m['output_tokens'] or 0) // 1000}k out → {cost}"

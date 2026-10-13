@@ -8,7 +8,12 @@ niemals einen Chat-Turn brechen. Ollama-Calls werden mit Kosten 0 erfasst
 import asyncio
 import logging
 
+import httpx
+
+from core.error_redaction import redact_error_text
+
 log = logging.getLogger(__name__)
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # USD pro 1M Tokens (input, output) — Substring-Match auf den Modellnamen.
 # Reihenfolge zählt: spezifischere Muster zuerst.
@@ -16,48 +21,159 @@ PRICES: list[tuple[str, float, float]] = [
     ("haiku",  1.00,  5.00),
     ("sonnet", 3.00, 15.00),
     ("opus",  15.00, 75.00),
+    # Schätzwerte, nur wenn OpenRouter für die Generation keinen Preis liefert.
+    ("openai/gpt-6-luna", 0.10, 0.40),
+    ("google/gemini-3.1-flash-lite", 0.075, 0.30),
 ]
 
 
-def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Kosten in USD für einen Call. Unbekannte/lokale Modelle → 0."""
+def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    """Schätzt bekannte Modellkosten; unbekannte Modelle bleiben unbekannt."""
     m = (model or "").lower()
+    if ":" in m or m.startswith(("ollama/", "local/")):
+        return 0.0
     for pattern, in_price, out_price in PRICES:
         if pattern in m:
             return (input_tokens * in_price + output_tokens * out_price) / 1_000_000
-    return 0.0
+    return None
+
+
+def _fallback_cost(provider: str, model: str, input_tokens: int, output_tokens: int) -> float | None:
+    if (provider or "").lower() in {"ollama", "local"}:
+        return 0.0
+    return cost_usd(model, input_tokens, output_tokens)
 
 
 def record(provider: str, model: str, input_tokens: int, output_tokens: int,
-           purpose: str = "chat", actual_cost: float | None = None) -> None:
+           purpose: str = "chat", actual_cost: float | None = None,
+           generation_id: str | None = None, api_key: str | None = None,
+           generation_client: httpx.AsyncClient | None = None) -> None:
     """Schreibt einen Usage-Eintrag. Läuft im Event-Loop asynchron (nicht blockierend),
     außerhalb davon synchron. Fehler werden nur geloggt."""
-    if not input_tokens and not output_tokens:
+    input_count = input_tokens or 0
+    output_count = output_tokens or 0
+    if not input_count and not output_count and actual_cost is None and not generation_id:
         return
     try:
         from core import db
-        cost = (actual_cost if actual_cost is not None
-                else cost_usd(model, input_tokens or 0, output_tokens or 0))
+        needs_generation_lookup = (
+            (provider or "").lower() == "openrouter"
+            and generation_id is not None
+            and actual_cost is None
+        )
+        cost = None if needs_generation_lookup else (
+            actual_cost if actual_cost is not None
+            else _fallback_cost(provider, model, input_count, output_count)
+        )
         sql = ("INSERT INTO llm_usage (provider, model, purpose, input_tokens, "
                "output_tokens, cost_usd) VALUES (%s,%s,%s,%s,%s,%s)")
-        params = (provider, model, purpose, input_tokens or 0, output_tokens or 0, cost)
+        params = (provider, model, purpose, input_count, output_count, cost)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
         if loop is not None:
-            task = loop.create_task(db.aexecute(sql, params))
+            if needs_generation_lookup:
+                task = loop.create_task(_record_with_generation_cost(
+                    provider, model, purpose, input_count, output_count,
+                    generation_id, api_key, generation_client,
+                ))
+            else:
+                task = loop.create_task(db.aexecute(sql, params))
             task.add_done_callback(_log_task_error)
         else:
+            if needs_generation_lookup:
+                params = (
+                    provider, model, purpose, input_count, output_count,
+                    _fallback_cost(provider, model, input_count, output_count),
+                )
             db.execute(sql, params)
     except Exception as e:
-        log.debug(f"llm_usage.record fehlgeschlagen: {e}")
+        log.debug("llm_usage.record fehlgeschlagen: %s", redact_error_text(e))
+
+
+async def _record_with_generation_cost(
+    provider: str,
+    model: str,
+    purpose: str,
+    input_tokens: int,
+    output_tokens: int,
+    generation_id: str,
+    api_key: str | None,
+    client: httpx.AsyncClient | None,
+) -> None:
+    """Schreibt zunächst unbekannte Kosten und trägt danach Generation-Kosten nach."""
+    from core import db
+
+    insert_sql = (
+        "INSERT INTO llm_usage (provider, model, purpose, input_tokens, output_tokens, cost_usd) "
+        "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id"
+    )
+    params = (provider, model, purpose, input_tokens, output_tokens, None)
+    try:
+        row_id = await db.ainsert_returning(insert_sql, params)
+    except Exception as exc:
+        log.debug("llm_usage.insert fehlgeschlagen: %s", type(exc).__name__)
+        return
+    if row_id is None:
+        return
+
+    try:
+        cost = await _fetch_openrouter_generation_cost(generation_id, api_key, client)
+    except Exception as exc:
+        log.debug("OpenRouter-Usage-Lookup fehlgeschlagen: %s", type(exc).__name__)
+        cost = None
+    if cost is None:
+        cost = _fallback_cost(provider, model, input_tokens, output_tokens)
+    if cost is None:
+        return
+    try:
+        await db.aexecute("UPDATE llm_usage SET cost_usd = %s WHERE id = %s", (cost, row_id))
+    except Exception as exc:
+        log.debug("llm_usage.cost-backfill fehlgeschlagen: %s", type(exc).__name__)
+
+
+async def _fetch_openrouter_generation_cost(
+    generation_id: str,
+    api_key: str | None,
+    client: httpx.AsyncClient | None = None,
+) -> float | None:
+    """Liest den tatsächlichen Preis einer OpenRouter-Generation; Fehler bleiben tolerant."""
+    if not generation_id:
+        return None
+    if api_key is None:
+        try:
+            import config
+            api_key = config.OPENROUTER_API_KEY
+        except Exception:
+            api_key = ""
+    key = str(api_key or "").strip()
+    if not key or any(char.isspace() for char in key):
+        return None
+    headers = {"Authorization": f"Bearer {key}"}
+    try:
+        if client is None:
+            async with httpx.AsyncClient(base_url=OPENROUTER_BASE_URL, timeout=5) as owned_client:
+                response = await owned_client.get("/generation", params={"id": generation_id}, headers=headers)
+        else:
+            response = await client.get(
+                "/generation", params={"id": generation_id}, headers=headers, timeout=5,
+            )
+        response.raise_for_status()
+        data = response.json().get("data") or {}
+        value = data.get("total_cost")
+        if value is None:
+            value = data.get("cost")
+        return float(value) if value is not None else None
+    except Exception as exc:
+        log.debug("OpenRouter-Usage-Lookup fehlgeschlagen: %s", type(exc).__name__)
+        return None
 
 
 def _log_task_error(task: asyncio.Task) -> None:
     exc = task.exception() if not task.cancelled() else None
     if exc:
-        log.debug(f"llm_usage insert fehlgeschlagen: {exc}")
+        log.debug("llm_usage insert fehlgeschlagen: %s", redact_error_text(exc))
 
 
 def summary(days: int = 30) -> dict:
@@ -99,11 +215,19 @@ def summary(days: int = 30) -> dict:
     ) or {"today": 0, "week": 0, "month": 0}
     return {
         "daily": [
-            {**d, "date": d["date"].isoformat(), "cost_usd": float(d["cost_usd"] or 0)}
+            {
+                **d,
+                "date": d["date"].isoformat(),
+                "cost_usd": float(d["cost_usd"]) if d["cost_usd"] is not None else None,
+            }
             for d in daily
         ],
         "by_model": [
-            {**m, "cost_usd": float(m["cost_usd"] or 0)} for m in by_model
+            {
+                **m,
+                "cost_usd": float(m["cost_usd"]) if m["cost_usd"] is not None else None,
+            }
+            for m in by_model
         ],
         "totals": {k: float(v or 0) for k, v in totals.items()},
     }

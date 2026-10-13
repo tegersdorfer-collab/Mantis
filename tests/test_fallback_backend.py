@@ -1,8 +1,11 @@
 """Unit-Tests für core/backends/fallback.py (Failover-Logik, kein LLM nötig)."""
 import sys, os
+import json
+import threading
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asyncio
+import pytest
 
 from core.backends.base import AgentBackend
 from core.backends.fallback import FallbackBackend
@@ -39,6 +42,11 @@ def _call(backend):
         messages=[{"role": "user", "content": "hi"}], tools=None,
         stream_cb=None, temperature=0.7, max_tokens=100,
     ))
+
+
+@pytest.fixture(autouse=True)
+def _avoid_real_database_logging(monkeypatch):
+    monkeypatch.setattr("core.db.log_error", lambda *args, **kwargs: None)
 
 
 class TestHappyPath:
@@ -186,3 +194,240 @@ def test_chain_uses_next_available_cloud_stage_during_primary_cooldown():
     assert primary.calls == 1
     assert secondary.calls == 2
     assert local.calls == 0
+
+
+@pytest.mark.parametrize("cloud_stage", [0, 1], ids=["primary", "secondary"])
+@pytest.mark.parametrize(
+    "failure",
+    ["timeout", "4xx", "5xx", "network", "stream-abort", "broken-tool-arguments"],
+)
+def test_each_openrouter_stage_falls_back_on_backend_errors(cloud_stage, failure):
+    import httpx
+    from core.backends.openrouter import OpenRouterBackend
+
+    class AbortedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            chunk = {"choices": [{"delta": {"content": "partial"}}]}
+            yield f"data: {json.dumps(chunk)}\n\n".encode()
+            raise httpx.ReadError("stream ended early")
+
+        async def aclose(self):
+            pass
+
+    def backend(stage):
+        def handler(request):
+            request_model = json.loads(request.content)["model"]
+            assert request_model == f"cloud-{stage}"
+            if stage < cloud_stage:
+                raise httpx.ConnectError("advance to secondary", request=request)
+            if stage > cloud_stage:
+                done = {"choices": [{"delta": {"content": "cloud fallback"}, "finish_reason": "stop"}]}
+                body = f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n"
+                return httpx.Response(200, content=body.encode())
+            if failure == "timeout":
+                raise httpx.ReadTimeout("timed out", request=request)
+            if failure == "4xx":
+                error_body = 'data: {"choices":[{"delta":{"content":"bad status accepted"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+                return httpx.Response(429, content=error_body.encode())
+            if failure == "5xx":
+                error_body = 'data: {"choices":[{"delta":{"content":"bad status accepted"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+                return httpx.Response(500, content=error_body.encode())
+            if failure == "network":
+                raise httpx.ConnectError("network unavailable", request=request)
+            if failure == "stream-abort":
+                return httpx.Response(200, stream=AbortedStream())
+            chunk = {
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call-invalid",
+                        "function": {"name": "noop", "arguments": "[]"},
+                    }]},
+                    "finish_reason": "tool_calls",
+                }],
+            }
+            return httpx.Response(200, content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode())
+
+        return OpenRouterBackend(
+            model=f"cloud-{stage}", api_key="synthetic-key",
+            client=httpx.AsyncClient(
+                transport=httpx.MockTransport(handler),
+                base_url="https://openrouter.ai/api/v1",
+            ),
+        )
+
+    primary = backend(0)
+    secondary = backend(1)
+    local = FakeBackend("ollama", result=("lokal", []))
+    chain = FallbackBackend(
+        backends=[primary, secondary, local],
+        stage_timeouts=[0.5, 0.5, None],
+        cooldown_s=0,
+    )
+
+    result = asyncio.run(chain.call(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"type": "function", "function": {"name": "noop", "parameters": {}}}],
+        stream_cb=lambda _: asyncio.sleep(0), temperature=0.5, max_tokens=50,
+    ))
+
+    if cloud_stage == 0:
+        assert result == ("cloud fallback", [])
+        assert local.calls == 0
+    else:
+        assert result == ("lokal", [])
+        assert local.calls == 1
+
+
+def test_malformed_tool_arguments_never_reach_tool_execution(monkeypatch):
+    import httpx
+    from core.agent import Agent
+    from core.backends.openrouter import OpenRouterBackend
+    from core import tools as toolreg
+
+    def bad_backend(model):
+        def handler(request):
+            message = {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-invalid",
+                    "type": "function",
+                    "function": {"name": "dangerous", "arguments": "[]"},
+                }],
+            }
+            return httpx.Response(200, json={
+                "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
+            })
+
+        return OpenRouterBackend(
+            model=model, api_key="synthetic-key",
+            client=httpx.AsyncClient(
+                transport=httpx.MockTransport(handler),
+                base_url="https://openrouter.ai/api/v1",
+            ),
+        )
+
+    executed = []
+    async def execute(name, args):
+        executed.append((name, args))
+        return "ran"
+
+    monkeypatch.setattr(toolreg, "execute", execute)
+    chain = FallbackBackend(
+        backends=[bad_backend("cloud-1"), bad_backend("cloud-2"), FakeBackend("ollama", result=("local", []))],
+        stage_timeouts=[0.5, 0.5, None],
+        cooldown_s=0,
+    )
+
+    text, trace = asyncio.run(Agent(chain).run(
+        messages=[{"role": "user", "content": "run it"}],
+        system="test",
+        allowed_tools=["dangerous"],
+    ))
+
+    assert text == "local"
+    assert trace == []
+    assert executed == []
+
+
+def test_failover_redacts_configured_keys_and_bearer_tokens(monkeypatch, caplog):
+    import config
+
+    openrouter_key = "synthetic-openrouter-secret"
+    anthropic_key = "synthetic-anthropic-secret"
+    bearer = "synthetic-bearer-secret"
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", f" {openrouter_key}\n")
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", anthropic_key)
+    events = []
+    monkeypatch.setattr("core.db.log_error", lambda source, exc: events.append(str(exc)))
+    raw = f"key={openrouter_key}\nkey={anthropic_key}\nAuthorization: Bearer {bearer}"
+    chain = FallbackBackend(
+        FakeBackend("cloud", error=RuntimeError(raw)),
+        FakeBackend("local"),
+        cooldown_s=0,
+    )
+
+    with caplog.at_level("WARNING", logger="core.backends.fallback"):
+        _call(chain)
+
+    all_error_text = caplog.text + " ".join(events)
+    assert openrouter_key not in all_error_text
+    assert anthropic_key not in all_error_text
+    assert bearer not in all_error_text
+    assert "[REDACTED]" in all_error_text
+
+
+def test_failover_database_logging_does_not_block_fallback(monkeypatch):
+    started = threading.Event()
+    finished = threading.Event()
+    release = threading.Event()
+
+    def slow_log_error(source, exc):
+        started.set()
+        release.wait(timeout=1)
+        finished.set()
+
+    monkeypatch.setattr("core.db.log_error", slow_log_error)
+    chain = FallbackBackend(
+        FakeBackend("cloud", error=ConnectionError("offline")),
+        FakeBackend("local", result=("survived", [])),
+        cooldown_s=0,
+    )
+
+    async def exercise():
+        result = await chain.call(
+            messages=[{"role": "user", "content": "hi"}], tools=None,
+            stream_cb=None, temperature=0.7, max_tokens=100,
+        )
+        assert result == ("survived", [])
+        assert await asyncio.to_thread(started.wait, 0.5)
+        assert not finished.is_set()
+        release.set()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+
+
+def test_stream_failover_replaces_partial_message_instead_of_appending():
+    from core.message_handler import MessageHandler
+
+    class StreamingChannel:
+        supports_streaming = True
+
+        async def start_message(self, text):
+            return 77
+
+        async def edit_message(self, message_id, text, **kwargs):
+            edits.append((message_id, text))
+
+    edits = []
+    handler = object.__new__(MessageHandler)
+    handler.channel = StreamingChannel()
+    stream_cb, finalize = asyncio.run(handler._make_stream())
+
+    class PartialThenFailure(FakeBackend):
+        async def call(self, messages, tools, stream_cb, temperature, max_tokens,
+                       think=False, force_tool_call=False):
+            self.calls += 1
+            await stream_cb("partial from cloud")
+            raise ConnectionError("stream failed")
+
+    class Replacement(FakeBackend):
+        async def call(self, messages, tools, stream_cb, temperature, max_tokens,
+                       think=False, force_tool_call=False):
+            self.calls += 1
+            await stream_cb("complete local answer")
+            return "complete local answer", []
+
+    chain = FallbackBackend(PartialThenFailure("cloud"), Replacement("local"), cooldown_s=0)
+    result = asyncio.run(chain.call(
+        messages=[{"role": "user", "content": "hi"}], tools=None,
+        stream_cb=stream_cb, temperature=0.5, max_tokens=50,
+    ))
+    asyncio.run(finalize(result[0]))
+
+    assert result == ("complete local answer", [])
+    assert edits[-1] == (77, "complete local answer")
+    assert all(message_id == 77 for message_id, _ in edits)
