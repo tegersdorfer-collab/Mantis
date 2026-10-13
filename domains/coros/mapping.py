@@ -281,7 +281,7 @@ _STAGE_RATIOS = {
 
 
 def parse_sleep(text: str) -> dict[str, dict]:
-    """querySleepData → {'2026-08-10': {'sleep_score': 77, 'sleep_deep': 1.56, …}, …}.
+    """querySleepOverview → {'2026-08-10': {'sleep_score': 77, 'sleep_deep': 1.56, …}, …}.
 
     Die Phasen stehen hier als Prozentanteil der Hauptschlafzeit; die absoluten
     Stunden werden daraus gerechnet. parse_daily_health liefert dieselben Phasen
@@ -333,7 +333,7 @@ def parse_sleep(text: str) -> dict[str, dict]:
         label, value = (p.strip() for p in stripped.split(":", 1))
         if label == "Sleep Score":
             raw["score"] = parse_int(value)
-        elif label == "Main Sleep":
+        elif label in {"Main Sleep", "Main Sleep (asleep)"}:
             raw["main_h"] = parse_duration_h(value)
         elif label == "Awake Time":
             raw["awake_h"] = parse_duration_h(value)

@@ -19,6 +19,24 @@ _UNSUPPORTED_ATTACHMENT = (
 _CODE_BLOCK = re.compile(r"(```[^\n]*\n.*?```)", re.DOTALL)
 
 
+class _DiscordVoiceWarningFilter(logging.Filter):
+    """Unterdrückt nur Hinweise zu nicht installierten Voice-Abhängigkeiten."""
+
+    _MESSAGES = ("pynacl is not installed", "davey is not installed")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "discord.client" or record.levelno != logging.WARNING:
+            return True
+        message = record.getMessage().casefold()
+        return not any(fragment in message for fragment in self._MESSAGES)
+
+
+def _install_voice_warning_filter() -> None:
+    discord_client_log = logging.getLogger("discord.client")
+    if not any(isinstance(item, _DiscordVoiceWarningFilter) for item in discord_client_log.filters):
+        discord_client_log.addFilter(_DiscordVoiceWarningFilter())
+
+
 def _table_cells(line: str) -> list[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
@@ -250,6 +268,7 @@ class DiscordChannel(CommunicationChannel):
         if not self._token:
             log.error("Discord-Kanal inaktiv: DISCORD_BOT_TOKEN fehlt")
             return
+        _install_voice_warning_filter()
         try:
             self._discord_module = self._load_discord()
         except ImportError:
@@ -258,8 +277,8 @@ class DiscordChannel(CommunicationChannel):
 
         intents = self._discord_module.Intents.none()
         intents.dm_messages = True
+        intents.guilds = True
         if self._channel_id:
-            intents.guilds = True
             intents.guild_messages = True
             intents.message_content = True
         factory = self._client_factory or self._discord_module.Client

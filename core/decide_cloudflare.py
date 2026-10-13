@@ -7,6 +7,8 @@ from typing import Any
 import httpx
 from jevkit.backends import BackendError, RawResponse, RETRY_STATUS
 
+MAX_CLEF_QUESTION_TEXT = 4096
+
 
 class CloudflareQuotaError(BackendError):
     """Cloudflare hat das Tageskontingent für Workers AI ausgeschöpft."""
@@ -31,6 +33,93 @@ def _is_daily_quota(status_code: int, payload: Any) -> bool:
         return True
     text = json.dumps(errors, ensure_ascii=False).casefold()
     return any(hint in text for hint in ("neuron", "daily", "allocation", "quota"))
+
+
+def _question_text(value: Any) -> str:
+    """Clef erhält Instructions als begrenzten Text, auch wenn Jev JSON nutzt."""
+    if isinstance(value, str):
+        return value.strip()[:MAX_CLEF_QUESTION_TEXT]
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))[:MAX_CLEF_QUESTION_TEXT]
+    except (TypeError, ValueError):
+        return ""
+
+
+def _bound_question_strings(value: Any) -> Any:
+    if isinstance(value, str):
+        return value[:MAX_CLEF_QUESTION_TEXT]
+    if isinstance(value, dict):
+        return {key: _bound_question_strings(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_bound_question_strings(child) for child in value]
+    return value
+
+
+def _normalize_questions(questions: Any) -> dict[str, dict]:
+    """Lässt leere/frühe Fehlformen weg und begrenzt Textfelder vor dem HTTP-Call."""
+    if not isinstance(questions, dict):
+        raise BackendError("Cloudflare questions must be a mapping", retryable=False)
+
+    normalized: dict[str, dict] = {}
+    for question_id, question in questions.items():
+        if not isinstance(question_id, str) or not question_id.strip() or not isinstance(question, dict):
+            continue
+        instructions = _question_text(question.get("instructions"))
+        if not instructions:
+            continue
+        normalized_question = _bound_question_strings(question)
+        normalized_question["instructions"] = instructions
+        normalized[question_id] = normalized_question
+
+    if not normalized:
+        raise BackendError("Cloudflare questions contain no non-empty instructions", retryable=False)
+    return normalized
+
+
+def _find_field_errors(value: Any) -> Any:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).casefold() == "fielderrors":
+                return child
+        for child in value.values():
+            found = _find_field_errors(child)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_field_errors(child)
+            if found is not None:
+                return found
+    elif isinstance(value, str):
+        marker = "fieldErrors"
+        if marker in value:
+            return value[value.index(marker):]
+    return None
+
+
+def _redact(value: Any, secrets: tuple[str, ...]) -> Any:
+    if isinstance(value, str):
+        for secret in secrets:
+            if secret:
+                value = value.replace(secret, "[redacted]")
+        return value
+    if isinstance(value, dict):
+        return {_redact(key, secrets): _redact(child, secrets) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_redact(child, secrets) for child in value]
+    return value
+
+
+def _http_error_detail(status_code: int, response_text: str, payload: Any,
+                       secrets: tuple[str, ...]) -> str:
+    if status_code == 422:
+        field_errors = _find_field_errors(payload)
+        if field_errors is not None:
+            detail = json.dumps(_redact(field_errors, secrets), ensure_ascii=False, sort_keys=True)
+            return f"fieldErrors: {detail}"
+    return str(_redact(response_text[:200], secrets))
 
 
 class CloudflareBackend:
@@ -64,7 +153,7 @@ class CloudflareBackend:
         timeout_s: float = 10.0,
     ) -> RawResponse:
         actual_model = model or self.default_model
-        body = {"model": actual_model, "state": state, "questions": questions}
+        body = {"model": actual_model, "state": state, "questions": _normalize_questions(questions)}
         payload = json.dumps(body, ensure_ascii=False).encode()
         headers = {
             "Authorization": f"Bearer {self.auth_token}",
@@ -89,8 +178,14 @@ class CloudflareBackend:
         if response.status_code != 200:
             if _is_daily_quota(response.status_code, data):
                 raise CloudflareQuotaError("Cloudflare daily Neuron quota exhausted", retryable=False)
+            detail = _http_error_detail(
+                response.status_code,
+                response.text,
+                data,
+                (self.auth_token, self.account_id),
+            )
             raise BackendError(
-                f"HTTP {response.status_code}: {response.text[:200]}",
+                f"HTTP {response.status_code}: {detail}",
                 retryable=response.status_code in RETRY_STATUS,
             )
 

@@ -47,12 +47,27 @@ def test_create_saves_review_artifact_without_executing(skill_dir):
     assert factory.list_dynamic_skills() == ['review_probe']
 
 
-def test_startup_never_imports_legacy_generated_python(skill_dir):
+def test_startup_never_imports_legacy_generated_python(skill_dir, caplog):
     marker = skill_dir / 'executed.txt'
     (skill_dir / 'review_probe.py').write_text('from core import tools as T\n' + source(marker))
-    assert factory.load_all_on_startup() == 0
+    with caplog.at_level('WARNING', logger='core.skill_factory'):
+        assert factory.load_all_on_startup() == 0
     assert not marker.exists()
     assert 'review_probe' not in T.REGISTRY
+    assert '1 dynamische Skill-Dateien bleiben inaktiv' in caplog.text
+
+
+def test_inactive_archive_is_not_scanned_or_warned(skill_dir, caplog):
+    archive = skill_dir / '_inaktiv'
+    archive.mkdir()
+    (archive / 'legacy_draft.py').write_text('raise RuntimeError("must stay inactive")')
+    (archive / 'README.md').write_text('Alte Entwürfe bleiben inaktiv.')
+
+    with caplog.at_level('WARNING', logger='core.skill_factory'):
+        assert factory.load_all_on_startup() == 0
+
+    assert factory.list_dynamic_skills() == []
+    assert 'dynamische Skill-Dateien bleiben inaktiv' not in caplog.text
 
 
 def test_delete_cannot_escape_skill_directory(skill_dir):

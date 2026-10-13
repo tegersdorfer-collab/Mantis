@@ -17,25 +17,20 @@ from domains.coros.client import CorosClient, payload
 
 log = logging.getLogger("mantis.coros")
 
-# Live gegen die COROS-API gemessen (2026-08-16): queryRestingHeartRate,
-# queryAvgHeartRate, queryStressLevel und querySleepHrv nehmen 365 Tage
-# klaglos an, irgendwo zwischen 365 und 1000 fangen sie an, mit einem
-# Fehlertext zu antworten. queryDailyHealthData und querySleepData vertragen
-# auch 1000, queryTrainingLoadAssessment deckelt sich selbst bei 31 Tagen —
-# aber ein einziger, für alle Tools gültiger Wert ist einfacher als je Tool
-# einer, und die gesamte Historie des Kontos umfasst nur 164 Tage. 365 ist
-# also reichlich Puffer, ohne je an die tatsächliche Grenze zu stoßen.
+# COROS liefert bei manchen Tools für sehr große Rückblicke Fehler statt leerer
+# Daten. Ein gemeinsamer 365-Tage-Deckel hält die Abfragen begrenzt; die Abfrage
+# nach Sleep Overview verwendet denselben yyyyMMdd-Zeitraum wie die übrigen Quellen.
 MAX_LOOKBACK_DAYS = 365
 
 # (Tool, Parser, braucht Datumsbereich) — tageslose Parser stehen weiter unten.
 #
 # Die Reihenfolge entscheidet: spätere Quellen überschreiben frühere (dict.update).
-# querySleepData steht deshalb VOR queryDailyHealthData — es rechnet die Phasen aus
+# querySleepOverview steht deshalb VOR queryDailyHealthData — es rechnet die Phasen aus
 # Prozentanteilen und deckt dafür die ganze Historie ab, während queryDailyHealthData
 # exakte Dauern liefert, aber nur für die jüngsten Tage. So füllt die gerechnete
 # Quelle die Lücken und die exakte gewinnt, wo es beide gibt.
 _DAY_SOURCES = [
-    ("querySleepData",              mapping.parse_sleep,         True),
+    ("querySleepOverview",          mapping.parse_sleep,         True),
     ("queryDailyHealthData",        mapping.parse_daily_health,  False),
     ("querySleepHrv",               mapping.parse_sleep_hrv,     True),
     ("queryRestingHeartRate",       mapping.parse_resting_hr,    False),
