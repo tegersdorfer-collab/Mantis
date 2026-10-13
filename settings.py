@@ -70,10 +70,15 @@ class MantisSettings(BaseSettings):
     STT_PARAKEET_MODEL: str = "mlx-community/parakeet-tdt-0.6b-v3"
     ANTHROPIC_API_KEY: str = ""
     CLAUDE_CHAT_MODEL: str = "claude-haiku-4-5-20251001"
+    CHAT_ANTHROPIC_MODEL: str = "claude-haiku-5-5"
     CHAT_CLOUD_MODEL: str = "openai/gpt-6-luna"
-    CHAT_CLOUD_FALLBACK_MODEL: str = "google/gemini-3.1-flash-lite"
+    CHAT_CLOUD_FALLBACK_MODEL: str = ""
     CHAT_CLOUD_REASONING_EFFORT: str = "low"
     CHAT_CLOUD_TIMEOUT_S: float = 30.0
+    CHAT_CHATGPT_PLAN_ENABLED: bool = True
+    CHAT_CHATGPT_PLAN_MODEL: str = "gpt-6-luna"
+    CHATGPT_AUTH_FILE: str = "~/.config/mantis/chatgpt_auth.json"
+    CHATGPT_AUTH_CALLBACK_PORT: int = 1456
     # Nur Chat-nahe Aufgaben (Fact-Extraction und KZG-Checkpoint) dürfen den
     # Chat-Cloud-Fallback nutzen. Andere Background-Jobs bleiben bei bg_llm.
     BG_CHAT_TASKS_USE_CLOUD: bool = True

@@ -110,15 +110,19 @@ class FallbackBackend(AgentBackend):
                     return await result
                 return await asyncio.wait_for(result, timeout=timeout)
             except Exception as e:
-                self._down_until[index] = time.time() + self._cooldown_s
+                permanently_disabled = bool(getattr(e, "disable_backend", False))
+                requested_cooldown = getattr(e, "fallback_cooldown_s", None)
+                cooldown = self._cooldown_s if requested_cooldown is None else max(0.0, float(requested_cooldown))
+                self._down_until[index] = float("inf") if permanently_disabled else time.time() + cooldown
                 if index == 0:
                     self._primary_down_until = self._down_until[index]
                 detail = redact_error_text(e).strip()
                 failure = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
                 next_backend = self._next_available_backend(index + 1)
+                fallback_period = "bis zum Neustart" if permanently_disabled else f"für {cooldown:.0f}s"
                 log.warning(
                     f"Backend {backend.model_name} ausgefallen ({failure}) — "
-                    f"Fallback auf {next_backend.model_name} für {self._cooldown_s:.0f}s"
+                    f"Fallback auf {next_backend.model_name} {fallback_period}"
                 )
                 self._report_failover(e, backend, next_backend)
 

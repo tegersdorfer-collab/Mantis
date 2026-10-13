@@ -95,6 +95,8 @@ def _extract_tool_calls(response) -> list[dict]:
     calls = []
     for block in response.content:
         if block.type == "tool_use":
+            if not isinstance(block.input, dict):
+                raise ValueError(f"Anthropic Tool-Argumente für {block.name} müssen ein JSON-Objekt sein")
             calls.append({
                 "id": block.id,
                 "function": {
@@ -111,8 +113,11 @@ def _extract_text(response) -> str:
 
 
 class ClaudeBackend(AgentBackend):
-    def __init__(self, model: str | None = None):
+    provider_name = "Anthropic"
+
+    def __init__(self, model: str | None = None, purpose: str = "chat-agent"):
         self._model = model or config.CLAUDE_CHAT_MODEL
+        self._purpose = purpose
         self._client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
     @property
@@ -177,7 +182,7 @@ class ClaudeBackend(AgentBackend):
                 llm_usage.record("claude", self._model,
                                  getattr(u, "input_tokens", 0) or 0,
                                  getattr(u, "output_tokens", 0) or 0,
-                                 purpose="chat-agent")
+                             purpose=self._purpose)
         except Exception:
             pass
 

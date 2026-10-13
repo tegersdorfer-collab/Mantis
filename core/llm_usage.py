@@ -20,6 +20,8 @@ _pending_generation_lookups: set[asyncio.Task] = set()
 # USD pro 1M Tokens (input, output) — Substring-Match auf den Modellnamen.
 # Reihenfolge zählt: spezifischere Muster zuerst.
 PRICES: list[tuple[str, float, float]] = [
+    # Anthropic Haiku 5.5: aus der Haiku-Preistabelle fortgeschrieben, daher Schätzwert.
+    ("claude-haiku-5-5", 1.00, 5.00),
     ("haiku",  1.00,  5.00),
     ("sonnet", 3.00, 15.00),
     ("opus",  15.00, 75.00),
@@ -39,7 +41,7 @@ def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
 
 
 def _fallback_cost(provider: str, model: str, input_tokens: int, output_tokens: int) -> float | None:
-    if (provider or "").lower() == "ollama":
+    if (provider or "").lower() in {"ollama", "chatgpt-plan"}:
         return 0.0
     return cost_usd(model, input_tokens, output_tokens)
 
