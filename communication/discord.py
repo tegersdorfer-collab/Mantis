@@ -3,6 +3,7 @@ import asyncio
 import importlib
 import logging
 import re
+import unicodedata
 from datetime import datetime
 
 from communication.base import CommunicationChannel, IncomingMessage, MessageHandler as MH
@@ -31,7 +32,15 @@ def _is_table_separator(line: str) -> bool:
 
 
 def _format_markdown_tables(text: str) -> str:
-    """Wandelt Markdown-Tabellen in auf Discord lesbare Listen um."""
+    """Formatiert Tabellen außerhalb von Codeblöcken in Discord-Listen um."""
+    pieces = _CODE_BLOCK.split(text)
+    return "".join(
+        piece if index % 2 else _format_markdown_tables_plain(piece)
+        for index, piece in enumerate(pieces)
+    )
+
+
+def _format_markdown_tables_plain(text: str) -> str:
     lines = text.splitlines()
     output: list[str] = []
     index = 0
@@ -42,9 +51,11 @@ def _format_markdown_tables(text: str) -> str:
             and _is_table_separator(lines[index + 1])
         ):
             headers = _table_cells(lines[index])
+            source_lines = [lines[index], lines[index + 1]]
             index += 2
             rows = []
             while index < len(lines) and "|" in lines[index]:
+                source_lines.append(lines[index])
                 cells = _table_cells(lines[index])
                 fields = [
                     f"{header}: {value}"
@@ -54,11 +65,35 @@ def _format_markdown_tables(text: str) -> str:
                 if fields:
                     rows.append("• " + "; ".join(fields))
                 index += 1
-            output.extend(rows or ["• " + "; ".join(headers)])
+            if any("`" in line for line in source_lines):
+                output.extend(source_lines)
+            else:
+                output.extend(rows or ["• " + "; ".join(headers)])
             continue
         output.append(lines[index])
         index += 1
     return "\n".join(output)
+
+
+def _is_grapheme_extension(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        char == "\u200d"
+        or unicodedata.category(char).startswith("M")
+        or 0xFE00 <= codepoint <= 0xFE0F
+        or 0xE0100 <= codepoint <= 0xE01EF
+        or 0x1F3FB <= codepoint <= 0x1F3FF
+    )
+
+
+def _safe_split_index(text: str, index: int) -> int:
+    """Zieht eine Grenze zurück, wenn sie eine Emoji-/Graphemfolge trennt."""
+    while 0 < index < len(text):
+        if _is_grapheme_extension(text[index]) or text[index - 1] == "\u200d":
+            index -= 1
+            continue
+        break
+    return index
 
 
 def _split_plain(text: str, limit: int) -> list[str]:
@@ -70,6 +105,9 @@ def _split_plain(text: str, limit: int) -> list[str]:
             remaining.rfind("\n", 0, limit + 1),
             remaining.rfind(" ", 0, limit + 1),
         )
+        if boundary <= 0:
+            boundary = limit
+        boundary = _safe_split_index(remaining, boundary)
         if boundary <= 0:
             boundary = limit
         chunk = remaining[:boundary].rstrip()
@@ -89,6 +127,9 @@ def _split_code_body(body: str, limit: int) -> list[str]:
     while len(remaining) > limit:
         newline = remaining.rfind("\n", 0, limit + 1)
         end = newline + 1 if newline >= 0 else limit
+        end = _safe_split_index(remaining, end)
+        if end <= 0:
+            end = limit
         chunks.append(remaining[:end])
         remaining = remaining[end:]
     if remaining:
@@ -306,7 +347,7 @@ class _DiscordRoute:
         destination = await self._resolve_destination()
         if destination is None:
             log.warning("Discord-Nachricht nicht gesendet: kein erlaubter Empfänger oder keine Verbindung")
-            return
+            raise ConnectionError("Discord nicht verbunden oder kein erlaubter Empfänger")
         for chunk in split_discord_message(text):
             await destination.send(chunk)
 

@@ -195,8 +195,14 @@ class MessageHandler:
                                                  stream_cb=stream_cb)
         if not response:
             response = "…"
-        await finalize(response)
         self._finish_turn(msg.text, response, trace, channel_name=channel_name)
+        try:
+            await finalize(response)
+        except Exception as exc:
+            log.warning(
+                "Antwortversand über %s fehlgeschlagen (%s)",
+                channel_name, type(exc).__name__,
+            )
 
         elapsed = time.time() - t0
         log.info(f"Antwort in {elapsed:.1f}s ({len(trace)} Tools, {self.agent.model_name})")

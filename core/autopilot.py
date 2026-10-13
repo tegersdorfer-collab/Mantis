@@ -127,10 +127,24 @@ class Autopilot:
         sent_reminder = False
         try:
             for r in self.reminders.get_due():
-                await self._send(f"⏰ Erinnerung: {r.text}", kind="reminder")
+                try:
+                    await self._send(f"⏰ Erinnerung: {r.text}", kind="reminder")
+                except Exception as e:
+                    log.warning(
+                        "Reminder %s konnte nicht zugestellt werden (%s)",
+                        r.id, type(e).__name__,
+                    )
+                    try:
+                        self.reminders.mark_delivery_failed(r.id)
+                    except Exception as mark_error:
+                        log.error(
+                            "Reminder %s konnte nicht für einen erneuten Versuch markiert werden (%s)",
+                            r.id, type(mark_error).__name__,
+                        )
+                    continue
                 sent_reminder = True
         except Exception as e:
-            log.debug(f"Reminder-Check: {e}")
+            log.debug("Reminder-Check fehlgeschlagen (%s)", type(e).__name__)
         if sent_reminder:
             return True
 

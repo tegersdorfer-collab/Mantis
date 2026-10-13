@@ -131,6 +131,36 @@ def test_discord_message_uses_its_reply_channel_and_persists_discord(monkeypatch
     assert idle_loop._state == "idle"
 
 
+def test_failed_discord_send_still_persists_answer_and_tool_metadata(monkeypatch, caplog):
+    orchestrator, inserted, _idle_loop = _make_orchestrator(monkeypatch)
+    destination = SimpleNamespace(
+        send=AsyncMock(side_effect=RuntimeError("discord-secret transport details"))
+    )
+    orchestrator.msg_handler.channels = {
+        "discord": DiscordChannel(enabled=False, allowed_user_ids=("123",)),
+    }
+    orchestrator.msg_handler.agent.run = AsyncMock(
+        return_value=("Antwort trotz Transportfehler", [{"tool": "get_health"}])
+    )
+    message = IncomingMessage(
+        "Prüffrage", "123", datetime(2026, 10, 13),
+        raw=SimpleNamespace(channel=destination), channel="discord",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="core.message_handler"):
+        asyncio.run(orchestrator.handle_message(message))
+
+    assert _persisted_role_channels(inserted) == [
+        ("user", "discord"),
+        ("assistant", "discord"),
+    ]
+    assistant_sql, assistant_params = inserted[-1]
+    assert assistant_params[1] == "Antwort trotz Transportfehler"
+    assert '"tools": ["get_health"]' in assistant_params[3]
+    assert "RuntimeError" in caplog.text
+    assert "discord-secret" not in caplog.text
+
+
 def test_discord_alpha_progression_response_goes_to_the_incoming_dm(monkeypatch):
     orchestrator, _inserted, _idle_loop = _make_orchestrator(monkeypatch)
     destination = SimpleNamespace(send=AsyncMock())

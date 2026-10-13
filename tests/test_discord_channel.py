@@ -291,6 +291,16 @@ def test_discord_long_messages_split_at_limit_and_keep_code_fences_balanced():
     asyncio.run(run())
 
 
+def test_discord_long_plain_text_is_split_at_the_message_limit():
+    text = "x" * 2001
+
+    chunks = split_discord_message(text)
+
+    assert len(chunks) == 2
+    assert all(len(chunk) <= 2000 for chunk in chunks)
+    assert "".join(chunks) == text
+
+
 def test_discord_code_block_splitting_preserves_python_indentation():
     text = f"```python\n{'x' * 1970}\n    keep_indent()\n{'y' * 2000}```"
 
@@ -298,6 +308,18 @@ def test_discord_code_block_splitting_preserves_python_indentation():
 
     assert any(chunk.startswith("```python\n    keep_indent()") for chunk in chunks)
     assert all(len(chunk) <= 2000 for chunk in chunks)
+
+
+def test_discord_code_block_keeps_markdown_table_in_python_string_unchanged():
+    text = '```python\ntable = """| Name | Wert |\n|---|---|\n| Fokus | 3 |"""\n```'
+
+    assert split_discord_message(text) == [text]
+
+
+def test_discord_table_formatter_preserves_inline_code_spans():
+    text = "| Name | Wert |\n|---|---|\n| `a|b` | Fokus |"
+
+    assert split_discord_message(text) == [text]
 
 
 def test_discord_markdown_tables_are_sent_as_readable_lists():
@@ -310,6 +332,80 @@ def test_discord_markdown_tables_are_sent_as_readable_lists():
         await channel.stop()
 
     asyncio.run(run())
+
+
+def test_discord_plain_text_split_keeps_family_emoji_together():
+    family = "👨‍👩‍👧‍👦"
+    text = "a" * 4 + family + "b" * 4
+
+    chunks = split_discord_message(text, limit=8)
+
+    assert "".join(chunks) == text
+    assert all(len(chunk) <= 8 for chunk in chunks)
+    assert sum(family in chunk for chunk in chunks) == 1
+
+
+def test_discord_rejects_a_bot_whose_id_is_in_the_allowlist():
+    async def run():
+        channel, client = await _start_channel(allowed_user_ids=("123",))
+        received = []
+
+        async def receive(message):
+            received.append(message)
+
+        channel.on_message(receive)
+
+        await client.events["on_message"](
+            _Message(_User(123, bot=True), _Destination("dm"))
+        )
+
+        assert received == []
+        await channel.stop()
+
+    asyncio.run(run())
+
+
+def test_discord_rejects_its_own_id_even_when_allowlisted():
+    async def run():
+        channel, client = await _start_channel(allowed_user_ids=("123",))
+        client.user = _User(123, bot=True, name="Mantis")
+        received = []
+
+        async def receive(message):
+            received.append(message)
+
+        channel.on_message(receive)
+
+        # The own-user check remains independently necessary even if the
+        # author flag is unavailable or incorrect.
+        await client.events["on_message"](
+            _Message(_User(123, bot=False), _Destination("dm"))
+        )
+
+        assert received == []
+        await channel.stop()
+
+    asyncio.run(run())
+
+
+def test_discord_send_without_client_reports_delivery_failure():
+    async def run():
+        channel = DiscordChannel(enabled=False, allowed_user_ids=("123",))
+
+        with pytest.raises(ConnectionError):
+            await channel.send("Reminder")
+
+    asyncio.run(run())
+
+
+def test_telegram_send_without_client_reports_delivery_failure():
+    from communication.telegram import TelegramChannel
+
+    channel = TelegramChannel(token="test-token")
+    channel._chat_id = "123"
+
+    with pytest.raises(ConnectionError):
+        asyncio.run(channel.send("Reminder"))
 
 
 def test_discord_typing_indicator_runs_until_the_reply_is_sent():
