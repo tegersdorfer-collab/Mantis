@@ -237,6 +237,54 @@ def test_sleep_derives_stage_hours_from_ratios():
     assert day["sleep_rem"] == 1.13               # 16 %
 
 
+def test_sleep_uses_daily_sleep_as_ratio_basis_when_scope_is_daily():
+    day = mapping.parse_sleep(_fix("sleep_overview_synthetic.txt"))["2026-08-10"]
+    assert day["sleep_duration"] == 7.47         # Main Sleep (asleep) bleibt die Schlafdauer
+    assert day["sleep_deep"] == 1.56             # 20 % von Daily Sleep: 7h48min
+
+
+def test_sleep_can_derive_daily_scope_ratios_without_a_main_sleep_line():
+    text = (
+        "2026-08-10\nDaily Sleep: 7h 48min (incl. naps)\n"
+        "Sleep metrics scope: daily\nDeep Sleep Ratio: 20%\n"
+    )
+    day = mapping.parse_sleep(text)["2026-08-10"]
+    assert "sleep_duration" not in day
+    assert day["sleep_deep"] == 1.56
+
+
+def test_sleep_uses_main_sleep_as_ratio_basis_when_scope_is_main():
+    text = (
+        "2026-08-10\nDaily Sleep: 7h 48min (incl. naps)\n"
+        "Main Sleep (asleep): 7h 28min\nSleep metrics scope: main\n"
+        "Deep Sleep Ratio: 20%\n"
+    )
+    day = mapping.parse_sleep(text)["2026-08-10"]
+    assert day["sleep_deep"] == 1.49             # 20 % von Main Sleep: 7h28min
+
+
+def test_sleep_defaults_to_main_sleep_when_scope_line_is_missing():
+    text = (
+        "2026-08-10\nDaily Sleep: 7h 48min (incl. naps)\n"
+        "Main Sleep (asleep): 7h 28min\nDeep Sleep Ratio: 20%\n"
+    )
+    day = mapping.parse_sleep(text)["2026-08-10"]
+    assert day["sleep_deep"] == 1.49
+
+
+@pytest.mark.parametrize("scope,basis_line", [
+    ("daily", "Main Sleep (asleep): 7h 28min"),
+    ("main", "Daily Sleep: 7h 48min (incl. naps)"),
+])
+def test_sleep_omits_ratio_when_selected_basis_line_is_missing(scope, basis_line):
+    text = (
+        f"2026-08-10\nSleep Score: 70\n{basis_line}\n"
+        f"Sleep metrics scope: {scope}\nDeep Sleep Ratio: 20%\n"
+    )
+    day = mapping.parse_sleep(text)["2026-08-10"]
+    assert "sleep_deep" not in day
+
+
 def test_sleep_awake_time_is_read_directly_not_from_ratio():
     # "Awake Time" steht als Dauer da — der Anteil wäre die ungenauere Quelle.
     days = mapping.parse_sleep(_fix("sleep_data.txt"))

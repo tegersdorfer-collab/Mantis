@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 from jevkit.backends import BackendError, RawResponse, RETRY_STATUS
+from core.error_redaction import redact_error_text
 
 MAX_CLEF_QUESTION_TEXT = 4096
 
@@ -119,7 +120,8 @@ def _http_error_detail(status_code: int, response_text: str, payload: Any,
         if field_errors is not None:
             detail = json.dumps(_redact(field_errors, secrets), ensure_ascii=False, sort_keys=True)
             return f"fieldErrors: {detail}"
-    return str(_redact(response_text[:200], secrets))
+    detail = redact_error_text(response_text)
+    return _redact(detail, secrets)[:200]
 
 
 class CloudflareBackend:

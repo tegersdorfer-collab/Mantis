@@ -106,15 +106,15 @@ def test_sleep_overview_uses_new_tool_and_imports_wakeup_day_values():
     assert sleep["sleep_score"] == 82
 
 
-def test_sleep_overview_parser_uses_wakeup_day_and_calculates_ratios():
+def test_sleep_overview_parser_uses_wakeup_day_and_daily_scope_ratios():
     text = (FIX / "sleep_overview_synthetic.txt").read_text(encoding="utf-8")
     days = importer.mapping.parse_sleep(text)
     sleep = days["2026-08-10"]
 
     assert sleep["sleep_duration"] == 7.47
-    assert sleep["sleep_deep"] == 1.49
-    assert sleep["sleep_core"] == 3.74
-    assert sleep["sleep_rem"] == 2.24
+    assert sleep["sleep_deep"] == 1.56
+    assert sleep["sleep_core"] == 3.9
+    assert sleep["sleep_rem"] == 2.34
     assert sleep["sleep_awake"] == 0.3
     assert sleep["sleep_awake_count"] == 3
     assert sleep["sleep_start"] == "23:12"

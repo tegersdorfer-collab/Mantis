@@ -11,6 +11,7 @@ from unittest.mock import patch
 import httpx
 import jevkit
 import pytest
+from jevkit.backends import BackendError
 
 from core import decide
 from core.decide import Noul, Choice, JevUnavailable
@@ -163,6 +164,20 @@ def test_cloudflare_422_logs_full_field_errors_and_falls_back_to_openrouter(monk
     assert answer.model == "typesafe/jev-1.13"
     assert "String must contain at most 4096 characters" in caplog.text
     assert "cf-test" not in caplog.text
+
+
+def test_cloudflare_redacts_tokens_beyond_the_error_text_limit():
+    secret = "cf-secret-token"
+    response_text = "x" * 190 + secret + " trailing response text"
+    backend = decide.CloudflareBackend(
+        "account-test", secret, transport=_transport(lambda _: httpx.Response(400, text=response_text))
+    )
+
+    with pytest.raises(BackendError) as error:
+        asyncio.run(backend.ask("state", {"q": {"type": "noul", "instructions": "question"}}))
+
+    assert secret not in str(error.value)
+    assert "cf-secret" not in str(error.value)
 
 
 def test_cloudflare_fehler_faellt_auf_openrouter_zurueck(monkeypatch):

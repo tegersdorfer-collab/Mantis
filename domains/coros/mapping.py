@@ -283,10 +283,11 @@ _STAGE_RATIOS = {
 def parse_sleep(text: str) -> dict[str, dict]:
     """querySleepOverview → {'2026-08-10': {'sleep_score': 77, 'sleep_deep': 1.56, …}, …}.
 
-    Die Phasen stehen hier als Prozentanteil der Hauptschlafzeit; die absoluten
-    Stunden werden daraus gerechnet. parse_daily_health liefert dieselben Phasen
-    als exakte Dauer, aber nur für die jüngsten Tage — deshalb steht diese Quelle
-    in _DAY_SOURCES *vor* ihr und wird von der genaueren überschrieben.
+    Die Phasen stehen hier als Prozentanteil von Daily Sleep oder Main Sleep
+    (asleep), abhängig von "Sleep metrics scope". Ohne Scope wird wie bisher
+    Main Sleep verwendet. parse_daily_health liefert dieselben Phasen als exakte
+    Dauer, aber nur für die jüngsten Tage — deshalb steht diese Quelle in
+    _DAY_SOURCES *vor* ihr und wird von der genaueren überschrieben.
 
     Fehlt jeder Tagesmarker (JJJJ-MM-TT), wird das nicht als leeres Ergebnis
     gewertet, sondern als CorosFormatError — siehe Moduldocstring.
@@ -307,15 +308,17 @@ def parse_sleep(text: str) -> dict[str, dict]:
         _put_text(fields, "sleep_start", raw.get("start"))
         _put_text(fields, "sleep_end", raw.get("end"))
         main_h = raw.get("main_h")
+        ratio_h = raw.get("daily_h") if raw.get("scope") == "daily" else main_h
         # 0 h Hauptschlaf heißt "Uhr nicht getragen", nicht "null Stunden
         # geschlafen" — daraus abgeleitete Phasen wären erfundene Nullen.
         if main_h:
             _put(fields, "sleep_duration", main_h)
             _put(fields, "sleep_awake", raw.get("awake_h"))
+        if ratio_h:
             for label, col in _STAGE_RATIOS.items():
                 pct = raw.get(label)
                 if pct is not None:
-                    _put(fields, col, round(main_h * pct) / 100)
+                    _put(fields, col, round(ratio_h * pct) / 100)
         if fields:
             out[day] = fields
 
@@ -335,6 +338,10 @@ def parse_sleep(text: str) -> dict[str, dict]:
             raw["score"] = parse_int(value)
         elif label in {"Main Sleep", "Main Sleep (asleep)"}:
             raw["main_h"] = parse_duration_h(value)
+        elif label == "Daily Sleep":
+            raw["daily_h"] = parse_duration_h(value)
+        elif label == "Sleep metrics scope":
+            raw["scope"] = value.casefold()
         elif label == "Awake Time":
             raw["awake_h"] = parse_duration_h(value)
         elif label == "Naps Total":
