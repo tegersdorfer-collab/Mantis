@@ -155,6 +155,72 @@ def test_voice_route_persists_both_roles_with_voice_channel(monkeypatch):
     assert idle_loop._task is not None
 
 
+def test_overlapping_dashboard_and_voice_turns_keep_idle_loop_paused_until_last_finishes(monkeypatch):
+    orchestrator, _inserted, idle_loop = _make_orchestrator(monkeypatch)
+
+    async def run_turns():
+        started = {channel: asyncio.Event() for channel in ("web", "voice")}
+        finish = {channel: asyncio.Event() for channel in ("web", "voice")}
+
+        async def wait_for_finish(_text, channel_name, **_kwargs):
+            started[channel_name].set()
+            await finish[channel_name].wait()
+            return "Antwort", []
+
+        orchestrator.msg_handler._agent_turn = wait_for_finish
+        dashboard_task = asyncio.create_task(orchestrator.dashboard_respond("dashboard"))
+        await started["web"].wait()
+        voice_task = asyncio.create_task(orchestrator.voice_respond("voice"))
+        await started["voice"].wait()
+
+        finish["web"].set()
+        await dashboard_task
+        assert idle_loop._state == "conversation"
+
+        finish["voice"].set()
+        await voice_task
+
+    asyncio.run(run_turns())
+    assert idle_loop._state == "idle"
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_overlapping_turn_failure_or_cancellation_keeps_idle_loop_paused(monkeypatch, failure):
+    orchestrator, _inserted, idle_loop = _make_orchestrator(monkeypatch)
+
+    async def run_turns():
+        dashboard_started = asyncio.Event()
+        finish_dashboard = asyncio.Event()
+        voice_started = asyncio.Event()
+        finish_voice = asyncio.Event()
+
+        async def dashboard_fails_or_voice_waits(_text, channel_name, **_kwargs):
+            if channel_name == "web":
+                dashboard_started.set()
+                await finish_dashboard.wait()
+                raise failure("turn aborted")
+            voice_started.set()
+            await finish_voice.wait()
+            return "Antwort", []
+
+        orchestrator.msg_handler._agent_turn = dashboard_fails_or_voice_waits
+        dashboard_task = asyncio.create_task(orchestrator.dashboard_respond("dashboard"))
+        await dashboard_started.wait()
+        voice_task = asyncio.create_task(orchestrator.voice_respond("voice"))
+        await voice_started.wait()
+
+        finish_dashboard.set()
+        with pytest.raises(failure, match="turn aborted"):
+            await dashboard_task
+        assert idle_loop._state == "conversation"
+
+        finish_voice.set()
+        await voice_task
+
+    asyncio.run(run_turns())
+    assert idle_loop._state == "idle"
+
+
 @pytest.mark.parametrize("facade", ["dashboard", "voice", "telegram"])
 @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
 def test_turn_failure_or_cancellation_always_resumes_idle_loop(monkeypatch, facade, failure):

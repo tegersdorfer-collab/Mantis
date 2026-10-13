@@ -5,6 +5,7 @@ Zuständig für: ReAct-Loop, Streaming, Post-Turn-Learning, Persistenz.
 import asyncio
 import json
 import logging
+import threading
 import time
 
 from communication.base import IncomingMessage
@@ -48,11 +49,32 @@ class MessageHandler:
         self.alphaprogression  = alphaprogression
         self.on_user_active    = on_user_active   # callback: () → None
         self.on_idle_ready     = on_idle_ready    # callback: () → None
+        self._turn_lock        = threading.Lock()
+        self._active_turns     = 0
 
     def _resume_idle_loop(self, callback=None) -> None:
         callback = callback or self.on_idle_ready
         if callback is not None:
             callback()
+
+    def _start_turn(self) -> None:
+        with self._turn_lock:
+            self._active_turns += 1
+            try:
+                self.on_user_active()
+            except BaseException:
+                self._active_turns -= 1
+                if self._active_turns == 0:
+                    self._resume_idle_loop()
+                raise
+
+    def _release_active_turn(self, callback=None) -> None:
+        with self._turn_lock:
+            if self._active_turns == 0:
+                return
+            self._active_turns -= 1
+            if self._active_turns == 0:
+                self._resume_idle_loop(callback)
 
     # ── Verification Bump ─────────────────────────────────────────────────────
 
@@ -87,10 +109,11 @@ class MessageHandler:
     # ── Telegram ──────────────────────────────────────────────────────────────
 
     async def handle(self, msg: IncomingMessage, resume_idle_cb) -> None:
+        self._start_turn()
         try:
             await self._handle_incoming(msg)
         finally:
-            self._resume_idle_loop(resume_idle_cb)
+            self._release_active_turn(resume_idle_cb)
 
     async def _handle_incoming(self, msg: IncomingMessage) -> None:
         t0 = time.time()
@@ -101,7 +124,6 @@ class MessageHandler:
         self.kzg.add("user", msg.text)
         self._persist_msg("user", msg.text, channel=channel_name)
         self._check_verification_bump(msg.text)
-        self.on_user_active()
 
         # Engagement Decay
         try:
@@ -164,8 +186,8 @@ class MessageHandler:
         self, text: str, stream_cb=None, agent=None, channel_name: str = "web",
         resume_idle_cb=None,
     ) -> tuple[str, list]:
+        self._start_turn()
         try:
-            self.on_user_active()
             self.kzg.add("user", text)
             self._persist_msg("user", text, channel=channel_name)
 
@@ -177,7 +199,7 @@ class MessageHandler:
             self._finish_turn(text, response, trace, channel_name=channel_name, agent=agent)
             return response, trace
         finally:
-            self._resume_idle_loop(resume_idle_cb)
+            self._release_active_turn(resume_idle_cb)
 
     # ── Gemeinsamer Agent-Turn (Telegram + Dashboard) ─────────────────────────
 
