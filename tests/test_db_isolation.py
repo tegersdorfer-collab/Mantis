@@ -13,6 +13,7 @@ from db_test_config import (
     TEST_DATABASE_URL,
     configure_test_database,
     ensure_test_database_isolated,
+    normalize_database_target,
 )
 from core.db import log_error as imported_log_error
 from core.db import log_event as imported_log_event
@@ -49,6 +50,102 @@ def test_guard_rejects_production_database_name_even_on_another_host():
             "postgresql://db.example:5432/mantis",
             (),
         )
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    (
+        "postgresql://localhost:5432/mantis_test?dbname=&user=mantis",
+        "postgresql://mantis@localhost/mantis_test?dbname=",
+    ),
+)
+def test_guard_rejects_empty_query_database_name(database_url):
+    with pytest.raises(ValueError, match="Test-DB-Schutz"):
+        ensure_test_database_isolated(database_url, ())
+
+
+def test_query_database_name_overrides_path_and_is_compared_after_resolution():
+    test_url = "postgresql://127.0.0.1/mantis_test?dbname=shared_db"
+
+    assert normalize_database_target(test_url) == ("localhost", 5432, "shared_db")
+    with pytest.raises(ValueError, match="dieselbe Datenbank"):
+        ensure_test_database_isolated(
+            test_url,
+            ("postgresql://localhost:5432/production_path?dbname=shared_db",),
+        )
+
+
+def test_missing_database_name_falls_back_to_user_and_blocks_mantis(monkeypatch):
+    monkeypatch.delenv("PGHOSTADDR", raising=False)
+
+    with pytest.raises(ValueError, match="darf nicht 'mantis' heißen"):
+        ensure_test_database_isolated(
+            "postgresql://localhost/?user=mantis",
+            (),
+        )
+
+
+def test_missing_database_and_user_fall_back_to_os_user(monkeypatch):
+    import getpass
+
+    monkeypatch.delenv("PGHOSTADDR", raising=False)
+    monkeypatch.delenv("PGUSER", raising=False)
+
+    assert normalize_database_target("postgresql://localhost/")[2] == getpass.getuser().casefold()
+
+
+def test_pytest_bootstrap_repairs_modules_and_pool_imported_before_pytest(tmp_path):
+    probe = Path(__file__).with_name(f"test_db_preimport_probe_{os.getpid()}.py")
+    probe.write_text(
+        """
+import os
+import config
+import settings
+from core import db
+
+def test_preimported_database_state_uses_test_url():
+    test_url = os.environ["TEST_DATABASE_URL"]
+    assert config.DATABASE_URL == test_url
+    assert config.cfg.DATABASE_URL == test_url
+    assert settings.cfg.DATABASE_URL == test_url
+    assert db._pool is None
+    assert db._preimport_pool.closed
+""",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["DATABASE_URL"] = "postgresql://127.0.0.1:1/mantis"
+    environment.pop("TEST_DATABASE_URL", None)
+    python_code = """
+import config
+from core import db
+
+class ExistingPool:
+    closed = False
+    def closeall(self):
+        self.closed = True
+
+db._pool = ExistingPool()
+db._preimport_pool = db._pool
+import pytest
+raise SystemExit(pytest.main([__import__("sys").argv[1], "-q"]))
+"""
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", python_code, str(probe)],
+            cwd=Path(__file__).resolve().parent.parent,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        probe.unlink(missing_ok=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
 
 
 def test_pytest_aborts_clearly_when_test_url_is_the_production_url():

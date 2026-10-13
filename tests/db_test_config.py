@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import getpass
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -70,15 +71,22 @@ def normalize_database_target(database_url: str) -> tuple[str, int, str]:
 
         path_database = unquote(parsed.path.lstrip("/"))
         database_values = query.get("dbname")
-        if database_values:
+        if database_values is not None:
             if len(database_values) != 1:
                 raise ValueError("mehrdeutiger PostgreSQL-Datenbankname")
-            query_database = unquote(database_values[0])
-            if path_database and query_database and path_database != query_database:
-                raise ValueError("widersprüchlicher PostgreSQL-Datenbankname")
-            database = query_database or path_database
+            database = database_values[0]
+            if not database:
+                raise ValueError("leerer PostgreSQL-Datenbankname")
         else:
             database = path_database
+
+        if not database:
+            user_values = query.get("user")
+            if user_values is not None and len(user_values) != 1:
+                raise ValueError("mehrdeutiger PostgreSQL-Benutzername")
+            query_user = user_values[0] if user_values else ""
+            uri_user = unquote(parsed.username) if parsed.username else ""
+            database = query_user or uri_user or os.environ.get("PGUSER") or getpass.getuser()
     except (TypeError, ValueError) as exc:
         raise ValueError("PostgreSQL-URL kann nicht sicher normalisiert werden") from exc
 
@@ -127,6 +135,7 @@ def ensure_test_database_isolated(
 def configure_test_database(
     environ: dict[str, str] | os._Environ[str] | None = None,
     dotenv_path: str | Path | None = None,
+    additional_production_urls: tuple[str, ...] | list[str] = (),
 ) -> tuple[str, tuple[str, ...]]:
     """Prüft die Test-URL und setzt sie vor Settings-/DB-Imports als DATABASE_URL."""
     global PRODUCTION_DATABASE_URLS, TEST_DATABASE_URL
@@ -139,6 +148,7 @@ def configure_test_database(
         environment_url,
         dotenv_url,
         DEFAULT_PRODUCTION_DATABASE_URL,
+        *additional_production_urls,
     ):
         if candidate and candidate not in production_urls:
             production_urls.append(candidate)
