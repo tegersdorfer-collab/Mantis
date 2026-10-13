@@ -162,14 +162,23 @@ class ClaudeBackend(AgentBackend):
 
         if stream_cb:
             collected = ""
+            received_message_stop = False
             async with self._client.messages.stream(**kwargs) as stream:
-                async for text in stream.text_stream:
-                    collected += text
-                    try:
-                        await stream_cb(collected)
-                    except Exception:
-                        pass
+                async for event in stream:
+                    if event.type == "message_stop":
+                        received_message_stop = True
+                    elif (
+                        event.type == "content_block_delta"
+                        and event.delta.type == "text_delta"
+                    ):
+                        collected += event.delta.text
+                        try:
+                            await stream_cb(collected)
+                        except Exception:
+                            pass
             final = await stream.get_final_message()
+            if not received_message_stop:
+                raise RuntimeError("Anthropic-Stream endete ohne message_stop")
             stop_reason = getattr(final, "stop_reason", None)
             if not isinstance(stop_reason, str) or not stop_reason:
                 raise RuntimeError("Anthropic-Stream endete ohne Abschluss")

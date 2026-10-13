@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 import asyncio
+import json
 
+import anthropic
+import httpx
 import pytest
 
 from core.backends.claude import ClaudeBackend, _extract_tool_calls
@@ -33,75 +36,88 @@ def test_haiku_55_cost_uses_explicit_estimated_price_table_entry():
     assert cost_usd("claude-haiku-5-5", 1_000_000, 1_000_000) == 6.0
 
 
-class _FakeStream:
-    def __init__(self, text, final_message):
-        self.text = text
-        self.final_message = final_message
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False
-
-    @property
-    def text_stream(self):
-        async def chunks():
-            if self.text:
-                yield self.text
-        return chunks()
-
-    async def get_final_message(self):
-        return self.final_message
-
-
-class _FakeMessages:
-    def __init__(self, stream):
-        self._stream = stream
-
-    def stream(self, **_kwargs):
-        return self._stream
-
-
-def _streaming_backend(final_message):
-    backend = object.__new__(ClaudeBackend)
-    backend._model = "claude-haiku-5-5"
-    backend._purpose = "chat-agent"
-    backend._client = SimpleNamespace(messages=_FakeMessages(_FakeStream(
-        "partial text", final_message,
-    )))
-    backend._record_usage = lambda _response: None
-    return backend
-
-
-async def _noop_stream_callback(_text):
-    pass
-
-
-def test_haiku_stream_without_message_stop_or_stop_reason_falls_back():
-    final = SimpleNamespace(
-        content=[SimpleNamespace(type="text", text="partial text")],
-        stop_reason=None,
+def _sdk_message_events(*, include_message_stop):
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-haiku-5-5",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            },
+        },
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "answer"},
+        },
+        {
+            "type": "content_block_stop",
+            "index": 0,
+        },
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 1},
+        },
+    ]
+    if include_message_stop:
+        events.append({"type": "message_stop"})
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+        for event in events
     )
 
-    with pytest.raises(RuntimeError, match="ohne Abschluss"):
-        asyncio.run(_streaming_backend(final).call(
-            [{"role": "user", "content": "hi"}], None, _noop_stream_callback, 0.2, 100,
+
+def _call_claude_with_sdk_events(*, include_message_stop):
+    async def call():
+        transport = httpx.MockTransport(lambda _request: httpx.Response(
+            200,
+            content=_sdk_message_events(include_message_stop=include_message_stop),
+            headers={"content-type": "text/event-stream"},
         ))
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            backend = object.__new__(ClaudeBackend)
+            backend._model = "claude-haiku-5-5"
+            backend._purpose = "chat-agent"
+            backend._client = anthropic.AsyncAnthropic(
+                api_key="test", http_client=http_client,
+            )
+            backend._record_usage = lambda _response: None
+            collected = []
+
+            async def stream_callback(text):
+                collected.append(text)
+
+            result = await backend.call(
+                [{"role": "user", "content": "hi"}], None,
+                stream_callback, 0.2, 100,
+            )
+            return result, collected
+
+    return asyncio.run(call())
 
 
-@pytest.mark.parametrize("stop_reason", ["end_turn", "tool_use", "max_tokens", "stop_sequence"])
-def test_haiku_stream_accepts_complete_stop_reasons_including_max_tokens(stop_reason):
-    final = SimpleNamespace(
-        content=[SimpleNamespace(type="text", text="answer")],
-        stop_reason=stop_reason,
-    )
+def test_haiku_stream_without_message_stop_falls_back_even_with_stop_reason():
+    with pytest.raises(RuntimeError, match="message_stop"):
+        _call_claude_with_sdk_events(include_message_stop=False)
 
-    result = asyncio.run(_streaming_backend(final).call(
-        [{"role": "user", "content": "hi"}], None, _noop_stream_callback, 0.2, 100,
-    ))
+
+def test_haiku_stream_accepts_sdk_stream_ending_with_message_stop():
+    result, collected = _call_claude_with_sdk_events(include_message_stop=True)
 
     assert result == ("answer", [])
+    assert collected == ["answer"]
 
 
 def test_haiku_tool_use_rejects_missing_required_arguments():

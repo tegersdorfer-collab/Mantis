@@ -40,6 +40,7 @@ class _CallbackServer(http.server.HTTPServer):
     callback_result: dict[str, str] | None = None
     callback_error: str | None = None
     request_timeout_s = 10.0
+    deadline: float | None = None
 
     def get_request(self):
         request, address = super().get_request()
@@ -47,8 +48,55 @@ class _CallbackServer(http.server.HTTPServer):
         return request, address
 
 
+class _DeadlineReader:
+    """Liest HTTP-Zeilen mit einem Timeout, der an der Gesamtfrist endet."""
+
+    def __init__(
+        self,
+        connection: socket.socket,
+        deadline: float | None,
+        idle_timeout_s: float,
+    ):
+        self._connection = connection
+        self._deadline = deadline
+        self._idle_timeout_s = idle_timeout_s
+
+    def readline(self, limit: int = -1) -> bytes:
+        line = bytearray()
+        while limit < 0 or len(line) < limit:
+            remaining = None
+            if self._deadline is not None:
+                remaining = self._deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("Login-Gesamtfrist beim Lesen des Callbacks abgelaufen")
+            timeout = self._idle_timeout_s
+            if remaining is not None:
+                timeout = min(timeout, remaining)
+            self._connection.settimeout(timeout)
+            chunk = self._connection.recv(1)
+            if not chunk:
+                break
+            line.extend(chunk)
+            if chunk == b"\n":
+                break
+        return bytes(line)
+
+    def close(self) -> None:
+        # Der Server schließt den Socket nach dem Request separat.
+        return
+
+
 def _callback_handler(expected_state: str, require_client_id: bool):
     class Handler(http.server.BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.rfile.close()
+            self.rfile = _DeadlineReader(
+                self.connection,
+                self.server.deadline,
+                self.server.request_timeout_s,
+            )
+
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path != CALLBACK_PATH:
@@ -107,6 +155,7 @@ def run_login(
         ("127.0.0.1", port),
         _callback_handler("", first_registration),
     )
+    server.deadline = deadline
     redirect_uri = f"http://127.0.0.1:{server.server_port}{CALLBACK_PATH}"
     authorization = build_authorization_request(
         client_id=issued_client_id,

@@ -4,7 +4,7 @@ import json
 import secrets
 import socket
 import time
-from threading import Thread
+from threading import Event, Thread
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -419,6 +419,84 @@ def test_callback_socket_without_request_respects_overall_login_deadline(
         worker.join(1)
 
     assert not worker.is_alive(), "Login hing trotz abgelaufener Gesamtfrist am Callback-Request"
+    assert isinstance(outcome.get("error"), TimeoutError)
+    assert time.monotonic() - started < 0.25
+
+
+def test_callback_socket_slow_trickle_cannot_extend_overall_login_deadline(
+    monkeypatch, tmp_path,
+):
+    import core.auth.chatgpt_login as login
+
+    servers = []
+
+    class SocketPairListener:
+        def __init__(self, accepted):
+            self.accepted = accepted
+
+        def accept(self):
+            return self.accepted, ("socketpair", 0)
+
+    class SocketPairServer(login._CallbackServer):
+        def __init__(self, address, handler):
+            self.server_port = address[1]
+            self.callback_result = None
+            self.callback_error = None
+            self.timeout = None
+            self.request_timeout_s = 10
+            self.deadline = None
+            self.accepted_socket, self.peer_socket = socket.socketpair()
+            self.socket = SocketPairListener(self.accepted_socket)
+            self.RequestHandlerClass = handler
+            servers.append(self)
+
+        def handle_request(self):
+            request, client_address = self.get_request()
+            try:
+                self.finish_request(request, client_address)
+            finally:
+                self.shutdown_request(request)
+
+        def server_close(self):
+            self.peer_socket.close()
+
+    monkeypatch.setattr(login, "_CallbackServer", SocketPairServer)
+    outcome = {}
+    sender_stop = Event()
+
+    def do_login():
+        try:
+            login.run_login(
+                auth_file=tmp_path / "chatgpt_auth.json", callback_port=1456,
+                timeout_s=0.15, open_browser=lambda _url: True,
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    def trickle_request_line():
+        while not sender_stop.wait(0.04):
+            try:
+                servers[0].peer_socket.sendall(b"x")
+            except OSError:
+                return
+
+    started = time.monotonic()
+    worker = Thread(target=do_login, daemon=True)
+    worker.start()
+    sender = Thread(target=trickle_request_line, daemon=True)
+    sender.start()
+    worker.join(0.25)
+    finished_by_deadline = not worker.is_alive()
+    sender_stop.set()
+    try:
+        servers[0].peer_socket.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    sender.join(0.2)
+    if worker.is_alive():
+        worker.join(1)
+
+    assert finished_by_deadline, "Langsam eintreffende Bytes haben die Login-Gesamtfrist verlängert"
     assert isinstance(outcome.get("error"), TimeoutError)
     assert time.monotonic() - started < 0.25
 
