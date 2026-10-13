@@ -11,19 +11,24 @@ class ReminderMemoryDB:
     def __init__(self, rows=None):
         self.now = datetime(2026, 10, 13, 12)
         self.table_exists = True
-        self.columns = {
-            "id", "text", "remind_at", "sent", "delivery_attempts",
-            "retry_after", "created_at",
-        }
-        self.rows = rows or [{
-            "id": 17,
-            "text": "Termin",
-            "remind_at": datetime(2026, 10, 12),
-            "sent": False,
-            "delivery_attempts": 0,
-            "retry_after": None,
-            "created_at": datetime(2026, 10, 12),
-        }]
+        self.columns = {"id", "text", "remind_at", "sent", "created_at"}
+        self.column_defaults = {}
+        self.rows = rows or [
+            {
+                "id": 17,
+                "text": "Offener Altbestand",
+                "remind_at": datetime(2026, 10, 12),
+                "sent": False,
+                "created_at": datetime(2026, 10, 12),
+            },
+            {
+                "id": 18,
+                "text": "Gesendeter Altbestand",
+                "remind_at": datetime(2026, 10, 11),
+                "sent": True,
+                "created_at": datetime(2026, 10, 11),
+            },
+        ]
 
     def cursor(self):
         return nullcontext(_ReminderCursor(self))
@@ -43,7 +48,10 @@ class ReminderMemoryDB:
                 continue
             if claim_query:
                 row["claimed_at"] = self.now
-            due.append({key: row[key] for key in ("id", "text", "remind_at", "sent")})
+            due.append({
+                key: row[key]
+                for key in ("id", "text", "remind_at", "sent", "claimed_at")
+            })
         return due
 
     def execute(self, sql, params=()):
@@ -56,8 +64,10 @@ class ReminderMemoryDB:
             return len(ids)
 
         if normalized.startswith("update reminders set delivery_attempts ="):
-            max_attempts, _retry_limit, reminder_id = params
+            max_attempts, _retry_limit, reminder_id, claimed_at = params
             row = self._row(reminder_id)
+            if row["sent"] or row["claimed_at"] != claimed_at:
+                return 0
             previous_attempts = row["delivery_attempts"]
             attempts = previous_attempts + 1
             sent_sql = re.search(r"sent\s*=\s*([^,]+)", sql, re.I)
@@ -82,7 +92,7 @@ class ReminderMemoryDB:
 
         if normalized.startswith("update reminders set claimed_at = null"):
             row = self._row(params[0])
-            if not row["sent"]:
+            if not row["sent"] and row["claimed_at"] == params[1]:
                 row["claimed_at"] = None
             return 1
 
@@ -137,7 +147,8 @@ class _ReminderCursor:
                     return
                 raise RuntimeError(f"column {column} already exists")
             self.database.columns.add(column)
-            default = 0 if " default 0" in normalized else None
+            default = 0 if re.search(r"\bdefault\s+0\b", normalized) else None
+            self.database.column_defaults[column] = default
             for row in self.database.rows:
                 row[column] = default
             return
@@ -153,7 +164,7 @@ def _install_fake_db(monkeypatch, database):
 
 def test_reminder_migration_is_idempotent_and_preserves_existing_rows(monkeypatch):
     database = ReminderMemoryDB()
-    original = dict(database.rows[0])
+    original = [dict(row) for row in database.rows]
     _install_fake_db(monkeypatch, database)
     store = ReminderStore()
 
@@ -161,7 +172,11 @@ def test_reminder_migration_is_idempotent_and_preserves_existing_rows(monkeypatc
     store.setup()
 
     assert {"delivery_attempts", "retry_after", "claimed_at"} <= database.columns
-    assert database.rows[0] == {**original, "claimed_at": None}
+    assert database.column_defaults["delivery_attempts"] == 0
+    assert database.rows == [
+        {**original[0], "delivery_attempts": 0, "retry_after": None, "claimed_at": None},
+        {**original[1], "delivery_attempts": 0, "retry_after": None, "claimed_at": None},
+    ]
 
 
 def test_get_due_claims_without_marking_sent_and_expired_claim_can_retry(monkeypatch):
@@ -181,6 +196,31 @@ def test_get_due_claims_without_marking_sent_and_expired_claim_can_retry(monkeyp
     retried = store.get_due()
     assert [reminder.id for reminder in retried] == [17]
     assert retried[0].sent is False
+
+
+def test_stale_claim_failure_cannot_reset_a_confirmed_delivery(monkeypatch):
+    database = ReminderMemoryDB(rows=[{
+        "id": 17,
+        "text": "Termin",
+        "remind_at": datetime(2026, 10, 12),
+        "sent": False,
+        "created_at": datetime(2026, 10, 12),
+    }])
+    _install_fake_db(monkeypatch, database)
+    store = ReminderStore()
+    store.setup()
+
+    original_claim = store.get_due()[0]
+    database.now += timedelta(minutes=2)
+    replacement_claim = store.get_due()[0]
+    assert replacement_claim.claimed_at != original_claim.claimed_at
+
+    store.mark_sent(17)
+    store.mark_delivery_failed(17, original_claim.claimed_at)
+
+    assert database.rows[0]["sent"] is True
+    assert database.rows[0]["delivery_attempts"] == 0
+    assert database.rows[0]["retry_after"] is None
 
 
 def test_confirmed_delivery_marks_sent_and_clears_its_claim(monkeypatch):
@@ -205,8 +245,9 @@ def test_retry_limit_marks_reminder_sent_and_removes_it_from_due_state(monkeypat
     store.setup()
 
     for attempt in range(3):
-        assert [reminder.id for reminder in store.get_due()] == [17]
-        store.mark_delivery_failed(17)
+        claimed = store.get_due()
+        assert [reminder.id for reminder in claimed] == [17]
+        store.mark_delivery_failed(17, claimed[0].claimed_at)
         if attempt < 2:
             database.now = database.rows[0]["retry_after"]
 

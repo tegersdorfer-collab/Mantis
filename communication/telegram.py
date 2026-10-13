@@ -21,6 +21,7 @@ from core.vision import describe_image as _describe_image_raw
 import config
 
 log = logging.getLogger(__name__)
+_MESSAGE_LIMIT = 4096
 
 
 # ── Ollama-Vision (für Fotos) ─────────────────────────────────────────────────
@@ -72,6 +73,17 @@ class TelegramChannel(CommunicationChannel):
                     chat_id=self._chat_id,
                     text=chunk,
                 )
+
+    async def send_plain(self, text: str) -> None:
+        """Sendet einen einzelnen Klartext-Text ohne Markdown und ohne Aufteilung."""
+        if not self._app or not self._chat_id:
+            log.warning("Telegram nicht verbunden — Nachricht nicht gesendet")
+            raise ConnectionError("Telegram nicht verbunden")
+        await self._app.bot.send_message(
+            chat_id=self._chat_id,
+            text=text[:_MESSAGE_LIMIT],
+            parse_mode=None,
+        )
 
     async def send_with_buttons(
         self,

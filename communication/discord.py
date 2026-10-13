@@ -227,6 +227,10 @@ class DiscordChannel(CommunicationChannel):
     async def send(self, text: str) -> None:
         await (await self._default_route()).send(text)
 
+    async def send_plain(self, text: str) -> None:
+        """Sendet einen unformatierten Text ohne Umwandlung oder Aufteilung."""
+        await (await self._default_route()).send_plain(text)
+
     async def send_typing(self) -> None:
         await (await self._default_route()).send_typing()
 
@@ -361,6 +365,15 @@ class _DiscordRoute:
             raise ConnectionError("Discord nicht verbunden oder kein erlaubter Empfänger")
         for chunk in split_discord_message(text):
             await destination.send(chunk)
+
+    async def send_plain(self, text: str) -> None:
+        """Sendet einen einzelnen Text unverändert, ohne Markdown-Verarbeitung."""
+        await self._stop_typing()
+        destination = await self._resolve_destination()
+        if destination is None:
+            log.warning("Discord-Nachricht nicht gesendet: kein erlaubter Empfänger oder keine Verbindung")
+            raise ConnectionError("Discord nicht verbunden oder kein erlaubter Empfänger")
+        await destination.send(text)
 
     async def send_typing(self) -> None:
         destination = await self._resolve_destination()
