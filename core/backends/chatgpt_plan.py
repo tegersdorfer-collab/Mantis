@@ -394,6 +394,7 @@ class ChatGPTPlanBackend(AgentBackend):
                 usage_recorded = True
                 self._record_usage(usage)
 
+        streamed_items: list[dict] = []
         try:
             async with self._client.stream("POST", RESPONSES_URL, json=payload, headers=headers) as response:
                 if response.is_error:
@@ -421,6 +422,12 @@ class ChatGPTPlanBackend(AgentBackend):
                                 await stream_cb("".join(text_parts))
                             except Exception:
                                 pass
+                    elif event_type == "response.output_item.done":
+                        # Mit store=false bleibt response.completed.output leer;
+                        # die fertigen Items kommen nur hier (live geprüft 13.10.2026).
+                        item = event.get("item")
+                        if isinstance(item, dict):
+                            streamed_items.append(item)
                     elif event_type == "response.failed":
                         error_code, _ = _error_fields(event)
                         if error_code:
@@ -435,7 +442,11 @@ class ChatGPTPlanBackend(AgentBackend):
                         if not isinstance(completed, dict) or completed.get("status", "completed") != "completed":
                             raise RuntimeError("Responses-API meldet keinen erfolgreichen Abschluss")
                         usage = _response_usage(completed)
+                        if not completed.get("output") and streamed_items:
+                            completed = {**completed, "output": streamed_items}
                         text, calls = _extract_responses_result(completed, tools)
+                        if not text and text_parts:
+                            text = "".join(text_parts)
                         record_usage_once()
                         if stream_cb and text and text != "".join(text_parts):
                             try:

@@ -397,3 +397,42 @@ def test_chatgpt_login_tokens_are_redacted_from_error_text(tmp_path):
     assert access_value not in result
     assert refresh_value not in result
     assert result.count("[REDACTED]") == 2
+
+
+def test_store_false_stream_uses_output_item_done_when_completed_output_is_empty(tmp_path, monkeypatch):
+    """Live-Format 13.10.2026: mit store=false ist response.completed.output leer;
+    Text kommt als Delta, Tool-Calls nur über response.output_item.done (Name ohne
+    Präfix, Namespace in eigenem Feld)."""
+    events = [
+        {"type": "response.output_item.done", "item": {
+            "type": "function_call", "status": "completed", "call_id": "call-live",
+            "name": "lookup", "namespace": "mantis", "arguments": '{"query":"zahnarzt"}',
+        }},
+        {"type": "response.completed", "response": {
+            "status": "completed", "output": [], "output_text": None,
+            "usage": {"input_tokens": 10, "output_tokens": 3},
+        }},
+    ]
+    text_events = [
+        {"type": "response.output_text.delta", "delta": "Hal"},
+        {"type": "response.output_text.delta", "delta": "lo!"},
+        {"type": "response.completed", "response": {"status": "completed", "output": []}},
+    ]
+    from core import llm_usage
+    monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: None)
+    tools = [{"type": "function", "function": {
+        "name": "lookup", "description": "Sucht.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+    }}]
+
+    def run(evts, with_tools):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=_sse(*evts), headers={"content-type": "text/event-stream"})))
+        backend = ChatGPTPlanBackend(model="gpt-6-luna", auth_file=_auth_file(tmp_path), client=client)
+        return asyncio.run(backend.call([{"role": "user", "content": "x"}], tools if with_tools else None, None, 0.3, 100))
+
+    text, calls = run(events, True)
+    assert calls == [{"id": "call-live", "tool_use_id": "call-live",
+                      "function": {"name": "lookup", "arguments": {"query": "zahnarzt"}}}]
+    text, calls = run(text_events, False)
+    assert text == "Hallo!" and calls == []
