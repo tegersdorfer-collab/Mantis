@@ -68,14 +68,30 @@ class Orchestrator:
     def __init__(self, channel: CommunicationChannel, lzg: LZG, thermal: ThermalMonitor,
                  chat_llm: LLMProvider, bg_llm: LLMProvider, embed_llm: LLMProvider,
                  agent_backend: AgentBackend, voice_agent_backend: AgentBackend | None = None,
-                 chat_task_llm: LLMProvider | None = None):
+                 chat_task_llm: LLMProvider | None = None,
+                 additional_channels: dict[str, CommunicationChannel] | None = None):
         self.chat_llm  = chat_llm
         self.bg_llm    = bg_llm
         self.chat_task_llm = chat_task_llm or bg_llm
         self.embed_llm = embed_llm
         self.channel   = channel
+        self.additional_channels = additional_channels or {}
+        self.message_channels = {"telegram": channel, **self.additional_channels}
         self.lzg       = lzg
         self.thermal   = thermal
+
+        reminder_channel = channel
+        if config.NOTIFY_CHANNEL != "telegram":
+            configured_channel = self.additional_channels.get(config.NOTIFY_CHANNEL)
+            if configured_channel is None:
+                log.warning(
+                    "NOTIFY_CHANNEL=%s ist nicht aktiv; Erinnerungen gehen über Telegram",
+                    config.NOTIFY_CHANNEL,
+                )
+            else:
+                reminder_channel = configured_channel
+                if hasattr(configured_channel, "for_first_allowed_user"):
+                    reminder_channel = configured_channel.for_first_allowed_user()
 
         # ── Kern-Komponenten ─────────────────────────────────────────────────
         self.kzg          = KZG()
@@ -121,7 +137,7 @@ class Orchestrator:
             channel=channel, proactive=self._proactive_engine,
             tracker=self._proactive_tracker, identity=IDENTITY,
             lock=None, is_user_active=self._user_active,
-            search=self._search,
+            search=self._search, reminder_channel=reminder_channel,
         )
 
         # ── Teilmodule ────────────────────────────────────────────────────────
@@ -139,6 +155,7 @@ class Orchestrator:
             bg_llm=bg_llm, alphaprogression=alphaprogression,
             on_user_active=self._mark_user_active,
             on_idle_ready=lambda: self.idle_loop.resume(),
+            channels=self.message_channels,
         )
 
         self.idle_loop = IdleLoop(
@@ -229,10 +246,20 @@ class Orchestrator:
         await self._restore_memory()
         await self._warmup()
         self.channel.on_message(self.handle_message)
+        for channel in self.additional_channels.values():
+            channel.on_message(self.handle_message)
         log_background_job_status()
         self.idle_loop.resume()
         self._bg_tasks.append(asyncio.create_task(self.idle_loop.monitoring_loop()))
         await self.channel.start()
+        for name, channel in self.additional_channels.items():
+            try:
+                await channel.start()
+            except Exception as e:
+                log.error(
+                    "Zusatzkanal %s konnte nicht gestartet werden (%s)",
+                    name, type(e).__name__,
+                )
         log_event("system", "Mantis gestartet")
         log.info("Mantis bereit ✅")
 
@@ -315,6 +342,11 @@ class Orchestrator:
             t.cancel()
         from core import llm_usage
         await llm_usage.shutdown_pending_generation_lookups()
+        for name, channel in self.additional_channels.items():
+            try:
+                await channel.stop()
+            except Exception as e:
+                log.warning("Zusatzkanal %s nicht sauber beendet (%s)", name, type(e).__name__)
         for closer, label in [
             (self.lzg.close, "LZG"),
             (self._dashboard.close, "Dashboard"),

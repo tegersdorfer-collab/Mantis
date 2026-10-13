@@ -54,8 +54,8 @@ class TelegramChannel(CommunicationChannel):
 
     async def send(self, text: str) -> None:
         if not self._app or not self._chat_id:
-            log.warning("Telegram nicht verbunden — Nachricht nicht gesendet: %s", text[:80])
-            return
+            log.warning("Telegram nicht verbunden — Nachricht nicht gesendet")
+            raise ConnectionError("Telegram nicht verbunden")
 
         # Lange Nachrichten aufteilen (Telegram-Limit: 4096 Zeichen)
         chunks = [text[i:i+4096] for i in range(0, len(text), 4096)]

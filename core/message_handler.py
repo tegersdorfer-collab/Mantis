@@ -37,7 +37,8 @@ def _safe_task(coro, label: str):
 class MessageHandler:
     def __init__(self, kzg, lzg, agent, prompt_builder, channel,
                  proactive_tracker, forgetting, extractor, bg_llm,
-                 alphaprogression, on_user_active, on_idle_ready=None):
+                 alphaprogression, on_user_active, on_idle_ready=None,
+                 channels=None):
         self.kzg               = kzg
         self.lzg               = lzg
         self.agent             = agent
@@ -50,8 +51,15 @@ class MessageHandler:
         self.alphaprogression  = alphaprogression
         self.on_user_active    = on_user_active   # callback: () → None
         self.on_idle_ready     = on_idle_ready    # callback: () → None
+        self.channels          = channels or {}
         self._turn_lock        = threading.Lock()
         self._active_turns     = 0
+
+    def _channel_for(self, msg: IncomingMessage):
+        channel = self.channels.get(getattr(msg, "channel", "telegram"), self.channel)
+        if hasattr(channel, "for_message") and msg.raw is not None:
+            return channel.for_message(msg.raw)
+        return channel
 
     def _resume_idle_loop(self, callback=None) -> None:
         callback = callback or self.on_idle_ready
@@ -111,14 +119,23 @@ class MessageHandler:
 
     async def handle(self, msg: IncomingMessage, resume_idle_cb) -> None:
         self._start_turn()
+        response_channel = None
         try:
-            await self._handle_incoming(msg)
+            response_channel = self._channel_for(msg)
+            await self._handle_incoming(msg, response_channel=response_channel)
         finally:
-            self._release_active_turn(resume_idle_cb)
+            try:
+                stop_typing = getattr(response_channel, "stop_typing", None)
+                if stop_typing:
+                    await stop_typing()
+            finally:
+                self._release_active_turn(resume_idle_cb)
 
-    async def _handle_incoming(self, msg: IncomingMessage) -> None:
+    async def _handle_incoming(self, msg: IncomingMessage, response_channel=None) -> None:
         t0 = time.time()
         channel_name = getattr(msg, "channel", "telegram")
+        if response_channel is None:
+            response_channel = self._channel_for(msg)
         BUS.emit("thinking", "Nachricht empfangen…", detail=msg.text[:60])
         log.info(f"Eingehend: {msg.text[:60]}")
 
@@ -149,6 +166,8 @@ class MessageHandler:
             self.kzg.add("assistant", response)
             self._persist_msg("assistant", response, channel=channel_name)
             BUS.emit("response", response)
+            if channel_name == "discord":
+                await response_channel.send(response)
             return
 
         # Accountability & Momentum: eingehende Antwort auf einen offenen
@@ -161,21 +180,30 @@ class MessageHandler:
             self.kzg.add("assistant", acc_reply)
             self._persist_msg("assistant", acc_reply, channel=channel_name)
             BUS.emit("response", acc_reply)
-            await self.channel.send(acc_reply)
+            await response_channel.send(acc_reply)
             return
 
         # Alpha Progression
-        if await self._handle_alpha_progression(msg.text, channel_name):
+        alpha_response = await self._handle_alpha_progression(msg.text, channel_name)
+        if alpha_response:
+            if channel_name == "discord":
+                await response_channel.send(alpha_response)
             return
 
         # Agent-Loop
-        stream_cb, finalize = await self._make_stream()
+        stream_cb, finalize = await self._make_stream(response_channel)
         response, trace = await self._agent_turn(msg.text, channel_name=channel_name,
                                                  stream_cb=stream_cb)
         if not response:
             response = "…"
-        await finalize(response)
         self._finish_turn(msg.text, response, trace, channel_name=channel_name)
+        try:
+            await finalize(response)
+        except Exception as exc:
+            log.warning(
+                "Antwortversand über %s fehlgeschlagen (%s)",
+                channel_name, type(exc).__name__,
+            )
 
         elapsed = time.time() - t0
         log.info(f"Antwort in {elapsed:.1f}s ({len(trace)} Tools, {self.agent.model_name})")
@@ -290,14 +318,15 @@ class MessageHandler:
 
     # ── Streaming ─────────────────────────────────────────────────────────────
 
-    async def _make_stream(self):
-        if not getattr(self.channel, "supports_streaming", False):
-            await self.channel.send_typing()
+    async def _make_stream(self, channel=None):
+        channel = channel or self.channel
+        if not getattr(channel, "supports_streaming", False):
+            await channel.send_typing()
             async def finalize_plain(text):
-                await self.channel.send(text)
+                await channel.send(text)
             return None, finalize_plain
 
-        msg_id = await self.channel.start_message("💭 …")
+        msg_id = await channel.start_message("💭 …")
         last_edit = [0.0]
 
         async def stream_cb(full: str):
@@ -305,10 +334,10 @@ class MessageHandler:
             if now - last_edit[0] < 0.8:
                 return
             last_edit[0] = now
-            await self.channel.edit_message(msg_id, full)
+            await channel.edit_message(msg_id, full)
 
         async def finalize(text: str):
-            await self.channel.edit_message(msg_id, text, markdown=True)
+            await channel.edit_message(msg_id, text, markdown=True)
 
         return stream_cb, finalize
 

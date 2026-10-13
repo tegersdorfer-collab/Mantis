@@ -2,10 +2,11 @@ import asyncio
 import logging
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from communication.base import IncomingMessage
+from communication.discord import DiscordChannel
 from core import db, log_observability
 from core.idle_loop import IdleLoop
 from core.message_handler import MessageHandler
@@ -106,6 +107,224 @@ def test_telegram_handler_persists_both_roles_with_telegram_channel(monkeypatch)
     ]
     assert idle_loop._state == "idle"
     assert idle_loop._task is not None
+
+
+def test_discord_message_uses_its_reply_channel_and_persists_discord(monkeypatch):
+    orchestrator, inserted, idle_loop = _make_orchestrator(monkeypatch)
+    telegram = orchestrator.msg_handler.channel
+    destination = SimpleNamespace(send=AsyncMock())
+    discord = DiscordChannel(enabled=False, allowed_user_ids=("123",))
+    orchestrator.msg_handler.channels = {"discord": discord}
+    message = IncomingMessage(
+        "hello from Discord", "123", datetime(2026, 10, 13),
+        raw=SimpleNamespace(channel=destination), channel="discord",
+    )
+
+    asyncio.run(orchestrator.handle_message(message))
+
+    assert destination.send.await_args.args == ("Antwort aus dem Agenten",)
+    telegram.send.assert_not_awaited()
+    assert _persisted_role_channels(inserted) == [
+        ("user", "discord"),
+        ("assistant", "discord"),
+    ]
+    assert idle_loop._state == "idle"
+
+
+def test_failed_discord_send_still_persists_answer_and_tool_metadata(monkeypatch, caplog):
+    orchestrator, inserted, _idle_loop = _make_orchestrator(monkeypatch)
+    destination = SimpleNamespace(
+        send=AsyncMock(side_effect=RuntimeError("discord-secret transport details"))
+    )
+    orchestrator.msg_handler.channels = {
+        "discord": DiscordChannel(enabled=False, allowed_user_ids=("123",)),
+    }
+    orchestrator.msg_handler.agent.run = AsyncMock(
+        return_value=("Antwort trotz Transportfehler", [{"tool": "get_health"}])
+    )
+    message = IncomingMessage(
+        "Prüffrage", "123", datetime(2026, 10, 13),
+        raw=SimpleNamespace(channel=destination), channel="discord",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="core.message_handler"):
+        asyncio.run(orchestrator.handle_message(message))
+
+    assert _persisted_role_channels(inserted) == [
+        ("user", "discord"),
+        ("assistant", "discord"),
+    ]
+    assistant_sql, assistant_params = inserted[-1]
+    assert assistant_params[1] == "Antwort trotz Transportfehler"
+    assert '"tools": ["get_health"]' in assistant_params[3]
+    assert "RuntimeError" in caplog.text
+    assert "discord-secret" not in caplog.text
+
+
+def test_discord_alpha_progression_response_goes_to_the_incoming_dm(monkeypatch):
+    orchestrator, _inserted, _idle_loop = _make_orchestrator(monkeypatch)
+    destination = SimpleNamespace(send=AsyncMock())
+    orchestrator.msg_handler.channels = {
+        "discord": DiscordChannel(enabled=False, allowed_user_ids=("123",)),
+    }
+    orchestrator.msg_handler.alphaprogression.extract_link = lambda _text: "https://example.test/workout"
+    orchestrator.msg_handler.alphaprogression.fetch_and_log = lambda _url: "Training importiert"
+    message = IncomingMessage(
+        "https://example.test/workout", "123", datetime(2026, 10, 13),
+        raw=SimpleNamespace(channel=destination), channel="discord",
+    )
+
+    asyncio.run(orchestrator.handle_message(message))
+
+    assert destination.send.await_args.args == ("Training importiert",)
+
+
+def test_discord_clarification_response_goes_to_the_incoming_dm(monkeypatch):
+    orchestrator, _inserted, _idle_loop = _make_orchestrator(monkeypatch)
+    destination = SimpleNamespace(send=AsyncMock())
+    orchestrator.msg_handler.channels = {
+        "discord": DiscordChannel(enabled=False, allowed_user_ids=("123",)),
+    }
+    monkeypatch.setattr(db, "query", lambda *_args, **_kwargs: [{"id": 17}])
+    message = IncomingMessage(
+        "Ja, bitte weitermachen", "123", datetime(2026, 10, 13),
+        raw=SimpleNamespace(channel=destination), channel="discord",
+    )
+
+    asyncio.run(orchestrator.handle_message(message))
+
+    assert destination.send.await_args.args == (
+        "Danke! Ich mache mit deiner Antwort weiter an der Aufgabe. 👍",
+    )
+
+
+def test_cancelled_discord_turn_stops_typing_and_resumes_idle_loop(monkeypatch):
+    orchestrator, _inserted, idle_loop = _make_orchestrator(monkeypatch)
+    typing_count = [0]
+    started = asyncio.Event()
+
+    class Typing:
+        async def __aenter__(self):
+            typing_count[0] += 1
+
+        async def __aexit__(self, *_args):
+            typing_count[0] -= 1
+
+    destination = SimpleNamespace(
+        send=AsyncMock(),
+        typing=lambda: Typing(),
+    )
+    orchestrator.msg_handler.channels = {
+        "discord": DiscordChannel(enabled=False, allowed_user_ids=("123",)),
+    }
+
+    async def wait_for_completion(**_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    orchestrator.msg_handler.agent.run = AsyncMock(side_effect=wait_for_completion)
+    message = IncomingMessage(
+        "hello", "123", datetime(2026, 10, 13),
+        raw=SimpleNamespace(channel=destination), channel="discord",
+    )
+
+    async def run():
+        task = asyncio.create_task(orchestrator.handle_message(message))
+        await started.wait()
+        assert typing_count == [1]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert typing_count == [0]
+        assert idle_loop._state == "idle"
+
+    asyncio.run(run())
+
+
+def test_orchestrator_wires_discord_for_messages_and_reminder_dms(monkeypatch):
+    import orchestrator as orchestrator_module
+
+    class Capture:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    for name in (
+        "KZG", "KnowledgeGraph", "Consolidator", "ForgettingCurve", "MemoryExtractor",
+        "Reflection", "Agent", "WebSearch", "DashboardReader", "ReminderStore",
+        "ProactiveTracker", "ProactiveEngine", "PromptBuilder", "IdleLoop",
+    ):
+        monkeypatch.setattr(orchestrator_module, name, Capture)
+
+    autopilot = Capture
+    monkeypatch.setattr(orchestrator_module, "Autopilot", autopilot)
+    message_handler = Capture
+    monkeypatch.setattr(orchestrator_module, "MessageHandler", message_handler)
+    monkeypatch.setattr(orchestrator_module.config, "NOTIFY_CHANNEL", "discord")
+
+    primary = object()
+    route = object()
+    discord = SimpleNamespace(for_first_allowed_user=lambda: route)
+    orchestrator = Orchestrator(
+        channel=primary,
+        lzg=object(),
+        thermal=object(),
+        chat_llm=object(),
+        bg_llm=object(),
+        embed_llm=object(),
+        agent_backend=object(),
+        additional_channels={"discord": discord},
+    )
+
+    assert orchestrator.autopilot.kwargs["reminder_channel"] is route
+    assert orchestrator.msg_handler.kwargs["channels"] == {
+        "telegram": primary,
+        "discord": discord,
+    }
+
+
+def test_orchestrator_starts_and_stops_additional_channels(monkeypatch):
+    primary = SimpleNamespace(
+        on_message=Mock(),
+        start=AsyncMock(),
+    )
+    discord = SimpleNamespace(
+        on_message=Mock(),
+        start=AsyncMock(),
+        stop=AsyncMock(),
+    )
+    idle_loop = SimpleNamespace(
+        resume=Mock(),
+        pause=Mock(),
+        monitoring_loop=AsyncMock(),
+    )
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.channel = primary
+    orchestrator.additional_channels = {"discord": discord}
+    orchestrator.idle_loop = idle_loop
+    orchestrator.lzg = SimpleNamespace(close=Mock())
+    orchestrator._dashboard = SimpleNamespace(close=Mock())
+    orchestrator._register_services = Mock()
+    orchestrator._init_db = AsyncMock()
+    orchestrator._init_skills = AsyncMock()
+    orchestrator._restore_memory = AsyncMock()
+    orchestrator._warmup = AsyncMock()
+    monkeypatch.setattr("orchestrator.log_background_job_status", lambda: None)
+    monkeypatch.setattr("orchestrator.log_event", lambda *_args: None)
+    monkeypatch.setattr("core.log_observability.install", lambda: None)
+    monkeypatch.setattr(db, "close_pool", lambda: None)
+
+    async def run():
+        await orchestrator.start()
+        await orchestrator.stop()
+
+    asyncio.run(run())
+
+    primary.on_message.assert_called_once_with(orchestrator.handle_message)
+    discord.on_message.assert_called_once_with(orchestrator.handle_message)
+    primary.start.assert_awaited_once()
+    discord.start.assert_awaited_once()
+    discord.stop.assert_awaited_once()
 
 
 @pytest.mark.parametrize("channel_name", ["web", "ios", "mcp"])
