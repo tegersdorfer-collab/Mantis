@@ -513,3 +513,12 @@ def test_jwks_discovery_is_standard_oidc_and_uses_no_client_secret():
     assert "ext_agent_host_id" not in params
     assert "client_secret" not in params
 
+
+
+def test_login_host_id_uses_urn_uuid_format():
+    import inspect
+    from core.auth import chatgpt_login
+
+    source = inspect.getsource(chatgpt_login)
+    assert 'f"urn:uuid:{uuid.uuid4()}"' in source
+    assert 'startswith("urn:uuid:")' in source

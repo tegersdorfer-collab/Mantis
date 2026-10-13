@@ -7,9 +7,9 @@ from __future__ import annotations
 import argparse
 import http.server
 import logging
-import secrets
 import socket
 import time
+import uuid
 import webbrowser
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -149,7 +149,11 @@ def run_login(
     first_registration = not issued_client_id.startswith("oaiapp_")
     if first_registration:
         issued_client_id = REGISTRATION_CLIENT_ID
-    host_id = str((previous or {}).get("ext_agent_host_id") or secrets.token_urlsafe(32))
+    # OpenAI erwartet laut Doku das Format "urn:uuid:…" (13.10.2026: ein
+    # token_urlsafe-Wert wurde mit invalid_authorize_request abgelehnt).
+    host_id = str((previous or {}).get("ext_agent_host_id") or "")
+    if not host_id.startswith("urn:uuid:"):
+        host_id = f"urn:uuid:{uuid.uuid4()}"
 
     server = _CallbackServer(
         ("127.0.0.1", port),
