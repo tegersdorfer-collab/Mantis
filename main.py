@@ -110,8 +110,9 @@ async def main():
     bg_llm = RoutedLLMProvider()
     log.info(f"🧠 Background-LLM: Routed (default={cfg.BG_DEFAULT_MODEL} | reasoning={cfg.BG_REASONING_MODEL} | code={cfg.BG_CODE_MODEL})")
 
-    # Diese beiden chat-nahen Analysen können dieselbe Cloud-Kette nutzen;
-    # alle übrigen Background-Jobs behalten den RoutedLLMProvider.
+    # Datenschutzgrenze: Nur aktuelle Chat-Turns, deren Fact-Extraction und KZG-
+    # Summary dürfen die Cloud-Kette nutzen. Gespeicherte private Daten aus
+    # Journal-, Aufgaben-, Gesundheits- und Dashboard-Routen bleiben bei bg_llm.
     chat_task_llm = build_chat_task_provider(cfg)
     if chat_task_llm:
         log.info("🧠 Fact-Extraction und KZG-Checkpoint nutzen die Chat-Kette")

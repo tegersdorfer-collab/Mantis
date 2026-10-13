@@ -144,6 +144,47 @@ def test_missing_tool_arguments_defaults_to_empty_object_when_no_fields_required
     }]
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_optional_tool_call_without_arguments_is_empty_object_in_both_paths(streaming):
+    tools = [{"type": "function", "function": {
+        "name": "optional_tool",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if streaming:
+            chunks = [
+                {"choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call-optional", "function": {"name": "optional_tool"},
+                }]}}]},
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            ]
+            body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+            return httpx.Response(
+                200, content=(body + "data: [DONE]\n\n").encode(),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(200, json=_completion(tool_calls=[{
+            "id": "call-optional",
+            "type": "function",
+            "function": {"name": "optional_tool"},
+        }]))
+
+    async def stream_cb(_):
+        return None
+
+    text, calls = asyncio.run(_backend(handler).call(
+        [{"role": "user", "content": "start"}], tools=tools,
+        stream_cb=stream_cb if streaming else None, temperature=0.2, max_tokens=30,
+    ))
+
+    assert text == ""
+    assert calls == [{
+        "id": "call-optional",
+        "function": {"name": "optional_tool", "arguments": {}},
+    }]
+
+
 @pytest.mark.parametrize("arguments", ["{not json", "", "[]", "null", '"text"', "42"])
 def test_extract_tool_calls_rejects_invalid_or_non_object_arguments(arguments):
     message = {"tool_calls": [{"id": "x", "function": {"name": "noop", "arguments": arguments}}]}
@@ -344,7 +385,7 @@ def test_streaming_tolerates_null_usage_and_reads_usage_after_finish_reason(monk
     })]
 
 
-@pytest.mark.parametrize("finish_reason", ["error", "content_filter", "length"])
+@pytest.mark.parametrize("finish_reason", ["error", "content_filter"])
 def test_streaming_rejects_non_success_finish_reason_after_reading_usage(monkeypatch, finish_reason):
     from core import llm_usage
 
@@ -372,6 +413,75 @@ def test_streaming_rejects_non_success_finish_reason_after_reading_usage(monkeyp
 
     assert records[0][0] == ("openrouter", "z-ai/glm-5.3", 120, 45)
     assert records[0][1]["actual_cost"] == 0.035
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_length_finish_reason_returns_available_response_in_both_paths(streaming):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if streaming:
+            chunks = [{"choices": [{
+                "delta": {"content": "Abgeschnittene Antwort"},
+                "finish_reason": "length",
+            }]}]
+            body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+            return httpx.Response(
+                200, content=(body + "data: [DONE]\n\n").encode(),
+                headers={"content-type": "text/event-stream"},
+            )
+        data = _completion(content="Abgeschnittene Antwort")
+        data["choices"][0]["finish_reason"] = "length"
+        return httpx.Response(200, json=data)
+
+    async def stream_cb(_):
+        return None
+
+    text, calls = asyncio.run(_backend(handler).call(
+        [{"role": "user", "content": "answer"}], tools=None,
+        stream_cb=stream_cb if streaming else None, temperature=0.2, max_tokens=30,
+    ))
+
+    assert text == "Abgeschnittene Antwort"
+    assert calls == []
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_length_finish_reason_still_rejects_truncated_tool_arguments(streaming):
+    tools = [{"type": "function", "function": {
+        "name": "optional_tool",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if streaming:
+            chunks = [
+                {"choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call-truncated", "function": {
+                        "name": "optional_tool", "arguments": '{"value":',
+                    },
+                }]}}]},
+                {"choices": [{"delta": {}, "finish_reason": "length"}]},
+            ]
+            body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+            return httpx.Response(
+                200, content=(body + "data: [DONE]\n\n").encode(),
+                headers={"content-type": "text/event-stream"},
+            )
+        data = _completion(tool_calls=[{
+            "id": "call-truncated",
+            "type": "function",
+            "function": {"name": "optional_tool", "arguments": '{"value":'},
+        }])
+        data["choices"][0]["finish_reason"] = "length"
+        return httpx.Response(200, json=data)
+
+    async def stream_cb(_):
+        return None
+
+    with pytest.raises(ValueError, match="ungültiges JSON"):
+        asyncio.run(_backend(handler).call(
+            [{"role": "user", "content": "call tool"}], tools=tools,
+            stream_cb=stream_cb if streaming else None, temperature=0.2, max_tokens=30,
+        ))
 
 
 def test_streaming_stops_at_done_and_ignores_later_events():

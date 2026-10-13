@@ -1,4 +1,10 @@
-"""Konfiguration und Aufbau der Chat-Backend-Ketten."""
+"""Konfiguration und Aufbau der Chat-Backend-Ketten.
+
+Datenschutzgrenze: Cloud ist nur für interaktive Chat-Turns sowie deren direkte
+Fact-Extraction und KZG-Summary vorgesehen. Persistierte private Daten aus
+Journal-, Aufgaben-, Gesundheits- und anderen Dashboard-/Background-Routen
+verwenden ausschließlich bg_llm.
+"""
 from core.backends.claude import ClaudeBackend
 from core.backends.fallback import FallbackBackend
 from core.backends.llm_adapter import BackendLLMAdapter
@@ -58,7 +64,7 @@ def build_chat_backend(cfg) -> FallbackBackend | OllamaBackend:
 
 
 def build_chat_task_provider(cfg) -> BackendLLMAdapter | None:
-    """Cloud-Kette nur für Fact-Extraction und KZG-Summary bereitstellen."""
+    """Cloud-Kette nur für Chat-Turn-Fact-Extraction und KZG-Summary bereitstellen."""
     if not getattr(cfg, "BG_CHAT_TASKS_USE_CLOUD", True):
         return None
     chain = _openrouter_chain(cfg, purpose="background")

@@ -89,6 +89,14 @@ verwenden unverändert `bg_llm`. Chat- und Background-Aufrufe werden als
 `purpose='background'` erfasst. Der Request fordert `usage.include=true` an und
 `llm_usage` speichert `usage.cost` als tatsächliche OpenRouter-Kosten.
 
+**Datenschutzgrenze:** Ausschließlich Inhalte, die Timo gerade selbst im
+interaktiven Chat schreibt, dürfen in die Cloud-Kette gelangen. Dazu zählen die
+daraus unmittelbar abgeleitete Fact-Extraction und die KZG-Summary der Chat-Turns.
+Gespeicherte private Daten bleiben immer lokal über `bg_llm`: Journal-Einträge
+(einschließlich Antworten), Gesundheit/COROS, Fitness, Ernährung, Aufgaben-Titel
+und -Notizen sowie LZG-Erinnerungen in Hintergrund- und Dashboard-Routen. Für
+Journal-Extraktion sind auch Verifier und Konfliktprüfung lokal.
+
 Tool-Schemas müssen auch im OpenAI-/Anthropic-kompatiblen Export gültiges JSON
 Schema enthalten: `type: object`, `properties` als Objekt, `required` als Teilmenge
 der Properties, gültige Property-Typen und `items` für Arrays. Der fehlerhafte

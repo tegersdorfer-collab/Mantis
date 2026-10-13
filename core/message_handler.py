@@ -247,7 +247,7 @@ class MessageHandler:
                 messages=self.kzg.recent_messages(max_tokens=3000),
                 system=system, stream_cb=stream_cb,
                 allowed_tools=allowed, force_tools=force_tools,
-                temperature=0.75, max_tokens=1500,
+                temperature=0.75, max_tokens=4000,
             )
         except Exception as e:
             log.error("Agent-Fehler (%s): %s", channel_name, redact_error_text(e))

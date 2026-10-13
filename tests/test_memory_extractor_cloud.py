@@ -72,3 +72,45 @@ def test_entity_extraction_uses_cloud_provider(monkeypatch):
     assert len(provider.calls) == 1
     assert "Nachricht: hallo" in provider.calls[0][0]
     assert local_client.calls == []
+
+
+def test_local_extractor_verifier_bypasses_jev(monkeypatch):
+    import memory.extractor as extractor_module
+
+    class LocalClient:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return type("Response", (), {
+                "message": type("Message", (), {"content": "JA"})(),
+            })()
+
+    async def jev_must_not_run(*_args, **_kwargs):
+        raise AssertionError("Lokale Journaldaten dürfen Jev nicht erreichen")
+
+    client = LocalClient()
+    monkeypatch.setattr(extractor_module.decisions, "claim_supported", jev_must_not_run)
+
+    assert asyncio.run(extractor_module.verify_claim(
+        client, "Ich wohne in Nürnberg", "Timo wohnt in Nürnberg.", allow_cloud=False
+    ))
+    assert len(client.calls) == 1
+
+
+def test_local_extractor_conflict_judge_bypasses_jev(monkeypatch):
+    import memory.conflict as conflict_module
+    import memory.extractor as extractor_module
+
+    async def local_judge(old, new):
+        return old == "alter Fakt" and new == "neuer Fakt"
+
+    async def jev_must_not_run(*_args, **_kwargs):
+        raise AssertionError("Lokale LZG-Daten dürfen Jev nicht erreichen")
+
+    monkeypatch.setattr(conflict_module, "make_llm_judge", lambda *_: local_judge)
+    monkeypatch.setattr(extractor_module.decisions, "supersedes", jev_must_not_run)
+    judge = extractor_module.make_judge(object(), "local-model", allow_cloud=False)
+
+    assert asyncio.run(judge("alter Fakt", "neuer Fakt"))

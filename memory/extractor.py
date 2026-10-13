@@ -41,7 +41,7 @@ def verify_prompt(user_text: str, claim: str) -> str:
     )
 
 
-async def verify_claim(client, user_text: str, claim: str) -> bool:
+async def verify_claim(client, user_text: str, claim: str, *, allow_cloud: bool = True) -> bool:
     """Steht die Behauptung wirklich im Text? Jev zuerst, lokal (qwen2.5:0.5b) als Fallback."""
     async def _lokal() -> bool:
         model = "qwen2.5:0.5b"
@@ -54,13 +54,18 @@ async def verify_claim(client, user_text: str, claim: str) -> bool:
             think=False,
         )
         return (vresp.message.content or "").strip().upper().startswith("JA")
+    if not allow_cloud:
+        return await _lokal()
     return await decisions.claim_supported(user_text, claim, _lokal)
 
 
-def make_judge(client, model: str):
+def make_judge(client, model: str, *, allow_cloud: bool = True):
     """Konflikt-Judge: Jev zuerst, sonst der bisherige LLM-Judge aus memory/conflict.py."""
     from memory import conflict
     lokal = conflict.make_llm_judge(client, model)
+
+    if not allow_cloud:
+        return lokal
 
     async def _judge(old: str, new: str) -> bool:
         async def _fb() -> bool:
@@ -168,11 +173,13 @@ class MemoryExtractor:
         lzg: LZG,
         kg: KnowledgeGraph | None = None,
         fact_llm=None,
+        local_only: bool = False,
     ):
         self._llm = llm_provider   # nur für embed()
         self._lzg = lzg
         self._kg  = kg
         self._fact_llm = fact_llm
+        self._local_only = local_only
         self._client = _ollama.AsyncClient(host=config.OLLAMA_BASE_URL)
 
     async def _ask_json(self, prompt: str, max_tokens: int, gate_timeout_s: float) -> str | None:
@@ -277,7 +284,9 @@ class MemoryExtractor:
 
             # ── 4b. Verifier: steht das wirklich im Text? (Jev, lokal 0.5B als Fallback) ──
             try:
-                if not await verify_claim(self._client, user_text, text):
+                if not await verify_claim(
+                    self._client, user_text, text, allow_cloud=not self._local_only
+                ):
                     log.debug(f"Extraktor: Verifier abgelehnt: '{text[:60]}'")
                     continue
             except Exception as ve:
@@ -318,7 +327,10 @@ class MemoryExtractor:
                 # Extraktion nie kippen.
                 try:
                     from memory import conflict
-                    judge = make_judge(self._client, config.AGENT_MODEL_FAST)
+                    judge = make_judge(
+                        self._client, config.AGENT_MODEL_FAST,
+                        allow_cloud=not self._local_only,
+                    )
                     await conflict.resolve(self._lzg, new_id, text, embedding, judge)
                 except Exception as e:
                     log.debug(f"Konfliktauflösung übersprungen: {e}")

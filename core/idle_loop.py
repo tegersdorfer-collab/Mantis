@@ -65,7 +65,7 @@ class IdleLoop:
     def __init__(self, autopilot, reflection, consolidator, forgetting,
                  kzg, lzg, dashboard, thermal, reminders,
                  proactive_engine, proactive_tracker,
-                 bg_llm, chat_llm, suggest_one,
+                 bg_llm, suggest_one,
                  is_user_active,
                  pattern_detector_mod, generate_insight_task,
                  chat_task_llm=None):
@@ -82,7 +82,6 @@ class IdleLoop:
         self.proactive_tracker   = proactive_tracker
         self.bg_llm              = bg_llm
         self.chat_task_llm       = chat_task_llm or bg_llm
-        self.chat_llm            = chat_llm
         self.suggest_one         = suggest_one
         self.is_user_active      = is_user_active
         self.pattern_detector    = pattern_detector_mod

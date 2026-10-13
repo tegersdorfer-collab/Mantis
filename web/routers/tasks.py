@@ -43,7 +43,7 @@ def build_router(orch=None) -> APIRouter:
             # Auto-Klassifikation ist optional — Fehler darf die Task-Erstellung
             # nicht kippen (Task existiert bereits), aber wird geloggt statt geschluckt.
             try:
-                assignee = await classify(d["title"], d.get("notes"), orch.chat_llm)
+                assignee = await classify(d["title"], d.get("notes"), orch.bg_llm)
                 db.execute("UPDATE tasks SET assigned_to=%s WHERE id=%s", (assignee, tid))
             except Exception as e:
                 log.warning(f"Task-Auto-Klassifikation fehlgeschlagen (Task {tid}): {e}")
@@ -87,7 +87,7 @@ def build_router(orch=None) -> APIRouter:
         if not orch:
             return {"ok": False, "error": "Kein Orchestrator"}
         import asyncio as _aio
-        _aio.create_task(suggest_one("Manueller Trigger durch Timo im Hub", orch.chat_llm, orch.lzg))
+        _aio.create_task(suggest_one("Manueller Trigger durch Timo im Hub", orch.bg_llm, orch.lzg))
         return {"ok": True}
 
     @router.post("/api/tasks/{tid}/complete")

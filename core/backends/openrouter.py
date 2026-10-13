@@ -258,18 +258,15 @@ class OpenRouterBackend(AgentBackend):
 
             if not completed:
                 raise RuntimeError("OpenRouter-Stream endete ohne Abschluss")
-            if finish_reason is not None and finish_reason not in {"stop", "tool_calls"}:
-                # `length` bedeutet, dass die Antwort am Tokenlimit abgeschnitten
-                # wurde. Wie andere unvollständige Endgründe geht sie in den
-                # Backend-Fallback, statt als verwendbare Antwort zurückzukommen.
+            if finish_reason is not None and finish_reason not in {"stop", "tool_calls", "length"}:
                 raise RuntimeError(f"OpenRouter-Stream mit finish_reason {finish_reason!r} beendet")
             full = "".join(parts)
-            message = {"tool_calls": [
-                {"id": slot["id"], "function": {
-                    "name": slot["name"], "arguments": slot["arguments"] or None,
-                }}
-                for _, slot in sorted(calls_by_index.items())
-            ]}
+            message = {"tool_calls": []}
+            for _, slot in sorted(calls_by_index.items()):
+                function = {"name": slot["name"]}
+                if slot["arguments"]:
+                    function["arguments"] = slot["arguments"]
+                message["tool_calls"].append({"id": slot["id"], "function": function})
             tool_calls = _extract_tool_calls(message, payload.get("tools"))
         except BaseException:
             # wait_for() cancels the stream on timeout; preserve any usage that

@@ -28,7 +28,6 @@ def _loop(chat_task_llm=None, bg_llm=None):
         proactive_engine=SimpleNamespace(),
         proactive_tracker=SimpleNamespace(),
         bg_llm=bg_llm,
-        chat_llm=None,
         suggest_one=noop,
         is_user_active=lambda: False,
         pattern_detector_mod=SimpleNamespace(update_memories=no_memories),
@@ -113,14 +112,12 @@ def test_training_plan_autogeneration_uses_only_local_background_llm(monkeypatch
     from domains import fitness, plan_generator
 
     local_llm = object()
-    cloud_chat_llm = object()
     selected = []
 
     async def generate(chat_llm, bg_llm):
         selected.append((chat_llm, bg_llm))
 
     loop = _loop(bg_llm=local_llm)
-    loop.chat_llm = cloud_chat_llm
     monkeypatch.setattr(config, "TRAINING_PLAN_AUTOGEN_ENABLED", True)
     monkeypatch.setattr(fitness, "active_plan", lambda: None)
     monkeypatch.setattr(plan_generator, "needs_regen", lambda *_: True)

@@ -82,7 +82,7 @@ def build_router(orch=None) -> APIRouter:
             if d.get("content"):
                 parts.append(f"Freier Text: {d['content']}")
             combined = "\n\n".join(parts)
-            _aio.create_task(orch.extractor.extract_from_exchange(
+            _aio.create_task(orch.local_extractor.extract_from_exchange(
                 f"Journal-Eintrag vom {date.today()}:\n{combined}", ""
             ))
         return {"id": jid}

@@ -82,11 +82,20 @@ class Orchestrator:
         self.kg           = KnowledgeGraph()
         self.consolidator = Consolidator(llm=bg_llm, lzg=lzg)
         self.forgetting   = ForgettingCurve()
+        # Datenschutzgrenze: Nur der Chat-Extractor verarbeitet den aktuellen Chat-Turn
+        # mit der optionalen Cloud-Kette. Dashboard-/Journal-Daten bleiben lokal.
         self.extractor    = MemoryExtractor(
             llm_provider=embed_llm,
             lzg=lzg,
             kg=self.kg,
             fact_llm=chat_task_llm,
+        )
+        self.local_extractor = MemoryExtractor(
+            llm_provider=embed_llm,
+            lzg=lzg,
+            kg=self.kg,
+            fact_llm=bg_llm,
+            local_only=True,
         )
         self.reflection   = Reflection(llm=bg_llm, lzg=lzg)
         self.agent        = Agent(backend=agent_backend, max_steps=8)
@@ -139,7 +148,7 @@ class Orchestrator:
             thermal=thermal, reminders=self._reminders,
             proactive_engine=self._proactive_engine,
             proactive_tracker=self._proactive_tracker,
-            bg_llm=bg_llm, chat_llm=chat_llm, suggest_one=suggest_one,
+            bg_llm=bg_llm, suggest_one=suggest_one,
             is_user_active=self._user_active,
             pattern_detector_mod=pattern_detector,
             generate_insight_task=generate_insight_task,

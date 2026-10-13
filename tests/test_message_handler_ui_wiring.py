@@ -53,3 +53,17 @@ class TestDashboardRespondUiWiring:
                 # darf keine Exception nach außen werfen
                 response, trace = asyncio.run(handler.dashboard_respond("Wie war mein Schlaf?"))
                 assert response == "Du hast 7.2h geschlafen."
+
+    def test_interaktiver_turn_hat_viertausend_token_budget(self, monkeypatch):
+        handler = _make_handler()
+
+        async def select_tools(_):
+            return [], False
+
+        monkeypatch.setattr("core.message_handler.fast_commands.match", lambda _: None)
+        monkeypatch.setattr("core.message_handler.skill_request.match", lambda _: None)
+        monkeypatch.setattr("core.message_handler.skills.T.select_tools_async", select_tools)
+
+        asyncio.run(handler._agent_turn("Hallo", channel_name="web"))
+
+        assert handler.agent.run.await_args.kwargs["max_tokens"] == 4000
