@@ -105,6 +105,15 @@ def validate_callback(
     return {"code": code, "client_id": client_id}
 
 
+def _deadline_timeout(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("ChatGPT-Login-Gesamtfrist ist abgelaufen")
+    return remaining
+
+
 def exchange_authorization_code(
     client: httpx.Client,
     *,
@@ -112,8 +121,12 @@ def exchange_authorization_code(
     code: str,
     code_verifier: str,
     redirect_uri: str,
+    deadline: float | None = None,
 ) -> dict:
     """Tauscht den Code form-encoded ein; der Aufrufer übergibt die ausgestellte Client-ID."""
+    request_options = {}
+    if deadline is not None:
+        request_options["timeout"] = _deadline_timeout(deadline)
     response = client.post(TOKEN_URL, data={
         "grant_type": "authorization_code",
         "client_id": client_id,
@@ -121,7 +134,7 @@ def exchange_authorization_code(
         "code_verifier": code_verifier,
         "redirect_uri": redirect_uri,
         "resource": RESOURCE,
-    })
+    }, **request_options)
     if response.is_error:
         raise RuntimeError(f"ChatGPT-Token-Austausch fehlgeschlagen (HTTP {response.status_code})")
     try:
@@ -140,13 +153,16 @@ def require_direct_token_scope(scope: str | list[str] | None) -> None:
         raise ValueError(f"OAuth-Berechtigung {DIRECT_TOKEN_SCOPE} fehlt")
 
 
-def fetch_jwks(client: httpx.Client) -> dict:
+def fetch_jwks(client: httpx.Client, *, deadline: float | None = None) -> dict:
     """Liest die JWKS-Adresse aus dem standardisierten OIDC-Discovery-Dokument.
 
     Annahme: Der Issuer veröffentlicht die JWKS-URI über OIDC Discovery; sie wird
     nicht fest im Code verdrahtet und muss auf auth.openai.com zeigen.
     """
-    discovery_response = client.get(DISCOVERY_URL)
+    request_options = {}
+    if deadline is not None:
+        request_options["timeout"] = _deadline_timeout(deadline)
+    discovery_response = client.get(DISCOVERY_URL, **request_options)
     if discovery_response.is_error:
         raise RuntimeError(f"OIDC-Discovery fehlgeschlagen (HTTP {discovery_response.status_code})")
     try:
@@ -156,7 +172,9 @@ def fetch_jwks(client: httpx.Client) -> dict:
     jwks_uri = discovery.get("jwks_uri") if isinstance(discovery, dict) else None
     if not isinstance(jwks_uri, str) or not jwks_uri.startswith(f"{ISSUER}/"):
         raise RuntimeError("OIDC-Discovery enthält keine vertrauenswürdige JWKS-Adresse")
-    response = client.get(jwks_uri)
+    if deadline is not None:
+        request_options["timeout"] = _deadline_timeout(deadline)
+    response = client.get(jwks_uri, **request_options)
     if response.is_error:
         raise RuntimeError(f"JWKS-Abruf fehlgeschlagen (HTTP {response.status_code})")
     try:

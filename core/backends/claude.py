@@ -90,13 +90,24 @@ def _ollama_msgs_to_anthropic(messages: list[dict]) -> tuple[str | None, list[di
     return system, result
 
 
-def _extract_tool_calls(response) -> list[dict]:
+def _extract_tool_calls(response, tools: list[dict] | None = None) -> list[dict]:
     """Extrahiert Tool-Calls aus Anthropic-Response ins einheitliche Format."""
+    required_by_name = {}
+    for tool in tools or []:
+        function = tool.get("function") or tool
+        parameters = function.get("parameters") or {}
+        required_by_name[function.get("name", "")] = parameters.get("required") or []
+
     calls = []
     for block in response.content:
         if block.type == "tool_use":
             if not isinstance(block.input, dict):
                 raise ValueError(f"Anthropic Tool-Argumente für {block.name} müssen ein JSON-Objekt sein")
+            missing = [name for name in required_by_name.get(block.name, []) if name not in block.input]
+            if missing:
+                raise ValueError(
+                    f"Anthropic Tool-Argumente fehlen für Pflichtargumente: {', '.join(missing)}",
+                )
             calls.append({
                 "id": block.id,
                 "function": {
@@ -159,13 +170,16 @@ class ClaudeBackend(AgentBackend):
                     except Exception:
                         pass
             final = await stream.get_final_message()
+            stop_reason = getattr(final, "stop_reason", None)
+            if not isinstance(stop_reason, str) or not stop_reason:
+                raise RuntimeError("Anthropic-Stream endete ohne Abschluss")
             self._record_usage(final)
-            tool_calls = _extract_tool_calls(final)
+            tool_calls = _extract_tool_calls(final, tools)
             return _extract_text(final) or collected, tool_calls
 
         response = await self._client.messages.create(**kwargs)
         self._record_usage(response)
-        tool_calls = _extract_tool_calls(response)
+        tool_calls = _extract_tool_calls(response, tools)
 
         # Tool-Result-Messages brauchen tool_use_id → rückwärts befüllen
         # (wird beim nächsten Call aus dem trace rekonstruiert)

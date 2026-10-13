@@ -8,6 +8,7 @@ import argparse
 import http.server
 import logging
 import secrets
+import socket
 import time
 import webbrowser
 from pathlib import Path
@@ -38,6 +39,12 @@ LOGIN_TIMEOUT_S = 300
 class _CallbackServer(http.server.HTTPServer):
     callback_result: dict[str, str] | None = None
     callback_error: str | None = None
+    request_timeout_s = 10.0
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(min(10.0, max(0.001, float(self.request_timeout_s))))
+        return request, address
 
 
 def _callback_handler(expected_state: str, require_client_id: bool):
@@ -86,6 +93,7 @@ def run_login(
     open_browser=webbrowser.open,
 ) -> None:
     """Führt Callback, Code-Tausch, OIDC-Prüfung und atomare Speicherung aus."""
+    deadline = time.monotonic() + timeout_s
     auth_path = Path(auth_file or config.CHATGPT_AUTH_FILE).expanduser()
     port = int(callback_port if callback_port is not None else config.CHATGPT_AUTH_CALLBACK_PORT)
     previous = _read_previous_auth(auth_path)
@@ -110,18 +118,32 @@ def run_login(
 
     client_owned = http_client is None
     client = http_client or httpx.Client(timeout=20)
+    server_closed = False
+
+    def close_server() -> None:
+        nonlocal server_closed
+        if not server_closed:
+            server_closed = True
+            server.server_close()
+
     try:
         opened = open_browser(authorization.url)
         if not opened:
             print(f"Öffne diese Anmeldeseite im Browser:\n{authorization.url}")
-        server.timeout = min(1.0, max(0.1, timeout_s))
-        deadline = time.monotonic() + timeout_s
+        if time.monotonic() >= deadline:
+            raise TimeoutError("ChatGPT-Login-Callback kam nicht innerhalb von fünf Minuten an")
         while server.callback_result is None and server.callback_error is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("ChatGPT-Login-Callback kam nicht innerhalb von fünf Minuten an")
             server.timeout = min(1.0, remaining)
-            server.handle_request()
+            server.request_timeout_s = min(10.0, remaining)
+            try:
+                server.handle_request()
+            except socket.timeout:
+                continue
+            if server.callback_result is not None or server.callback_error is not None:
+                close_server()
         if server.callback_error:
             raise ValueError(server.callback_error)
         callback = server.callback_result or {}
@@ -137,7 +159,10 @@ def run_login(
             code=callback["code"],
             code_verifier=authorization.code_verifier,
             redirect_uri=redirect_uri,
+            deadline=deadline,
         )
+        if time.monotonic() >= deadline:
+            raise TimeoutError("ChatGPT-Login-Gesamtfrist ist abgelaufen")
         access_token = token_data.get("access_token")
         refresh_token = token_data.get("refresh_token")
         id_token = token_data.get("id_token")
@@ -150,8 +175,10 @@ def run_login(
             id_token,
             client_id=client_id,
             nonce=authorization.nonce,
-            jwks=fetch_jwks(client),
+            jwks=fetch_jwks(client, deadline=deadline),
         )
+        if time.monotonic() >= deadline:
+            raise TimeoutError("ChatGPT-Login-Gesamtfrist ist abgelaufen")
         expires_in = token_data.get("expires_in", 3600)
         if isinstance(expires_in, bool) or not isinstance(expires_in, (int, float)) or expires_in <= 0:
             raise RuntimeError("ChatGPT-Tokenantwort enthält eine ungültige Gültigkeitsdauer")
@@ -164,7 +191,7 @@ def run_login(
             "scope": scope,
         })
     finally:
-        server.server_close()
+        close_server()
         if client_owned:
             client.close()
 

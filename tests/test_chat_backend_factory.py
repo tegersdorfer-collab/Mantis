@@ -310,12 +310,11 @@ def test_missing_chatgpt_login_is_reported_and_stage_is_skipped(monkeypatch, cap
 
 
 def test_chatgpt_stage_is_skipped_when_auth_scope_lacks_direct_usage(tmp_path, monkeypatch):
-    _install_fake_backends(monkeypatch)
     from core.auth.chatgpt import save_auth
 
     path = tmp_path / "chatgpt_auth.json"
     save_auth(path, {
-        "client_id": "oaiapp-test", "ext_agent_host_id": "host-test",
+        "client_id": "oaiapp_test", "ext_agent_host_id": "host-test",
         "access_token": secrets.token_urlsafe(32), "refresh_token": secrets.token_urlsafe(32),
         "expires_at": 9999999999, "scope": "openid profile offline_access",
     })

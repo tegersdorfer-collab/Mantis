@@ -11,6 +11,7 @@ from core.backends.chatgpt_plan import (
     ChatGPTPlanError,
     ChatGPTPlanBackend,
     classify_api_error,
+    _extract_responses_result,
     messages_to_responses_input,
     tools_to_responses,
 )
@@ -53,10 +54,15 @@ def test_responses_converters_use_standard_function_call_and_output_items():
     ])
 
     assert tools == [{
-        "type": "function",
-        "name": "lookup",
-        "description": "Find a record",
-        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        "type": "namespace",
+        "name": "mantis",
+        "description": "Mantis-Assistent-Tools",
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "description": "Find a record",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        }],
     }]
     assert input_items == [
         {"role": "system", "content": "Be helpful"},
@@ -75,7 +81,7 @@ def test_responses_request_always_streams_and_disables_storage_and_tool_roundtri
             "status": "completed",
             "output": [
                 {"type": "message", "content": [{"type": "output_text", "text": "done"}]},
-                {"type": "function_call", "call_id": "call-next", "name": "lookup", "arguments": '{"query":"next"}'},
+                {"type": "function_call", "call_id": "call-next", "name": "mantis/lookup", "arguments": '{"query":"next"}'},
             ],
             "usage": {"input_tokens": 31, "output_tokens": 4},
         }},
@@ -107,7 +113,17 @@ def test_responses_request_always_streams_and_disables_storage_and_tool_roundtri
     assert payload["stream"] is True
     assert payload["store"] is False
     assert payload["model"] == "gpt-6-luna"
-    assert payload["tools"][0]["name"] == "lookup"
+    assert payload["tools"] == [{
+        "type": "namespace",
+        "name": "mantis",
+        "description": "Mantis-Assistent-Tools",
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "description": "Find",
+            "parameters": {"type": "object", "properties": {}},
+        }],
+    }]
     assert not {"temperature", "top_p", "max_output_tokens", "metadata", "user", "truncation", "previous_response_id"} & payload.keys()
     assert text == "done"
     assert calls == [{
@@ -117,6 +133,31 @@ def test_responses_request_always_streams_and_disables_storage_and_tool_roundtri
     assert records == [(('chatgpt-plan', 'gpt-6-luna', 31, 4), {
         "purpose": "chat-agent (Abo)", "actual_cost": 0.0,
     })]
+
+
+@pytest.mark.parametrize("remote_name", ["lookup", "mantis.lookup", "mantis/lookup", "mantis__lookup"])
+def test_responses_maps_documented_namespace_name_spellings(remote_name):
+    tool = {"type": "function", "function": {
+        "name": "lookup", "parameters": {"type": "object", "properties": {}},
+    }}
+
+    _, calls = _extract_responses_result({"output": [{
+        "type": "function_call", "call_id": "call-1", "name": remote_name, "arguments": "{}",
+    }]}, [tool])
+
+    assert calls == [{
+        "id": "call-1", "tool_use_id": "call-1",
+        "function": {"name": "lookup", "arguments": {}},
+    }]
+
+
+def test_responses_rejects_unknown_function_names_instead_of_guessing():
+    tool = {"type": "function", "function": {"name": "lookup"}}
+
+    with pytest.raises(RuntimeError, match="unbekanntes Mantis-Tool"):
+        _extract_responses_result({"output": [{
+            "type": "function_call", "call_id": "call-1", "name": "mantis/other", "arguments": "{}",
+        }]}, [tool])
 
 
 @pytest.mark.parametrize("event", [
@@ -152,6 +193,66 @@ def test_responses_requires_completed_event_and_valid_tool_arguments(tmp_path):
         )
         with pytest.raises((RuntimeError, ValueError)):
             asyncio.run(backend.call([{"role": "user", "content": "hi"}], None, None, 0.2, 50))
+
+
+@pytest.mark.parametrize(("event", "cooldown", "disabled", "requires_login", "param"), [
+    ({"type": "error", "code": "subscription_sharing_usage_unavailable"}, None, False, False, ""),
+    ({"type": "error", "code": "subscription_sharing_usage_limit_exceeded"}, 1800, False, False, ""),
+    ({"type": "error", "message": "subscription_sharing_usage_limit_exceeded"}, 1800, False, False, ""),
+    ({"type": "error", "code": "subscription_sharing_invalid_user"}, None, True, True, ""),
+    ({"type": "error", "code": "invalid_client"}, None, True, False, ""),
+    ({"type": "error", "code": "subscription_sharing_unsupported_capability", "param": "tools"}, None, False, False, "tools"),
+    ({"type": "response.failed", "response": {"error": {"code": "subscription_sharing_invalid_user"}}}, None, True, True, ""),
+])
+def test_sse_errors_use_the_same_failover_classes_as_http_errors(
+    tmp_path, event, cooldown, disabled, requires_login, param,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(event), headers={"content-type": "text/event-stream"})
+
+    backend = ChatGPTPlanBackend(
+        model="gpt-6-luna", auth_file=_auth_file(tmp_path),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ChatGPTPlanError) as caught:
+        asyncio.run(backend.call([{"role": "user", "content": "hi"}], None, None, 0.2, 50))
+
+    assert caught.value.cooldown_s == cooldown
+    assert caught.value.disable_backend is disabled
+    assert caught.value.requires_login is requires_login
+    assert caught.value.param == param
+
+
+def test_stream_callback_cancellation_does_not_record_completed_usage_twice(tmp_path, monkeypatch):
+    event = {"type": "response.completed", "response": {
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "done"}]}],
+        "usage": {"input_tokens": 10, "output_tokens": 3},
+    }}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(event), headers={"content-type": "text/event-stream"})
+
+    records = []
+    from core import llm_usage
+    monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: records.append((args, kwargs)))
+    backend = ChatGPTPlanBackend(
+        model="gpt-6-luna", auth_file=_auth_file(tmp_path),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    async def cancel_final_callback(_text):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(backend.call(
+            [{"role": "user", "content": "hi"}], None, cancel_final_callback, 0.2, 50,
+        ))
+
+    assert records == [(('chatgpt-plan', 'gpt-6-luna', 10, 3), {
+        "purpose": "chat-agent (Abo)", "actual_cost": 0.0,
+    })]
 
 
 @pytest.mark.parametrize(("status", "payload", "cooldown", "disabled"), [

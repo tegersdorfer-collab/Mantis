@@ -67,18 +67,26 @@ class ChatGPTPlanError(RuntimeError):
 def _error_fields(payload) -> tuple[str, str]:
     if not isinstance(payload, dict):
         return "", ""
+    values = []
     for key in ("error", "detail"):
-        value = payload.get(key)
+        if key in payload:
+            values.append((payload[key], True))
+    response = payload.get("response")
+    if isinstance(response, dict) and "error" in response:
+        values.append((response["error"], True))
+    values.append((payload, False))
+
+    for value, is_error_object in values:
         if isinstance(value, dict):
-            code = value.get("code") or value.get("type") or ""
-            param = value.get("param") or ""
+            code = value.get("code") or (value.get("type") if is_error_object else "") or ""
+            param = value.get("param") or payload.get("param") or ""
             if code:
                 return str(code), str(param)
             value = value.get("message")
         if isinstance(value, str):
             match = _CODE_PATTERN.search(value)
             if match:
-                return match.group(0), ""
+                return match.group(0), str(payload.get("param") or "")
     return "", ""
 
 
@@ -144,22 +152,25 @@ def _arguments_json(value) -> str:
 
 
 def tools_to_responses(tools: list[dict]) -> list[dict]:
-    """Wandelt Mantis-Tools in das Standard-Responses-Function-Format um.
-
-    Annahme: Die unklare Namespace-/additional_tools-Dokumentation wird mit
-    ``tools=[{type:function,name,description,parameters}]`` umgesetzt. Dieser
-    Konverter kapselt die Annahme für spätere Schemaänderungen.
-    """
-    result = []
+    """Wandelt Mantis-Tools in einen einzelnen Responses-Namespace um."""
+    # Annahme laut Doku 13.10.2026: Function-Tools werden im `tools`-Feld gruppiert.
+    functions = []
     for tool in tools:
         function = tool.get("function") or tool
-        result.append({
+        functions.append({
             "type": "function",
             "name": function["name"],
             "description": function.get("description", ""),
             "parameters": function.get("parameters", {"type": "object", "properties": {}}),
         })
-    return result
+    if not functions:
+        return []
+    return [{
+        "type": "namespace",
+        "name": "mantis",
+        "description": "Mantis-Assistent-Tools",
+        "tools": functions,
+    }]
 
 
 def messages_to_responses_input(messages: list[dict]) -> list[dict]:
@@ -204,10 +215,17 @@ def _extract_responses_result(response: dict, tools: list[dict] | None) -> tuple
         raise RuntimeError("Responses-API lieferte ungültige Output-Daten")
     text_parts = []
     required_by_name = {}
+    response_name_to_tool_name = {}
     for tool in tools or []:
         function = tool.get("function") or tool
         params = function.get("parameters") or {}
-        required_by_name[function.get("name", "")] = params.get("required") or []
+        tool_name = function.get("name", "")
+        required_by_name[tool_name] = params.get("required") or []
+        for alias in (tool_name, f"mantis.{tool_name}", f"mantis/{tool_name}", f"mantis__{tool_name}"):
+            previous = response_name_to_tool_name.get(alias)
+            if previous is not None and previous != tool_name:
+                raise RuntimeError("Mantis-Toolnamen sind für Responses-Namespaces nicht eindeutig")
+            response_name_to_tool_name[alias] = tool_name
 
     calls = []
     for item in output:
@@ -227,17 +245,20 @@ def _extract_responses_result(response: dict, tools: list[dict] | None) -> tuple
             call_id = item.get("call_id")
             if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
                 raise RuntimeError("Responses-API lieferte einen Tool-Call ohne Name oder call_id")
+            tool_name = response_name_to_tool_name.get(name)
+            if tool_name is None:
+                raise RuntimeError("Responses-API nannte ein unbekanntes Mantis-Tool")
             if "arguments" not in item:
-                required = required_by_name.get(name, [])
+                required = required_by_name.get(tool_name, [])
                 if required:
                     raise ValueError(f"ChatGPT Tool-Argumente fehlen für Pflichtargumente: {', '.join(required)}")
                 arguments = {}
             else:
-                arguments = _json_arguments(item["arguments"], tool_name=name)
+                arguments = _json_arguments(item["arguments"], tool_name=tool_name)
             calls.append({
                 "id": call_id,
                 "tool_use_id": call_id,
-                "function": {"name": name, "arguments": arguments},
+                "function": {"name": tool_name, "arguments": arguments},
             })
     response_text = response.get("output_text")
     text = "".join(text_parts)
@@ -365,6 +386,14 @@ class ChatGPTPlanBackend(AgentBackend):
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         text_parts: list[str] = []
         usage = None
+        usage_recorded = False
+
+        def record_usage_once() -> None:
+            nonlocal usage_recorded
+            if not usage_recorded and usage is not None:
+                usage_recorded = True
+                self._record_usage(usage)
+
         try:
             async with self._client.stream("POST", RESPONSES_URL, json=payload, headers=headers) as response:
                 if response.is_error:
@@ -393,11 +422,9 @@ class ChatGPTPlanBackend(AgentBackend):
                             except Exception:
                                 pass
                     elif event_type == "response.failed":
-                        failed = event.get("response") or {}
-                        error_payload = failed.get("error") or event.get("error") or {}
-                        error_code, _ = _error_fields({"error": error_payload})
+                        error_code, _ = _error_fields(event)
                         if error_code:
-                            self._raise_api_error(500, {"error": error_payload})
+                            self._raise_api_error(500, event)
                         raise RuntimeError("Responses-API meldet response.failed")
                     elif event_type == "response.incomplete":
                         raise RuntimeError("Responses-API meldet response.incomplete")
@@ -409,7 +436,7 @@ class ChatGPTPlanBackend(AgentBackend):
                             raise RuntimeError("Responses-API meldet keinen erfolgreichen Abschluss")
                         usage = _response_usage(completed)
                         text, calls = _extract_responses_result(completed, tools)
-                        self._record_usage(usage)
+                        record_usage_once()
                         if stream_cb and text and text != "".join(text_parts):
                             try:
                                 await stream_cb(text)
@@ -418,8 +445,7 @@ class ChatGPTPlanBackend(AgentBackend):
                         return text, calls
             raise RuntimeError("Responses-Stream endete ohne response.completed")
         except BaseException:
-            if usage:
-                self._record_usage(usage)
+            record_usage_once()
             raise
 
     def _record_usage(self, usage: dict | None) -> None:
