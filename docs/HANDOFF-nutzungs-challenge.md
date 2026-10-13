@@ -80,3 +80,4 @@ und das auch **nach 4 Wochen** noch.
 
 - **2026-10-13** — Challenge gestartet (Windows). Diagnose + Regeln festgelegt, Handoff geschrieben.
   Backend vom PC aus nicht erreichbar.
+2026-10-13 — Phase 0 (Mac). Backend läuft (launchd `com.mantis.assistant`, KeepAlive, seit 03.10.; `/health` antwortet, verlangt aber Auth). Mac seit 12 Tagen an, Sleep durch Assertions verhindert; Tailscale-IP 100.107.172.123 aktiv → die Nichterreichbarkeit vom PC lag vermutlich an Auth/Port, nicht am Mac. Baseline: `chat_messages` ist komplett leer (Chat wird nicht persistiert!), `llm_usage` purpose=chat-agent nur an 3 Tagen in 8 Wochen (09.09., 22.09.), seitdem 0. Hintergrundjobs laufen dagegen weiter (~1000 LLM-Calls, 1986 Fehler, v. a. `agent_fallback: api down` bis 06.10., llama-server-Timeouts). Fazit: Nutzung = 0, Mantis beschäftigt sich hauptsächlich mit sich selbst.
