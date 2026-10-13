@@ -73,6 +73,7 @@ class Autopilot:
         self.lock = lock
         self.is_user_active = is_user_active or (lambda: False)
         self.search = search  # WebSearch-Instanz für Recherche
+        self._pending_reminder_confirmations: set[int] = set()
 
     # ── Dedup-Helfer (eine Aktivität pro Tag) ────────────────────────────────
 
@@ -126,6 +127,14 @@ class Autopilot:
         log_event(kind, text[:120])
         self.tracker.record_sent()
 
+    async def _confirm_reminder_delivery(self, reminder_id: int) -> None:
+        """Bestätigt eine bereits zugestellte Erinnerung in der Datenbank."""
+        async def mark_sent() -> None:
+            self.reminders.mark_sent(reminder_id)
+
+        await asyncio.shield(asyncio.create_task(mark_sent()))
+        self._pending_reminder_confirmations.discard(reminder_id)
+
     # ── Haupt-Tick ────────────────────────────────────────────────────────────
 
     async def tick(self) -> bool:
@@ -134,9 +143,22 @@ class Autopilot:
         sent_reminder = False
         due_reminders = []
         confirmed_delivery_ids = set()
+        for reminder_id in tuple(self._pending_reminder_confirmations):
+            try:
+                await self._confirm_reminder_delivery(reminder_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as mark_error:
+                log.error(
+                    "Reminder %s wurde gesendet, Zustellstatus konnte nicht bestätigt werden (%s)",
+                    reminder_id, type(mark_error).__name__,
+                )
         try:
             due_reminders = self.reminders.get_due()
             for r in due_reminders:
+                if r.id in self._pending_reminder_confirmations:
+                    confirmed_delivery_ids.add(r.id)
+                    continue
                 reminder_text = f"⏰ Erinnerung: {r.text}"
                 if len(reminder_text) > _MAX_REMINDER_MESSAGE_LENGTH:
                     reminder_text = (
@@ -162,12 +184,10 @@ class Autopilot:
                     continue
 
                 sent_reminder = True
+                self._pending_reminder_confirmations.add(r.id)
                 confirmed_delivery_ids.add(r.id)
                 try:
-                    async def mark_sent() -> None:
-                        self.reminders.mark_sent(r.id)
-
-                    await asyncio.shield(asyncio.create_task(mark_sent()))
+                    await self._confirm_reminder_delivery(r.id)
                 except asyncio.CancelledError:
                     raise
                 except Exception as mark_error:
