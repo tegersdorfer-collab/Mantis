@@ -86,9 +86,20 @@ def _is_grapheme_extension(char: str) -> bool:
     )
 
 
+def _is_regional_indicator(char: str) -> bool:
+    return 0x1F1E6 <= ord(char) <= 0x1F1FF
+
+
 def _safe_split_index(text: str, index: int) -> int:
     """Zieht eine Grenze zurück, wenn sie eine Emoji-/Graphemfolge trennt."""
     while 0 < index < len(text):
+        if _is_regional_indicator(text[index - 1]) and _is_regional_indicator(text[index]):
+            run_start = index - 1
+            while run_start > 0 and _is_regional_indicator(text[run_start - 1]):
+                run_start -= 1
+            if (index - run_start) % 2:
+                index -= 1
+                continue
         if _is_grapheme_extension(text[index]) or text[index - 1] == "\u200d":
             index -= 1
             continue

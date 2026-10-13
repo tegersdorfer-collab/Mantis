@@ -345,6 +345,17 @@ def test_discord_plain_text_split_keeps_family_emoji_together():
     assert sum(family in chunk for chunk in chunks) == 1
 
 
+def test_discord_plain_text_split_keeps_regional_indicator_pair_together():
+    text = "x" * 1999 + "🇩🇪z"
+
+    chunks = split_discord_message(text)
+
+    assert "".join(chunks) == text
+    assert all(len(chunk) <= 2000 for chunk in chunks)
+    assert sum("🇩🇪" in chunk for chunk in chunks) == 1
+    assert all(chunk.count("🇩") == chunk.count("🇪") for chunk in chunks)
+
+
 def test_discord_rejects_a_bot_whose_id_is_in_the_allowlist():
     async def run():
         channel, client = await _start_channel(allowed_user_ids=("123",))

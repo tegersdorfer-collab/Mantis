@@ -12,6 +12,7 @@ from core import db as _db
 log = logging.getLogger(__name__)
 
 _MAX_DELIVERY_ATTEMPTS = 3
+_CLAIM_LEASE_MINUTES = 2
 
 
 @dataclass
@@ -34,6 +35,7 @@ class ReminderStore:
                     sent       BOOLEAN DEFAULT FALSE,
                     delivery_attempts INTEGER NOT NULL DEFAULT 0,
                     retry_after TIMESTAMPTZ,
+                    claimed_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
@@ -43,6 +45,9 @@ class ReminderStore:
             )
             cur.execute(
                 "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS retry_after TIMESTAMPTZ"
+            )
+            cur.execute(
+                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ"
             )
 
     def add(self, text: str, remind_at: datetime) -> int:
@@ -56,20 +61,37 @@ class ReminderStore:
         return rid
 
     def get_due(self) -> list[Reminder]:
-        """Gibt fällige Reminders frei und beansprucht sie bis zur Zustellung."""
+        """Beansprucht fällige Reminder kurzzeitig, ohne sie vorab als gesendet zu markieren."""
         rows = _db.query(
-            "SELECT id, text, remind_at, sent FROM reminders "
+            "WITH due AS ("
+            "SELECT id FROM reminders "
             "WHERE remind_at <= NOW() AND sent = FALSE "
             "AND (retry_after IS NULL OR retry_after <= NOW()) "
-            "ORDER BY remind_at ASC"
+            f"AND (claimed_at IS NULL OR claimed_at <= "
+            f"NOW() - INTERVAL '{_CLAIM_LEASE_MINUTES} minutes') "
+            "ORDER BY remind_at ASC FOR UPDATE SKIP LOCKED"
+            ") UPDATE reminders AS reminder SET claimed_at = NOW() "
+            "FROM due WHERE reminder.id = due.id "
+            "RETURNING reminder.id, reminder.text, reminder.remind_at, reminder.sent"
         )
-        if rows:
-            ids = [r["id"] for r in rows]
-            _db.execute(
-                "UPDATE reminders SET sent = TRUE WHERE id = ANY(%s)", (ids,)
-            )
+        rows.sort(key=lambda row: row["remind_at"])
         return [Reminder(id=r["id"], text=r["text"],
                          remind_at=r["remind_at"], sent=r["sent"]) for r in rows]
+
+    def mark_sent(self, reminder_id: int) -> None:
+        """Bestätigt einen vollständig zugestellten Reminder."""
+        _db.execute(
+            "UPDATE reminders SET sent = TRUE, claimed_at = NULL, retry_after = NULL "
+            "WHERE id = %s",
+            (reminder_id,),
+        )
+
+    def release_claim(self, reminder_id: int) -> None:
+        """Gibt einen ungesendeten Reminder nach Abbruch oder Fehler wieder frei."""
+        _db.execute(
+            "UPDATE reminders SET claimed_at = NULL WHERE id = %s AND sent = FALSE",
+            (reminder_id,),
+        )
 
     def mark_delivery_failed(self, reminder_id: int) -> None:
         """Gibt einen fehlgeschlagenen Versand mit Backoff wieder frei.
@@ -81,6 +103,7 @@ class ReminderStore:
             "UPDATE reminders SET "
             "delivery_attempts = delivery_attempts + 1, "
             "sent = delivery_attempts + 1 >= %s, "
+            "claimed_at = NULL, "
             "retry_after = CASE "
             "WHEN delivery_attempts + 1 >= %s THEN NULL "
             "WHEN delivery_attempts = 0 THEN NOW() + INTERVAL '1 minute' "

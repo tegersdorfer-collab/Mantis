@@ -11,6 +11,7 @@ Zeitbewusste, wertorientierte proaktive Aktivitäten statt simpler Zufallsgedank
 
 Completion-driven: läuft kontinuierlich, dedupliziert Tagesaktivitäten via Settings.
 """
+import asyncio
 import json
 import logging
 from datetime import date, datetime, timedelta
@@ -44,6 +45,7 @@ STYLE = (
 # Mindestlänge an echtem Text (ohne Emoji/Whitespace), damit eine Nachricht
 # gesendet wird — fängt kaputte Modell-Fragmente wie "Liebe Zeit" ab.
 _MIN_CONTENT_CHARS = 20
+_MAX_REMINDER_MESSAGE_LENGTH = 2000
 
 
 def _content_len(text: str) -> int:
@@ -125,10 +127,21 @@ class Autopilot:
         """Ein autonomer Schritt. Gibt True zurück wenn etwas gesendet wurde."""
         # 1. Fällige Reminder (zeitkritisch, immer – auch wenn User gerade aktiv)
         sent_reminder = False
+        due_reminders = []
         try:
-            for r in self.reminders.get_due():
+            due_reminders = self.reminders.get_due()
+            for r in due_reminders:
                 try:
-                    await self._send(f"⏰ Erinnerung: {r.text}", kind="reminder")
+                    reminder_text = f"⏰ Erinnerung: {r.text}"
+                    if len(reminder_text) > _MAX_REMINDER_MESSAGE_LENGTH:
+                        reminder_text = (
+                            reminder_text[:_MAX_REMINDER_MESSAGE_LENGTH - 1].rstrip() + "…"
+                        )
+                    await self._send(reminder_text, kind="reminder")
+                    self.reminders.mark_sent(r.id)
+                    sent_reminder = True
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     log.warning(
                         "Reminder %s konnte nicht zugestellt werden (%s)",
@@ -141,10 +154,17 @@ class Autopilot:
                             "Reminder %s konnte nicht für einen erneuten Versuch markiert werden (%s)",
                             r.id, type(mark_error).__name__,
                         )
-                    continue
-                sent_reminder = True
         except Exception as e:
             log.debug("Reminder-Check fehlgeschlagen (%s)", type(e).__name__)
+        finally:
+            for reminder in due_reminders:
+                try:
+                    self.reminders.release_claim(reminder.id)
+                except Exception as release_error:
+                    log.error(
+                        "Reminder %s konnte nicht freigegeben werden (%s)",
+                        reminder.id, type(release_error).__name__,
+                    )
         if sent_reminder:
             return True
 
