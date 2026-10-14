@@ -21,6 +21,16 @@ def test_redacts_cartesia_key_from_error_text(monkeypatch):
     assert text.count("[REDACTED]") == 2
 
 
+def test_redacts_google_tts_key_from_error_text(monkeypatch):
+    synthetic_key = "google-tts-synthetic-test-key"
+    monkeypatch.setattr(config, "GOOGLE_TTS_API_KEY", synthetic_key, raising=False)
+
+    text = redact_error_text(f"Request failed with {synthetic_key}")
+
+    assert synthetic_key not in text
+    assert text.endswith("[REDACTED]")
+
+
 @pytest.mark.db
 def test_db_log_error_redacts_synthetic_api_key_in_summary_and_detail(monkeypatch):
     from core import db

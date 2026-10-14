@@ -9,7 +9,7 @@ Verwendung:
 from __future__ import annotations
 import json
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -72,6 +72,8 @@ class MantisSettings(BaseSettings):
     # Lautschreibung für Wörter, die die deutsche Stimme falsch ausspricht (Timo, 14.10.2026: Mantis englisch).
     TTS_CARTESIA_PRONUNCIATIONS: dict[str, str] = {"Mantis": "Mäntis"}
     TTS_CARTESIA_USD_PER_MILLION_CHARS: float = 65.0  # Pro-Überschuss, 1 Zeichen = 1 Credit
+    GOOGLE_TTS_API_KEY: SecretStr = SecretStr("")
+    TTS_GOOGLE_VOICE: str = "de-DE-Chirp3-HD-Charon"
     STT_ENGINE: str = "parakeet"
     STT_PARAKEET_MODEL: str = "mlx-community/parakeet-tdt-0.6b-v3"
     STT_PRELOAD: bool = True

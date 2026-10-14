@@ -6,6 +6,8 @@ wird. Lokale Modelle werden erst geladen, wenn Cartesia nicht verfügbar ist.
 """
 from __future__ import annotations
 import asyncio
+import base64
+import binascii
 import io
 import logging
 import re
@@ -37,6 +39,12 @@ _CARTESIA_VERSION = "2025-04-16"
 _CARTESIA_TIMEOUT_S = 5.0
 _CARTESIA_PAUSE_S = 30 * 60
 _CARTESIA_PAUSE_STATUSES = {401, 402, 403, 429}
+_GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
+_GOOGLE_TTS_TIMEOUT_S = 5.0
+_GOOGLE_TTS_MODEL = "chirp3-hd"
+_GOOGLE_TTS_USD_PER_MILLION_CHARS = 30.0
+_GOOGLE_TTS_PAUSE_S = 30 * 60
+_GOOGLE_TTS_PAUSE_STATUSES = {401, 403, 429}
 
 VOICE_MODELS: dict[str, str] = {
     "thorsten-high": "de_DE-thorsten-high",
@@ -57,6 +65,8 @@ _kokoro: object | None = None
 _kokoro_unavailable = False
 _cartesia_paused_until = 0.0
 _cartesia_pause_warned = False
+_google_tts_paused_until = 0.0
+_google_tts_pause_warned = False
 _lock = asyncio.Lock()
 
 
@@ -68,8 +78,16 @@ def _cartesia_key() -> str:
     return str(getattr(config, "CARTESIA_API_KEY", "") or "").strip()
 
 
+def _google_tts_key() -> str:
+    return str(getattr(config, "GOOGLE_TTS_API_KEY", "") or "").strip()
+
+
 def _cartesia_is_paused() -> bool:
     return time.monotonic() < _cartesia_paused_until
+
+
+def _google_tts_is_paused() -> bool:
+    return time.monotonic() < _google_tts_paused_until
 
 
 def _kokoro_paths() -> tuple[Path, Path]:
@@ -136,7 +154,9 @@ def is_available() -> bool:
     """True, wenn IRGENDEINE Engine sprechen kann — Kokoro oder Piper."""
     if _engine() == "cartesia" and _cartesia_key() and not _cartesia_is_paused():
         return True
-    if _engine() in {"kokoro", "cartesia"} and not _kokoro_unavailable:
+    if _engine() == "google" and _google_tts_key() and not _google_tts_is_paused():
+        return True
+    if _engine() in {"kokoro", "cartesia", "google"} and not _kokoro_unavailable:
         onnx, voices = _kokoro_paths()
         if onnx.exists() and voices.exists():
             return True
@@ -585,6 +605,58 @@ async def _cartesia_synthesize(text: str) -> bytes:
     return response.content
 
 
+async def _google_tts_request(text: str, audio_encoding: str) -> bytes:
+    """Ruft Google Cloud TTS auf und dekodiert das Base64-Audio."""
+    payload = {
+        "input": {
+            "text": _apply_cartesia_pronunciations(_numbers_to_german_words(text)),
+        },
+        "voice": {
+            "languageCode": "de-DE",
+            "name": config.TTS_GOOGLE_VOICE,
+        },
+        "audioConfig": {
+            "audioEncoding": audio_encoding,
+            "sampleRateHertz": 24000,
+        },
+    }
+    headers = {
+        "x-goog-api-key": _google_tts_key(),
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    async with httpx.AsyncClient(timeout=_GOOGLE_TTS_TIMEOUT_S) as client:
+        response = await client.post(_GOOGLE_TTS_URL, headers=headers, json=payload)
+    response.raise_for_status()
+    try:
+        encoded = response.json()["audioContent"]
+        return base64.b64decode(encoded, validate=True)
+    except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+        raise ValueError("Google TTS lieferte kein gültiges Audio") from exc
+
+
+def _google_ogg_encoding_unsupported(exc: httpx.HTTPStatusError) -> bool:
+    if exc.response.status_code != 400:
+        return False
+    try:
+        error = exc.response.json().get("error", {})
+    except (ValueError, AttributeError):
+        return False
+    message = str(error.get("message", "")).lower()
+    return error.get("status") == "INVALID_ARGUMENT" and any(
+        term in message for term in ("ogg_opus", "audio encoding", "audioencoding")
+    )
+
+
+async def _google_tts_synthesize(text: str) -> tuple[bytes, bool]:
+    """Liefert (Audio, ist_wav); OGG_OPUS wird bei Format-Ablehnung erneut angefragt."""
+    try:
+        return await _google_tts_request(text, "OGG_OPUS"), False
+    except httpx.HTTPStatusError as exc:
+        if not _google_ogg_encoding_unsupported(exc):
+            raise
+    return await _google_tts_request(text, "LINEAR16"), True
+
+
 def _record_cartesia_usage(text: str) -> None:
     chars = len(text)
     estimated_cost = chars * float(config.TTS_CARTESIA_USD_PER_MILLION_CHARS) / 1_000_000
@@ -603,6 +675,24 @@ def _record_cartesia_usage(text: str) -> None:
         log.debug("Cartesia-Usage konnte nicht erfasst werden: %s", redact_error_text(exc))
 
 
+def _record_google_tts_usage(text: str) -> None:
+    chars = len(text)
+    estimated_cost = chars * _GOOGLE_TTS_USD_PER_MILLION_CHARS / 1_000_000
+    try:
+        from core import llm_usage
+
+        llm_usage.record(
+            "google",
+            _GOOGLE_TTS_MODEL,
+            chars,
+            0,
+            purpose="tts",
+            actual_cost=estimated_cost,
+        )
+    except Exception as exc:
+        log.debug("Google-TTS-Usage konnte nicht erfasst werden: %s", redact_error_text(exc))
+
+
 def _pause_cartesia(status: int) -> None:
     global _cartesia_paused_until, _cartesia_pause_warned
     _cartesia_paused_until = time.monotonic() + _CARTESIA_PAUSE_S
@@ -612,6 +702,17 @@ def _pause_cartesia(status: int) -> None:
             status,
         )
         _cartesia_pause_warned = True
+
+
+def _pause_google_tts(status: int) -> None:
+    global _google_tts_paused_until, _google_tts_pause_warned
+    _google_tts_paused_until = time.monotonic() + _GOOGLE_TTS_PAUSE_S
+    if not _google_tts_pause_warned:
+        log.warning(
+            "Google Cloud TTS pausiert nach HTTP %s für 30 Minuten; nutze lokales TTS",
+            status,
+        )
+        _google_tts_pause_warned = True
 
 
 async def _try_cartesia(text: str) -> bytes | None:
@@ -634,6 +735,35 @@ async def _try_cartesia(text: str) -> bytes | None:
 
     _record_cartesia_usage(text)
     return wav
+
+
+async def _try_google_tts_ogg(text: str) -> bytes | None:
+    """Gibt Google-Audio als OGG/Opus oder None für den lokalen Fallback zurück."""
+    if not _google_tts_key() or _google_tts_is_paused():
+        return None
+    try:
+        audio, is_wav = await _google_tts_synthesize(text)
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in _GOOGLE_TTS_PAUSE_STATUSES:
+            _pause_google_tts(status)
+        else:
+            log.warning("Google Cloud TTS HTTP %s; nutze lokales TTS", status)
+        return None
+    except Exception as exc:
+        # HTTP-Fehlertexte und Requests können vertrauliche Header enthalten.
+        log.warning("Google Cloud TTS fehlgeschlagen (%s); nutze lokales TTS", type(exc).__name__)
+        return None
+
+    _record_google_tts_usage(text)
+    try:
+        ogg = await asyncio.to_thread(_wav_to_ogg, audio) if is_wav else audio
+        if not ogg or (not is_wav and not ogg.startswith(b"OggS")):
+            raise ValueError("Google TTS lieferte kein gültiges OGG")
+    except Exception as exc:
+        log.warning("Google-TTS-Audio nicht nutzbar (%s); nutze lokales TTS", type(exc).__name__)
+        return None
+    return ogg
 
 
 def _wav_nframes(wav: bytes) -> int:
@@ -670,7 +800,7 @@ async def _try_cartesia_ogg(text: str) -> bytes | None:
 
 async def _synthesize_local(text: str, speed: float) -> bytes:
     """Lokaler Fallback: Kokoro lazy laden, bei dessen Nichtverfügbarkeit Piper nutzen."""
-    if _engine() in {"kokoro", "cartesia"} and not _kokoro_unavailable:
+    if _engine() in {"kokoro", "cartesia", "google"} and not _kokoro_unavailable:
         if await asyncio.to_thread(_load_kokoro) is not None:
             return await asyncio.to_thread(_synth_kokoro, text, speed)
     return await asyncio.to_thread(_synth, text, speed)
@@ -679,7 +809,11 @@ async def _synthesize_local(text: str, speed: float) -> bytes:
 async def _synthesize_unlocked(text: str, speed: float) -> bytes:
     """Erzeugt ein vollständiges Audio, ohne den Stream-Lock selbst zu verwalten."""
     try:
-        ogg = await _try_cartesia_ogg(text) if _engine() == "cartesia" else None
+        engine = _engine()
+        if engine == "google":
+            ogg = await _try_google_tts_ogg(text)
+        else:
+            ogg = await _try_cartesia_ogg(text) if engine == "cartesia" else None
         if ogg is None:
             wav = await _synthesize_local(text, speed)
             ogg = await asyncio.to_thread(_wav_to_ogg, wav)
@@ -698,8 +832,8 @@ async def synthesize(
 ) -> bytes:
     """Text → OGG/Opus-Bytes (Telegram voice message format).
 
-    `voice` bleibt aus API-Kompatibilitätsgründen erhalten. Cartesia nutzt die
-    konfigurierte Stimme; beim lokalen Fallback gelten die vorhandenen Stimmen.
+    `voice` bleibt aus API-Kompatibilitätsgründen erhalten. Cartesia und Google
+    nutzen die konfigurierte Stimme; beim lokalen Fallback gelten die vorhandenen Stimmen.
     Kürzt automatisch auf max_chars um Timeouts zu vermeiden.
     Gibt leere Bytes zurück wenn TTS nicht verfügbar.
     """
@@ -838,7 +972,11 @@ async def synthesize_stream(
     async with _lock:
         for i, stueck in enumerate(stuecke):
             try:
-                ogg = await _try_cartesia_ogg(stueck) if _engine() == "cartesia" else None
+                engine = _engine()
+                if engine == "google":
+                    ogg = await _try_google_tts_ogg(stueck)
+                else:
+                    ogg = await _try_cartesia_ogg(stueck) if engine == "cartesia" else None
                 if ogg is None:
                     wav = await _synthesize_local(stueck, speed)
                     ogg = await asyncio.to_thread(_wav_to_ogg, wav)
@@ -856,6 +994,8 @@ async def list_voices() -> list[str]:
         return []
     if _engine() == "cartesia":
         return [config.TTS_CARTESIA_VOICE]
+    if _engine() == "google":
+        return [config.TTS_GOOGLE_VOICE]
     if _engine() == "kokoro" and not _kokoro_unavailable:
         return [config.TTS_KOKORO_VOICE]
     return [DEFAULT_VOICE]

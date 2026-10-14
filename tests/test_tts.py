@@ -3,6 +3,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asyncio
+import base64
 import json
 import logging
 from unittest.mock import MagicMock
@@ -327,6 +328,38 @@ def cartesia_engine(monkeypatch):
     )
 
 
+@pytest.fixture
+def google_engine(monkeypatch):
+    monkeypatch.setattr(tts.config, "TTS_ENGINE", "google", raising=False)
+    monkeypatch.setattr(tts.config, "GOOGLE_TTS_API_KEY", "google-tts-test-key", raising=False)
+    monkeypatch.setattr(
+        tts.config,
+        "TTS_GOOGLE_VOICE",
+        "de-DE-Chirp3-HD-Charon",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        tts.config,
+        "TTS_CARTESIA_PRONUNCIATIONS",
+        {"Mantis": "Mäntis"},
+        raising=False,
+    )
+    monkeypatch.setattr(tts.db, "get_setting", lambda *_args: tts.DEFAULT_VOICE)
+
+
+def _mock_google(monkeypatch, handler):
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    timeouts = []
+
+    def make_client(**kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        return real_async_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(tts.httpx, "AsyncClient", make_client)
+    return timeouts
+
+
 def _fake_local_synthesis(monkeypatch):
     monkeypatch.setattr(tts, "_load_kokoro", lambda: MagicMock())
     monkeypatch.setattr(
@@ -612,6 +645,134 @@ class TestCartesiaKonvertierung:
         import settings
 
         assert settings.MantisSettings.model_fields["TTS_CARTESIA_USD_PER_MILLION_CHARS"].default == 65.0
+
+
+class TestGoogle:
+    def test_synthesizes_ogg_mit_header_stimme_normalisierung_und_kosten(
+        self, google_engine, monkeypatch
+    ):
+        audio = b"OggS-google-audio"
+        requests = []
+        _mock_google(
+            monkeypatch,
+            lambda request: (
+                requests.append(request)
+                or httpx.Response(
+                    200,
+                    json={"audioContent": base64.b64encode(audio).decode("ascii")},
+                )
+            ),
+        )
+        usage = []
+        from core import llm_usage
+        monkeypatch.setattr(llm_usage, "record", lambda *a, **k: usage.append((a, k)))
+
+        result = asyncio.run(tts.synthesize("**Mantis** hat 2 Termine."))
+
+        assert result == audio
+        assert len(requests) == 1
+        request = requests[0]
+        assert str(request.url) == "https://texttospeech.googleapis.com/v1/text:synthesize"
+        assert not request.url.query
+        assert request.headers["x-goog-api-key"] == "google-tts-test-key"
+        payload = json.loads(request.content)
+        assert payload == {
+            "input": {"text": "Mäntis hat zwei Termine."},
+            "voice": {"languageCode": "de-DE", "name": "de-DE-Chirp3-HD-Charon"},
+            "audioConfig": {"audioEncoding": "OGG_OPUS", "sampleRateHertz": 24000},
+        }
+        assert len(usage) == 1
+        args, kwargs = usage[0]
+        assert args[:4] == ("google", "chirp3-hd", len("Mantis hat 2 Termine."), 0)
+        assert kwargs["purpose"] == "tts"
+        assert kwargs["actual_cost"] == pytest.approx(len("Mantis hat 2 Termine.") * 30 / 1_000_000)
+
+    def test_wechselt_bei_abgelehntem_ogg_zu_linear16_und_konvertiert(
+        self, google_engine, monkeypatch
+    ):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(
+                    400,
+                    json={
+                        "error": {
+                            "code": 400,
+                            "status": "INVALID_ARGUMENT",
+                            "message": "OGG_OPUS audio encoding is not supported",
+                        }
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"audioContent": base64.b64encode(b"GOOGLE_WAV").decode("ascii")},
+            )
+
+        _mock_google(monkeypatch, handler)
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OGG:" + wav)
+
+        result = asyncio.run(tts.synthesize("Hallo."))
+
+        assert result == b"OGG:GOOGLE_WAV"
+        assert [json.loads(request.content)["audioConfig"] for request in requests] == [
+            {"audioEncoding": "OGG_OPUS", "sampleRateHertz": 24000},
+            {"audioEncoding": "LINEAR16", "sampleRateHertz": 24000},
+        ]
+        assert all(request.headers["x-goog-api-key"] == "google-tts-test-key" for request in requests)
+
+    def test_google_stream_synthesisiert_jeden_satzblock_einzeln(
+        self, google_engine, monkeypatch
+    ):
+        requested_texts = []
+
+        def handler(request):
+            payload = json.loads(request.content)
+            requested_texts.append(payload["input"]["text"])
+            return httpx.Response(
+                200,
+                json={"audioContent": base64.b64encode(b"OggS-block").decode("ascii")},
+            )
+
+        _mock_google(monkeypatch, handler)
+        monkeypatch.setattr(tts, "_record_google_usage", lambda _text: None, raising=False)
+        text = " ".join(
+            f"Das ist Satz Nummer {i} mit einigen zusätzlichen Wörtern."
+            for i in range(1, 8)
+        )
+        expected = tts._split_for_streaming(tts._clean_for_speech(text))
+
+        async def collect():
+            return [chunk async for chunk in tts.synthesize_stream(text)]
+
+        chunks = asyncio.run(collect())
+
+        assert requested_texts == [tts._numbers_to_german_words(block) for block in expected]
+        assert chunks == [b"OggS-block"] * len(expected)
+
+    def test_api_fehler_faellt_lokal_zurueck_und_loggt_keinen_key(
+        self, google_engine, monkeypatch, caplog
+    ):
+        _fake_local_synthesis(monkeypatch)
+        _mock_google(
+            monkeypatch,
+            lambda request: httpx.Response(500, text="failed google-tts-test-key"),
+        )
+        caplog.set_level(logging.WARNING, logger=tts.__name__)
+
+        result = asyncio.run(tts.synthesize("Hallo."))
+
+        assert result == b"OGG:KOKORO_WAV:Hallo."
+        assert "google-tts-test-key" not in caplog.text
+
+    def test_google_key_macht_tts_ohne_lokale_modelle_verfuegbar(
+        self, google_engine, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(tts, "_MODEL_DIR", tmp_path)
+        monkeypatch.setattr(tts, "_KOKORO_DIR", tmp_path)
+
+        assert tts.is_available() is True
 
 
 def _leeres_wav() -> bytes:
