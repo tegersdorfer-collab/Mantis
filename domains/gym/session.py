@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from core import db
 from domains import fitness
-from domains.gym.aliases import is_pullup_name, normalize_alias
+from domains.gym.aliases import is_pullup_name, normalize_alias, split_equipment_variant
 from domains.gym.progression import personal_records, progression_set_count, recommend_next
 
 
@@ -94,7 +94,8 @@ def _close_timed_out(cur, workout: dict) -> None:
 
 
 def _exercise_defaults(name: str, equipment: str | None, load_mode: str) -> dict:
-    lower = name.casefold()
+    canonical_name, embedded_equipment = split_equipment_variant(name)
+    lower = canonical_name.casefold()
     default_equipment = {
         "bankdrücken": "barbell", "bankdruecken": "barbell", "bench press": "barbell",
         "kniebeuge": "barbell", "squat": "barbell", "squats": "barbell",
@@ -102,7 +103,7 @@ def _exercise_defaults(name: str, equipment: str | None, load_mode: str) -> dict
     }.get(lower)
     if is_pullup_name(name):
         load_mode = "added"
-    equipment = equipment or default_equipment
+    equipment = equipment or embedded_equipment or default_equipment
     exercise_type = "isolation" if any(
         term in lower for term in (
             "curl", "fly", "flieg", "heben", "raise", "extension", "pushdown",
@@ -110,7 +111,7 @@ def _exercise_defaults(name: str, equipment: str | None, load_mode: str) -> dict
     ) else "compound"
     low, high, start = (8, 12, 10) if exercise_type == "isolation" else (6, 10, 8)
     increment = {"barbell": 2.5, "dumbbell": 1.0, "machine": 2.5}.get(equipment)
-    muscle = fitness.guess_muscle(name)
+    muscle = fitness.guess_muscle(canonical_name)
     return {
         "category": "strength", "muscle": muscle, "unit": "reps",
         "exercise_type": exercise_type, "equipment": equipment,
@@ -122,6 +123,8 @@ def _exercise_defaults(name: str, equipment: str | None, load_mode: str) -> dict
 
 def _equipment_variant_name(cur, name: str, equipment: str | None, load_mode: str) -> str:
     """Gibt gerätegleiche Bestandsübungen zurück, sonst einen getrennten Namen."""
+    name, embedded_equipment = split_equipment_variant(name)
+    equipment = equipment or embedded_equipment
     if not equipment:
         return name
     label = {
@@ -133,15 +136,13 @@ def _equipment_variant_name(cur, name: str, equipment: str | None, load_mode: st
     if not label:
         return name
     variant = f"{name} ({label})"
-    rows = _fetchall(
-        cur,
-        """SELECT id,name,equipment,load_mode FROM exercises
-           WHERE LOWER(name)=LOWER(%s) OR LOWER(name)=LOWER(%s)""",
-        (name, variant),
-    )
+    rows = _fetchall(cur, "SELECT id,name,equipment,load_mode FROM exercises")
     for row in rows:
-        effective_equipment = row.get("equipment") or _exercise_defaults(
-            row["name"], None, row.get("load_mode") or load_mode
+        row_base, name_equipment = split_equipment_variant(row["name"])
+        if normalize_alias(row_base) != normalize_alias(name):
+            continue
+        effective_equipment = row.get("equipment") or name_equipment or _exercise_defaults(
+            row_base, None, row.get("load_mode") or load_mode
         )["equipment"]
         if effective_equipment == equipment:
             return row["name"]
@@ -152,6 +153,8 @@ def _equipment_variant_name(cur, name: str, equipment: str | None, load_mode: st
 
 def _ensure_exercise(cur, name: str, alias: str | None, equipment: str | None,
                      load_mode: str, *, allow_create: bool) -> dict | None:
+    name, embedded_equipment = split_equipment_variant(name)
+    equipment = equipment or embedded_equipment
     storage_name = _equipment_variant_name(cur, name, equipment, load_mode)
     row = _fetchone(
         cur,
@@ -189,22 +192,41 @@ def _ensure_exercise(cur, name: str, alias: str | None, equipment: str | None,
         )
     else:
         defaults = _exercise_defaults(name, equipment, load_mode)
-        row = _fetchone(
-            cur,
-            """UPDATE exercises SET
-                 exercise_type=COALESCE(exercise_type,%s), equipment=COALESCE(equipment,%s),
-                 rep_min=COALESCE(rep_min,%s), rep_max=COALESCE(rep_max,%s),
-                 rep_start=COALESCE(rep_start,%s), load_mode=COALESCE(load_mode,%s),
-                 weight_increment_kg=COALESCE(weight_increment_kg,%s),
-                 dumbbell_pair=COALESCE(dumbbell_pair,%s)
-               WHERE id=%s
-               RETURNING id, name, exercise_type, equipment, rep_min, rep_max, rep_start,
-                         load_mode, weight_increment_kg, dumbbell_pair""",
-            (defaults["exercise_type"], defaults["equipment"], defaults["rep_min"],
-             defaults["rep_max"], defaults["rep_start"], defaults["load_mode"],
-             defaults["weight_increment_kg"], defaults["dumbbell_pair"], row["id"]),
-        )
-    if alias:
+        _base_name, stored_equipment = split_equipment_variant(row.get("name") or "")
+        if stored_equipment:
+            # Legacy names encode equipment already. Use that metadata for this
+            # write without migrating or rewriting the existing exercise row.
+            row = {
+                **row,
+                "equipment": row.get("equipment") or defaults["equipment"],
+                "exercise_type": row.get("exercise_type") or defaults["exercise_type"],
+                "rep_min": row.get("rep_min") or defaults["rep_min"],
+                "rep_max": row.get("rep_max") or defaults["rep_max"],
+                "rep_start": row.get("rep_start") or defaults["rep_start"],
+                "load_mode": row.get("load_mode") or defaults["load_mode"],
+                "weight_increment_kg": row.get("weight_increment_kg") or defaults["weight_increment_kg"],
+                "dumbbell_pair": (
+                    row.get("dumbbell_pair")
+                    if row.get("dumbbell_pair") is not None else defaults["dumbbell_pair"]
+                ),
+            }
+        else:
+            row = _fetchone(
+                cur,
+                """UPDATE exercises SET
+                     exercise_type=COALESCE(exercise_type,%s), equipment=COALESCE(equipment,%s),
+                     rep_min=COALESCE(rep_min,%s), rep_max=COALESCE(rep_max,%s),
+                     rep_start=COALESCE(rep_start,%s), load_mode=COALESCE(load_mode,%s),
+                     weight_increment_kg=COALESCE(weight_increment_kg,%s),
+                     dumbbell_pair=COALESCE(dumbbell_pair,%s)
+                   WHERE id=%s
+                   RETURNING id, name, exercise_type, equipment, rep_min, rep_max, rep_start,
+                             load_mode, weight_increment_kg, dumbbell_pair""",
+                (defaults["exercise_type"], defaults["equipment"], defaults["rep_min"],
+                 defaults["rep_max"], defaults["rep_start"], defaults["load_mode"],
+                 defaults["weight_increment_kg"], defaults["dumbbell_pair"], row["id"]),
+            )
+    if alias and not equipment:
         cur.execute(
             """INSERT INTO exercise_aliases (alias, normalized_alias, exercise_id)
                VALUES (%s,%s,%s) ON CONFLICT (normalized_alias) DO NOTHING""",
@@ -293,10 +315,17 @@ def _exercise_state(cur, workout_id: int, exercise_id: int) -> dict:
            FROM exercises WHERE id=%s""",
         (exercise_id,),
     ) or {}
-    metadata = {key: exercise.get(key) for key in (
+    defaults = _exercise_defaults(
+        exercise.get("name") or "", exercise.get("equipment"),
+        exercise.get("load_mode") or "external",
+    )
+    metadata = {
+        key: exercise.get(key) if exercise.get(key) is not None else defaults.get(key)
+        for key in (
         "exercise_type", "equipment", "rep_min", "rep_max", "rep_start",
         "load_mode", "weight_increment_kg", "dumbbell_pair",
-    )}
+        )
+    }
     prior_rows = [row for group in groups if group and group[0]["workout_id"] != workout_id for row in group]
     count = progression_set_count(
         len(current), _planned_set_count(cur, exercise.get("name", "")),
@@ -305,7 +334,9 @@ def _exercise_state(cur, workout_id: int, exercise_id: int) -> dict:
     return {
         "current_sets": current,
         "previous_sets": previous,
-        "progression": recommend_next(current, previous, metadata, set_count=count),
+        "progression": recommend_next(
+            current, previous, metadata, set_count=count, historical_sets=prior_rows
+        ),
         "records": personal_records(current, prior_rows, load_mode=metadata.get("load_mode") or "external"),
         "metadata": metadata,
     }
@@ -395,7 +426,9 @@ def add_sets(parsed, *, allow_create: bool = False, now: datetime | None = None)
             "exercise": exercise["name"], "sets": inserted_sets,
             "current_sets": current, "previous_sets": previous,
             "records": personal_records(current, prior_rows, load_mode=metadata.get("load_mode") or "external"),
-            "progression": recommend_next(current, previous, metadata, set_count=set_count),
+            "progression": recommend_next(
+                current, previous, metadata, set_count=set_count, historical_sets=prior_rows
+            ),
             "metadata": metadata,
         }
 
@@ -562,6 +595,7 @@ def exercise_history(exercise_name: str, limit: int = 5) -> list[dict]:
             order.append(wid)
         grouped[wid].append(row)
     return [{"workout_id": wid, "date": grouped[wid][0].get("date"),
+             "created_at": grouped[wid][0].get("created_at"),
              "sets": grouped[wid]} for wid in order[:limit]]
 
 

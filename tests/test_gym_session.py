@@ -80,6 +80,8 @@ def test_equipment_variants_do_not_reuse_or_mutate_a_different_equipment_exercis
 
     def fetchall(_cur, _sql, params=()):
         names = {value.casefold() for value in params}
+        if not names:
+            return [row.copy() for row in rows.values()]
         return [row.copy() for row in rows.values() if row["name"].casefold() in names]
 
     def fetchone(_cur, sql, params=()):
@@ -121,6 +123,20 @@ def test_equipment_variants_do_not_reuse_or_mutate_a_different_equipment_exercis
     assert repeated["id"] == dumbbell["id"]
     assert barbell["id"] == 1
     assert rows[1] == original
+
+
+def test_equipment_prefix_resolves_to_a_legacy_exercise_name_without_duplication(monkeypatch):
+    legacy = [
+        {"id": 10, "name": "KH Schulterdrücken", "equipment": None, "load_mode": "external"},
+        {"id": 11, "name": "LH Schulterdrücken", "equipment": None, "load_mode": "external"},
+    ]
+    monkeypatch.setattr(session, "_fetchall", lambda *_args, **_kwargs: legacy)
+
+    resolved = session._equipment_variant_name(
+        None, "Schulterdrücken", "dumbbell", "external"
+    )
+
+    assert resolved == "KH Schulterdrücken"
 
 
 def test_reps_correction_conflict_does_not_issue_an_update(monkeypatch):

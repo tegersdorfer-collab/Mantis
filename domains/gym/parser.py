@@ -6,7 +6,10 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from domains.gym.aliases import builtin_aliases, is_pullup_name, normalize_alias, resolve_alias
+from domains.gym.aliases import (
+    builtin_aliases, is_pullup_name, normalize_alias, resolve_alias,
+    split_equipment_variant,
+)
 
 
 _NUMBER = re.compile(r"(?<![\w.])[+]?\d+(?:[.,]\d+)?(?![\d.])")
@@ -14,7 +17,7 @@ _EQUIPMENT = (
     (re.compile(r"^(?:kh|kurzhantel(?:n)?)\b[\s-]*", re.I), "dumbbell"),
     (re.compile(r"^(?:lh|langhantel(?:n)?)\b[\s-]*", re.I), "barbell"),
     (re.compile(r"^(?:sz(?:-?stange)?)\b[\s-]*", re.I), "ez_bar"),
-    (re.compile(r"^kabel\b[\s-]*", re.I), "machine"),
+    (re.compile(r"^(?:kabel|maschine|maschinen)\b[\s-]*", re.I), "machine"),
 )
 _REJECTION_TERMS = (
     "pound", " lb", "umrechnen", "wie viel", "wieviel", "wie schwer",
@@ -22,12 +25,47 @@ _REJECTION_TERMS = (
     "kalorie", "kcal",
 )
 _REP_WORDS = re.compile(
-    r"\b(?:kg|kilo|wdh\.?|wiederholungen?|reps?|saetze?|sätze?|mal|à)\b", re.I
+    r"\b(?:kg|kilo|wdh\.?|wiederholungen?|reps?|saetze?|sätze?)\b", re.I
 )
+_SET_WORDS = re.compile(
+    r"(?<!\w)(\d{1,2})\s*(?:saetze?|sätze?)\s*(?:à|x)?\s*(\d{1,2})\b",
+    re.I,
+)
+_REP_MARKERS = re.compile(r"\b(?:wdh\.?|wiederholungen?|reps?)\b", re.I)
 _NON_EXERCISE_START = re.compile(
-    r"^(?:heute|morgen|gestern|ich|wir|du|ihr|er|sie|es|mein(?:e|er|en|em|es)?|"
+    r"^(?:heute|morgen|gestern|ich|wir|du|ihr|er|sie|es|schreib(?:e)?|loesch(?:e)?|"
+    r"entferne|formuliere|verfasse|mein(?:e|er|en|em|es)?|"
     r"unser(?:e|er|en|em|es)?|die|der|das|ein(?:e|er|en|em|es)?)\b"
 )
+_NEGATIVE_NUMBER = re.compile(r"(?<!\w)-\s*\d+(?:[.,]\d+)?")
+_TIME_TOKEN = re.compile(r"(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?!\d)")
+_DATE_TOKEN = re.compile(
+    r"(?<!\d)(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|"
+    r"\d{4}[./-]\d{1,2}[./-]\d{1,2})(?!\d)"
+)
+_SHORT_DATE_TOKEN = re.compile(
+    r"(?<!\d)(?P<day>\d{1,2})(?P<separator>[./-])"
+    r"(?P<month>\d{1,2})(?![\d.])"
+)
+_WARMUP_TOKEN = re.compile(r"\b(?:warm\s*up|warmup|aufwärm\w*)\b", re.I)
+
+
+def _has_date_token(text: str) -> bool:
+    if _DATE_TOKEN.search(text):
+        return True
+    slash_list = re.search(r"(?<!\d)\d{1,2}(?:\s*/\s*\d{1,2}){2,}(?!\d)", text)
+    for match in _SHORT_DATE_TOKEN.finditer(text):
+        day = int(match.group("day"))
+        month = int(match.group("month"))
+        if not 1 <= day <= 31 or not 1 <= month <= 12:
+            continue
+        if slash_list and slash_list.start() <= match.start() < slash_list.end():
+            continue
+        if _NUMBER.search(text[:match.start()]):
+            continue
+        if match.group("separator") in "/-" or len(match.group("month")) == 2:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -106,6 +144,12 @@ def _prefix_and_remainder(text: str, aliases: dict[str, list[str]]):
     tail = remainder[first_number.start():].strip()
     if not raw_name:
         return "", tail, equipment, None, (), False, False
+    base_name, suffix_equipment = split_equipment_variant(raw_name)
+    if suffix_equipment:
+        if equipment and equipment != suffix_equipment:
+            return raw_name, "", equipment, None, (), False, False
+        raw_name = base_name
+        equipment = equipment or suffix_equipment
     exercise, ambiguous, fuzzy = resolve_alias(raw_name, aliases)
     return raw_name, tail, equipment, exercise, ambiguous, fuzzy, bool(exercise)
 
@@ -140,7 +184,6 @@ def _parse_chunk(chunk: str, allow_bodyweight: bool) -> list[ParsedSet] | None:
     cleaned = re.sub(r"(?<=\d)\s*(?:kg|kilo)\b", " ", chunk, flags=re.I)
     cleaned = re.sub(r"(?<!\w)\+\s+(?=\d)", "+", cleaned)
     cleaned = _REP_WORDS.sub(" ", cleaned)
-    cleaned = re.sub(r"\b(?:mal|à)\b", " ", cleaned, flags=re.I)
     cleaned = re.sub(r"(?<=\d)\s*:\s*(?=\d)", " ", cleaned)
     cleaned = cleaned.strip()
 
@@ -157,7 +200,7 @@ def _parse_chunk(chunk: str, allow_bodyweight: bool) -> list[ParsedSet] | None:
             return None
         return [ParsedSet(weight, reps) for _ in range(count)]
 
-    # Kompakte Konvention: Gewicht × Sätze × Wiederholungen.
+    # Kompakt: Gewicht × Wiederholungen × Sätze.
     compact_weighted_set_rep = re.fullmatch(
         r"([+]?\d+(?:[.,]\d+)?)\s*x\s*(\d{1,2})\s*x\s*(\d{1,2})",
         cleaned,
@@ -165,7 +208,7 @@ def _parse_chunk(chunk: str, allow_bodyweight: bool) -> list[ParsedSet] | None:
     )
     if compact_weighted_set_rep:
         weight = _numeric_value(compact_weighted_set_rep.group(1))
-        count, reps = int(compact_weighted_set_rep.group(2)), int(compact_weighted_set_rep.group(3))
+        reps, count = int(compact_weighted_set_rep.group(2)), int(compact_weighted_set_rep.group(3))
         if weight is None or not 0 < weight <= 10000 or not 1 <= count <= 10 or not 1 <= reps <= 30:
             return None
         return [ParsedSet(weight, reps) for _ in range(count)]
@@ -192,22 +235,22 @@ def _parse_chunk(chunk: str, allow_bodyweight: bool) -> list[ParsedSet] | None:
         return [ParsedSet(None, reps) for _ in range(count)]
 
     # Explizite Schreibweise wie "80 kg 3 Sätze à 8 Wiederholungen".
-    set_words = re.search(
-        r"(?<!\w)(\d{1,2})\s*(?:saetze?|sätze?)\s*(?:à|x)?\s*(\d{1,2})\b",
-        chunk,
-        re.I,
-    )
+    set_words = _SET_WORDS.search(chunk)
     if set_words:
         count, reps = int(set_words.group(1)), int(set_words.group(2))
         if not 1 <= count <= 10 or not 1 <= reps <= 30:
             return None
         remaining = chunk[:set_words.start()] + " " + chunk[set_words.end():]
         remaining = _REP_WORDS.sub(" ", remaining)
-        remaining = re.sub(r"\b(?:x|mal|à)\b", " ", remaining, flags=re.I)
-        values = [_numeric_value(match.group()) for match in _NUMBER.finditer(remaining)]
-        if len(values) > 1 or any(value is None or value <= 0 for value in values):
+        remaining = remaining.strip()
+        if not remaining:
+            weight = None
+        elif re.fullmatch(r"\+?\d+(?:[.,]\d+)?", remaining):
+            weight = _numeric_value(remaining)
+        else:
             return None
-        weight = values[0] if values else None
+        if weight is not None and weight <= 0:
+            return None
         return [ParsedSet(weight, reps) for _ in range(count)]
 
     # Ein kompaktes Komma-Triplett ohne vorheriges Gewicht bleibt bei bekannten
@@ -248,6 +291,12 @@ def parse_set_message(
     if not isinstance(text, str) or not text.strip():
         return None
     normalized_text = unicodedata.normalize("NFKC", text).strip()
+    if (
+        _NEGATIVE_NUMBER.search(normalized_text)
+        or _TIME_TOKEN.search(normalized_text)
+        or _has_date_token(normalized_text)
+    ):
+        return None
     low = " " + normalize_alias(normalized_text) + " "
     if "?" in normalized_text or any(term in low for term in _REJECTION_TERMS):
         return None
@@ -265,10 +314,8 @@ def parse_set_message(
     )
     if not tail:
         return None
-    warmup = bool(re.search(r"\b(?:warm\s*up|warmup|aufwärm\w*)\b", tail, re.I))
-    tail = re.sub(r"\b(?:warm\s*up|warmup|aufwärm\w*)\b", " ", tail, flags=re.I)
     suffix_equipment = re.match(
-        r"^(kh|kurzhantel(?:n)?|lh|langhantel(?:n)?|sz(?:-?stange)?|kabel|cable)\b[\s-]*",
+        r"^(kh|kurzhantel(?:n)?|lh|langhantel(?:n)?|sz(?:-?stange)?|kabel|cable|maschine|maschinen)\b[\s-]*",
         tail,
         re.I,
     )
@@ -277,19 +324,81 @@ def parse_set_message(
         suffix_kind = (
             "dumbbell" if suffix.startswith(("kh", "kurzhantel")) else
             "barbell" if suffix.startswith(("lh", "langhantel")) else
-            "machine" if suffix.startswith(("kabel", "cable")) else "ez_bar"
+            "machine" if suffix.startswith(("kabel", "cable", "maschine")) else "ez_bar"
         )
         if equipment and equipment != suffix_kind:
             return None
         equipment = suffix_kind
         tail = tail[suffix_equipment.end():]
+    # Ein aufgelöster Datenbankname kann selbst ein Gerätepräfix oder -suffix tragen.
+    if exercise and not ambiguous:
+        base_name, embedded_equipment = split_equipment_variant(exercise)
+        if embedded_equipment:
+            if equipment and equipment != embedded_equipment:
+                return None
+            equipment = equipment or embedded_equipment
+            exercise = base_name
+    if ambiguous and equipment:
+        matching = [
+            choice for choice in ambiguous
+            if split_equipment_variant(choice)[1] == equipment
+        ]
+        generic = [
+            choice for choice in ambiguous
+            if split_equipment_variant(choice)[1] is None
+        ]
+        choices = matching or (generic if len(generic) == 1 else [])
+        if len(choices) == 1:
+            exercise, embedded_equipment = split_equipment_variant(choices[0])
+            equipment = equipment or embedded_equipment
+            ambiguous = ()
+            known = True
+        elif choices:
+            ambiguous = tuple(choices)
+    if re.search(r"(?<!\w)\+\s*\d", tail) and not (
+        known and is_pullup_name(exercise)
+    ):
+        return None
     tail = re.sub(r"(?<=\d)\s*:\s*(?=\d)", " ", tail)
     # A comma followed by whitespace separates set pairs. A decimal comma does not.
     chunks = re.split(r",\s+", tail)
     parsed_sets = []
     bodyweight = known and is_pullup_name(exercise) and equipment is None
     for chunk in chunks:
-        parsed = _parse_chunk(chunk, allow_bodyweight=bodyweight)
+        markers = list(_WARMUP_TOKEN.finditer(chunk))
+        chunk_warmup = False
+        if markers:
+            if len(markers) != 1:
+                return None
+            marker = markers[0]
+            before = chunk[:marker.start()].strip()
+            after = chunk[marker.end():].strip()
+            if before and after:
+                return None
+            chunk_warmup = True
+            chunk = (before or after).strip()
+        set_markers = list(re.finditer(r"\b(?:saetze?|sätze?)\b", chunk, re.I))
+        set_words = _SET_WORDS.search(chunk)
+        if len(set_markers) > 1 or bool(set_markers) != bool(set_words):
+            return None
+        for marker in re.finditer(r"\bà\b", chunk, re.I):
+            if not set_words or not set_words.start() <= marker.start() < set_words.end():
+                return None
+        rep_markers = list(_REP_MARKERS.finditer(chunk))
+        if len(rep_markers) > 1 or rep_markers and re.search(
+            r"\d", chunk[rep_markers[0].end():]
+        ):
+            return None
+        kg_markers = list(re.finditer(r"\b(?:kg|kilo)\b", chunk, re.I))
+        if kg_markers:
+            marker = kg_markers[0]
+            load_token = chunk[:marker.start()].strip()
+            if len(kg_markers) != 1 or not re.fullmatch(
+                r"\+?\s*\d+(?:[.,]\d+)?", load_token
+            ):
+                return None
+        explicit_added_marker = bool(re.search(r"(?<=\d)\s*(?:kg|kilo)\b", chunk, re.I))
+        parsed = _parse_chunk(chunk, allow_bodyweight=bodyweight and not explicit_added_marker)
         if not parsed and parsed_sets:
             # Nach einer Last kann ein einzelner Wert ein weiterer Satz mit derselben Last sein.
             reps = _rep_values(chunk)
@@ -300,7 +409,7 @@ def parse_set_message(
         if not parsed:
             return None
         parsed_sets.extend(
-            ParsedSet(item.weight_kg, item.reps, warmup) for item in parsed
+            ParsedSet(item.weight_kg, item.reps, chunk_warmup) for item in parsed
         )
     if not 1 <= len(parsed_sets) <= 20:
         return None

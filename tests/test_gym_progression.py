@@ -26,11 +26,16 @@ def test_set_count_can_come_from_default_plan_fallback():
     assert suggestion["target_reps"] == [8, 8, 8]
 
 
-def test_set_count_prefers_current_input_then_plan_then_default():
-    assert progression_set_count(current_count=1, planned_count=4) == 4
+def test_set_count_uses_current_input_then_plan_then_last_workout_then_default():
+    assert progression_set_count(current_count=1, planned_count=4) == 1
     assert progression_set_count(current_count=0, planned_count=4) == 4
     assert progression_set_count(current_count=0, planned_count=None) == 3
     assert progression_set_count(current_count=1, previous_count=3, planned_count=None) == 3
+    assert progression_set_count(current_count=1, previous_count=3, planned_count=4) == 3
+
+
+def test_set_count_uses_the_last_workout_count_instead_of_a_three_set_default():
+    assert progression_set_count(current_count=2, previous_count=2, planned_count=None) == 2
 
 
 def test_single_set_input_keeps_the_previous_session_target_count():
@@ -84,6 +89,28 @@ def test_upper_rep_boundary_increases_barbell_weight_and_resets_goal():
     )
 
     assert suggestion == {"weight_kg": 82.5, "target_reps": [6, 6, 6], "incremented": True}
+
+
+def test_best_performance_at_current_load_is_not_lost_after_a_weaker_session():
+    current = _sets(80, [8, 8, 7])
+    last = _sets(80, [8, 8, 7])
+    history = _sets(80, [8, 8, 8]) + last
+
+    suggestion = recommend_next(
+        current, last, {"exercise_type": "compound", "equipment": "barbell"},
+        historical_sets=history,
+    )
+
+    assert suggestion == {"weight_kg": 80, "target_reps": [8, 8, 8], "incremented": False}
+
+
+def test_new_load_progression_does_not_reuse_the_old_load_rep_target():
+    suggestion = recommend_next(
+        _sets(82.5, [6, 6, 6]), _sets(80, [10, 10, 10]),
+        {"exercise_type": "compound", "equipment": "barbell"},
+    )
+
+    assert suggestion == {"weight_kg": 82.5, "target_reps": [7, 7, 7], "incremented": False}
 
 
 def test_dumbbell_progression_increments_per_hantel():

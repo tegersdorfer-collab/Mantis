@@ -76,16 +76,21 @@ def test_history_and_finish_have_separate_actions(monkeypatch):
     assert coach.classify("Training fertig").action == "finish"
 
 
-def test_parser_fallback_is_limited_to_plausible_strength_messages(monkeypatch):
+def test_unknown_exercise_requires_an_open_session_and_explicit_kg(monkeypatch):
     monkeypatch.setattr(coach_module, "load_aliases", _aliases)
     monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: None)
     coach = GymCoach()
 
     intent = coach.classify("Neue Übung 80 kg, 8 Wiederholungen, 8 Wiederholungen")
 
+    assert intent is None
+    assert coach.classify("80 kg wie viel sind das in pounds?") is None
+
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: {"id": 7})
+    intent = coach.classify("Neue Übung 80 kg, 8 Wiederholungen, 8 Wiederholungen")
+
     assert intent is not None
     assert intent.action == "parser_fallback"
-    assert coach.classify("80 kg wie viel sind das in pounds?") is None
 
 
 @pytest.mark.parametrize("text", ["Bank 8,8,7", "Bank 80 12,5"])
@@ -214,12 +219,111 @@ def test_old_pending_is_ignored_when_a_later_assistant_message_is_normal(monkeyp
 
 def test_last_set_repair_keeps_the_claimed_old_value(monkeypatch):
     monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: {"id": 7})
 
     intent = GymCoach().classify("letzter Satz 7 nicht 8")
 
     assert intent is not None
     assert intent.action == "correct_reps"
     assert intent.payload == {"reps": 7, "expected_reps": 8}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Lösch den letzten Satz aus dem Anschreiben",
+        "Schreib als Beispiel: falsch, letzter Satz 7 nicht 8",
+    ],
+)
+def test_correction_grammar_does_not_capture_text_edit_requests(monkeypatch, text):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: {"id": 7})
+
+    assert GymCoach().classify(text) is None
+
+
+def test_corrections_are_not_gym_actions_without_an_open_session(monkeypatch):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: None)
+
+    assert GymCoach().classify("letzter Satz 7 nicht 8") is None
+    assert GymCoach().classify("Bank war 82,5") is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Rechnung 80 8 8", "Bus 52 5 5"],
+)
+def test_three_plausible_numbers_alone_do_not_create_unknown_exercises(monkeypatch, text):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: None)
+
+    assert GymCoach().classify(text) is None
+
+
+def test_unknown_exercise_without_kg_or_equipment_is_not_captured_even_in_open_session(monkeypatch):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: {"id": 7})
+
+    assert GymCoach().classify("Miete 650 5") is None
+
+
+def test_time_for_a_known_exercise_alias_is_not_logged_as_a_set(monkeypatch):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: {"id": 7})
+
+    intent = GymCoach().classify("Bank 14:30")
+
+    assert intent is None or intent.action != "set_logged"
+
+
+def test_known_exercise_with_unexplained_trailing_text_is_not_directly_logged(monkeypatch):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: None)
+
+    intent = GymCoach().classify("Bank 80 kg 3 Sätze à 8 morgen")
+
+    assert intent is None or intent.action != "set_logged"
+
+
+def test_known_set_shape_with_trailing_text_gets_confirmation_even_at_small_weights(monkeypatch):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: None)
+
+    intent = GymCoach().classify("Bank 20 kg 8 8 morgen")
+
+    assert intent is not None
+    assert intent.action == "parser_fallback"
+
+
+def test_pending_selection_accepts_a_custom_equipment_variant_name(monkeypatch):
+    monkeypatch.setattr(coach_module, "load_aliases", lambda: {
+        **_aliases(), "rudern kh": ["Rudern KH"], "rudern lh": ["Rudern LH"],
+    })
+    coach = GymCoach()
+    coach._latest_pending = lambda: {
+        "kind": "ambiguous",
+        "candidate": {"ambiguous": ["Rudern KH", "Rudern LH"]},
+        "expires_at": "2026-10-14T10:10:00+02:00",
+    }
+
+    intent = coach.classify("Rudern KH", now=datetime(2026, 10, 14, 8, tzinfo=timezone.utc))
+
+    assert intent is not None
+    assert intent.action == "pending_selected"
+    assert intent.payload["selected"] == "Rudern KH"
+
+
+def test_equipment_free_builtin_alias_asks_when_database_has_multiple_variants(monkeypatch):
+    monkeypatch.setattr(coach_module, "load_aliases", lambda: {
+        **_aliases(), "schulterdruecken": ["KH Schulterdrücken", "LH Schulterdrücken"],
+    })
+
+    intent = GymCoach().classify("Schulterdrücken 22,5 10")
+
+    assert intent is not None
+    assert intent.action == "ambiguous_exercise"
+    assert set(intent.parsed.ambiguous) == {"KH Schulterdrücken", "LH Schulterdrücken"}
 
 
 def test_last_set_repair_reports_a_mismatch_without_claiming_success(monkeypatch):
@@ -361,3 +465,33 @@ def test_next_workout_uses_a_matching_active_plan_before_asking_split(monkeypatc
     assert "Upper A" in result.text
     assert "Bench Press 80 kg, Ziel 8" in result.text
     assert result.pending is None
+
+
+def test_upper_lower_rotation_classifies_workouts_from_exercise_categories(monkeypatch):
+    monkeypatch.setattr(coach_module.db, "get_setting", lambda _key: "Upper/Lower")
+    monkeypatch.setattr(coach_module.fitness, "active_plan", lambda: None)
+    monkeypatch.setattr(coach_module.session, "workout_exercise_history", lambda **_kwargs: [
+        {"workout_id": 9, "date": "2026-10-14", "created_at": "2026-10-14T10:00:00+02:00",
+         "exercise": "Bankdrücken", "muscle": "chest", "reps": 8, "weight_kg": 80},
+        {"workout_id": 9, "date": "2026-10-14", "created_at": "2026-10-14T10:00:00+02:00",
+         "exercise": "Klimmzüge", "muscle": "back", "reps": 8, "weight_kg": None},
+    ])
+
+    result = GymCoach()._next_workout(datetime(2026, 10, 14, 12, tzinfo=timezone.utc))
+
+    assert "Nächste Einheit: Lower" in result.text
+
+
+def test_history_trend_uses_creation_time_for_workouts_on_the_same_date(monkeypatch):
+    monkeypatch.setattr(coach_module.session.db, "query", lambda *_args, **_kwargs: [
+        {"workout_id": 2, "date": "2026-10-14", "created_at": "2026-10-14T11:00:00+02:00",
+         "set_index": 1, "reps": 8, "weight_kg": 85, "is_warmup": False,
+         "exercise": "Bank", "load_mode": "external"},
+        {"workout_id": 1, "date": "2026-10-14", "created_at": "2026-10-14T10:00:00+02:00",
+         "set_index": 1, "reps": 8, "weight_kg": 80, "is_warmup": False,
+         "exercise": "Bank", "load_mode": "external"},
+    ])
+
+    result = GymCoach()._history("Bank")
+
+    assert "e1RM +6.3 kg" in result.text

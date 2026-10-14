@@ -23,6 +23,56 @@ BUILTIN_ALIAS_GROUPS = {
     "Hammercurls": ("Hammercurls", "Hammercurl", "Hammer Curls", "Hammer Curl"),
 }
 
+_EQUIPMENT_PREFIXES = (
+    (re.compile(r"^(?:kh|kurzhantel(?:n)?)\b[\s-]*", re.I), "dumbbell"),
+    (re.compile(r"^(?:lh|langhantel(?:n)?)\b[\s-]*", re.I), "barbell"),
+    (re.compile(r"^(?:sz(?:-?stange)?)\b[\s-]*", re.I), "ez_bar"),
+    (re.compile(r"^(?:kabel|maschine|maschinen)\b[\s-]*", re.I), "machine"),
+)
+_EQUIPMENT_SUFFIXES = (
+    (re.compile(r"\s*\((?:kurzhantel|kh)\)$", re.I), "dumbbell"),
+    (re.compile(r"\s*\((?:langhantel|lh)\)$", re.I), "barbell"),
+    (re.compile(r"\s*\((?:sz(?:-?stange)?)\)$", re.I), "ez_bar"),
+    (re.compile(r"\s*\((?:maschine|kabel|cable)\)$", re.I), "machine"),
+    (re.compile(r"\s+(?:kh|kurzhantel(?:n)?)$", re.I), "dumbbell"),
+    (re.compile(r"\s+(?:lh|langhantel(?:n)?)$", re.I), "barbell"),
+    (re.compile(r"\s+(?:sz(?:-?stange)?)$", re.I), "ez_bar"),
+    (re.compile(r"\s+(?:kabel|maschine|maschinen)$", re.I), "machine"),
+)
+_EQUIPMENT_SHORT_NAMES = {
+    "dumbbell": "KH",
+    "barbell": "LH",
+    "ez_bar": "SZ",
+    "machine": "Kabel",
+}
+
+
+def split_equipment_variant(value: str) -> tuple[str, str | None]:
+    """Trennt ein Gerätepräfix oder einen Gerätezusatz vom Übungsnamen."""
+    text = str(value or "").strip()
+    for pattern, equipment in _EQUIPMENT_PREFIXES:
+        match = pattern.match(text)
+        if match and text[match.end():].strip():
+            return text[match.end():].strip(), equipment
+    for pattern, equipment in _EQUIPMENT_SUFFIXES:
+        match = pattern.search(text)
+        if match and text[:match.start()].strip():
+            base = text[:match.start()].strip()
+            if equipment == "machine" and not match.group().lstrip().startswith("("):
+                if normalize_alias(base).endswith(" am"):
+                    continue
+            return base, equipment
+    return text, None
+
+
+def _variant_choice(name: str, equipment: str | None) -> str:
+    base, embedded_equipment = split_equipment_variant(name)
+    if embedded_equipment:
+        return name.strip()
+    if equipment:
+        return f"{_EQUIPMENT_SHORT_NAMES.get(equipment, equipment)} {base}"
+    return name.strip()
+
 
 def normalize_alias(value: str) -> str:
     """Normalisiert Schreibweise, Umlaute, Bindestriche und Leerzeichen."""
@@ -53,28 +103,71 @@ def load_aliases() -> dict[str, list[str]]:
     result = builtin_aliases()
     try:
         alias_rows = db.query(
-            """SELECT ea.alias, e.name AS exercise FROM exercise_aliases ea
+            """SELECT ea.alias, e.name AS exercise, e.id AS exercise_id, e.equipment
+               FROM exercise_aliases ea
                JOIN exercises e ON e.id=ea.exercise_id
                WHERE ea.exercise_id IS NOT NULL"""
         )
-        exercise_rows = db.query("SELECT name AS alias, name AS exercise FROM exercises")
+        exercise_rows = db.query(
+            "SELECT id AS exercise_id, name AS alias, name AS exercise, equipment FROM exercises"
+        )
     except Exception:
         return result
-    for row in alias_rows + exercise_rows:
-        alias = normalize_alias(row.get("alias"))
-        exercise = (row.get("exercise") or "").strip()
-        if alias and exercise:
-            # Ein gespeicherter Alias ist an eine konkrete Bestands-ID gebunden.
-            # Diese Zuordnung hat Vorrang vor dem vorläufigen Built-in-Namen.
-            result[alias] = [exercise]
-    existing = list(dict.fromkeys(
-        (row.get("exercise") or "").strip() for row in alias_rows + exercise_rows
-        if row.get("exercise")
-    ))
+
+    records: dict[str, dict] = {}
+    for row in exercise_rows:
+        name = (row.get("exercise") or row.get("alias") or "").strip()
+        if not name:
+            continue
+        identity = str(row.get("exercise_id") or normalize_alias(name))
+        records[identity] = {
+            "name": name, "equipment": row.get("equipment"), "aliases": {name},
+        }
+    for row in alias_rows:
+        name = (row.get("exercise") or "").strip()
+        alias = (row.get("alias") or "").strip()
+        if not name or not alias:
+            continue
+        identity = str(row.get("exercise_id") or normalize_alias(name))
+        record = records.setdefault(identity, {
+            "name": name, "equipment": row.get("equipment"), "aliases": {name},
+        })
+        record["aliases"].add(alias)
+
+    variants_by_base: dict[str, list[str]] = {}
+    plain_names = []
+    for record in records.values():
+        name = record["name"]
+        base, embedded_equipment = split_equipment_variant(name)
+        equipment = record.get("equipment") or embedded_equipment
+        choice = _variant_choice(name, equipment)
+        if equipment:
+            variants_by_base.setdefault(normalize_alias(base), []).append(choice)
+        else:
+            plain_names.append(name)
+        for alias in record["aliases"]:
+            key = normalize_alias(alias)
+            if key:
+                result.setdefault(key, [])
+                if choice not in result[key]:
+                    result[key].append(choice)
+        full_name = normalize_alias(name)
+        if full_name:
+            result.setdefault(full_name, [])
+            if choice not in result[full_name]:
+                result[full_name].append(choice)
+
     for canonical_aliases in BUILTIN_ALIAS_GROUPS.values():
         keys = {normalize_alias(name) for name in canonical_aliases}
-        matches = [name for name in existing if normalize_alias(name) in keys]
-        if len(matches) == 1:
+        matches = [name for name in plain_names if normalize_alias(name) in keys]
+        variant_choices = list(dict.fromkeys(
+            choice for base, choices in variants_by_base.items() if base in keys
+            for choice in choices
+        ))
+        if variant_choices:
+            for key in keys:
+                result[key] = variant_choices.copy()
+        elif len(matches) == 1:
             for key in keys:
                 result[key] = matches
         elif len(matches) > 1:
@@ -82,6 +175,10 @@ def load_aliases() -> dict[str, list[str]]:
                 key = normalize_alias(name)
                 exact = [candidate for candidate in matches if normalize_alias(candidate) == key]
                 result[key] = exact or matches
+
+    for base, choices in variants_by_base.items():
+        unique_choices = list(dict.fromkeys(choices))
+        result[base] = unique_choices
     return result
 
 

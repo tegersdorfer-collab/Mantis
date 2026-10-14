@@ -168,6 +168,7 @@ def test_open_accountability_prompt_takes_priority_over_gym_routing(monkeypatch)
 def test_parser_fallback_sends_only_current_text_and_aliases_to_chat_chain(monkeypatch):
     raw = '{"exercise":"Cable Fly","sets":[{"weight_kg":12.5,"reps":12},{"weight_kg":12.5,"reps":10}]}'
     handler, persisted, _kzg, _lzg, agent, _channel = _handler(monkeypatch, agent_reply=(raw, []))
+    monkeypatch.setattr(gym_session, "open_session", lambda *_args, **_kwargs: {"id": 12})
     monkeypatch.setattr(gym_session, "add_sets", Mock(side_effect=AssertionError("must wait for confirmation")))
     message = IncomingMessage(
         "Neue Übung 80 kg, 8 Wiederholungen, 8 Wiederholungen", "timo", datetime(2026, 10, 14)

@@ -238,3 +238,85 @@ def test_parser_and_alias_resolution_stay_under_300ms_p95():
 
     p95 = sorted(samples)[94]
     assert p95 < 0.3
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Bank 80 kg 3 Sätze à 8 nicht geschafft",
+        "Bank 80 8 kg",
+        "Bank 80 3 Sätze à 8 kg",
+        "Bank 80 kg 3 Sätze à 8 morgen",
+        "Bank mal 80 8",
+        "Bank Wdh 80 8",
+        "Bank 80 8 mal",
+        "Bank à 80 8",
+        "Bank 14:30",
+        "Bank 14.10 8",
+        "Bank 14/10",
+        "Bank -80 8",
+        "Bank +80 8",
+        "Bank 80 -8",
+        "Bank 14.10.2026 8",
+    ],
+)
+def test_strict_grammar_rejects_unexplained_tokens_times_dates_and_negative_values(text):
+    assert parse_set_message(text) is None
+
+
+def test_added_load_with_kg_on_pullups_is_not_mistaken_for_a_rep():
+    parsed = parse_set_message("Klimmzüge 10 kg 8 7")
+
+    assert parsed is not None
+    assert parsed.load_mode == "added"
+    assert [item.weight_kg for item in parsed.sets] == [10, 10]
+    assert [item.reps for item in parsed.sets] == [8, 7]
+
+
+def test_compact_weight_reps_sets_order_matches_the_gym_grammar():
+    parsed = parse_set_message("Bank 80x8x3")
+
+    assert parsed is not None
+    assert [(item.weight_kg, item.reps) for item in parsed.sets] == [
+        (80, 8), (80, 8), (80, 8),
+    ]
+
+
+def test_equipment_after_an_unknown_exercise_name_is_part_of_the_grammar():
+    parsed = parse_set_message("Rudern KH 40 8")
+
+    assert parsed is not None
+    assert parsed.exercise == "Rudern"
+    assert parsed.equipment == "dumbbell"
+    assert parsed.known is False
+
+
+def test_warmup_marker_applies_only_to_its_comma_separated_block():
+    parsed = parse_set_message("Bank 40 10 Warmup, 80 8")
+
+    assert parsed is not None
+    assert [(item.weight_kg, item.reps, item.is_warmup) for item in parsed.sets] == [
+        (40, 10, True), (80, 8, False),
+    ]
+
+
+def test_alias_without_equipment_is_ambiguous_when_database_has_multiple_variants(monkeypatch):
+    def query(sql, _params=()):
+        if "exercise_aliases" in sql:
+            return []
+        return [
+            {"alias": "KH Schulterdrücken", "exercise": "KH Schulterdrücken", "equipment": None},
+            {"alias": "LH Schulterdrücken", "exercise": "LH Schulterdrücken", "equipment": None},
+        ]
+
+    monkeypatch.setattr(db, "query", query)
+    aliases = load_aliases()
+
+    bare = parse_set_message("Schulterdrücken 22,5 10", aliases)
+    dumbbell = parse_set_message("KH Schulterdrücken 22,5 10", aliases)
+
+    assert bare is not None
+    assert set(bare.ambiguous) == {"KH Schulterdrücken", "LH Schulterdrücken"}
+    assert dumbbell is not None
+    assert dumbbell.ambiguous == ()
+    assert dumbbell.equipment == "dumbbell"

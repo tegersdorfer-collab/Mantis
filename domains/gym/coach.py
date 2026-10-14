@@ -178,9 +178,9 @@ class GymCoach:
 
     @staticmethod
     def _correction_intent(text: str, aliases: dict[str, list[str]]) -> GymIntent | None:
-        normalized = normalize_alias(text)
-        match = re.search(
-            r"(?:\bfalsch\b.*)?\bletzter satz\s+(\d{1,2})\s+nicht\s+(\d{1,2})\b",
+        normalized = normalize_alias(text).strip()
+        match = re.fullmatch(
+            r"(?:falsch\s+)?letzter satz\s+(\d{1,2})\s+nicht\s+(\d{1,2})",
             normalized,
         )
         if match and all(1 <= int(value) <= 30 for value in match.groups()):
@@ -188,9 +188,13 @@ class GymCoach:
                 "correct_reps",
                 payload={"reps": int(match.group(1)), "expected_reps": int(match.group(2))},
             )
-        if re.search(r"\b(?:loesch|loesche|entferne)\s+(?:bitte\s+)?(?:den\s+)?letzten satz\b", normalized):
+        if re.fullmatch(
+            r"(?:loesch|loesche|entferne)\s+(?:bitte\s+)?(?:den\s+)?letzten satz",
+            normalized,
+        ):
             return GymIntent("delete_last_set")
-        match = re.match(r"(.+?)\s+war\s+([+]?\d+(?:[.,]\d+)?)\s*(?:kg)?$", text.strip(), re.I)
+        cleaned = text.strip().rstrip("!?.,; ")
+        match = re.fullmatch(r"(.+?)\s+war\s+([+]?\d+(?:[.,]\d+)?)\s*(?:kg)?", cleaned, re.I)
         if match:
             name, weight = match.groups()
             exercise, _ambiguous, _fuzzy = resolve_alias(name, aliases)
@@ -224,7 +228,7 @@ class GymCoach:
             "ich bin", "ich wiege",
         )) or re.search(r"\bmal\b", normalized):
             return False
-        has_marker = bool(re.search(r"\b(?:kg|wdh|wiederholungen?|satz|saetze|x)\b|×", text, re.I))
+        has_marker = bool(re.search(r"\b(?:kg|kilo|wdh|wiederholungen?|satz|saetze|x)\b|×", text, re.I))
         numbers = re.findall(r"[+]?[0-9]+(?:[.,][0-9]+)?", text)
         known_name = any(normalized.startswith(alias + " ") or normalized == alias for alias in aliases)
         name_match = re.match(r"^\s*(.*?)\s*[+]?\d", text)
@@ -241,45 +245,43 @@ class GymCoach:
                 and all(1 <= value <= 30 for value in values[1:])
             )
         return (
-            has_exercise_name and len(values) >= 3 and values[0] > 30
+            has_exercise_name and has_marker and len(values) >= 2 and values[0] > 0
             and all(1 <= value <= 30 for value in values[1:])
         )
 
     @staticmethod
     def _looks_like_time_or_date(text: str) -> bool:
-        raw_values = re.findall(r"(?<![\w.])[+]?[0-9]+(?:[.,][0-9]+)?(?![\d.])", text)
-        try:
-            values = [float(value.lstrip("+").replace(",", ".")) for value in raw_values]
-        except ValueError:
-            return False
-        if len(values) >= 3 and values[0] >= 1900:
-            if 1 <= values[1] <= 12 and 1 <= values[2] <= 31:
+        if re.search(r"(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?!\d)", text):
+            return True
+        if re.search(
+            r"(?<!\d)(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|"
+            r"\d{4}[./-]\d{1,2}[./-]\d{1,2})(?!\d)",
+            text,
+        ):
+            return True
+        for match in re.finditer(
+            r"(?<!\d)(?P<day>\d{1,2})(?P<separator>[./-])"
+            r"(?P<month>\d{1,2})(?![\d.])",
+            text,
+        ):
+            day, month = int(match.group("day")), int(match.group("month"))
+            if (
+                1 <= day <= 31 and 1 <= month <= 12
+                and (match.group("separator") in "/-" or len(match.group("month")) == 2)
+            ):
                 return True
-        if len(values) < 2:
-            return False
-        pairs = list(zip(values, values[1:]))
-        if len(values) == 2:
-            return any(
-                0 <= first <= 24 and 0 <= second <= 59
-                or 1 <= first <= 31 and 1 <= second <= 12
-                for first, second in pairs
-            )
-        if all(0 <= value <= 31 for value in values):
-            return any(
-                0 <= first <= 24 and 0 <= second <= 59
-                or 1 <= first <= 31 and 1 <= second <= 12
-                for first, second in pairs
-            )
         return False
 
     def classify(self, text: str, now: datetime | None = None) -> GymIntent | None:
         now = session.local_now(now)
         normalized = normalize_alias(text).strip(" .,!?")
-        static_aliases = builtin_aliases()
+        has_equipment_name = bool(re.search(
+            r"\b(?:kh|kurzhantel(?:n)?|lh|langhantel(?:n)?|sz(?:-?stange)?|kabel|cable|maschine)\b",
+            normalized,
+        ))
         pending_reply = bool(
-            _confirmation(text)
-            or self._split_sequence(text)
-            or normalized in static_aliases
+            _confirmation(text) or self._split_sequence(text)
+            or normalized in builtin_aliases() or has_equipment_name
         )
         if pending_reply:
             pending_intent = self._pending_intent(text, self._latest_pending(), now)
@@ -325,7 +327,12 @@ class GymCoach:
         aliases = load_aliases()
         correction = self._correction_intent(text, aliases)
         if correction:
-            return correction
+            try:
+                if session.open_session(now):
+                    return correction
+            except Exception:
+                return None
+            return None
         parsed = parse_set_message(text, aliases)
         if parsed:
             if parsed.ambiguous:
@@ -336,22 +343,35 @@ class GymCoach:
                 return GymIntent("set_logged", parsed=parsed)
             explicit_gym = bool(
                 parsed.equipment
-                or re.search(r"\b(?:kg|kilo|wdh|wiederholungen?|reps?|sätze?|saetze?)\b", text, re.I)
+                or re.search(r"\b(?:kg|kilo)\b", text, re.I)
             )
-            if not explicit_gym and self._looks_like_time_or_date(text):
-                return None
             if explicit_gym:
-                return GymIntent("confirm_new_exercise", parsed=parsed)
+                try:
+                    active_session = session.open_session(now)
+                except Exception:
+                    active_session = None
+                if active_session:
+                    return GymIntent("confirm_new_exercise", parsed=parsed)
+                return None
+            return None
+
+        if self._strong_training_intent(text, aliases):
+            known_alias = any(
+                normalized.startswith(alias + " ") or normalized == alias
+                for alias in aliases
+            )
+            if known_alias:
+                return GymIntent("parser_fallback", payload={"text": text})
+            explicit_gym = bool(
+                re.search(r"\b(?:kg|kilo)\b", text, re.I)
+                or re.match(r"\s*(?:kh|kurzhantel|lh|langhantel|sz|kabel|maschine)\b", text, re.I)
+            )
             try:
                 active_session = session.open_session(now)
             except Exception:
                 active_session = None
-            if active_session or self._strong_training_intent(text, aliases):
-                return GymIntent("confirm_new_exercise", parsed=parsed)
-            return None
-
-        if self._strong_training_intent(text, aliases):
-            return GymIntent("parser_fallback", payload={"text": text})
+            if active_session and explicit_gym:
+                return GymIntent("parser_fallback", payload={"text": text})
         return None
 
     @staticmethod
@@ -602,7 +622,9 @@ class GymCoach:
             rows.append(f"{date_text}: {'/'.join(rendered)}")
         trend = ""
         if e1rms:
-            ordered = sorted(e1rms, key=lambda item: str(item[0]))
+            ordered = sorted(e1rms, key=lambda item: (
+                _timestamp(item[0]).timestamp() if _timestamp(item[0]) else float("-inf")
+            ))
             delta = ordered[-1][1] - ordered[0][1]
             best = max(value for _date, value in e1rms)
             trend = f" · e1RM {'+' if delta >= 0 else ''}{delta:.1f} kg · Bestwert {best:.1f} kg"
@@ -649,6 +671,7 @@ class GymCoach:
     def _next_workout(self, now: datetime) -> GymResult:
         split = db.get_setting("gym_split")
         history = session.workout_exercise_history(limit=200)
+        sequence = self._split_sequence(split) if split else []
         workouts: dict[int, dict] = {}
         for row in history:
             if row.get("is_warmup"):
@@ -661,9 +684,8 @@ class GymCoach:
             workouts.values(),
             key=lambda item: str(item.get("created_at") or item.get("date") or date.min),
         )
-        categories = [self._workout_category(item["rows"]) for item in ordered]
+        categories = [self._workout_category(item["rows"], sequence) for item in ordered]
         categories = [item for item in categories if item]
-        sequence = self._split_sequence(split) if split else []
         if sequence:
             last = categories[-1] if categories else None
             next_category = sequence[(sequence.index(last) + 1) % len(sequence)] if last in sequence else sequence[0]
@@ -679,7 +701,29 @@ class GymCoach:
         return GymResult("❓ Welchen Split nutzt du? Zum Beispiel Push/Pull/Beine oder Upper/Lower.", "next_workout", pending)
 
     @staticmethod
-    def _workout_category(rows: list[dict]) -> str | None:
+    def _workout_category(rows: list[dict], split: list[str] | None = None) -> str | None:
+        if split and set(split) <= {"Upper", "Lower"}:
+            upper = {"chest", "shoulders", "back", "arms", "biceps", "triceps", "forearms"}
+            lower = {"legs", "glutes", "quads", "hamstrings", "calves"}
+            found = set()
+            for row in rows:
+                muscle = str(row.get("muscle") or "").lower()
+                name = normalize_alias(row.get("exercise") or "")
+                if muscle in upper or any(word in name for word in (
+                    "brust", "bankdrueck", "schulter", "rudern", "klimmzug", "latzug",
+                    "curl", "trizeps", "bizeps", "shoulder", "bench", "row",
+                )):
+                    found.add("Upper")
+                if muscle in lower or any(word in name for word in (
+                    "kniebeug", "squat", "beinpresse", "leg press", "beincurl", "waden",
+                )):
+                    found.add("Lower")
+            if found == {"Upper"}:
+                return "Upper"
+            if found == {"Lower"}:
+                return "Lower"
+            return "Ganzkörper" if found else None
+
         groups = set()
         for row in rows:
             muscle = str(row.get("muscle") or "").lower()
@@ -762,10 +806,11 @@ class GymCoach:
     def _next_workout_reply(category: str, history: list[dict], now: datetime) -> GymResult:
         suggestions = []
         seen = set()
+        split = ["Upper", "Lower"] if category in {"Upper", "Lower"} else None
         for row in history:
             if row.get("is_warmup") or row.get("exercise") in seen:
                 continue
-            if GymCoach._workout_category([row]) != category:
+            if GymCoach._workout_category([row], split) != category:
                 continue
             seen.add(row.get("exercise"))
             if row.get("weight_kg") is not None:
@@ -794,7 +839,7 @@ class GymCoach:
             categories_by_workout.values(),
             key=lambda rows: str(rows[0].get("created_at") or rows[0].get("date") or ""),
         )
-        categories = [self._workout_category(rows) for rows in ordered]
+        categories = [self._workout_category(rows, sequence) for rows in ordered]
         categories = [item for item in categories if item]
         if categories and categories[-1] in sequence:
             next_category = sequence[(sequence.index(categories[-1]) + 1) % len(sequence)]

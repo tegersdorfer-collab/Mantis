@@ -44,7 +44,7 @@ def progression_set_count(
     planned_count: int | None,
     previous_count: int = 0,
 ) -> int:
-    """Hält mindestens aktuelle, letzte und geplante Satzanzahl bereit."""
+    """Verwendet bei Historie die Satzanzahl der letzten Einheit."""
     try:
         current_count = int(current_count)
     except (TypeError, ValueError):
@@ -57,8 +57,13 @@ def progression_set_count(
         planned_count = int(planned_count) if planned_count is not None else 0
     except (TypeError, ValueError):
         planned_count = 0
-    planned_count = planned_count if 1 <= planned_count <= 20 else 3
-    return max(current_count, previous_count, planned_count)
+    if 1 <= previous_count <= 20:
+        return previous_count
+    if 1 <= current_count <= 20:
+        return current_count
+    if 1 <= planned_count <= 20:
+        return planned_count
+    return 3
 
 
 def recommend_next(
@@ -67,6 +72,7 @@ def recommend_next(
     metadata: dict | None = None,
     *,
     set_count: int | None = None,
+    historical_sets: list[dict] | None = None,
 ) -> dict:
     """Berechnet Gewicht und Wiederholungsziel, ohne bei Einbruch zu entlasten."""
     current = _working_sets(current_sets)
@@ -75,17 +81,36 @@ def recommend_next(
         return {"weight_kg": None, "target_reps": [], "incremented": False}
 
     low, high, start = _rep_bounds(metadata)
-    count = max(len(current), int(set_count or 0))
-    current_reps = [int(row.get("reps") or 0) for row in current]
-    current_reps.extend([None] * (count - len(current_reps)))
+    count = max(1, int(set_count)) if set_count else len(current)
+    current_reps = [int(row.get("reps") or 0) for row in current[:count]]
+    current_reps.extend([None] * max(0, count - len(current_reps)))
     weight = current[0].get("weight_kg")
     target = [start] * count
     incremented = False
 
-    if previous:
-        previous_reps = [int(row.get("reps") or 0) for row in previous]
+    history = _working_sets([*(historical_sets or []), *previous])
+    if history:
+        def same_load(row):
+            row_weight = row.get("weight_kg")
+            if weight is None or row_weight is None:
+                return weight is None and row_weight is None
+            try:
+                return math.isclose(float(row_weight), float(weight), abs_tol=0.001)
+            except (TypeError, ValueError):
+                return False
+
+        best_by_position: dict[int, int] = {}
+        for offset, row in enumerate(history):
+            if not same_load(row):
+                continue
+            try:
+                reps = int(row.get("reps") or 0)
+                position = int(row.get("set_index") or offset + 1)
+            except (TypeError, ValueError):
+                continue
+            best_by_position[position] = max(best_by_position.get(position, 0), reps)
         previous_goals = [
-            min(high, max(low, previous_reps[index] if index < len(previous_reps) else start))
+            min(high, max(low, best_by_position.get(index + 1, low)))
             for index in range(count)
         ]
         if any(reps is None or reps < goal for reps, goal in zip(current_reps, previous_goals)):
