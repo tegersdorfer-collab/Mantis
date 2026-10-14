@@ -103,3 +103,6 @@ und das auch **nach 4 Wochen** noch.
 - Fix nach Live-Gang: PROMPT_SAFE_SQL enthielt literales % → KZG-Restore brach ab (psycopg2-Falle), behoben.
 - Nebenbei: ~/.local/bin/codex-task gehärtet; Codex-Kontingent nachts zweimal leer (Sonnet-Subagenten als Ersatz).
 - Nächster Schritt Challenge: Woche nutzen, am 21.10. /api/usage/daily auswerten (use_case gym/inbox/agent).
+
+### 2026-10-14 – Gym-Tracker Web-App v1 live
+Timo bleibt bei AlphaProgression-Gewohnheiten (schnelles Abhaken, Plan, Pausentimer, Verlauf; Progressionsvorschläge egal) und will eine eigene, ähnliche App statt Nachbau per REA. v1 = Big Three (Squats, Bench Press, Deadlifts), Web-App auf eigenem Port `http://100.107.172.123:7782` (Tailnet, wie Filmroulette), eigene Cookie-Session 180 Tage, Offline-Queue mit client_id-Idempotenz, schreibt in `workouts`/`workout_sets` (Vorbefüllung aus AP-Altdaten). Spec `docs/specs/2026-10-14-gym-tracker-web.md`, Plan `docs/superpowers/plans/2026-10-14-gym-tracker-web.md`. 4 Review-Runden (Sol, zuletzt Opus-Subagent wegen Codex-Kontingent), Merge a2353e5, nicht gepusht. Nächstes: Timo testet im Gym; Live-Coach, weitere Übungen, Plan-Rotation erst nach echtem Bedarf. Bekannt offen: nach Reload zeigen offene Zeilen wieder die Vorbefüllung statt zuletzt geänderter Werte. Nutzungszählung: Sätze mit `client_id`.
