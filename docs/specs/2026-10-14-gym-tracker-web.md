@@ -12,8 +12,13 @@ nicht. Vorgehen laut Timo: klein und sauber anfangen, dann nach echter Nutzung n
 ## Entscheidungen
 - Web-App statt nativer iOS-App (Timo): kein Ablauf nach 7 Tagen, kein Neuinstallieren, Empfang
   im Gym ist gut. Als Homescreen-App (Vollbild) nutzbar.
-- Erreichbar über das bestehende `tailscale serve` (`https://macbook-air-von-timo.tail7e29ff.ts.net`
-  → `127.0.0.1:7779`), Pfad **`/gym`**. Kein neues Binding, keine Netzwerkänderung.
+- Eigener Port wie Filmroulette (Timo, 14.10.: ein Unterpfad lässt sich nicht sauber als
+  Homescreen-App speichern): **`http://100.107.172.123:7782/`** (Tailscale-IP, nur im Tailnet).
+  Eigene kleine FastAPI-App, die im Mantis-Prozess als zweiter uvicorn-Server läuft
+  (Settings `GYM_HOST`, Default = Tailscale-IP aus `.env`, `GYM_PORT` = 7782, `GYM_ENABLED`).
+  Host-Validierung wie `DASHBOARD_HOST` (nur Loopback oder Tailscale-IP). Ist die IP beim Start
+  noch nicht verfügbar, wird der Bind im Hintergrund mit Backoff wiederholt; Mantis selbst darf
+  daran nie scheitern.
 - Nur die Big Three: `Bench Press`, `Squats`, `Deadlifts` (exakt die Namen aus dem
   AlphaProgression-Import, damit Verlauf und „letztes Mal“ ab dem ersten Tag aus den Altdaten kommen).
 - Daten in den bestehenden Tabellen `workouts`/`workout_sets`, Sessionlogik aus
@@ -42,19 +47,20 @@ wiederhergestellt.
 Sätze, Volumen). Ohne Beenden greift der vorhandene Session-Timeout.
 
 ## Technik
-- **Frontend:** eine statische Datei `web/gym.html` (HTML/CSS/Vanilla-JS, kein Build-Schritt),
-  mobil zuerst, Dark-Mode, plus `web/gym.webmanifest` (Name „Gym“, `display: standalone`,
-  `start_url: /gym`). Ausgeliefert über eine Route `GET /gym`; Shell und Manifest kommen in
-  `PUBLIC_PATHS` (enthalten keine Daten), alle Daten-Endpunkte bleiben geschützt.
-- **Login:** nutzt das vorhandene Session-Cookie (`POST /auth/session` mit Bearer-Token). Ohne
-  gültiges Cookie zeigt die Shell ein Token-Feld (einmalig). `SESSION_SECONDS` wird ein Setting
-  `DASHBOARD_SESSION_DAYS` (Default **90**), damit Timo sich nicht wöchentlich neu anmeldet.
-  Sicherheitsrelevant → Claude prüft diesen Teil selbst.
+- **Frontend:** statische Dateien unter `web/gym/` (`index.html`, `app.js`, `app.css`,
+  `manifest.webmanifest`; Vanilla-JS, kein Build-Schritt), mobil zuerst, Dark-Mode, iOS-Meta-Tags
+  für Vollbild (`apple-mobile-web-app-capable`, Icon), `start_url: /`. Shell-Dateien sind ohne
+  Login abrufbar (enthalten keine Daten), alle `/api/*` sind geschützt.
+- **Login:** eigene, von der Dashboard-Auth getrennte Session für die Gym-App: Shell zeigt einmalig
+  ein Token-Feld, `POST /auth/session` prüft `DASHBOARD_TOKEN` (hmac-Vergleich) und setzt ein
+  eigenes HttpOnly-Cookie `mantis_gym` (SameSite=Strict, Laufzeit Setting `GYM_SESSION_DAYS`,
+  Default **180**). Dashboard-Session bleibt unverändert bei 7 Tagen. Strikte Origin-Prüfung bei
+  schreibenden Requests (nur eigene Origin). Sicherheitsrelevant → Claude prüft diesen Teil selbst.
 - **Offline-Puffer:** abgehakte Sätze gehen zuerst in eine Warteschlange in `localStorage` (mit
   Client-ID je Satz) und werden sofort gesendet; bei Fehler erneuter Versuch beim nächsten ✓,
   bei `online`-Event und beim Öffnen. Anzeige „n Sätze nicht synchronisiert“, solange offen.
   Server dedupliziert über die Client-ID (Idempotenz), damit Wiederholungen keine Doppel erzeugen.
-- **API** (neuer Router `web/routers/gym.py`, JSON, alles hinter `DashboardAuth`):
+- **API** (in der Gym-App, Modul `web/gym_app.py`, JSON, alles hinter der Gym-Session):
   - `GET /api/gym/state` → offene Session (oder null), Übungsliste mit Vorbefüllung je Übung,
     bereits in der offenen Session gespeicherte Sätze je Übung.
   - `POST /api/gym/sets` `{client_id, exercise, weight_kg, reps}` → speichert einen Arbeitssatz
@@ -79,12 +85,13 @@ Sätze, Volumen). Ohne Beenden greift der vorhandene Session-Timeout.
 - Gewicht ≤ 0 oder > 500, Wdh. < 1 oder > 100 → 400.
 
 ## Tests (TDD, gegen `mantis_test`)
-- Router: Auth nötig (401 ohne Cookie), `/gym` und Manifest öffentlich ohne Daten.
+- Gym-App: Auth nötig (401 ohne Cookie), Shell/Manifest öffentlich ohne Daten, falsches Token 401,
+  fremde Origin bei POST 403, Cookie-Laufzeit aus `GYM_SESSION_DAYS`, Host-Validierung.
+- Start: Bind-Fehler des Gym-Servers bringt Mantis nicht zum Absturz.
 - `state`: Vorbefüllung aus letzter Session, Aufwärmsätze ausgeschlossen, leere Historie.
 - `sets`: Anlegen öffnet Session, Idempotenz über `client_id`, Validierung, Allowlist.
 - `PATCH`/`DELETE` nur in offener Session, sonst 404/409.
 - `finish` und `history`.
-- Session-Dauer-Setting wird für das Cookie verwendet.
 - Frontend: Smoke-Test im Browser-Pane (Login, Satz abhaken, Timer, Offline-Puffer per
   simuliertem Netzfehler, Neuladen) durch Claude nach dem Merge-Kandidaten.
 - `python3.14 -m pytest tests/ -q` und `python3.14 -m ruff check .` grün.
