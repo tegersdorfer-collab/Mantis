@@ -92,6 +92,31 @@ def test_responses_input_converts_image_blocks_to_data_urls():
     }]
 
 
+def test_responses_input_drops_empty_turns_merges_roles_and_keeps_tool_outputs():
+    input_items = messages_to_responses_input([
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "  \n"},
+        {"role": "user", "content": "Question"},
+        {"role": "user", "content": "Next"},
+        {"role": "assistant", "content": "\t"},
+        {"role": "assistant", "content": "Answer"},
+        {"role": "assistant", "content": "More"},
+        {"role": "assistant", "content": " ", "tool_calls": [{
+            "id": "call-1",
+            "function": {"name": "lookup", "arguments": {"q": "x"}},
+        }]},
+        {"role": "tool", "tool_use_id": "call-1", "content": "found"},
+    ])
+
+    assert input_items == [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "Question\nNext"},
+        {"role": "assistant", "content": "Answer\nMore"},
+        {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": '{"q": "x"}'},
+        {"type": "function_call_output", "call_id": "call-1", "output": "found"},
+    ]
+
+
 def test_responses_request_always_streams_and_disables_storage_and_tool_roundtrips(tmp_path, monkeypatch):
     seen = {}
     access_value = secrets.token_urlsafe(32)
@@ -221,7 +246,7 @@ def test_responses_requires_completed_event_and_valid_tool_arguments(tmp_path):
     ({"type": "error", "message": "subscription_sharing_usage_limit_exceeded"}, 1800, False, False, ""),
     ({"type": "error", "code": "subscription_sharing_invalid_user"}, None, True, True, ""),
     ({"type": "error", "code": "invalid_client"}, None, True, False, ""),
-    ({"type": "error", "code": "subscription_sharing_unsupported_capability", "param": "tools"}, None, False, False, "tools"),
+    ({"type": "error", "code": "subscription_sharing_unsupported_capability", "param": "tools"}, 0, False, False, "tools"),
     ({"type": "response.failed", "response": {"error": {"code": "subscription_sharing_invalid_user"}}}, None, True, True, ""),
 ])
 def test_sse_errors_use_the_same_failover_classes_as_http_errors(
@@ -275,6 +300,13 @@ def test_stream_callback_cancellation_does_not_record_completed_usage_twice(tmp_
     })]
 
 
+@pytest.mark.parametrize("code", ["invalid_request", "subscription_sharing_unsupported_capability"])
+def test_request_specific_400_errors_do_not_request_provider_cooldown(code):
+    error = classify_api_error(400, {"error": {"code": code}})
+
+    assert error.fallback_cooldown_s == 0
+
+
 @pytest.mark.parametrize(("status", "payload", "cooldown", "disabled"), [
     (503, {"error": {"code": "subscription_sharing_usage_unavailable"}}, None, False),
     (400, {"detail": "subscription_sharing_user_unavailable"}, None, False),
@@ -290,8 +322,8 @@ def test_stream_callback_cancellation_does_not_record_completed_usage_twice(tmp_
     (403, {"error": {"code": "subscription_sharing_route_not_supported"}}, None, True),
     (403, {"detail": "chatpass_v2_access_denied"}, None, True),
     (400, {"error": {"code": "invalid_client"}}, None, True),
-    (400, {"error": {"code": "subscription_sharing_unsupported_capability", "param": "tools"}}, None, False),
-    (400, {"error": {"code": "invalid_request"}}, None, False),
+    (400, {"error": {"code": "subscription_sharing_unsupported_capability", "param": "tools"}}, 0, False),
+    (400, {"error": {"code": "invalid_request"}}, 0, False),
 ])
 def test_api_error_classification_controls_pause_and_permanent_disable(status, payload, cooldown, disabled):
     error = classify_api_error(status, payload)
@@ -324,7 +356,7 @@ def test_permanent_login_error_is_logged_once(caplog):
     (429, {"error": {"code": "subscription_sharing_usage_limit_exceeded"}}, 1800, False),
     (401, {"detail": {"code": "subscription_sharing_invalid_user"}}, None, True),
     (403, {"error": {"code": "subscription_sharing_route_not_supported"}}, None, True),
-    (400, {"error": {"code": "subscription_sharing_unsupported_capability", "param": "tools"}}, None, False),
+    (400, {"error": {"code": "subscription_sharing_unsupported_capability", "param": "tools"}}, 0, False),
 ])
 def test_http_errors_are_classified_before_they_reach_fallback(tmp_path, status, payload, cooldown, disabled):
     def handler(request: httpx.Request) -> httpx.Response:

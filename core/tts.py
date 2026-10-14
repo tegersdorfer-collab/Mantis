@@ -213,12 +213,22 @@ def _wav_to_ogg(wav_bytes: bytes) -> bytes:
         Path(ogg_path).unlink(missing_ok=True)
 
 
+def _apply_cartesia_pronunciations(text: str) -> str:
+    """Ersetzt Wörter, die die deutsche Cartesia-Stimme falsch ausspricht, durch eine Lautschreibung.
+
+    Nur für die Sprachausgabe; der angezeigte Text bleibt unverändert.
+    """
+    for word, spoken in (config.TTS_CARTESIA_PRONUNCIATIONS or {}).items():
+        text = re.sub(rf"\b{re.escape(word)}\b", spoken, text, flags=re.IGNORECASE)
+    return text
+
+
 async def _cartesia_synthesize(text: str) -> bytes:
     """Ruft Cartesia auf und liefert WAV-Bytes für die vorhandene OGG-Konvertierung."""
     api_key = _cartesia_key()
     payload = {
         "model_id": config.TTS_CARTESIA_MODEL,
-        "transcript": text,
+        "transcript": _apply_cartesia_pronunciations(text),
         "voice": {"mode": "id", "id": config.TTS_CARTESIA_VOICE},
         "language": config.TTS_CARTESIA_LANGUAGE,
         "output_format": {

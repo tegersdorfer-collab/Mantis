@@ -14,6 +14,7 @@ AGENT_REMOTE_REPLY_PREFIX = "Agent-Remote"
 PROMPT_SAFE_SQL = """
 COALESCE(lower(meta->>'untrusted'), 'false') <> 'true'
 AND COALESCE(meta->>'use_case', '') <> 'agent'
+AND content ~ '[^[:space:]]'
 AND NOT (role = 'assistant' AND left(ltrim(content), 12) = 'Agent-Remote')
 """
 
@@ -30,6 +31,9 @@ def _message_meta(message: Mapping[str, Any]) -> dict[str, Any]:
 
 def is_safe_for_prompt(message: Mapping[str, Any]) -> bool:
     """Schließt nicht vertrauenswürdige und Agent-Remote-Nachrichten aus."""
+    content = message.get("content")
+    if content is None or (isinstance(content, str) and not content.strip()):
+        return False
     meta = _message_meta(message)
     if meta.get("untrusted") is True or str(meta.get("untrusted", "")).casefold() == "true":
         return False

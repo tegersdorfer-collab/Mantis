@@ -54,6 +54,8 @@ class MantisSettings(BaseSettings):
     TTS_CARTESIA_MODEL: str = "sonic-3.6"
     TTS_CARTESIA_VOICE: str = "afa425cf-5489-4a09-8a3f-d3cb1f82150d"
     TTS_CARTESIA_LANGUAGE: str = "de"
+    # Lautschreibung für Wörter, die die deutsche Stimme falsch ausspricht (Timo, 14.10.2026: Mantis englisch).
+    TTS_CARTESIA_PRONUNCIATIONS: dict[str, str] = {"Mantis": "Mäntis"}
     TTS_CARTESIA_USD_PER_MILLION_CHARS: float = 65.0  # Pro-Überschuss, 1 Zeichen = 1 Credit
     STT_ENGINE: str = "parakeet"
     STT_PARAKEET_MODEL: str = "mlx-community/parakeet-tdt-0.6b-v3"

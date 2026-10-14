@@ -10,6 +10,10 @@ def test_prompt_safe_sql_has_no_literal_percent():
     assert "%" not in PROMPT_SAFE_SQL
 
 
+def test_prompt_safe_sql_filters_empty_turns_before_the_history_limit():
+    assert "content ~ '[^[:space:]]'" in PROMPT_SAFE_SQL
+
+
 @pytest.mark.db
 def test_prompt_safe_sql_works_in_parametrized_query():
     try:

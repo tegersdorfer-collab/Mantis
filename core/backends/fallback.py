@@ -175,7 +175,16 @@ class FallbackBackend(AgentBackend):
                 await abort_attempt()
                 permanently_disabled = bool(getattr(e, "disable_backend", False))
                 requested_cooldown = getattr(e, "fallback_cooldown_s", None)
-                cooldown = self._cooldown_s if requested_cooldown is None else max(0.0, float(requested_cooldown))
+                status_code = getattr(e, "status_code", None)
+                if status_code is None:
+                    status_code = getattr(getattr(e, "response", None), "status_code", None)
+                if requested_cooldown is None and status_code in {400, 422}:
+                    cooldown = 0.0
+                else:
+                    cooldown = (
+                        self._cooldown_s if requested_cooldown is None
+                        else max(0.0, float(requested_cooldown))
+                    )
                 self._down_until[index] = float("inf") if permanently_disabled else time.time() + cooldown
                 if index == 0:
                     self._primary_down_until = self._down_until[index]

@@ -19,6 +19,7 @@ whisper.cpp bleibt als Fallback erhalten (STT_ENGINE="whisper", oder automatisch
 wenn parakeet-mlx nicht installiert ist).
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import time
 
@@ -29,6 +30,7 @@ log = logging.getLogger(__name__)
 
 _whisper_model = None
 _parakeet_model = None
+_parakeet_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parakeet-mlx")
 # Beide Engines teilen sich EINEN Lock: whisper.cpp/ggml crasht bei parallelen
 # transcribe()-Aufrufen (s.u.), und zwei gleichzeitig geladene STT-Modelle wären auf
 # dem 16-GB-Mac ohnehin verschwenderisch.
@@ -90,7 +92,8 @@ async def _transcribe_parakeet(audio_path: str) -> str:
         model_id = getattr(config, "STT_PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
         log.info(f"🔊 Lade Parakeet-Modell '{model_id}' …")
         try:
-            _parakeet_model = await asyncio.to_thread(from_pretrained, model_id)
+            loop = asyncio.get_running_loop()
+            _parakeet_model = await loop.run_in_executor(_parakeet_executor, from_pretrained, model_id)
         except Exception as e:
             # Typisch: kein Netz beim allerersten Start (Modell noch nicht im HF-Cache).
             log.error(f"Parakeet-Modell konnte nicht geladen werden: {e}")
@@ -98,7 +101,8 @@ async def _transcribe_parakeet(audio_path: str) -> str:
             return ""
 
     try:
-        result = await asyncio.to_thread(_parakeet_model.transcribe, audio_path)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(_parakeet_executor, _parakeet_model.transcribe, audio_path)
         return (result.text or "").strip()
     except Exception as e:
         # Laufzeitfehler (kaputte Datei o.ä.) — kein Grund, die Engine zu wechseln.

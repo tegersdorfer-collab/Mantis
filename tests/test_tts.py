@@ -615,3 +615,10 @@ class TestCartesiaLeeresWav:
         assert len(chunks) == len(expected)
         assert chunks[1] == b"OGG:KOKORO_WAV:" + expected[1].encode()
         assert chunks[0] == b"OGG:WAV:" + expected[0].encode()
+
+
+def test_cartesia_pronunciation_replaces_whole_words_only(monkeypatch):
+    from core import tts
+    monkeypatch.setattr(tts.config, "TTS_CARTESIA_PRONUNCIATIONS", {"Mantis": "Mäntis"})
+    assert tts._apply_cartesia_pronunciations("Hallo, ich bin Mantis. mantis!") == "Hallo, ich bin Mäntis. Mäntis!"
+    assert tts._apply_cartesia_pronunciations("Gottesanbeterinnen heißen Mantiden") == "Gottesanbeterinnen heißen Mantiden"

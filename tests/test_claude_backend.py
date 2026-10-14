@@ -6,7 +6,7 @@ import anthropic
 import httpx
 import pytest
 
-from core.backends.claude import ClaudeBackend, _extract_tool_calls
+from core.backends.claude import ClaudeBackend, _extract_tool_calls, _ollama_msgs_to_anthropic
 from llm.claude import ClaudeProvider
 
 
@@ -65,6 +65,39 @@ def test_claude_tool_use_requires_object_arguments():
 
     with pytest.raises(ValueError, match="JSON-Objekt"):
         _extract_tool_calls(response)
+
+
+def test_anthropic_messages_drop_empty_turns_merge_roles_and_keep_tool_results():
+    system, messages = _ollama_msgs_to_anthropic([
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "  \n"},
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "\t"},
+        {"role": "assistant", "content": "Answer"},
+        {
+            "role": "assistant",
+            "content": " ",
+            "tool_calls": [{
+                "id": "call-1",
+                "function": {"name": "lookup", "arguments": {"q": "x"}},
+            }],
+        },
+        {"role": "tool", "content": "found", "tool_use_id": "call-1"},
+        {"role": "user", "content": "Next"},
+    ])
+
+    assert system == "system prompt"
+    assert messages == [
+        {"role": "user", "content": [{"type": "text", "text": "Question"}]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Answer"},
+            {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {"q": "x"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call-1", "content": "found"},
+            {"type": "text", "text": "Next"},
+        ]},
+    ]
 
 
 def test_claude_usage_preserves_background_purpose(monkeypatch):

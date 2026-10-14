@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ log = logging.getLogger(__name__)
 _transport: httpx.AsyncBaseTransport | None = None
 _down_until: dict[str, float] = {}
 _active_provider: str | None = None
+_INVALID_QUESTION_ID_CHARACTERS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def _monotonic() -> float:
@@ -38,6 +40,36 @@ def _monotonic() -> float:
 def _utcnow() -> datetime:
     """Wrappbarer UTC-Zeitgeber für Cloudflares Tageskontingent."""
     return datetime.now(timezone.utc)
+
+
+def _sanitize_question_ids(
+    questions: dict[str, Noul | Choice | Score],
+) -> tuple[dict[str, Noul | Choice | Score], dict[str, str]]:
+    """Jev-IDs erfüllen das API-Pattern; Antworten werden intern zurückbenannt."""
+    safe_questions = {}
+    internal_ids = {}
+    for internal_id, question in questions.items():
+        base = _INVALID_QUESTION_ID_CHARACTERS.sub(".", str(internal_id))[:100] or "question"
+        safe_id = base
+        suffix = 2
+        while safe_id in internal_ids:
+            marker = f"_{suffix}"
+            safe_id = f"{base[:100 - len(marker)]}{marker}"
+            suffix += 1
+        safe_questions[safe_id] = question
+        internal_ids[safe_id] = internal_id
+    return safe_questions, internal_ids
+
+
+def _is_request_validation_error(error: BaseException | None) -> bool:
+    if error is None:
+        return False
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+    if status_code in {400, 422}:
+        return True
+    return bool(re.match(r"^HTTP (?:400|422):", str(error)))
 
 # Modellpräfixe, für die die Bänder in core/decisions.py kalibriert sind. Der
 # direkte TypeSafe-Endpunkt und OpenRouter geben unterschiedliche IDs zurück.
@@ -158,6 +190,7 @@ async def decide(state: str | dict | list, questions: dict[str, Noul | Choice | 
     if not enabled():
         raise JevUnavailable("Jev aus, kein Provider mit Credentials oder alle im Cooldown")
 
+    provider_questions, internal_ids = _sanitize_question_ids(questions)
     providers = provider_chain()
     configured_timeout = max(0.0, float(config.JEV_TIMEOUT_S))
     started = _monotonic()
@@ -193,7 +226,7 @@ async def decide(state: str | dict | list, questions: dict[str, Noul | Choice | 
         try:
             total_remaining = max(0.0, deadline - _monotonic())
             async with asyncio.timeout(total_remaining):
-                d = await c.decide(state, questions)
+                d = await c.decide(state, provider_questions)
         except TimeoutError:
             c._down_until = max(c._down_until, _monotonic() + config.JEV_COOLDOWN_S)
             switch_reason = f"{provider} Zeitbudget überschritten"
@@ -205,6 +238,11 @@ async def decide(state: str | dict | list, questions: dict[str, Noul | Choice | 
                 seconds_until_reset = max(0.0, (reset_at - _utcnow()).total_seconds())
                 c._down_until = _monotonic() + seconds_until_reset
                 switch_reason = f"Cloudflare-Tageskontingent bis {reset_at:%Y-%m-%d %H:%M UTC}"
+            elif _is_request_validation_error(cause):
+                # jevkit setzt für jeden HTTP-Fehler intern einen Cooldown; ein
+                # ungültiger Einzelrequest ist aber kein Provider-Ausfall.
+                c._down_until = _down_until.get(provider, 0.0)
+                switch_reason = f"{provider} Request abgelehnt"
             else:
                 switch_reason = f"{provider} nicht verfügbar"
             continue
@@ -213,7 +251,10 @@ async def decide(state: str | dict | list, questions: dict[str, Noul | Choice | 
             # Breaker nicht mit einem älteren Stand überschreiben (Lost Update).
             _down_until[provider] = max(_down_until.get(provider, 0.0), c._down_until)
 
-        return {qid: Answer.from_jevkit(a, model=d.model) for qid, a in d.answers.items()}
+        return {
+            internal_ids.get(qid, qid): Answer.from_jevkit(a, model=d.model)
+            for qid, a in d.answers.items()
+        }
 
     if attempted:
         log.info("Jev-Providerwechsel: %s → Fast-Cloud-Fallback (%s)", last_provider, switch_reason)

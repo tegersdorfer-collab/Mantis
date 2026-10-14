@@ -103,7 +103,7 @@ def classify_api_error(status: int, payload, *, refresh: bool = False) -> ChatGP
     description = f"ChatGPT-Plan HTTP {int(status)}" + (f" ({code})" if code else "")
 
     if code == "subscription_sharing_unsupported_capability":
-        return ChatGPTPlanError(description, error_code=code, param=param)
+        return ChatGPTPlanError(description, cooldown_s=0, error_code=code, param=param)
     if code == "subscription_sharing_usage_limit_exceeded":
         return ChatGPTPlanError(description, cooldown_s=QUOTA_PAUSE_S, error_code=code)
 
@@ -126,6 +126,8 @@ def classify_api_error(status: int, payload, *, refresh: bool = False) -> ChatGP
         "subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable",
     }:
         return ChatGPTPlanError(description, error_code=code)
+    if status in {400, 422}:
+        return ChatGPTPlanError(description, cooldown_s=0, error_code=code, param=param)
     return ChatGPTPlanError(description, error_code=code)
 
 
@@ -199,10 +201,22 @@ def messages_to_responses_input(messages: list[dict]) -> list[dict]:
     for message in messages:
         role = message.get("role")
         if role == "assistant":
-            content = message.get("content") or ""
-            if content:
+            content = message.get("content")
+            if isinstance(content, str) and not content.strip():
+                content = ""
+            elif isinstance(content, list):
+                content = content_to_responses(content)
+                content = [
+                    block for block in content
+                    if block.get("type") != "input_text" or str(block.get("text", "")).strip()
+                ]
+            calls = message.get("tool_calls") or []
+            if content and not calls and result and result[-1].get("role") == "assistant":
+                previous = result[-1]["content"]
+                result[-1]["content"] = _merge_responses_content(previous, content)
+            elif content:
                 result.append({"role": "assistant", "content": content})
-            for call in message.get("tool_calls") or []:
+            for call in calls:
                 function = call.get("function") or {}
                 call_id = call.get("id") or call.get("tool_use_id") or f"call_{uuid.uuid4().hex[:12]}"
                 pending_ids.append(call_id)
@@ -224,8 +238,39 @@ def messages_to_responses_input(messages: list[dict]) -> list[dict]:
                 "output": str(message.get("content", "")),
             })
         else:
-            result.append({"role": role, "content": content_to_responses(message.get("content", ""))})
+            content = content_to_responses(message.get("content", ""))
+            if isinstance(content, str) and not content.strip():
+                continue
+            if isinstance(content, list):
+                content = [
+                    block for block in content
+                    if block.get("type") != "input_text" or str(block.get("text", "")).strip()
+                ]
+                if not content:
+                    continue
+            entry = {"role": role, "content": content}
+            if role == "user" and result and result[-1].get("role") == "user":
+                result[-1]["content"] = _merge_responses_content(result[-1]["content"], content)
+            else:
+                result.append(entry)
     return result
+
+
+def _merge_responses_content(previous, current):
+    if isinstance(previous, str) and isinstance(current, str):
+        return f"{previous}\n{current}"
+    parts = []
+    if isinstance(previous, str):
+        if previous:
+            parts.append({"type": "input_text", "text": previous})
+    else:
+        parts.extend(previous)
+    if isinstance(current, str):
+        if current:
+            parts.append({"type": "input_text", "text": current})
+    else:
+        parts.extend(current)
+    return parts
 
 
 def _extract_responses_result(response: dict, tools: list[dict] | None) -> tuple[str, list[dict]]:

@@ -89,6 +89,30 @@ def _persisted_role_channels(inserted):
     return [(params[0], params[2]) for _sql, params in inserted]
 
 
+def test_prompt_history_filters_empty_and_whitespace_turns():
+    from memory.chat_messages import filter_prompt_messages
+
+    messages = filter_prompt_messages([
+        {"role": "user", "content": "  \n"},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "valid"},
+    ])
+
+    assert messages == [{"role": "user", "content": "valid"}]
+
+
+def test_empty_message_is_not_persisted(monkeypatch):
+    orchestrator, inserted, _ = _make_orchestrator(monkeypatch)
+    handler = orchestrator.msg_handler
+    lzg_saved = []
+    handler.lzg.save_kzg_turn = lambda *args, **kwargs: lzg_saved.append((args, kwargs))
+
+    handler._persist_msg("user", " \t\n")
+
+    assert inserted == []
+    assert lzg_saved == []
+
+
 def test_incoming_message_defaults_to_telegram_channel():
     message = IncomingMessage("hi", "1", datetime(2026, 10, 13))
 

@@ -197,7 +197,7 @@ def test_three_stage_chain_falls_through_timeout_and_http_error_then_cools_down(
         error=httpx.HTTPStatusError(
             "bad request",
             request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
-            response=httpx.Response(400),
+            response=httpx.Response(503),
         ),
     )
     local = FakeBackend("ollama", result=("lokal", []))
@@ -270,6 +270,27 @@ def test_anthropic_unsupported_parameter_400_falls_through_without_permanent_dis
     assert anthropic.calls == 1
     assert fallback.calls == 1
     assert backend._down_until[0] != float("inf")
+
+
+def test_request_validation_error_does_not_cool_down_provider_for_following_calls():
+    import httpx
+
+    error = httpx.HTTPStatusError(
+        "invalid request structure",
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        response=httpx.Response(400),
+    )
+    primary = FakeBackend("claude-haiku-5-5", error=error)
+    fallback = FakeBackend("chatgpt-plan", result=("fallback", []))
+    backend = FallbackBackend(
+        backends=[primary, fallback], stage_timeouts=[0.5, 0.5], cooldown_s=180,
+    )
+
+    assert _call(backend) == ("fallback", [])
+    assert _call(backend) == ("fallback", [])
+
+    assert primary.calls == 2
+    assert fallback.calls == 2
 
 
 def test_chain_uses_next_available_cloud_stage_during_primary_cooldown():

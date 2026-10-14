@@ -166,3 +166,59 @@ def test_cloud_decision_log_records_model_and_probability_without_user_text(monk
     assert payload["model"] == "cloud:fixture"
     assert "private transcript" not in json.dumps(payload)
     assert jevkit.DecisionLog(path).records()[0].answer.p == 0.9
+
+
+def test_every_generated_question_id_sent_to_jev_matches_api_pattern(monkeypatch):
+    import re
+    import httpx
+    from unittest.mock import patch
+
+    monkeypatch.setattr(decide.config, "JEV_ENABLED", True)
+    monkeypatch.setattr(decide.config, "JEV_PROVIDER_CHAIN", "", raising=False)
+    monkeypatch.setattr(decide.config, "JEV_PROVIDER", "typesafe")
+    monkeypatch.setattr(decide.config, "TYPESAFE_API_KEY", "test-key")
+    monkeypatch.setattr(decide.config, "OPENROUTER_API_KEY", "")
+    monkeypatch.setattr(decide.config, "JEV_MODEL", "jev-latest")
+    decide.reset_for_tests()
+
+    questions = {
+        "addressed": decisions.Q_ADDRESSED,
+        jevkit.GUARD_ID: decisions.Q_ADDRESSED,
+        "voice_address": decisions.Q_ADDRESSED,
+        "fact_supported": decisions.Q_CLAIM_SUPPORTED,
+        "supported": decisions.Q_CLAIM_SUPPORTED,
+        "supersedes": decisions.Q_SUPERSEDES,
+        **{
+            f"cat:{category}": decisions.Noul(description)
+            for category, description in decisions.TOOL_CATEGORY_DESCRIPTIONS.items()
+        },
+        "aktion": decisions.Q_ACTION,
+        "ui_action": decide.Choice("Choose a safe action.", {"wait": "Wait"}),
+    }
+    seen_ids = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        seen_ids.extend(payload["questions"])
+        assert all(re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", qid) for qid in payload["questions"])
+        answers = {}
+        for qid, question in payload["questions"].items():
+            if question["type"] == "noul":
+                answers[qid] = {"type": "noul", "noul": 0.9}
+            else:
+                choice = next(iter(question["criteria"]))
+                answers[qid] = {
+                    "type": "choice", "choice": choice,
+                    "probabilities": {label: float(label == choice) for label in question["criteria"]},
+                    "confidence": 1.0,
+                }
+        return httpx.Response(200, json={
+            "model": "jev-1.13", "answers": answers, "usage": {},
+        })
+
+    with patch.object(decide, "_transport", httpx.MockTransport(handler)):
+        answers = asyncio.run(decide.decide("state", questions))
+
+    assert len(seen_ids) == len(questions)
+    assert set(answers) == set(questions)
+    assert answers["cat:fitness"].p == 0.9

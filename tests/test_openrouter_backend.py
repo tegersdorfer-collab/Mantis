@@ -76,6 +76,38 @@ def test_tool_result_uses_openai_tool_call_id():
     assert tool == {"role": "tool", "content": "10:42", "tool_call_id": "call_1"}
 
 
+def test_openrouter_messages_drop_empty_turns_merge_roles_and_keep_tool_results():
+    converted = _msgs_to_openai([
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "  \n"},
+        {"role": "user", "content": "Question"},
+        {"role": "user", "content": "Next"},
+        {"role": "assistant", "content": "\t"},
+        {"role": "assistant", "content": "Answer"},
+        {
+            "role": "assistant",
+            "content": " ",
+            "tool_calls": [{
+                "id": "call-1",
+                "function": {"name": "lookup", "arguments": {"q": "x"}},
+            }],
+        },
+        {"role": "tool", "content": "found", "tool_use_id": "call-1"},
+    ])
+
+    assert converted[0] == {"role": "system", "content": "system prompt"}
+    assert converted[1] == {"role": "user", "content": "Question\nNext"}
+    assert converted[2] == {
+        "role": "assistant",
+        "content": "Answer",
+        "tool_calls": [{
+            "id": "call-1", "type": "function",
+            "function": {"name": "lookup", "arguments": '{"q": "x"}'},
+        }],
+    }
+    assert converted[3] == {"role": "tool", "content": "found", "tool_call_id": "call-1"}
+
+
 def test_tool_call_without_id_gets_stable_generated_id():
     msgs = [
         {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "clock", "arguments": {}}}]},
