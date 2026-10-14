@@ -503,6 +503,37 @@ def test_length_finish_reason_returns_available_response_in_both_paths(streaming
 
 
 @pytest.mark.parametrize("streaming", [False, True])
+def test_voice_length_finish_reason_drops_incomplete_last_sentence(streaming):
+    partial = "Der erste Satz ist fertig. Die Nacht davor waren 8"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if streaming:
+            chunks = [{"choices": [{
+                "delta": {"content": partial},
+                "finish_reason": "length",
+            }]}]
+            body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+            return httpx.Response(
+                200, content=(body + "data: [DONE]\n\n").encode(),
+                headers={"content-type": "text/event-stream"},
+            )
+        data = _completion(content=partial)
+        data["choices"][0]["finish_reason"] = "length"
+        return httpx.Response(200, json=data)
+
+    async def stream_cb(_):
+        return None
+
+    text, calls = asyncio.run(_backend(handler, purpose="voice").call(
+        [{"role": "user", "content": "answer"}], tools=None,
+        stream_cb=stream_cb if streaming else None, temperature=0.2, max_tokens=500,
+    ))
+
+    assert text == "Der erste Satz ist fertig."
+    assert calls == []
+
+
+@pytest.mark.parametrize("streaming", [False, True])
 def test_length_finish_reason_still_rejects_truncated_tool_arguments(streaming):
     tools = [{"type": "function", "function": {
         "name": "optional_tool",

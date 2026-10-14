@@ -309,6 +309,28 @@ def _fake_local_synthesis(monkeypatch):
 
 
 class TestCartesia:
+    def test_schreibt_live_zahlenbeispiele_vor_cartesia_aus(
+        self, cartesia_engine, monkeypatch
+    ):
+        requests = []
+        _mock_cartesia(
+            monkeypatch,
+            lambda request: (requests.append(request) or httpx.Response(200, content=b"WAV")),
+        )
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda _wav: b"OGG")
+        monkeypatch.setattr(tts, "_record_cartesia_usage", lambda _text: None)
+
+        result = asyncio.run(tts.synthesize(
+            "vom 12. auf den 13. Oktober, 10,4 Stunden. "
+            "Die Nacht davor waren 8 Stunden. 8:30 Uhr und 53 bpm."
+        ))
+
+        assert result == b"OGG"
+        assert json.loads(requests[0].content)["transcript"] == (
+            "vom zwölften auf den dreizehnten Oktober, zehn Komma vier Stunden. "
+            "Die Nacht davor waren acht Stunden. acht Uhr dreißig und dreiundfünfzig bpm."
+        )
+
     def test_sendet_cartesia_felder_und_gibt_ogg_zurueck(
         self, cartesia_engine, monkeypatch
     ):
@@ -622,3 +644,19 @@ def test_cartesia_pronunciation_replaces_whole_words_only(monkeypatch):
     monkeypatch.setattr(tts.config, "TTS_CARTESIA_PRONUNCIATIONS", {"Mantis": "Mäntis"})
     assert tts._apply_cartesia_pronunciations("Hallo, ich bin Mantis. mantis!") == "Hallo, ich bin Mäntis. Mäntis!"
     assert tts._apply_cartesia_pronunciations("Gottesanbeterinnen heißen Mantiden") == "Gottesanbeterinnen heißen Mantiden"
+
+
+def test_cartesia_number_spelling_has_a_fallback_without_num2words(monkeypatch):
+    monkeypatch.setattr(tts, "_num2words", None)
+
+    assert tts._number_to_german_words(53) == "dreiundfünfzig"
+
+
+def test_cartesia_numeric_date_uses_the_correct_ordinal_case():
+    assert tts._numbers_to_german_words(
+        "am 12.10. und 12. Oktober; außerdem 20%."
+    ) == "am zwölften Oktober und zwölfter Oktober; außerdem zwanzig Prozent."
+
+
+def test_cartesia_non_date_dot_numbers_do_not_break_number_speech():
+    assert tts._numbers_to_german_words("Version 1.13.5") == "Version eins.dreizehn.fünf"

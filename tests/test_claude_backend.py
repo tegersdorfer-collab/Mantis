@@ -147,7 +147,9 @@ def test_haiku_55_cost_uses_explicit_estimated_price_table_entry():
     assert cost_usd("claude-haiku-5-5", 1_000_000, 1_000_000) == 6.0
 
 
-def _sdk_message_events(*, include_message_stop, text_deltas=("answer",)):
+def _sdk_message_events(
+    *, include_message_stop, text_deltas=("answer",), stop_reason="end_turn",
+):
     events = [
         {
             "type": "message_start",
@@ -181,7 +183,7 @@ def _sdk_message_events(*, include_message_stop, text_deltas=("answer",)):
         },
         {
             "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
             "usage": {"output_tokens": 1},
         },
     ]
@@ -193,19 +195,23 @@ def _sdk_message_events(*, include_message_stop, text_deltas=("answer",)):
     )
 
 
-def _call_claude_with_sdk_events(*, include_message_stop, text_deltas=("answer",)):
+def _call_claude_with_sdk_events(
+    *, include_message_stop, text_deltas=("answer",),
+    stop_reason="end_turn", purpose="chat-agent",
+):
     async def call():
         transport = httpx.MockTransport(lambda _request: httpx.Response(
             200,
             content=_sdk_message_events(
                 include_message_stop=include_message_stop, text_deltas=text_deltas,
+                stop_reason=stop_reason,
             ),
             headers={"content-type": "text/event-stream"},
         ))
         async with httpx.AsyncClient(transport=transport) as http_client:
             backend = object.__new__(ClaudeBackend)
             backend._model = "claude-haiku-5-5"
-            backend._purpose = "chat-agent"
+            backend._purpose = purpose
             backend._client = anthropic.AsyncAnthropic(
                 api_key="test", http_client=http_client,
             )
@@ -243,6 +249,51 @@ def test_haiku_stream_reports_exact_text_deltas():
 
     assert result == ("Es ist sonnig.", [])
     assert collected == ["Es ist son", "nig."]
+
+
+def test_voice_stream_max_tokens_drops_incomplete_last_sentence():
+    result, collected = _call_claude_with_sdk_events(
+        include_message_stop=True,
+        text_deltas=("Der erste Satz ist fertig. ", "Die Nacht davor waren 8"),
+        stop_reason="max_tokens",
+        purpose="voice",
+    )
+
+    assert result == ("Der erste Satz ist fertig.", [])
+    assert collected == ["Der erste Satz ist fertig. ", "Die Nacht davor waren 8"]
+
+
+def test_voice_nonstream_max_tokens_drops_incomplete_last_sentence():
+    partial = "Der erste Satz ist fertig. Die Nacht davor waren 8"
+    response_body = {
+        "id": "msg_voice_limit",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": partial}],
+        "model": "claude-haiku-5-5",
+        "stop_reason": "max_tokens",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 10},
+    }
+
+    async def call():
+        transport = httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=response_body),
+        )
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            backend = object.__new__(ClaudeBackend)
+            backend._model = "claude-haiku-5-5"
+            backend._purpose = "voice"
+            backend._client = anthropic.AsyncAnthropic(
+                api_key="test", http_client=http_client,
+            )
+            backend._record_usage = lambda _response: None
+            return await backend.call(
+                [{"role": "user", "content": "hi"}], None,
+                None, 0.2, 500,
+            )
+
+    assert asyncio.run(call()) == ("Der erste Satz ist fertig.", [])
 
 
 def test_haiku_tool_use_rejects_missing_required_arguments():

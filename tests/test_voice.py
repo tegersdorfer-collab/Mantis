@@ -320,7 +320,7 @@ def test_voice_settings_default_to_short_answers_and_stt_preload(monkeypatch):
 
     settings = MantisSettings(_env_file=None)
 
-    assert settings.VOICE_MAX_TOKENS == 350
+    assert settings.VOICE_MAX_TOKENS == 500
     assert settings.STT_PRELOAD is True
 
 
