@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.fast_commands import match, match_voice
+from core.fast_commands import has_voice_wakeword, match, match_voice
 
 
 def _m(text):
@@ -288,8 +288,24 @@ def test_voice_reflex_does_not_capture_location_or_normal_questions():
     assert match_voice("Die Musik wird lauter") is None
 
 
+@pytest.mark.parametrize("text", [
+    "Mantis. Wie spät ist es?",
+    "Mantis: wie spät ist es",
+    "Hey Mantis! Wie spät ist es?",
+])
+def test_voice_reflex_accepts_sentence_punctuation_after_wakeword(text):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime(2026, 10, 14, 12, 34, tzinfo=ZoneInfo("Europe/Berlin"))
+    command = match_voice(text, now=now)
+
+    assert command is not None and command.tool == "voice_reflex"
+    assert command.args["response"] == "Es ist 12:34 Uhr."
+
+
 @pytest.mark.parametrize("prefix", [
-    "Mantis", "mantis", "Mäntis", "Mann das", "Man tis", "Mentis", "Mantas", "Manthis",
+    "Mantis", "mantis", "Mäntis", "Mann das", "Man tis", "Mentis", "Manthis",
     "Hey Mantis", "hey mantis", "Okay Mantis", "okay mantis",
 ])
 @pytest.mark.parametrize("separator", [" ", ", "])
@@ -313,6 +329,24 @@ def test_ambiguous_mann_das_is_removed_only_when_remainder_is_a_reflex():
 
     assert command is not None and command.tool == "voice_reflex"
     assert match_voice("Mann, das ist blöd") is None
+
+
+@pytest.mark.parametrize("text", [
+    "Mann, das Timer auf 5 Minuten",
+    "Mann, das lauter",
+    "Mann das stopp den Timer",
+    "Mann, das Licht aus",
+])
+def test_ambiguous_mann_das_does_not_trigger_non_reflex_commands(text):
+    assert match_voice(text) is None
+    assert has_voice_wakeword(text) is False
+
+
+def test_mantas_is_not_a_voice_wakeword_variant():
+    text = "mantas, wie spät ist es?"
+
+    assert match_voice(text) is None
+    assert has_voice_wakeword(text) is False
 
 
 def test_voice_stop_reflex_is_exact():

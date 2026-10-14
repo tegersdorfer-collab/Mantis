@@ -2,7 +2,24 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from core.prompt_builder import CacheableSystemPrompt, PromptBuilder
+import pytest
+
+from core.prompt_builder import (
+    CacheableSystemPrompt, PromptBuilder, _is_recallless_acknowledgement,
+)
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("ja, und erinner mich an X", False),
+    ("ja bitte schreib Lisa", False),
+    ("nein danke", False),
+    ("ja ja", False),
+    ("Ja.", True),
+    ("ja!", True),
+    ("ok", True),
+])
+def test_recallless_acknowledgement_requires_a_bare_confirmation(text, expected):
+    assert _is_recallless_acknowledgement(text) is expected
 
 
 def test_prompt_builder_marks_static_prefix_and_keeps_live_context_in_dynamic_suffix(monkeypatch):

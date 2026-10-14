@@ -290,7 +290,8 @@ def test_ack_filler_uses_fake_clock_precedes_answer_and_is_not_text(monkeypatch)
     assert logged[0][2]["filler"] == "ack"
     assert logged[0][2]["filler_ms"] == 1000.0
     assert logged[0][2]["first_tts_block_ms"] is not None
-    assert logged[0][2]["first_answer_audio_ms"] > logged[0][2]["first_tts_block_ms"]
+    # Zeitwerte sind auf 0,1 ms gerundet; die Chunk-Reihenfolge oben prüft den Ablauf.
+    assert logged[0][2]["first_answer_audio_ms"] >= logged[0][2]["first_tts_block_ms"]
 
 
 def test_tool_filler_is_queued_before_answer_and_only_one_filler_is_used(monkeypatch):

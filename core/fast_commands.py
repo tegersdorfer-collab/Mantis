@@ -219,8 +219,8 @@ _TIMER_STOP_RE = re.compile(
 )
 _WAKEWORD_PREFIX_RE = re.compile(
     r"^\s*(?:(?:hey|okay)\s*,?\s+)?"
-    r"(?P<wake>mantis|mäntis|mann\s*,?\s*das|man\s*tis|mentis|mantas|manthis)"
-    r"(?:\s*,\s*|\s+|$)",
+    r"(?P<wake>mantis|mäntis|mann\s*,?\s*das|man\s*tis|mentis|manthis)"
+    r"(?:[\s,.:!-]+|$)",
     re.IGNORECASE,
 )
 
