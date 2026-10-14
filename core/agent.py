@@ -51,12 +51,19 @@ class Agent:
         force_tool_call: bool = False,
     ) -> tuple[str, list[dict], str | None]:
         timer = voice_timing.LlmCall()
-        content, tool_calls, attempt_id = await self._call_backend_inner(
-            messages, tools=tools, stream_cb=stream_cb, temperature=temperature,
-            max_tokens=max_tokens, think=think, force_tool_call=force_tool_call,
-            timer=timer,
-        )
-        timer.finish(tool_calls)
+        tool_calls = []
+        error = None
+        try:
+            content, tool_calls, attempt_id = await self._call_backend_inner(
+                messages, tools=tools, stream_cb=stream_cb, temperature=temperature,
+                max_tokens=max_tokens, think=think, force_tool_call=force_tool_call,
+                timer=timer,
+            )
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            timer.finish(tool_calls, error=error)
         return content, tool_calls, attempt_id
 
     async def _call_backend_inner(

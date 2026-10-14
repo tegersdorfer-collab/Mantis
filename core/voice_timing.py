@@ -30,10 +30,14 @@ class TurnTiming:
         }
 
 
-def start() -> TurnTiming:
+def start() -> contextvars.Token:
     timing = TurnTiming()
-    _current.set(timing)
-    return timing
+    return _current.set(timing)
+
+
+def reset(token: contextvars.Token) -> None:
+    """Stellt den Timing-Kontext wieder her, der vor `start()` aktiv war."""
+    _current.reset(token)
 
 
 def current() -> TurnTiming | None:
@@ -71,17 +75,20 @@ class LlmCall:
         if self._first is None:
             self._first = time.perf_counter()
 
-    def finish(self, tool_calls) -> None:
+    def finish(self, tool_calls, *, error: str | None = None) -> None:
         if self._timing is None:
             return
         end = time.perf_counter()
         first = self._first
-        self._timing.llm_calls.append({
+        call = {
             "ms_to_first_token": round(((first or end) - self._started) * 1000, 1),
             "ms_total": round((end - self._started) * 1000, 1),
             "output_tokens": self._timing.pending_tokens,
             "had_tool_calls": bool(tool_calls),
-        })
+        }
+        if error is not None:
+            call["error"] = error
+        self._timing.llm_calls.append(call)
 
 
 def note_output_tokens(n: int | None) -> None:

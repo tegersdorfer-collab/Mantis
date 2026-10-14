@@ -402,3 +402,35 @@ def test_voice_latency_event_contains_phase_timings(monkeypatch):
         assert isinstance(detail[key], (int, float))
     assert detail["context_ms"] == 30.0
     assert detail["llm_calls"][0]["output_tokens"] == 9
+
+
+def test_streaming_voice_turn_resets_timing_context(monkeypatch):
+    from core import voice_timing
+
+    logged = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            voice_timing.current().context_ms = 17.0
+            return "Antwort.", []
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+
+    async def run():
+        outer_token = voice_timing.start()
+        outer_timing = voice_timing.current()
+        try:
+            await sende_streaming_antwort(
+                FakeWebSocket(), "Hi", FakeOrchestrator(),
+            )
+            assert voice_timing.current() is outer_timing
+        finally:
+            voice_timing.reset(outer_token)
+
+    asyncio.run(run())
+
+    assert logged[0][2]["context_ms"] == 17.0
