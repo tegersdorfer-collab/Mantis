@@ -459,6 +459,104 @@ test("bei fehlgeschlagenem PATCH bleibt ein korrigierter Queue-Eintrag gespeiche
   assert.match(app.elements.get("#notice-host").innerHTML, /fehlgeschlagen/i);
 });
 
+test("PATCH 409 verwirft den Queue-Eintrag, zeigt Serverwerte und synchronisiert den nächsten Satz", async () => {
+  const first = { ...queuedSet, client_id: "first-id", weight_kg: 70, reps: 8 };
+  const second = { ...queuedSet, client_id: "second-id", weight_kg: 50, reps: 5 };
+  const storage = new Map([["gym_queue", JSON.stringify([first, second])]]);
+  const state = makeState();
+  const app = createFrontend({
+    storage,
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url === "/api/sets" && options.method === "POST") {
+        const item = JSON.parse(options.body);
+        if (item.client_id === "first-id") {
+          const stored = { ...queuedSet, id: 81, set_index: 1 };
+          state.exercises[0].logged = [stored];
+          return response(200, stored);
+        }
+        const stored = { ...item, id: 82, set_index: 2 };
+        state.exercises[0].logged.push(stored);
+        return response(201, stored);
+      }
+      if (url === "/api/sets/81" && options.method === "PATCH") {
+        return response(409, { detail: "Training bereits beendet" });
+      }
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error("Unexpected request: " + url);
+    },
+  });
+
+  assert.equal(await waitFor(() => storage.get("gym_queue") === "[]"), true);
+  assert.equal(app.calls.filter((call) => call.url === "/api/sets" && call.method === "POST").length, 2);
+  assert.equal(await waitFor(() => app.elements.get("#notice-host").innerHTML.includes("Training bereits beendet")), true);
+  await waitFor(() => app.elements.get("#screen").innerHTML.includes("Squats"));
+  assert.deepEqual(
+    state.exercises[0].logged.map((set) => [set.id, set.weight_kg]),
+    [[81, 60], [82, 50]],
+  );
+  assert.equal(app.run("appState.exercises[0].logged.some((set) => set.weight_kg === 70)"), false);
+});
+
+test("bei PATCH-Netzwerkfehler bleibt der Queue-Eintrag und wird später erneut versucht", async () => {
+  const correctedItem = { ...queuedSet, weight_kg: 70, reps: 8 };
+  const storage = new Map([["gym_queue", JSON.stringify([correctedItem])]]);
+  let patchAttempts = 0;
+  const app = createFrontend({
+    storage,
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url === "/api/sets" && options.method === "POST") {
+        return response(200, { ...queuedSet, id: 83, set_index: 1 });
+      }
+      if (url === "/api/sets/83" && options.method === "PATCH") {
+        patchAttempts += 1;
+        if (patchAttempts === 1) throw new Error("offline");
+        return response(200, { ...queuedSet, id: 83, set_index: 1, weight_kg: 70, reps: 8 });
+      }
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error("Unexpected request: " + url);
+    },
+  });
+
+  assert.equal(await waitFor(() => patchAttempts === 1), true);
+  await waitFor(() => app.elements.get("#notice-host").innerHTML.includes("Korrektur"));
+  assert.equal(storage.get("gym_queue"), JSON.stringify([correctedItem]));
+  await app.run("flushQueue()");
+  assert.equal(patchAttempts, 2);
+  assert.equal(storage.get("gym_queue"), "[]");
+});
+
+test("62,3 wird auf 62,25 gerundet gesendet, ohne PATCH, und das Feld zeigt 62,25", async () => {
+  const state = makeState({ prefill: [{ weight_kg: 60, reps: 10 }] });
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sets" && options.method === "POST") {
+        const item = JSON.parse(options.body);
+        const saved = { ...item, id: 84, set_index: 1 };
+        state.exercises[0].logged.push(saved);
+        return response(201, saved);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  const input = app.input(0, "weight_kg", "62,3");
+  await app.click("log-draft", { index: "0" });
+  await waitFor(() => app.calls.some((call) => call.url === "/api/sets"));
+  await waitFor(() => app.run("appState.exercises[0].logged.length") === 1);
+
+  const posts = app.calls.filter((call) => call.url === "/api/sets");
+  assert.equal(JSON.parse(posts[0].body).weight_kg, 62.25);
+  assert.equal(app.calls.some((call) => call.method === "PATCH"), false);
+  assert.equal(input.value, "62,25");
+  assert.equal(app.run("appState.exercises[0].logged[0].weight_kg"), 62.25);
+});
+
 test("nur definierte Validierungsfehler entfernen Queue-Sätze; andere Status behalten sie", async () => {
   for (const status of [400, 404, 409, 422]) {
     const storage = new Map([["gym_queue", JSON.stringify([queuedSet])]]);

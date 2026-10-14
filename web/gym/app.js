@@ -85,6 +85,12 @@ function parseDecimal(value) {
   return normalized ? Number(normalized) : Number.NaN;
 }
 
+function roundWeight(value) {
+  return Math.round(Number(value) * 4) / 4;
+}
+
+const WEIGHT_EPSILON = 1e-6;
+
 function formatWeight(value) {
   if (value === null || value === undefined || value === "") return "–";
   return Number(value).toLocaleString("de-DE", { maximumFractionDigits: 2 });
@@ -486,10 +492,11 @@ function keepSavedSet(item, saved) {
 
 async function reconcileSavedSet(item, saved) {
   const values = {
-    weight_kg: Number(item.weight_kg),
+    weight_kg: roundWeight(item.weight_kg),
     reps: Number(item.reps),
   };
-  if (Number(saved.weight_kg) === values.weight_kg && Number(saved.reps) === values.reps) {
+  if (Math.abs(Number(saved.weight_kg) - values.weight_kg) < WEIGHT_EPSILON
+    && Number(saved.reps) === values.reps) {
     return { ok: true, saved };
   }
 
@@ -499,16 +506,22 @@ async function reconcileSavedSet(item, saved) {
       return {
         ok: false,
         status: response.status,
+        permanent: [400, 404, 409, 422].includes(response.status),
+        saved,
         message: payload?.error || payload?.detail || `HTTP ${response.status}`,
       };
     }
-    return {
-      ok: true,
-      saved: { ...saved, ...payload, ...values },
-    };
+    const stored = payload && payload.weight_kg !== undefined && payload.reps !== undefined
+      ? { ...saved, ...payload }
+      : { ...saved, ...values };
+    return { ok: true, saved: stored };
   } catch (_error) {
     return { ok: false, message: "Keine Verbindung für die Korrektur." };
   }
+}
+
+function permanentCorrectionNotice(result) {
+  return `Korrektur nicht möglich, der Server-Wert bleibt gespeichert. ${result.message}`;
 }
 
 function correctionFailureNotice(result) {
@@ -623,6 +636,15 @@ function flushQueue() {
           break;
         }
         const reconciled = await reconcileSavedSet(item, saved);
+        if (!reconciled.ok && reconciled.permanent) {
+          queue = queue.slice(1);
+          writeStored("gym_queue", queue);
+          keepSavedSet(item, reconciled.saved);
+          notice = permanentCorrectionNotice(reconciled);
+          validationRejected = true;
+          serverChanged = true;
+          continue;
+        }
         if (!reconciled.ok) {
           if (reconciled.status === 401 || reconciled.status === 403) {
             screenMode = "login";
@@ -712,12 +734,19 @@ async function logDraft(clientId) {
   const list = exercise ? draftsFor(exercise) : [];
   const draft = list.find((entry) => entry.client_id === clientId);
   if (!exercise || !draft) return;
-  const weight = parseDecimal(draft.weight_kg);
+  const weight = roundWeight(parseDecimal(draft.weight_kg));
   const reps = Number(String(draft.reps).trim());
   if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || !Number.isInteger(reps) || reps < 1 || reps > 100) {
     notice = "Gewicht muss über 0 und höchstens 500 kg liegen; Wiederholungen: 1 bis 100.";
     render();
     return;
+  }
+  const shownWeight = inputWeight(weight);
+  if (draft.weight_kg !== shownWeight) {
+    draft.weight_kg = shownWeight;
+    for (const input of screen.querySelectorAll("[data-draft-input]")) {
+      if (input.dataset.clientId === clientId && input.dataset.field === "weight_kg") input.value = shownWeight;
+    }
   }
 
   const item = {
@@ -757,6 +786,12 @@ async function logDraft(clientId) {
           return false;
         }
         const reconciled = await reconcileSavedSet(item, confirmation);
+        if (!reconciled.ok && reconciled.permanent) {
+          keepSavedSet(item, reconciled.saved);
+          removeDraft(exercise, clientId);
+          notice = permanentCorrectionNotice(reconciled);
+          return true;
+        }
         if (!reconciled.ok) {
           if (reconciled.status === 401 || reconciled.status === 403) {
             screenMode = "login";
