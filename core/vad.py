@@ -220,7 +220,7 @@ def _has_open_ending(value: str, words: list[str]) -> bool:
     if last in _OPEN_PREPOSITIONS:
         return not (_is_complete_command_particle(words) or _is_closed_question_particle(words))
     if last in _DETERMINERS and not _is_closed_question_pronoun(words):
-        return True
+        return not (last in _SEPARABLE_PARTICLES and _is_complete_command_particle(words))
     if last in _OPEN_FILLERS and words != ["wie", "bitte"]:
         return True
     if last in _MODAL_OR_WISH_VERBS:
