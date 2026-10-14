@@ -156,7 +156,11 @@ async def sende_streaming_antwort(
 
     def request_filler(kind: str) -> None:
         nonlocal filler_kind, pending_filler
-        if not getattr(config, "VOICE_FILLERS_ENABLED", True) or filler_kind is not None:
+        if (
+            not getattr(config, "VOICE_FILLERS_ENABLED", True)
+            or filler_kind is not None
+            or response_audio_ready
+        ):
             return
         selected = voice_fillers.choose_cached_filler(kind)
         if selected is None:
@@ -180,7 +184,8 @@ async def sende_streaming_antwort(
         nonlocal ack_done
         try:
             delay_ms = max(0, int(getattr(config, "VOICE_FILLER_ACK_DELAY_MS", 800)))
-            await sleep(delay_ms / 1000)
+            deadline = started_at + delay_ms / 1000
+            await sleep(max(0, deadline - time.perf_counter()))
             # Gib einem bereits fertigen TTS-Block bei gleichzeitigem Wake-up den Vorrang.
             await asyncio.sleep(0)
             if not response_audio_ready:
@@ -383,7 +388,7 @@ async def sende_streaming_antwort(
             exc, (WebSocketDisconnect, RuntimeError, asyncio.CancelledError),
         )
         for task in (responder, synthesizer, sender, ack_task):
-            if not task.done():
+            if task is not None and not task.done():
                 task.cancel()
         await asyncio.gather(
             *(task for task in (responder, synthesizer, sender, ack_task) if task is not None),
@@ -392,7 +397,7 @@ async def sende_streaming_antwort(
         raise
     finally:
         for task in (responder, synthesizer, sender, ack_task):
-            if not task.done():
+            if task is not None and not task.done():
                 task.cancel()
         await asyncio.gather(
             *(task for task in (responder, synthesizer, sender, ack_task) if task is not None),

@@ -73,7 +73,7 @@ def test_preload_uses_fake_tts_once_and_reuses_cached_files(tmp_path, monkeypatc
         calls.append(text)
         return f"OGG:{text}".encode()
 
-    monkeypatch.setattr(fillers.tts, "synthesize", fake_synthesize)
+    monkeypatch.setattr(fillers.tts, "synthesize_filler", fake_synthesize)
 
     asyncio.run(fillers.preload_voice_fillers())
     asyncio.run(fillers.preload_voice_fillers())
@@ -97,7 +97,7 @@ def test_preload_errors_are_swallowed_and_leave_no_cache_file(tmp_path, monkeypa
     async def broken_synthesize(_text):
         raise RuntimeError("fake TTS failure")
 
-    monkeypatch.setattr(fillers.tts, "synthesize", broken_synthesize)
+    monkeypatch.setattr(fillers.tts, "synthesize_filler", broken_synthesize)
 
     asyncio.run(fillers.preload_voice_fillers())
 
@@ -117,7 +117,7 @@ def test_missing_runtime_cache_skips_filler_without_synthesizing(tmp_path, monke
         calls.append(text)
         return b"should not run"
 
-    monkeypatch.setattr(fillers.tts, "synthesize", fake_synthesize)
+    monkeypatch.setattr(fillers.tts, "synthesize_filler", fake_synthesize)
 
     assert fillers.choose_cached_filler("ack") is None
     assert calls == []
@@ -176,4 +176,38 @@ def test_opus_duration_is_read_from_cached_ogg_page():
     ogg = header + bytes((len(body),)) + body
 
     assert _ogg_opus_duration_ms(ogg) == duration_ms
+
+
+def test_preload_does_not_wait_for_response_tts_lock(tmp_path, monkeypatch):
+    import config
+    import core.voice_fillers as fillers
+    from core import tts
+
+    monkeypatch.setattr(fillers, "FILLERS_DIR", tmp_path)
+    monkeypatch.setattr(config, "VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr(config, "VOICE_FILLERS_ACK", ["Mhm."])
+    monkeypatch.setattr(config, "VOICE_FILLERS_TOOL", [])
+    monkeypatch.setattr(tts, "_engine", lambda: "piper")
+    monkeypatch.setattr(tts, "_active_voice_name", lambda: "thorsten-high")
+    monkeypatch.setattr(tts, "is_available", lambda: True)
+    synthesized = []
+
+    async def fake_synthesize_local(text, _speed):
+        synthesized.append(text)
+        return b"WAV"
+
+    monkeypatch.setattr(tts, "_synthesize_local", fake_synthesize_local)
+    monkeypatch.setattr(tts, "_wav_to_ogg", lambda _wav: b"OGG")
+
+    async def run_with_response_stream_owning_the_lock():
+        await tts._lock.acquire()
+        try:
+            await asyncio.wait_for(fillers.preload_voice_fillers(), timeout=0.2)
+        finally:
+            tts._lock.release()
+
+    asyncio.run(run_with_response_stream_owning_the_lock())
+
+    assert synthesized == ["Mhm."]
+    assert next(tmp_path.glob("*.ogg")).read_bytes() == b"OGG"
 

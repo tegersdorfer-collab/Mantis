@@ -676,6 +676,20 @@ async def _synthesize_local(text: str, speed: float) -> bytes:
     return await asyncio.to_thread(_synth, text, speed)
 
 
+async def _synthesize_unlocked(text: str, speed: float) -> bytes:
+    """Erzeugt ein vollständiges Audio, ohne den Stream-Lock selbst zu verwalten."""
+    try:
+        ogg = await _try_cartesia_ogg(text) if _engine() == "cartesia" else None
+        if ogg is None:
+            wav = await _synthesize_local(text, speed)
+            ogg = await asyncio.to_thread(_wav_to_ogg, wav)
+        log.info(f"🔊 TTS: {len(text)} Zeichen → {len(ogg)//1024}KB OGG")
+        return ogg
+    except Exception as e:
+        log.error("TTS fehlgeschlagen: %s", redact_error_text(e))
+        return b""
+
+
 async def synthesize(
     text: str,
     voice: str = DEFAULT_VOICE,
@@ -701,16 +715,27 @@ async def synthesize(
         return b""
 
     async with _lock:
-        try:
-            ogg = await _try_cartesia_ogg(text) if _engine() == "cartesia" else None
-            if ogg is None:
-                wav = await _synthesize_local(text, speed)
-                ogg = await asyncio.to_thread(_wav_to_ogg, wav)
-            log.info(f"🔊 TTS: {len(text)} Zeichen → {len(ogg)//1024}KB OGG")
-            return ogg
-        except Exception as e:
-            log.error("TTS fehlgeschlagen: %s", redact_error_text(e))
-            return b""
+        return await _synthesize_unlocked(text, speed)
+
+
+async def synthesize_filler(text: str, max_chars: int = 2000) -> bytes:
+    """Synthesisiert einen Cache-Füller ohne den Antwort-Stream-Lock.
+
+    Füller werden vollständig als einzelne Datei erzeugt und nicht an den Stream
+    gesendet. Der Cache-Aufbau darf deshalb einen laufenden Antwort-Stream nicht
+    aufhalten.
+    """
+    if not is_available():
+        log.warning("TTS nicht verfügbar — Modelle fehlen in data/tts/piper/")
+        return b""
+
+    text = _clean_for_speech(text)
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(".", 1)[0] + "."
+    if not text.strip():
+        return b""
+
+    return await _synthesize_unlocked(text, DEFAULT_SPEED)
 
 
 # Schnittgrößen fürs Streaming. Der erste Block ist bewusst klein: er bestimmt,
