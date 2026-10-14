@@ -290,6 +290,11 @@ def cartesia_engine(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(tts.config, "TTS_CARTESIA_LANGUAGE", "de", raising=False)
+    # Test-Fakes sind keine echten WAVs: nur echte RIFF-Daten werden wirklich geparst.
+    real_nframes = tts._wav_nframes
+    monkeypatch.setattr(
+        tts, "_wav_nframes", lambda wav: real_nframes(wav) if wav.startswith(b"RIFF") else 1
+    )
 
 
 def _fake_local_synthesis(monkeypatch):
@@ -555,3 +560,58 @@ class TestCartesiaKonvertierung:
         import settings
 
         assert settings.MantisSettings.model_fields["TTS_CARTESIA_USD_PER_MILLION_CHARS"].default == 65.0
+
+
+def _leeres_wav() -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(44100)
+    data = buf.getvalue()
+    assert len(data) == 44
+    return data
+
+
+class TestCartesiaLeeresWav:
+    def test_synthesize_nutzt_lokal_bei_wav_ohne_samples(self, cartesia_engine, monkeypatch, caplog):
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        _fake_local_synthesis(monkeypatch)
+        # Konverter liefert (wie ffmpeg) trotzdem ein nicht-leeres OGG.
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OGG:" + (wav if not wav.startswith(b"RIFF") else b"EMPTYOGG"))
+        wav = _leeres_wav()
+        _mock_cartesia(monkeypatch, lambda request: httpx.Response(200, content=wav))
+        caplog.set_level(logging.WARNING, logger=tts.__name__)
+
+        assert asyncio.run(tts.synthesize("Hallo")) == b"OGG:KOKORO_WAV:Hallo"
+        assert tts._cartesia_paused_until == 0.0
+        assert any("Cartesia" in r.message for r in caplog.records)
+
+    def test_stream_nutzt_lokal_bei_wav_ohne_samples(self, cartesia_engine, monkeypatch):
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        _fake_local_synthesis(monkeypatch)
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OGG:" + (wav if not wav.startswith(b"RIFF") else b"EMPTYOGG"))
+        text = " ".join(
+            f"Das ist Satz Nummer {i} mit einigen zusätzlichen Wörtern."
+            for i in range(1, 8)
+        )
+        expected = tts._split_for_streaming(tts._clean_for_speech(text))
+        leer = _leeres_wav()
+
+        async def fake_cartesia(t):
+            return leer if t == expected[1] else b"WAV:" + t.encode()
+
+        monkeypatch.setattr(tts, "_cartesia_synthesize", fake_cartesia)
+        monkeypatch.setattr(tts, "_record_cartesia_usage", lambda t: None)
+
+        async def collect():
+            return [c async for c in tts.synthesize_stream(text)]
+
+        chunks = asyncio.run(collect())
+
+        assert len(chunks) == len(expected)
+        assert chunks[1] == b"OGG:KOKORO_WAV:" + expected[1].encode()
+        assert chunks[0] == b"OGG:WAV:" + expected[0].encode()

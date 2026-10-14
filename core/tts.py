@@ -288,6 +288,18 @@ async def _try_cartesia(text: str) -> bytes | None:
     return wav
 
 
+def _wav_nframes(wav: bytes) -> int:
+    with wave.open(io.BytesIO(wav), "rb") as wav_file:
+        return wav_file.getnframes()
+
+
+def _cartesia_wav_to_ogg(wav: bytes) -> bytes:
+    """Prüft das Cartesia-WAV (parsebar, > 0 Samples) und konvertiert es."""
+    if _wav_nframes(wav) <= 0:
+        raise ValueError("WAV ohne Samples")
+    return _wav_to_ogg(wav)
+
+
 async def _try_cartesia_ogg(text: str) -> bytes | None:
     """Cartesia-Audio als OGG oder None (Ausfall ODER nicht konvertierbares Audio).
 
@@ -298,7 +310,7 @@ async def _try_cartesia_ogg(text: str) -> bytes | None:
     if wav is None:
         return None
     try:
-        ogg = await asyncio.to_thread(_wav_to_ogg, wav)
+        ogg = await asyncio.to_thread(_cartesia_wav_to_ogg, wav)
     except Exception as exc:
         log.warning("Cartesia-Audio nicht konvertierbar (%s); nutze lokales TTS", type(exc).__name__)
         return None
