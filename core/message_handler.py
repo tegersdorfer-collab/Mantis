@@ -10,6 +10,7 @@ import time
 
 from communication.base import IncomingMessage
 from core.background_review import run_background_review
+from memory.chat_messages import is_safe_for_prompt
 from core.status import BUS
 from core import skills, db, ui_state, fast_commands, skill_request
 from core.error_redaction import redact_error_text
@@ -346,9 +347,9 @@ class MessageHandler:
     def _persist_msg(self, role: str, content: str, channel: str = "telegram",
                      meta: dict | None = None) -> None:
         metadata = meta or {}
-        if not metadata.get("untrusted", False):
+        if is_safe_for_prompt({"role": role, "content": content, "meta": metadata}):
             try:
-                self.lzg.save_kzg_turn(role, content)
+                self.lzg.save_kzg_turn(role, content, meta=metadata)
             except Exception as e:
                 log.error(f"KZG-Turn nicht gespeichert: {e}")
         try:

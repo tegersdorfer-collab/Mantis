@@ -2,13 +2,15 @@
 Tageswechsel-Reset und Sende-Zählung. Reine Logik, kein LLM/DB nötig.
 """
 
+import asyncio
 import os
 import sys
 from datetime import date, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from proactive import ProactiveTracker
+import proactive
+from proactive import ProactiveEngine, ProactiveTracker
 
 
 def _dt(h, m=0):
@@ -71,3 +73,50 @@ def test_can_send_blocked_when_recent(monkeypatch):
     monkeypatch.setattr(t, "_is_night", staticmethod(lambda now: False))
     t._last_sent = datetime.now()  # gerade eben gesendet
     assert t.can_send() is False   # Mindestabstand nicht erreicht
+
+
+def test_proactive_prompt_excludes_agent_remote_chat_history(monkeypatch):
+    import core.db
+
+    captured = {}
+
+    class Lzg:
+        def get_all(self, limit):
+            return []
+
+        def format_for_context(self, memories):
+            return "Keine Erinnerungen"
+
+    class Llm:
+        async def chat(self, messages, **_kwargs):
+            captured["prompt"] = messages[0].content
+            return "Gedanke"
+
+    rows = [
+        {
+            "role": "assistant", "content": "Agent-Remote remote-123456789abc: erledigt",
+            "channel": "discord", "meta": {},
+        },
+        {
+            "role": "assistant", "content": "Agent-Ergebnis: früherer Payload",
+            "channel": "discord", "meta": {"use_case": "agent"},
+        },
+        {
+            "role": "user", "content": "codex: mantis analysiere Dateien",
+            "channel": "discord", "meta": {"use_case": "agent"},
+        },
+        {
+            "role": "user", "content": "Sicherer Gesprächskontext",
+            "channel": "telegram", "meta": {},
+        },
+    ]
+    monkeypatch.setattr(proactive, "_dashboard", None)
+    monkeypatch.setattr(core.db, "query", lambda *_args, **_kwargs: rows)
+
+    result = asyncio.run(ProactiveEngine(Llm(), Lzg()).generate())
+
+    assert result == "Gedanke"
+    assert "Sicherer Gesprächskontext" in captured["prompt"]
+    assert "Agent-Remote remote-123456789abc" not in captured["prompt"]
+    assert "früherer Payload" not in captured["prompt"]
+    assert "codex: mantis analysiere Dateien" not in captured["prompt"]

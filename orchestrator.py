@@ -12,7 +12,6 @@ Eigene Logik ausgelagert in:
   core/idle_loop.py       — Autopilot-Ticks + Maintenance + Monitoring
 """
 import asyncio
-import json
 import logging
 import time
 from pathlib import Path
@@ -330,17 +329,10 @@ class Orchestrator:
     async def _restore_memory(self) -> None:
         """KZG aus letzter Session wiederherstellen + Memory-Übersicht loggen."""
         try:
+            from memory.chat_messages import filter_prompt_messages
+
             past = self.lzg.load_recent_kzg(max_turns=config.KZG_MAX_TURNS)
-            safe_turns = []
-            for t in past:
-                meta = t.get("meta", {})
-                if isinstance(meta, str):
-                    try:
-                        meta = json.loads(meta)
-                    except (TypeError, ValueError):
-                        meta = {}
-                if not isinstance(meta, dict) or meta.get("untrusted") is not True:
-                    safe_turns.append(t)
+            safe_turns = filter_prompt_messages(past)
             for t in safe_turns:
                 self.kzg.add(t["role"], t["content"])
             if safe_turns:

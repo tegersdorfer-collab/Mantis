@@ -1,0 +1,4 @@
+global	filter.lfs.process git-lfs filter-process
+global	filter.lfs.required true
+global	filter.lfs.clean git-lfs clean -- %f
+global	filter.lfs.smudge git-lfs smudge -- %f

@@ -2,43 +2,29 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import sys
-import tempfile
 import time
 from pathlib import Path
 
-from process import process_identity
+try:
+    from .process import process_identity
+    from .state import locked_state, write_locked_state
+except ImportError:  # Ausführung als direktes Python-Skript
+    from process import process_identity
+    from state import locked_state, write_locked_state
 
 
 _REMOTE_ID = re.compile(r"^remote-[a-f0-9]{12}$")
 
 
-def _write_state(path: Path, data: dict) -> None:
-    descriptor, temporary = tempfile.mkstemp(prefix=".state-", dir=path.parent)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, sort_keys=True)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary, path)
-        path.chmod(0o600)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-
-
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    getpid=os.getpid,
+    getpgrp=os.getpgrp,
+) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) < 3:
         return 2
@@ -54,29 +40,38 @@ def main(argv: list[str] | None = None) -> int:
     ):
         return 2
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("remote_id") != remote_id or state.get("status") not in {"starting", "running"}:
-            return 2
-        if state.get("pid") not in {None, os.getpid()}:
-            return 2
-        identity = process_identity(os.getpid())
-        if not identity:
-            return 2
-        state.update(
-            status="running",
-            pid=os.getpid(),
-            pgid=os.getpgrp(),
-            process_identity=identity,
-        )
-        _write_state(state_path, state)
-    except (OSError, TypeError, ValueError):
-        return 1
+        with locked_state(state_path) as (state_file, state):
+            if state.get("remote_id") != remote_id or state.get("status") != "starting":
+                return 2
+            pid = getpid()
+            pgid = getpgrp()
+            if state.get("pid") not in {None, pid} or state.get("pgid") not in {None, pgid}:
+                return 2
+            identity = process_identity(pid)
+            if not identity:
+                return 2
+            saved_identity = state.get("process_identity")
+            if saved_identity not in {None, identity}:
+                return 2
+            state.update(pid=pid, pgid=pgid, process_identity=identity)
 
-    try:
-        os.execve(binary, [binary, *task_args], os.environ)
-    except OSError:
-        state.update(status="failed", ended_at=time.time())
-        _write_state(state_path, state)
+            # Compare-and-set direkt vor execve: Recovery darf den Startstatus
+            # während dieser Prüfung nicht auf interrupted setzen.
+            if (
+                state.get("status") != "starting"
+                or state.get("remote_id") != remote_id
+                or state.get("process_identity") != identity
+            ):
+                return 2
+            state["status"] = "running"
+            write_locked_state(state_file, state)
+            try:
+                os.execve(binary, [binary, *task_args], os.environ)
+            except OSError:
+                state.update(status="failed", ended_at=time.time())
+                write_locked_state(state_file, state)
+                return 1
+    except (OSError, TypeError, ValueError):
         return 1
     return 1
 

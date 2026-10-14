@@ -1,0 +1,40 @@
+            "execve",
+            lambda *args: exec_calls.append(args),
+        )
+    
+        def launch():
+            launcher_result.append(
+                launcher_module.main([
+                    str(state_file), remote_id, sys.executable, "-c", "pass",
+                ]),
+            )
+    
+        def recover():
+            asyncio.run(service.start())
+            recovery_finished.set()
+    
+        launcher_thread = threading.Thread(target=launch)
+        launcher_thread.start()
+        assert identity_ready.wait(2)
+        recovery_thread = threading.Thread(target=recover)
+        recovery_thread.start()
+    
+        recovery_won_without_launcher_lock = recovery_finished.wait(1.5)
+        allow_launcher.set()
+        launcher_thread.join(5)
+        recovery_thread.join(5)
+    
+        assert not launcher_thread.is_alive()
+        assert not recovery_thread.is_alive()
+        assert recovery_won_without_launcher_lock is False
+        assert len(exec_calls) == 1
+>       assert json.loads(state_file.read_text())["status"] == "running"
+E       AssertionError: assert 'lost' == 'running'
+E         
+E         - running
+E         + lost
+
+tests/test_agent_remote.py:1088: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_agent_remote.py::test_recovery_cannot_overwrite_launcher_transition_before_exec
+1 failed, 57 deselected in 2.02s

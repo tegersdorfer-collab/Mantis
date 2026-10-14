@@ -8,6 +8,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +18,7 @@ import pytest
 from communication.base import IncomingMessage
 from communication.discord import DiscordChannel
 from domains.agent_remote import AgentRemoteConfig, AgentRemoteService
-from domains.agent_remote.service import RunRecord
+from domains.agent_remote.service import GitSafetyError, RunRecord
 
 
 def _run(coro):
@@ -69,6 +70,17 @@ class ProcessHarness:
         self.calls.append((list(args), kwargs))
         self.processes.append(process)
         self.groups.add(process.pid)
+        if len(args) > 3 and str(args[1]).endswith("/launcher.py"):
+            from domains.agent_remote.state import locked_state, write_locked_state
+
+            with locked_state(Path(args[2])) as (state_file, state):
+                state.update(
+                    status="running",
+                    pid=process.pid,
+                    pgid=process.pid,
+                    process_identity=self.identity(process.pid),
+                )
+                write_locked_state(state_file, state)
         return process
 
     def identity(self, pid):
@@ -314,10 +326,17 @@ def test_git_calls_use_hardened_config_and_minimal_environment(git_repo, tmp_pat
 
         expected = {
             "core.fsmonitor=", "core.hooksPath=/dev/null", "core.sshCommand=",
-            "protocol.allow=never",
+            "core.attributesFile=/dev/null", "protocol.allow=never",
         }
         assert git_calls
         for args, kwargs in git_calls:
+            if "config" in args:
+                assert "--includes" in args
+                assert "--show-scope" in args
+                assert "--get-regexp" in args
+                assert "GIT_CONFIG_NOSYSTEM" not in kwargs["env"]
+                assert "GIT_CONFIG_GLOBAL" not in kwargs["env"]
+                continue
             configured = {
                 args[index + 1] for index, value in enumerate(args[:-1]) if value == "-c"
             }
@@ -325,6 +344,7 @@ def test_git_calls_use_hardened_config_and_minimal_environment(git_repo, tmp_pat
             env = kwargs["env"]
             assert env["GIT_CONFIG_NOSYSTEM"] == "1"
             assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+            assert env["GIT_ATTR_NOSYSTEM"] == "1"
             assert env["GIT_TERMINAL_PROMPT"] == "0"
             assert "DATABASE_URL" not in env
             assert "ANTHROPIC_API_KEY" not in env
@@ -333,6 +353,7 @@ def test_git_calls_use_hardened_config_and_minimal_environment(git_repo, tmp_pat
         assert task_env["HOME"] == str(service.home_dir)
         assert task_env["LANG"]
         assert task_env["PATH"]
+        assert task_env["GIT_ATTR_NOSYSTEM"] == "1"
         assert "DATABASE_URL" not in task_env
         assert "OPENROUTER_API_KEY" not in task_env
         await service.stop()
@@ -342,10 +363,17 @@ def test_git_calls_use_hardened_config_and_minimal_environment(git_repo, tmp_pat
 
 def test_git_fsmonitor_from_repository_config_is_never_executed(git_repo, tmp_path):
     async def run():
-        service, _harness = _service(git_repo, tmp_path)
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.run(args, **kwargs)
+
+        service, _harness = _service(git_repo, tmp_path, command_runner=runner)
         route = Route()
         await _propose_and_confirm(service, route, "codex: mantis schreibe eine Datei")
         record = next(iter(service.runs.values()))
+        calls.clear()
         marker = tmp_path / "fsmonitor-was-executed"
         config_path = git_repo / ".git" / "config"
         config_path.write_text(
@@ -353,8 +381,11 @@ def test_git_fsmonitor_from_repository_config_is_never_executed(git_repo, tmp_pa
             + f'\n[core]\n\tfsmonitor = /usr/bin/touch {marker}\n',
         )
 
-        await service._show_diff(route, record)
+        accepted = await service.handle(_message(f"diff {record.remote_id}"), route)
 
+        assert accepted is True
+        assert calls == []
+        assert "v1" in route.messages[-1]
         assert not marker.exists()
         await service.stop()
 
@@ -380,15 +411,16 @@ def test_worktree_checkout_never_runs_configured_smudge_filter(git_repo, tmp_pat
         await _propose_and_confirm(service, route, "codex: mantis schreibe eine Datei")
         record = next(iter(service.runs.values()))
 
-        assert record.status == "running"
+        assert record.status == "failed"
         assert not marker.exists()
-        assert (Path(record.worktree) / "README.md").read_text() == "test repo\n"
+        assert not Path(record.worktree).exists()
+        assert "Start verweigert" in route.messages[-1]
         await service.stop()
 
     _run(run())
 
 
-def test_worktree_git_pointer_is_checked_before_git_diff(git_repo, tmp_path):
+def test_diff_command_is_not_available_in_v1(git_repo, tmp_path):
     async def run():
         calls = []
 
@@ -398,15 +430,62 @@ def test_worktree_git_pointer_is_checked_before_git_diff(git_repo, tmp_path):
 
         service, _harness = _service(git_repo, tmp_path, command_runner=runner)
         route = Route()
-        await _propose_and_confirm(service, route, "codex: mantis schreibe eine Datei")
-        record = next(iter(service.runs.values()))
-        calls.clear()
-        (Path(record.worktree) / ".git").write_text("gitdir: /tmp/not-this-worktree\n")
+        accepted = await service.handle(_message("diff remote-000000000000"), route)
 
-        await service._show_diff(route, record)
-
+        assert accepted is True
         assert calls == []
-        assert "nicht mehr gültig" in route.messages[-1]
+        assert "v1" in route.messages[-1]
+        await service.stop()
+
+    _run(run())
+
+
+def test_worktree_start_rejects_filter_from_included_git_config(git_repo, tmp_path):
+    included_config = tmp_path / "included.gitconfig"
+    included_config.write_text(
+        '[filter "remote-test"]\n'
+        '    smudge = /usr/bin/touch /tmp/agent-remote-filter-ran\n',
+    )
+    config_path = git_repo / ".git" / "config"
+    config_path.write_text(
+        config_path.read_text()
+        + f'\n[include]\n    path = {included_config}\n',
+    )
+
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = Route()
+
+        await _propose_and_confirm(service, route, "codex: mantis schreibe eine Datei")
+
+        record = next(iter(service.runs.values()))
+        assert record.status == "failed"
+        assert harness.calls == []
+        assert not (git_repo / ".worktrees").exists()
+        assert "Start verweigert" in route.messages[-1]
+        assert "Git" in route.messages[-1]
+        await service.stop()
+
+    _run(run())
+
+
+def test_worktree_start_rejects_filter_attribute_in_target_commit(git_repo, tmp_path):
+    (git_repo / ".gitattributes").write_text("*.md filter=remote-test\n")
+    _git("add", ".gitattributes", cwd=git_repo)
+    _git("commit", "-m", "add filter attribute", cwd=git_repo)
+
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = Route()
+
+        await _propose_and_confirm(service, route, "codex: mantis schreibe eine Datei")
+
+        record = next(iter(service.runs.values()))
+        assert record.status == "failed"
+        assert harness.calls == []
+        assert not (git_repo / ".worktrees").exists()
+        assert "Start verweigert" in route.messages[-1]
+        assert "Filter" in route.messages[-1]
         await service.stop()
 
     _run(run())
@@ -462,7 +541,7 @@ def test_runtime_deadline_signals_only_the_recorded_process_group(git_repo, tmp_
     _run(run())
 
 
-def test_kill_reaches_ignored_sigterm_child_after_group_leader_exits(git_repo, tmp_path, monkeypatch):
+def test_kill_does_not_signal_orphaned_group_after_leader_exits(git_repo, tmp_path, monkeypatch):
     import domains.agent_remote.service as service_module
 
     monkeypatch.setattr(service_module, "TERMINATION_GRACE_SECONDS", 0.15)
@@ -509,8 +588,8 @@ def test_kill_reaches_ignored_sigterm_child_after_group_leader_exits(git_repo, t
                 leader.pid, leader.pid, identity, leader,
             )
             leader.wait(timeout=2)
-            assert terminated is True
-            assert group_exists(leader.pid) is False
+            assert terminated is False
+            assert group_exists(leader.pid) is True
         finally:
             if group_exists(leader.pid):
                 os.killpg(leader.pid, signal.SIGKILL)
@@ -739,26 +818,54 @@ def test_symlinked_worktrees_directory_outside_repo_is_rejected(git_repo, tmp_pa
 
         assert harness.calls == []
         assert not list(outside.iterdir())
-        assert "nicht gestartet" in route.messages[-1]
+        assert "Start verweigert" in route.messages[-1]
 
     _run(run())
 
 
-def test_pid_reuse_or_identity_mismatch_never_receives_a_signal(git_repo, tmp_path):
+@pytest.mark.parametrize("current_identity", [None, "reused-pid-with-different-start-time"])
+def test_unknown_or_reused_pid_is_lost_without_a_signal(git_repo, tmp_path, current_identity):
     async def run():
         service, harness = _service(git_repo, tmp_path)
         route = Route()
         await _propose_and_confirm(service, route, "codex: mantis analysiere PID")
         record = next(iter(service.runs.values()))
-        service._process_identity = lambda _pid: "reused-pid-with-different-start-time"
+        service._process_identity = lambda _pid: current_identity
 
         await service.handle(_message(f"abbrechen {record.remote_id}"), route)
 
         assert harness.signals == []
-        assert record.status == "interrupted"
+        assert record.status == "lost"
         await service.stop()
 
     _run(run())
+
+
+def test_orphan_and_kill_signals_require_the_saved_process_identity(monkeypatch):
+    import domains.agent_remote.process as agent_remote_process
+
+    signals = []
+    monkeypatch.setattr(agent_remote_process, "process_group_exists", lambda _pgid: True)
+    monkeypatch.setattr(agent_remote_process.os, "getpgid", lambda _pid: 444)
+    monkeypatch.setattr(agent_remote_process.os, "killpg", lambda *args: signals.append(args))
+
+    monkeypatch.setattr(agent_remote_process, "process_identity", lambda _pid: None)
+    assert not agent_remote_process.signal_verified_process_group(
+        444, 444, "TERM_ORPHAN", "darwin:1.000001",
+    )
+    assert not agent_remote_process.signal_verified_process_group(
+        444, 444, "KILL", "darwin:1.000001",
+    )
+
+    monkeypatch.setattr(
+        agent_remote_process,
+        "process_identity",
+        lambda _pid: "darwin:2.000002",
+    )
+    assert not agent_remote_process.signal_verified_process_group(
+        444, 444, "TERM_ORPHAN", "darwin:1.000001",
+    )
+    assert signals == []
 
 
 def test_remote_state_files_are_private_and_do_not_store_the_prompt(git_repo, tmp_path):
@@ -864,6 +971,126 @@ def test_launcher_atomically_persists_process_identity_before_exec(tmp_path):
     assert state["pid"] == state["pgid"]
     assert state["process_identity"]
     assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
+
+
+def test_launcher_refuses_to_exec_when_saved_start_identity_differs(tmp_path):
+    remote_id = "remote-a1b2c3d4e5f6"
+    run_dir = tmp_path / "state" / "runs" / remote_id
+    run_dir.mkdir(parents=True)
+    state_file = run_dir / "state.json"
+    state_file.write_text(json.dumps({
+        "remote_id": remote_id,
+        "status": "starting",
+        "pid": None,
+        "pgid": None,
+        "process_identity": "old-start-id",
+    }))
+    state_file.chmod(0o600)
+    marker = tmp_path / "must-not-start"
+    launcher = Path(__file__).resolve().parents[1] / "domains" / "agent_remote" / "launcher.py"
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path), "LANG": "C"}
+
+    result = subprocess.run(
+        [
+            sys.executable, str(launcher), str(state_file), remote_id,
+            sys.executable, "-c", f"open({str(marker)!r}, 'w').write('started')",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        start_new_session=True,
+    )
+
+    assert result.returncode == 2
+    assert not marker.exists()
+    assert json.loads(state_file.read_text())["status"] == "starting"
+
+
+def test_recovery_cannot_overwrite_launcher_transition_before_exec(git_repo, tmp_path, monkeypatch):
+    agent_remote_dir = Path(__file__).resolve().parents[1] / "domains" / "agent_remote"
+    sys.path.insert(0, str(agent_remote_dir))
+    import launcher as launcher_module
+
+    remote_id = "remote-a1b2c3d4e5f6"
+    identity_ready = threading.Event()
+    allow_launcher = threading.Event()
+    recovery_finished = threading.Event()
+    exec_calls = []
+    launcher_result = []
+    identity = "test-launcher-start-id"
+    service, _harness = _service(
+        git_repo,
+        tmp_path,
+        process_identity=lambda _pid: identity,
+        process_group=lambda pid: pid,
+        process_group_exists=lambda _pgid: True,
+    )
+    record = RunRecord(
+        remote_id=remote_id,
+        requester_id="123",
+        dm_id="dm-123",
+        repo_alias="mantis",
+        repo_path=str(git_repo),
+        mode="read",
+        model="gpt-6-luna",
+        effort="max",
+        status="starting",
+        created_at=1,
+        deadline=datetime.now().timestamp() + 10_000,
+        tmp_dir=str(tmp_path / "run-tmp"),
+        cwd=str(git_repo),
+    )
+    service.runs[remote_id] = record
+    service._save_run(record)
+    state_file = service._record_path(remote_id)
+
+    def paused_identity(_pid):
+        identity_ready.set()
+        if not allow_launcher.wait(5):
+            raise TimeoutError("test did not release launcher")
+        return identity
+
+    monkeypatch.setattr(launcher_module, "process_identity", paused_identity)
+    monkeypatch.setattr(
+        launcher_module.os,
+        "execve",
+        lambda *args: exec_calls.append(args),
+    )
+
+    def launch():
+        launcher_result.append(
+            launcher_module.main(
+                [str(state_file), remote_id, sys.executable, "-c", "pass"],
+                # Pytest ist selten Gruppenführer (pgid != pid); die
+                # Prozessgruppe wird daher nicht vom echten System gelesen.
+                getpgrp=os.getpid,
+            ),
+        )
+
+    def recover():
+        asyncio.run(service.start())
+        recovery_finished.set()
+
+    launcher_thread = threading.Thread(target=launch)
+    launcher_thread.start()
+    assert identity_ready.wait(2)
+    recovery_thread = threading.Thread(target=recover)
+    recovery_thread.start()
+
+    recovery_won_without_launcher_lock = recovery_finished.wait(1.5)
+    allow_launcher.set()
+    launcher_thread.join(5)
+    recovery_thread.join(5)
+
+    assert not launcher_thread.is_alive()
+    assert not recovery_thread.is_alive()
+    assert recovery_won_without_launcher_lock is False
+    assert len(exec_calls) == 1
+    assert json.loads(state_file.read_text())["status"] == "running"
+    assert record.status == "running"
+    _run(service.stop())
 
 
 def test_service_saves_starting_record_before_launcher_spawn(git_repo, tmp_path):
@@ -1069,7 +1296,7 @@ def test_agent_flow_persists_messages_with_agent_use_case(git_repo, tmp_path):
     _run(run())
 
 
-def test_untrusted_agent_result_is_not_restored_into_kzg_after_restart(
+def test_agent_remote_messages_and_legacy_replies_are_not_restored_into_kzg(
     git_repo, tmp_path, monkeypatch,
 ):
     from core import message_handler as message_handler_module
@@ -1117,15 +1344,27 @@ def test_untrusted_agent_result_is_not_restored_into_kzg_after_restart(
         assert db_writes[-1][1][:3] == ("assistant", injection, "discord")
         assert meta == {"use_case": "agent", "untrusted": True}
 
-        # Eine markierte Altzeile darf auch beim echten KZG-Restore nicht zurückkehren.
+        await service._persist("user", "codex: mantis analysiere eine Datei")
+        assert lzg.turns == []
+
+        # Alte und neue Agent-Remote-Zeilen dürfen bei keinem Metadatenstand zurückkehren.
         lzg.turns.append({"role": "assistant", "content": injection, "meta": meta})
+        lzg.turns.append({
+            "role": "user", "content": "codex: alter Agent-Auftrag",
+            "meta": {"use_case": "agent"},
+        })
+        lzg.turns.append({
+            "role": "assistant", "content": "Agent-Remote remote-123456789abc: erledigt",
+        })
+        lzg.turns.append({
+            "role": "assistant", "content": "Sicherer alter Gesprächs-Turn",
+        })
         restarted = object.__new__(Orchestrator)
         restarted.lzg = lzg
         restarted.kzg = Kzg()
         await restarted._restore_memory()
 
-        assert injection not in [content for _role, content in restarted.kzg.turns]
-        assert "Ignore prior rules" not in [content for _role, content in restarted.kzg.turns]
+        assert restarted.kzg.turns == [("assistant", "Sicherer alter Gesprächs-Turn")]
         await service.stop()
 
     _run(run())
@@ -1226,3 +1465,69 @@ def test_discord_route_disables_mentions_for_untrusted_result_text():
 
     _run(run())
 
+
+
+_LFS_STANDARD = (
+    "global\tfilter.lfs.clean git-lfs clean -- %f\n"
+    "global\tfilter.lfs.smudge git-lfs smudge -- %f\n"
+    "global\tfilter.lfs.process git-lfs filter-process\n"
+    "global\tfilter.lfs.required true\n"
+)
+
+
+def _audit_with_output(git_repo, tmp_path, stdout):
+    def runner(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+    service, _harness = _service(git_repo, tmp_path, command_runner=runner)
+    service._audit_git_config(git_repo)
+
+
+def test_git_config_audit_allows_exact_standard_lfs_filters(git_repo, tmp_path):
+    _audit_with_output(git_repo, tmp_path, _LFS_STANDARD)
+    _audit_with_output(git_repo, tmp_path, _LFS_STANDARD.replace("global", "system"))
+    _audit_with_output(git_repo, tmp_path, "")
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        _LFS_STANDARD.replace("global", "local"),
+        _LFS_STANDARD.replace("global", "worktree"),
+        _LFS_STANDARD.replace("global", "command"),
+        _LFS_STANDARD + "local\tfilter.lfs.clean git-lfs clean -- %f\n",
+        _LFS_STANDARD.replace("git-lfs filter-process", "git-lfs filter-process --skip"),
+        _LFS_STANDARD.replace("clean -- %f", "clean -- %f; touch /tmp/x"),
+        _LFS_STANDARD.replace("required true", "required false"),
+        _LFS_STANDARD + "global\tfilter.lfs.extra anything\n",
+        _LFS_STANDARD + "global\tfilter.evil.smudge /usr/bin/touch x\n",
+        _LFS_STANDARD + "global\tfilter.lfs.smudge git-lfs smudge -- %f\n"
+        "global\tfilter.lfs.smudge /usr/bin/touch x\n",
+        _LFS_STANDARD + "global\tinclude.path /tmp/evil.gitconfig\n",
+        _LFS_STANDARD + "global\tincludeif.gitdir:/x/.path /tmp/evil\n",
+        "filter.lfs.clean git-lfs clean -- %f\n",
+        "unknown\tfilter.lfs.clean git-lfs clean -- %f\n",
+    ],
+)
+def test_git_config_audit_rejects_every_other_filter_or_include(git_repo, tmp_path, stdout):
+    with pytest.raises(GitSafetyError):
+        _audit_with_output(git_repo, tmp_path, stdout)
+
+
+def test_git_config_audit_with_real_git_allows_global_lfs_but_not_local(git_repo, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    (home / ".gitconfig").write_text(
+        '[filter "lfs"]\n'
+        "\tclean = git-lfs clean -- %f\n"
+        "\tsmudge = git-lfs smudge -- %f\n"
+        "\tprocess = git-lfs filter-process\n"
+        "\trequired = true\n",
+    )
+    service, _harness = _service(git_repo, tmp_path)
+    service._audit_git_config(git_repo)
+
+    config_path = git_repo / ".git" / "config"
+    config_path.write_text(config_path.read_text() + '\n[filter "lfs"]\n\tclean = git-lfs clean -- %f\n')
+    with pytest.raises(GitSafetyError):
+        service._audit_git_config(git_repo)

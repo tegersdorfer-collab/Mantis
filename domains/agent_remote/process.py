@@ -98,31 +98,16 @@ def signal_verified_process_group(pid: int, pgid: int, kind: str, expected_ident
     """Signale nach Identitätsprüfung; KILL bleibt für die verifizierte Gruppe möglich."""
     if not isinstance(pid, int) or pid <= 0 or pgid != pid or not expected_identity:
         return False
-    if kind == "TERM":
-        try:
-            if os.getpgid(pid) != pgid or process_identity(pid) != expected_identity:
-                return False
-        except (ProcessLookupError, PermissionError, OSError):
+    if not process_group_exists(pgid):
+        return True
+    try:
+        if os.getpgid(pid) != pgid or process_identity(pid) != expected_identity:
             return False
-        sig = signal.SIGTERM
-    elif kind == "TERM_ORPHAN":
-        # Nur bei gespeichertem Status "cancelling" nach vorheriger PID-Prüfung.
-        if not process_group_exists(pgid):
-            return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    if kind in {"TERM", "TERM_ORPHAN"}:
         sig = signal.SIGTERM
     elif kind == "KILL":
-        # Aufrufer darf KILL erst nach geprüftem SIGTERM an dieselbe Gruppe senden.
-        # Gruppenleiter dürfen inzwischen weg sein, während Kinder noch dazugehören.
-        if not process_group_exists(pgid):
-            return True
-        try:
-            current_pgid = os.getpgid(pid)
-        except ProcessLookupError:
-            current_pgid = None
-        except (PermissionError, OSError):
-            return False
-        if current_pgid == pgid and process_identity(pid) != expected_identity:
-            return False
         sig = signal.SIGKILL
     else:
         return False

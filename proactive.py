@@ -7,6 +7,7 @@ from datetime import date, datetime
 
 from llm.base import LLMProvider, Message
 from memory.lzg import LZG
+from memory.chat_messages import load_prompt_chat_messages
 import config
 
 try:
@@ -109,10 +110,8 @@ class ProactiveTracker:
         if (datetime.now() - self._last_sent).total_seconds() < self._interval():
             return
         try:
-            from core import db
-            rows = db.query(
-                "SELECT 1 FROM chat_messages WHERE role='user' AND created_at > %s LIMIT 1",
-                (self._last_sent,),
+            rows = load_prompt_chat_messages(
+                role="user", after=self._last_sent, limit=1,
             )
             if not rows:
                 self.record_ignored()
@@ -264,14 +263,7 @@ class ProactiveEngine:
         recent_chat_ctx = ""
         last_proactive_ctx = ""
         try:
-            from core import db as _db
-            rows = _db.query(
-                """
-                SELECT role, content, channel FROM chat_messages
-                ORDER BY created_at DESC
-                LIMIT 20
-                """,
-            )
+            rows = load_prompt_chat_messages(limit=20)
             if rows:
                 # Letzte proaktive Mantis-Nachrichten explizit hervorheben
                 proactive_msgs = [

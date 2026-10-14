@@ -11,7 +11,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 import uuid
@@ -26,6 +25,7 @@ from domains.agent_remote.process import (
     process_identity as _process_identity,
     signal_verified_process_group as _verified_signal_group,
 )
+from domains.agent_remote.state import locked_state, write_locked_state
 
 log = logging.getLogger(__name__)
 
@@ -56,13 +56,19 @@ _READ_WORDS = re.compile(
 )
 _CONFIRMATIONS = {"ja", "start"}
 _REJECTIONS = {"nein"}
+_REMOVED_DIFF_COMMAND = re.compile(r"^diff\s+\S+$", re.IGNORECASE)
 _REGISTRY_FIELDS = {"pid", "start", "dir", "session", "run", "title"}
 _GIT_HARDENING = (
     ("core.fsmonitor", ""),
     ("core.hooksPath", "/dev/null"),
     ("core.sshCommand", ""),
+    ("core.attributesFile", "/dev/null"),
     ("protocol.allow", "never"),
 )
+
+
+class GitSafetyError(ValueError):
+    """Sicherheitsprüfung verweigert einen Start vor der Worktree-Erstellung."""
 
 
 @dataclass
@@ -295,7 +301,6 @@ class AgentRemoteService:
             return "latest", None
         for kind, pattern in (
             ("cancel", r"^abbrechen\s+(\S+)$"),
-            ("diff", r"^diff\s+(\S+)$"),
             ("result", r"^was\s+kam\s+bei\s+(\S+)\s+raus\??$"),
         ):
             match = re.match(pattern, normalized, re.IGNORECASE)
@@ -644,6 +649,22 @@ class AgentRemoteService:
             return True
         is_confirmation = folded in _CONFIRMATIONS | _REJECTIONS and pending
         is_mode_reply = clarification and folded in {"lesen", "schreiben"}
+        if (
+            body is None
+            and command is None
+            and not is_confirmation
+            and not is_mode_reply
+            and _REMOVED_DIFF_COMMAND.fullmatch(text.strip())
+            and self._is_trusted_dm(msg)
+        ):
+            self.pending.pop(user_id, None)
+            self.clarifications.pop(user_id, None)
+            await self._persist("user", text)
+            await self._reply(
+                route,
+                "`diff <id>` ist in v1 nicht verfügbar. Die Dateiliste steht im Codex-Ergebnis.",
+            )
+            return True
         if body is None and command is None and not is_confirmation and not is_mode_reply:
             if self._is_trusted_dm(msg):
                 self.pending.pop(user_id, None)
@@ -712,21 +733,8 @@ class AgentRemoteService:
         self._ensure_private_dir(self.state_dir)
         self._ensure_private_dir(self.runs_dir)
         self._ensure_private_dir(path.parent)
-        payload = json.dumps(asdict(record), ensure_ascii=False, sort_keys=True)
-        fd, temp_name = tempfile.mkstemp(prefix=".state-", dir=path.parent)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as file:
-                file.write(payload)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temp_name, path)
-            path.chmod(0o600)
-        finally:
-            try:
-                os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
+        with locked_state(path, create=True) as (state_file, _state):
+            write_locked_state(state_file, asdict(record))
 
     def _load_runs(self) -> None:
         if not self.runs_dir.is_dir():
@@ -736,12 +744,12 @@ class AgentRemoteService:
             if folder.is_symlink() or state.is_symlink() or not state.is_file():
                 continue
             try:
-                state.chmod(0o600)
-                data = json.loads(state.read_text(encoding="utf-8"))
+                with locked_state(state) as (state_file, data):
+                    if data.get("status") == "preparing":
+                        data["status"] = "starting"
+                        write_locked_state(state_file, data)
                 allowed = {item.name for item in RunRecord.__dataclass_fields__.values()}
                 record = RunRecord(**{key: value for key, value in data.items() if key in allowed})
-                if record.status == "preparing":
-                    record.status = "starting"
                 if record.remote_id != folder.name or not _REMOTE_ID_RE.fullmatch(record.remote_id):
                     continue
                 self.runs[record.remote_id] = record
@@ -753,19 +761,81 @@ class AgentRemoteService:
         if path.is_symlink() or not path.is_file():
             return False
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-            if state.get("remote_id") != record.remote_id:
-                return False
-            pid = state.get("pid")
-            pgid = state.get("pgid")
-            identity = state.get("process_identity")
-            if not isinstance(pid, int) or not isinstance(pgid, int) or not identity:
-                return False
-            record.pid = pid
-            record.pgid = pgid
-            record.process_identity = identity
-            record.status = state.get("status", record.status)
-            return True
+            with locked_state(path) as (_state_file, state):
+                if state.get("remote_id") != record.remote_id:
+                    return False
+                for name in RunRecord.__dataclass_fields__:
+                    if name in state:
+                        setattr(record, name, state[name])
+                return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def _record_launch_identity(self, record: RunRecord, pid: int) -> bool:
+        path = self._record_path(record.remote_id)
+        identity = self._process_identity(pid)
+        if path.is_symlink() or not path.is_file() or not identity:
+            return False
+        try:
+            with locked_state(path) as (state_file, state):
+                if state.get("remote_id") != record.remote_id:
+                    return False
+                if state.get("status") != "starting":
+                    for name in RunRecord.__dataclass_fields__:
+                        if name in state:
+                            setattr(record, name, state[name])
+                    if (
+                        record.status == "running"
+                        and (record.pid != pid or record.process_identity != identity)
+                    ):
+                        state.update(status="lost", ended_at=self._clock())
+                        write_locked_state(state_file, state)
+                        for name in RunRecord.__dataclass_fields__:
+                            if name in state:
+                                setattr(record, name, state[name])
+                    return record.status == "running"
+                if (
+                    state.get("pid") not in {None, pid}
+                    or state.get("pgid") not in {None, pid}
+                    or state.get("process_identity") not in {None, identity}
+                ):
+                    return False
+                state.update(
+                    pid=pid,
+                    pgid=pid,
+                    process_identity=identity,
+                    deadline=record.deadline,
+                )
+                write_locked_state(state_file, state)
+                for name in RunRecord.__dataclass_fields__:
+                    if name in state:
+                        setattr(record, name, state[name])
+                return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def _mark_starting_interrupted(self, record: RunRecord) -> bool:
+        """CAS starting→interrupted; eine zwischenzeitliche Launcher-Änderung gewinnt."""
+        path = self._record_path(record.remote_id)
+        if path.is_symlink() or not path.is_file():
+            return False
+        try:
+            with locked_state(path) as (state_file, state):
+                if state.get("remote_id") != record.remote_id:
+                    return False
+                expected = (record.pid, record.pgid, record.process_identity)
+                current = (state.get("pid"), state.get("pgid"), state.get("process_identity"))
+                if state.get("status") != "starting" or current != expected:
+                    for name in RunRecord.__dataclass_fields__:
+                        if name in state:
+                            setattr(record, name, state[name])
+                    return False
+                ended_at = self._clock()
+                state.update(status="interrupted", ended_at=ended_at)
+                write_locked_state(state_file, state)
+                record.status = "interrupted"
+                record.ended_at = ended_at
+                return True
         except (OSError, TypeError, ValueError):
             return False
 
@@ -789,6 +859,7 @@ class AgentRemoteService:
             "LANG": "en_US.UTF-8",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_CONFIG_COUNT": str(len(_GIT_HARDENING)),
         }
@@ -824,57 +895,133 @@ class AgentRemoteService:
             **kwargs,
         )
 
-    def _checkout_filter_config(self, repo: Path) -> list[tuple[str, str]]:
-        """Leert lokal konfigurierte Filtertreiber, bevor der erste Checkout läuft."""
+    def _audit_git_config(self, repo: Path) -> None:
+        """Bricht ab, sobald irgendein Config-Scope Includes oder Filter nennt."""
+        git = shutil.which("git", path=self._base_path())
+        if not git:
+            raise GitSafetyError("Git ist für die Konfigurationsprüfung nicht verfügbar.")
+        inherited_env = os.environ.copy()
+        env = inherited_env.copy()
+        for key in ("GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+            env.pop(key, None)
+        env["HOME"] = str(self.home_dir)
+        env.pop("XDG_CONFIG_HOME", None)
+        env["GIT_ATTR_NOSYSTEM"] = "1"
+        envs = [env]
+        if "GIT_CONFIG_GLOBAL" in inherited_env or "GIT_CONFIG_SYSTEM" in inherited_env:
+            selected_env = inherited_env.copy()
+            selected_env["HOME"] = str(self.home_dir)
+            selected_env.pop("XDG_CONFIG_HOME", None)
+            selected_env.pop("GIT_CONFIG_NOSYSTEM", None)
+            selected_env["GIT_ATTR_NOSYSTEM"] = "1"
+            envs.append(selected_env)
+        for audit_env in envs:
+            try:
+                result = self._command_runner(
+                    [
+                        git, "-C", str(repo), "config", "--includes", "--show-scope",
+                        "--get-regexp", r"^(include|includeif|filter)\.",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env=audit_env,
+                    shell=False,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise GitSafetyError("Git-Konfiguration konnte nicht sicher geprüft werden.") from exc
+            if result.returncode not in {0, 1}:
+                raise GitSafetyError("Git-Konfiguration konnte nicht sicher geprüft werden.")
+            if not self._only_standard_lfs_config(result.stdout):
+                raise GitSafetyError(
+                    "Git-Konfiguration enthält include-, includeIf- oder filter-Einträge."
+                )
+
+    _STANDARD_LFS_FILTERS = {
+        "filter.lfs.clean": "git-lfs clean -- %f",
+        "filter.lfs.smudge": "git-lfs smudge -- %f",
+        "filter.lfs.process": "git-lfs filter-process",
+        "filter.lfs.required": "true",
+    }
+
+    @classmethod
+    def _only_standard_lfs_config(cls, output: str) -> bool:
+        """Erlaubt ausschließlich die Standard-git-lfs-Filter aus global/system."""
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            scope, tab, rest = line.partition("\t")
+            if not tab or scope not in {"global", "system"}:
+                return False
+            key, _space, value = rest.partition(" ")
+            if cls._STANDARD_LFS_FILTERS.get(key) != value:
+                return False
+        return True
+
+    @staticmethod
+    def _has_filter_attribute(content: str) -> bool:
+        for line in content.splitlines():
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if re.search(r"(?:^|\s)-?filter(?:\s*=|\s|$)", line):
+                return True
+        return False
+
+    def _audit_filter_attributes(self, repo: Path) -> None:
+        """Prüft info/attributes und alle .gitattributes im Ziel-Commit."""
         git_dir = repo / ".git"
-        config_path = git_dir / "config"
-        if git_dir.is_symlink() or not git_dir.is_dir() or config_path.is_symlink():
-            raise ValueError("Git-Konfigurationspfad ist ungültig")
-        try:
-            text = config_path.read_text(encoding="utf-8", errors="strict")
-        except (OSError, UnicodeError) as exc:
-            raise ValueError("Git-Konfiguration kann nicht sicher gelesen werden") from exc
-        names: set[str] = set()
-        for line in text.splitlines():
-            section = re.match(r'^\s*\[\s*filter\s+"([^"\\]+)"\s*\]\s*(?:[#;].*)?$', line, re.I)
-            if section:
-                names.add(section.group(1))
-            elif re.match(r"^\s*\[\s*filter(?:\s|\])", line, re.I):
-                raise ValueError("Filtertreibername in Git-Konfiguration ist nicht sicher lesbar")
-        result = self._run_git(
+        if git_dir.is_symlink() or not git_dir.is_dir():
+            raise GitSafetyError("Git-Konfigurationspfad ist ungültig.")
+        info_dir = git_dir / "info"
+        if info_dir.is_symlink():
+            raise GitSafetyError("Git-Attribute können nicht sicher geprüft werden.")
+        info_attributes = info_dir / "attributes"
+        if info_attributes.is_symlink():
+            raise GitSafetyError("Git-Attribute können nicht sicher geprüft werden.")
+        if info_attributes.exists():
+            try:
+                content = info_attributes.read_text(encoding="utf-8", errors="strict")
+            except (OSError, UnicodeError) as exc:
+                raise GitSafetyError("Git-Attribute können nicht sicher geprüft werden.") from exc
+            if self._has_filter_attribute(content):
+                raise GitSafetyError("Git-Attribute enthalten Filter-Einträge.")
+
+        tree = self._run_git(
             repo,
-            [
-                "config", "--local", "--name-only", "--get-regexp",
-                r"^filter\..*\.(smudge|process|required)$",
-            ],
+            ["ls-tree", "-r", "--name-only", "-z", "main"],
             check=False,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=15,
         )
-        if result.returncode not in {0, 1}:
-            raise ValueError("Git-Filterkonfiguration konnte nicht sicher geprüft werden")
-        for key in result.stdout.splitlines():
-            match = re.fullmatch(r"filter\.([A-Za-z0-9_.-]+)\.(?:smudge|process|required)", key.strip(), re.I)
-            if match:
-                names.add(match.group(1))
-            elif key.strip().casefold().startswith("filter."):
-                raise ValueError("Filtertreibername in Git-Konfiguration ist nicht zulässig")
-        overrides = []
-        for name in sorted(names):
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-                raise ValueError("Filtertreibername in Git-Konfiguration ist ungültig")
-            overrides.extend((
-                (f"filter.{name}.smudge", ""),
-                (f"filter.{name}.process", ""),
-                (f"filter.{name}.required", "false"),
-            ))
-        return overrides
+        if tree.returncode != 0:
+            raise GitSafetyError("Ziel-Commit main konnte nicht sicher geprüft werden.")
+        paths = [path for path in tree.stdout.split("\0") if path.endswith(".gitattributes")]
+        for path in paths:
+            result = self._run_git(
+                repo,
+                ["show", f"main:{path}"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                raise GitSafetyError("Git-Attribute im Ziel-Commit konnten nicht gelesen werden.")
+            if self._has_filter_attribute(result.stdout):
+                raise GitSafetyError("Git-Attribute im Ziel-Commit enthalten Filter-Einträge.")
+
+    def _audit_worktree_git_safety(self, repo: Path) -> None:
+        self._audit_git_config(repo)
+        self._audit_filter_attributes(repo)
 
     def _create_worktree(self, proposal: Proposal) -> str:
         if proposal.worktree is None or proposal.branch is None:
             raise ValueError("Schreibvorschlag ohne isoliertes Ziel")
         repo = Path(proposal.repo_path).resolve(strict=True)
+        self._audit_worktree_git_safety(repo)
         parent = repo / ".worktrees"
         if parent.is_symlink():
             raise ValueError("Symlink-basiertes .worktrees-Verzeichnis wird abgelehnt")
@@ -907,12 +1054,10 @@ class AgentRemoteService:
             raise RuntimeError("Aufgelöster Worktree liegt außerhalb des Allowlist-Repos") from exc
         if not self._worktree_gitdir_matches(repo, resolved_target):
             raise RuntimeError("Git-Worktree-Verweis passt nicht zum Allowlist-Repo")
-        filters = self._checkout_filter_config(repo)
         try:
             checkout = self._run_git(
                 resolved_target,
                 ["checkout", "--no-recurse-submodules", proposal.branch],
-                config=filters,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -952,52 +1097,12 @@ class AgentRemoteService:
         except (OSError, UnicodeError, ValueError, RuntimeError):
             return False
 
-    def _recover_registry_before_pid_save(self, record: RunRecord) -> bool:
-        """Schließt das Startfenster über TMPDIR/meta, ohne einen Auftrag neu zu starten."""
-        for folder in self._registry_candidates(record):
-            meta = _read_key_value_file(folder / "meta")
-            try:
-                pid = int(meta.get("pid", ""))
-                run_path = Path(meta.get("run", "")).resolve(strict=True)
-                run_cwd = Path(meta.get("dir", "")).resolve(strict=True)
-                expected_cwd = Path(record.cwd).resolve(strict=True)
-                tmp = Path(record.tmp_dir).resolve(strict=True)
-            except (OSError, ValueError, RuntimeError):
-                continue
-            status = (_read_text(folder / "status", 64) or "").strip()
-            if (
-                run_path.name != folder.name
-                or run_path.parent != tmp
-                or run_cwd != expected_cwd
-                or status not in {"running", "ok", "fail", "quota"}
-            ):
-                continue
-            try:
-                pgid = self._process_group(pid)
-                identity = self._process_identity(pid)
-            except (OSError, ProcessLookupError, PermissionError):
-                pgid, identity = pid, None
-            if status == "running" and (pgid != pid or not identity):
-                continue
-            record.pid = pid
-            record.pgid = pgid
-            record.process_identity = identity
-            record.registry_id = folder.name
-            record.registry_run = str(run_path)
-            record.status = "running" if status == "running" else {
-                "ok": "succeeded", "fail": "failed", "quota": "quota",
-            }[status]
-            if record.status != "running":
-                record.ended_at = self._clock()
-            self._save_run(record)
-            return True
-        return False
-
     def _task_prompt(self, task: str) -> str:
         return (
             f"{task}\n\n"
             "Führe passende Tests während dieses Laufs selbst aus und nenne am Ende eine "
-            "klare Testzeile mit Befehl und Ergebnis.\n"
+            "klare Testzeile mit Befehl und Ergebnis. Liste außerdem die geänderten Dateien "
+            "aus deinem eigenen Ergebnisbericht auf.\n"
             "Zusätzliche Sicherheitsgrenze: keine Commits, Merges oder Pushes ausführen."
         )
 
@@ -1085,36 +1190,48 @@ class AgentRemoteService:
             record.deadline = self._clock() + min(
                 DEFAULT_TIMEOUT_SECONDS, max(1, self.config.timeout_seconds),
             )
-            record.status = "running" if process.poll() is None and record.process_identity else "failed"
-            if record.status == "failed":
-                record.ended_at = self._clock()
-            try:
-                self._save_run(record)
-            except OSError as exc:
-                log.warning("Agent-Remote-PID konnte nicht persistiert werden (%s)", type(exc).__name__)
-            self._sync_registry(record)
-            if record.status == "running":
+            self._record_launch_identity(record, record.pid)
+            for _attempt in range(20):
+                self._refresh_launch_identity(record)
+                if record.status != "starting":
+                    break
+                await self._sleep(0.05)
+            if record.status == "starting":
+                self._mark_starting_interrupted(record)
+            if record.status == "running" and process.poll() is None:
+                self._sync_registry(record)
                 self._track(asyncio.create_task(self._monitor_process(remote_id, process)))
                 monitor_started = True
                 reg = f" · Registry {record.registry_id}" if record.registry_id else ""
                 await self._reply(route, f"Lauf {remote_id} gestartet{reg}. Status wird gemeldet.")
-            else:
+            elif record.status == "running":
                 await self._finish_run(record, int(process.returncode or 1))
+            elif record.status == "failed":
+                await self._finish_run(record, int(process.returncode or 1))
+            else:
+                await self._reply(route, f"Lauf {remote_id} wurde vor dem Codex-Start unterbrochen.")
         except Exception as exc:
-            if process is not None and process.poll() is None:
+            if process is not None:
                 record.pid = int(process.pid)
                 record.pgid = int(process.pid)
                 if record.process_identity is None:
                     record.process_identity = self._process_identity(record.pid)
-                record.status = "running" if record.process_identity else "interrupted"
-                try:
-                    self._save_run(record)
-                except OSError:
-                    log.error("Agent-Remote-PID bleibt nur über TMPDIR/meta wiederauffindbar")
+                self._record_launch_identity(record, record.pid)
+                self._refresh_launch_identity(record)
+            if process is not None and process.poll() is None and record.status == "starting":
+                self._mark_starting_interrupted(record)
+                self._refresh_launch_identity(record)
+            if process is not None and process.poll() is None and record.status == "running":
                 if not monitor_started:
                     self._track(asyncio.create_task(self._monitor_process(remote_id, process)))
                 log.warning("Nach dem codex-task-Start trat ein Folgefehler auf (%s)", type(exc).__name__)
                 await self._reply(route, f"Lauf {remote_id} gestartet; die Statusverknüpfung wird wiederhergestellt.")
+                return
+            if record.status in {"interrupted", "lost"}:
+                await self._reply(route, f"Lauf {remote_id} wurde vor dem Codex-Start unterbrochen.")
+                return
+            if process is not None and record.status == "running":
+                await self._finish_run(record, int(process.returncode or 1))
                 return
             record.status = "failed"
             record.ended_at = self._clock()
@@ -1123,7 +1240,10 @@ class AgentRemoteService:
             except OSError:
                 log.error("Agent-Remote-Fehlerstatus konnte nicht persistiert werden")
             log.warning("Agent-Remote-Start fehlgeschlagen (%s)", type(exc).__name__)
-            await self._reply(route, f"Lauf konnte nicht gestartet werden ({type(exc).__name__}).")
+            if isinstance(exc, ValueError):
+                await self._reply(route, f"Start verweigert: {exc}")
+            else:
+                await self._reply(route, f"Lauf konnte nicht gestartet werden ({type(exc).__name__}).")
 
     def _track(self, task: asyncio.Task) -> None:
         self._tasks.add(task)
@@ -1245,7 +1365,16 @@ class AgentRemoteService:
         except (OSError, ProcessLookupError, PermissionError):
             return False
 
+    def _mark_lost(self, record: RunRecord) -> None:
+        record.status = "lost"
+        record.termination_reason = None
+        record.ended_at = self._clock()
+        self._save_run(record)
+
     async def _terminate(self, record: RunRecord, process=None) -> bool:
+        if not self._identity_matches(record.pid, record.pgid, record.process_identity):
+            self._mark_lost(record)
+            return False
         return await self._terminate_identity(
             record.pid,
             record.pgid,
@@ -1268,6 +1397,8 @@ class AgentRemoteService:
         while record.status == "cancelling":
             if await self._terminate(record):
                 await self._complete_termination(record)
+                return
+            if record.status != "cancelling":
                 return
             await self._sleep(0.5)
 
@@ -1376,7 +1507,7 @@ class AgentRemoteService:
         }
         return (
             f"Agent-Remote {record.remote_id}: {labels.get(record.status, record.status)}. "
-            "Ergebnis und Diff kannst du mit der Lauf-ID abrufen."
+            "Das Codex-Ergebnis kannst du mit der Lauf-ID abrufen."
         )
 
     def _queue_notification_retry(self, remote_id: str) -> None:
@@ -1417,29 +1548,23 @@ class AgentRemoteService:
                 else:
                     self._track(asyncio.create_task(self._monitor_cancelling(record.remote_id)))
             if record.status in {"starting", "preparing"}:
-                if record.status == "starting" and not record.pid:
-                    for _attempt in range(20):
-                        if self._refresh_launch_identity(record):
-                            break
-                        await self._sleep(0.05)
-                recovered = self._recover_registry_before_pid_save(record)
-                if not recovered and record.pid and self._identity_matches(
-                    record.pid, record.pgid, record.process_identity,
-                ):
-                    record.status = "running"
-                    self._save_run(record)
-                elif not recovered and record.pid:
-                    self._finish_from_registry(record)
-                elif not recovered:
-                    record.status = "interrupted"
-                    record.ended_at = self._clock()
-                    self._save_run(record)
+                for _attempt in range(20):
+                    self._refresh_launch_identity(record)
+                    if record.status != "starting":
+                        break
+                    await self._sleep(0.05)
+                if record.status == "starting":
+                    self._mark_starting_interrupted(record)
             if record.status == "running":
                 self._sync_registry(record)
                 if self._identity_matches(record.pid, record.pgid, record.process_identity):
                     self._track(asyncio.create_task(self._monitor_recovered(record.remote_id)))
                 else:
-                    self._finish_from_registry(record)
+                    identity = self._process_identity(record.pid) if isinstance(record.pid, int) else None
+                    if identity is None and not self._process_group_exists(record.pgid):
+                        self._finish_from_registry(record)
+                    else:
+                        self._mark_lost(record)
             if record.status not in {"running", "starting", "preparing", "cancelling"}:
                 await self._notify_completion(record)
 
@@ -1476,11 +1601,6 @@ class AgentRemoteService:
                 await self._reply(route, "Diese ID gehört zu keinem abbrechbaren Agent-Remote-Lauf.")
                 return
             await self._cancel(record, route)
-        elif kind == "diff":
-            if record is None:
-                await self._reply(route, "Zu dieser ID gibt es keinen Remote-Worktree-Diff.")
-                return
-            await self._show_diff(route, record)
         elif kind == "result":
             if record is not None:
                 await self._show_result(route, record.remote_id)
@@ -1600,55 +1720,28 @@ class AgentRemoteService:
         status = _read_text(registry / "status", 64)
         await self._reply(route, result or f"{identifier}: {(status or 'unbekannt').strip()}.")
 
-    async def _show_diff(self, route, record: RunRecord) -> None:
-        if not record.worktree:
-            await self._reply(route, "Für diesen Leselauf existiert kein Remote-Worktree-Diff.")
-            return
-        worktree = Path(record.worktree)
-        if not self._valid_worktree(record, worktree):
-            await self._reply(route, "Der gespeicherte Worktree-Pfad ist nicht mehr gültig.")
-            return
-        try:
-            result = self._run_git(
-                worktree,
-                ["diff", "--stat"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-        except (OSError, subprocess.SubprocessError, FileNotFoundError):
-            await self._reply(route, "Diff konnte nicht gelesen werden.")
-            return
-        output = result.stdout.strip() or "Keine Änderungen im git diff."
-        await self._reply(route, f"{record.remote_id}\n{output}")
-
-    def _valid_worktree(self, record: RunRecord, worktree: Path) -> bool:
-        try:
-            root = Path(record.repo_path).resolve(strict=True)
-            target = worktree.resolve(strict=True)
-            target.relative_to(root / ".worktrees")
-            return (
-                target.is_dir()
-                and record.mode == "write"
-                and self._worktree_gitdir_matches(root, target)
-            )
-        except (OSError, ValueError, RuntimeError):
-            return False
-
     async def _cancel(self, record: RunRecord, route) -> None:
+        if record.status == "running" and not self._identity_matches(
+            record.pid, record.pgid, record.process_identity,
+        ):
+            self._mark_lost(record)
+            await self._reply(route, f"Lauf {record.remote_id} ist nicht mehr sicher identifizierbar.")
+            return
         if record.status == "running" and record.pid and record.process_identity:
             recorded_identity = record.process_identity
             record.status = "cancelling"
             record.termination_reason = "cancelled"
             self._save_run(record)
             if not await self._terminate(record):
+                if record.status == "lost":
+                    await self._reply(
+                        route,
+                        f"Lauf {record.remote_id} ist nicht mehr sicher identifizierbar.",
+                    )
+                    return
                 current_identity = self._process_identity(record.pid)
                 if current_identity is not None and current_identity != recorded_identity:
-                    record.status = "interrupted"
-                    record.termination_reason = None
-                    record.ended_at = self._clock()
-                    self._save_run(record)
+                    self._mark_lost(record)
                     await self._reply(route, f"Lauf {record.remote_id} ließ sich nicht sicher signalisieren.")
                     return
                 self._track(asyncio.create_task(self._monitor_cancelling(record.remote_id)))

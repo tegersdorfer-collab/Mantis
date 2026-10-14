@@ -301,15 +301,18 @@ class LZG:
         )
 
     def load_recent_kzg(self, max_turns: int = 10) -> list[dict]:
+        from memory.chat_messages import PROMPT_SAFE_SQL, filter_prompt_messages
+
         rows = _db.query(
-            """
+            f"""
             SELECT role, content, meta FROM kzg_sessions
+            WHERE {PROMPT_SAFE_SQL}
             ORDER BY created_at DESC
             LIMIT %s
             """,
             (max_turns,),
         )
-        return list(reversed(rows))
+        return list(filter_prompt_messages(list(reversed(rows))))
 
     def clear_kzg_sessions(self, keep_last: int = 20) -> None:
         _db.execute(
