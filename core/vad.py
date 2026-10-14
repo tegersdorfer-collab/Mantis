@@ -182,6 +182,22 @@ def _is_complete_command_particle(words: list[str]) -> bool:
     )
 
 
+_EIN_COMMAND_VERBS = frozenset({"schalte", "schalt", "stell", "stelle", "trag", "trage", "richte", "richt"})
+_EIN_BLOCKERS = frozenset({"mir", "dir", "uns", "euch", "ihm", "ihr", "auf", "aus", "in", "an", "mit", "von", "zu", "für", "heute"})
+
+
+def _is_complete_ein_command(words: list[str]) -> bool:
+    """'Schalte das Licht ein': nur enge Form Verb + Objekt + Partikel 'ein'."""
+    middle = words[1:-1]
+    return (
+        words[0] in _EIN_COMMAND_VERBS
+        and 2 <= len(middle) <= 4
+        and middle[0] in _DETERMINERS
+        and middle[-1] not in _DETERMINERS
+        and not any(word in _EIN_BLOCKERS for word in middle)
+    )
+
+
 def _is_closed_question_pronoun(words: list[str]) -> bool:
     if words[0] not in _QUESTION_WORDS:
         return False
@@ -220,7 +236,7 @@ def _has_open_ending(value: str, words: list[str]) -> bool:
     if last in _OPEN_PREPOSITIONS:
         return not (_is_complete_command_particle(words) or _is_closed_question_particle(words))
     if last in _DETERMINERS and not _is_closed_question_pronoun(words):
-        return not (last in _SEPARABLE_PARTICLES and _is_complete_command_particle(words))
+        return not (last == "ein" and _is_complete_ein_command(words))
     if last in _OPEN_FILLERS and words != ["wie", "bitte"]:
         return True
     if last in _MODAL_OR_WISH_VERBS:
