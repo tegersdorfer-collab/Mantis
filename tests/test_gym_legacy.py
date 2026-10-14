@@ -151,6 +151,24 @@ def test_legacy_alias_keeps_bench_variants_ambiguous_until_equipment_is_given(mo
     assert prefixed.parsed.equipment == "dumbbell"
 
 
+@pytest.mark.parametrize(("stock", "typed"), [
+    ("Bench Press", "Bank"),
+    ("Incline Bench Press", "Schrägbank"),
+    ("Shoulder Press", "Schulterdrücken"),
+    ("Curls", "Curls"),
+])
+def test_legacy_alias_keeps_all_equipment_variants_ambiguous(monkeypatch, stock, typed):
+    variant = f"{stock} (Kurzhantel)"
+    _legacy_db(monkeypatch, [stock, variant])
+    aliases = load_aliases()
+    monkeypatch.setattr(coach_module, "load_aliases", lambda: aliases)
+
+    intent = GymCoach().classify(f"{typed} 30 10")
+
+    assert intent is not None and intent.action == "ambiguous_exercise"
+    assert set(intent.parsed.ambiguous) == {stock, variant}
+
+
 def test_single_stored_exercise_with_equipment_keeps_its_real_name(monkeypatch):
     _legacy_db(monkeypatch, ["Bankdrücken"], {"Bankdrücken": "barbell"})
 

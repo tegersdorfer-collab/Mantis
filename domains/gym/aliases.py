@@ -201,15 +201,20 @@ def load_aliases() -> dict[str, list[str]]:
         stored = by_name.get(normalize_alias(entry.name))
         if stored is None:
             continue
+        base_name, _equipment = split_equipment_variant(stored)
+        legacy_choices = list(dict.fromkeys(
+            variants_by_base.get(normalize_alias(base_name), [stored])
+        ))
         for alias in (entry.name, *entry.aliases):
             key = normalize_alias(alias)
             if key:
                 existing = result.get(key, [])
                 if len(existing) > 1:
-                    if stored not in existing:
-                        existing.append(stored)
+                    for choice in legacy_choices:
+                        if choice not in existing:
+                            existing.append(choice)
                 else:
-                    result[key] = [stored]
+                    result[key] = legacy_choices.copy()
     return result
 
 
