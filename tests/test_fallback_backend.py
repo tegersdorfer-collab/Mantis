@@ -10,6 +10,7 @@ import pytest
 from core.backends.base import AgentBackend
 from core.backends.fallback import AllBackendsFailedError, FallbackBackend
 from core.agent import Agent
+from core import tools as toolreg
 
 
 class FakeBackend(AgentBackend):
@@ -63,6 +64,62 @@ class TestHappyPath:
     def test_model_name_is_primary(self):
         fb = FallbackBackend(FakeBackend("claude"), FakeBackend("qwen"))
         assert fb.model_name == "claude"
+
+    def test_deferred_selection_is_filtered_before_selected_only_fallback(self):
+        class FullCatalogBackend(FakeBackend):
+            sends_full_tool_catalog = True
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.received_tools = []
+                self.selection = None
+
+            async def call(self, messages, tools, stream_cb, temperature, max_tokens,
+                           think=False, force_tool_call=False):
+                self.received_tools.append(tools)
+                if self.selection is not None and not self.selection.done():
+                    self.selection.set_result((["allowed"], False))
+                return await super().call(messages, tools, stream_cb, temperature, max_tokens,
+                                          think, force_tool_call)
+
+        class SelectedOnlyBackend(FakeBackend):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.received_tools = []
+
+            async def call(self, messages, tools, stream_cb, temperature, max_tokens,
+                           think=False, force_tool_call=False):
+                self.received_tools.append(tools)
+                return await super().call(messages, tools, stream_cb, temperature, max_tokens,
+                                          think, force_tool_call)
+
+        saved = dict(toolreg.REGISTRY)
+        toolreg.REGISTRY["allowed"] = toolreg.Tool(
+            "allowed", "Allowed", {}, lambda: asyncio.sleep(0),
+        )
+        toolreg.REGISTRY["denied"] = toolreg.Tool(
+            "denied", "Denied", {}, lambda: asyncio.sleep(0),
+        )
+        try:
+            first = FullCatalogBackend("anthropic", error=ConnectionError("fail over"))
+            second = SelectedOnlyBackend("openrouter", result=("answer", []))
+            backend = FallbackBackend(first, second, cooldown_s=0)
+
+            async def run():
+                selection = asyncio.get_running_loop().create_future()
+                first.selection = selection
+                return await Agent(backend).run(
+                    [], system="s", tool_selection_task=selection,
+                )
+
+            answer, _ = asyncio.run(run())
+            assert answer == "answer"
+            full_catalog = {tool["function"]["name"] for tool in first.received_tools[0]}
+            assert {"allowed", "denied"} <= full_catalog
+            assert [tool["function"]["name"] for tool in second.received_tools[0]] == ["allowed"]
+        finally:
+            toolreg.REGISTRY.clear()
+            toolreg.REGISTRY.update(saved)
 
 
 class TestFailover:
@@ -224,6 +281,40 @@ def test_single_configured_cloud_stage_can_run_without_a_fake_fallback():
 
     assert _call(backend) == ("cloud answer", [])
     assert only_provider.calls == 1
+
+
+def test_total_timeout_also_bounds_waiting_for_filtered_tool_selection():
+    import time
+
+    provider = FakeBackend("filtered-provider")
+    backend = FallbackBackend(
+        backends=[provider], stage_timeouts=[None], total_timeout_s=0.02,
+    )
+
+    async def run():
+        async def select_slowly():
+            await asyncio.sleep(0.2)
+            return ["allowed"], False
+
+        selection = asyncio.create_task(select_slowly())
+        started = time.monotonic()
+        try:
+            with pytest.raises(TimeoutError, match="Gesamt-Timeout"):
+                await backend.call(
+                    messages=[], tools=None, stream_cb=None,
+                    temperature=0.7, max_tokens=100,
+                    tool_selection_task=selection,
+                )
+            elapsed = time.monotonic() - started
+            assert selection.cancelled()
+            assert provider.calls == 0
+            assert elapsed < 0.1
+        finally:
+            if not selection.done():
+                selection.cancel()
+                await asyncio.gather(selection, return_exceptions=True)
+
+    asyncio.run(run())
 
 
 def test_all_backend_failures_raise_a_clear_exhaustion_error():

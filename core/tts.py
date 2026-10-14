@@ -676,6 +676,20 @@ async def _synthesize_local(text: str, speed: float) -> bytes:
     return await asyncio.to_thread(_synth, text, speed)
 
 
+async def _synthesize_unlocked(text: str, speed: float) -> bytes:
+    """Erzeugt ein vollständiges Audio, ohne den Stream-Lock selbst zu verwalten."""
+    try:
+        ogg = await _try_cartesia_ogg(text) if _engine() == "cartesia" else None
+        if ogg is None:
+            wav = await _synthesize_local(text, speed)
+            ogg = await asyncio.to_thread(_wav_to_ogg, wav)
+        log.info(f"🔊 TTS: {len(text)} Zeichen → {len(ogg)//1024}KB OGG")
+        return ogg
+    except Exception as e:
+        log.error("TTS fehlgeschlagen: %s", redact_error_text(e))
+        return b""
+
+
 async def synthesize(
     text: str,
     voice: str = DEFAULT_VOICE,
@@ -701,16 +715,27 @@ async def synthesize(
         return b""
 
     async with _lock:
-        try:
-            ogg = await _try_cartesia_ogg(text) if _engine() == "cartesia" else None
-            if ogg is None:
-                wav = await _synthesize_local(text, speed)
-                ogg = await asyncio.to_thread(_wav_to_ogg, wav)
-            log.info(f"🔊 TTS: {len(text)} Zeichen → {len(ogg)//1024}KB OGG")
-            return ogg
-        except Exception as e:
-            log.error("TTS fehlgeschlagen: %s", redact_error_text(e))
-            return b""
+        return await _synthesize_unlocked(text, speed)
+
+
+async def synthesize_filler(text: str, max_chars: int = 2000) -> bytes:
+    """Synthesisiert einen Cache-Füller ohne den Antwort-Stream-Lock.
+
+    Füller werden vollständig als einzelne Datei erzeugt und nicht an den Stream
+    gesendet. Der Cache-Aufbau darf deshalb einen laufenden Antwort-Stream nicht
+    aufhalten.
+    """
+    if not is_available():
+        log.warning("TTS nicht verfügbar — Modelle fehlen in data/tts/piper/")
+        return b""
+
+    text = _clean_for_speech(text)
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(".", 1)[0] + "."
+    if not text.strip():
+        return b""
+
+    return await _synthesize_unlocked(text, DEFAULT_SPEED)
 
 
 # Schnittgrößen fürs Streaming. Der erste Block ist bewusst klein: er bestimmt,
@@ -726,23 +751,39 @@ _STREAM_FIRST_MAX_CHARS = 90   # erster Block klein halten: er bestimmt die Wart
 _STREAM_REST_MAX_CHARS = 250
 _STREAM_MIN_CHARS = 35      # Untergrenze: zu kurze Blöcke puffern zu wenig Wiedergabezeit
 _STREAM_WACHSTUM = 3        # ein Block höchstens 3× so lang wie sein Vorgänger
+_STREAM_FIRST_EARLY_MIN_CHARS = 25
+_STREAM_EARLY_BOUNDARY_RE = re.compile(r"(?<!\d),(?!\d)|(?<!\d)[–—:](?!\d)")
+
+
+def _first_early_stream_boundary(text: str) -> int | None:
+    """Liefert eine frühe Satzteilgrenze; Zahlen, Uhrzeiten und Zahlenbereiche bleiben zusammen."""
+    for match in _STREAM_EARLY_BOUNDARY_RE.finditer(text):
+        if match.end() >= _STREAM_FIRST_EARLY_MIN_CHARS:
+            return match.end()
+    return None
 
 
 def _split_for_streaming(text: str) -> list[str]:
     """Zerlegt Text in Stücke, die einzeln synthetisiert werden.
 
-    Geschnitten wird NUR an Satzgrenzen. Das ist der Grund, warum die Stücke
-    lückenlos aneinandergehängt klingen: an einem Satzende steht ohnehin eine
-    Sprechpause, der Übergang fällt dort nicht auf. Innerhalb eines Satzes zu
-    schneiden würde man hören.
+    Der erste Block darf nach mindestens 25 Zeichen an Komma, Gedankenstrich oder
+    Doppelpunkt enden. Danach wird wie bisher satzweise geschnitten. An solchen
+    Satzteilgrenzen klingt der Übergang natürlich; Zahlen, Uhrzeiten, Zahlenbereiche
+    und Dezimalkommas bleiben ungeteilt.
 
-    Ein einzelner überlanger Satz wird nicht zerlegt — lieber ein spätes Stück
-    als ein hörbarer Schnitt mitten im Satz.
+    Ohne passende frühe Satzteilgrenze wird ein einzelner überlanger Satz nicht
+    willkürlich zerlegt — lieber ein spätes Stück als ein hörbarer Schnitt.
     """
     saetze = [t for t in re.split(r"(?<=[.!?…])\s+", text.strip()) if t.strip()]
     if not saetze:
         return []
-    stuecke: list[str] = []
+    erster_frueher_teil = None
+    grenze = _first_early_stream_boundary(saetze[0])
+    if grenze is not None and saetze[0][grenze:].strip():
+        erster_frueher_teil = saetze[0][:grenze].strip()
+        saetze[0] = saetze[0][grenze:].strip()
+
+    stuecke: list[str] = [erster_frueher_teil] if erster_frueher_teil else []
     aktuell = ""
     for satz in saetze:
         if not stuecke:
@@ -776,8 +817,8 @@ async def synthesize_stream(
     """Wie synthesize(), liefert die Antwort aber stückweise als einzelne
     OGG/Opus-Blöcke — jeder für sich abspielbar.
 
-    Damit startet die Wiedergabe nach dem ersten Satz statt nach der ganzen
-    Antwort: bei vier Sätzen rund 0,6 s statt 4,5 s bis zum ersten Ton.
+    Damit startet die Wiedergabe nach dem ersten Satzteil oder Satz statt nach der
+    ganzen Antwort: bei vier Sätzen rund 0,6 s statt 4,5 s bis zum ersten Ton.
 
     Der Lock wird über den GESAMTEN Stream gehalten. Zwei gleichzeitige Antworten
     würden sonst ihre Stücke ineinander schieben — und es läuft ohnehin nur ein

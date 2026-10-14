@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.fast_commands import match
+from core.fast_commands import match, match_voice
 
 
 def _m(text):
@@ -261,3 +261,70 @@ def test_fortschritt_does_not_hijack_goals():
     # "fortschritt" is a goals keyword; a fortschritt question must NOT be force-routed to skilltree
     fc = match("wie ist mein fortschritt beim ziel?")
     assert fc is None or fc.tool != "get_skilltree"
+
+
+def test_voice_time_date_and_weekday_are_local_reflexes():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime(2026, 10, 14, 9, 7, tzinfo=ZoneInfo("Europe/Berlin"))
+
+    time = match_voice("Wie spät ist es?", now=now)
+    date = match_voice("Welches Datum ist heute?", now=now)
+    weekday = match_voice("Welcher Wochentag ist heute?", now=now)
+
+    assert time is not None and time.tool == "voice_reflex"
+    assert time.args["response"] == "Es ist 09:07 Uhr."
+    assert date is not None and "14. Oktober 2026" in date.args["response"]
+    assert weekday is not None and weekday.args["response"] == "Heute ist Mittwoch."
+
+
+def test_voice_reflex_does_not_capture_location_or_normal_questions():
+    assert match_voice("Wie spät ist es in Tokio?") is None
+    assert match_voice("Wie wird mein Tag?") is None
+    assert match_voice("Fünf Minuten sollten reichen") is None
+    assert match_voice("Die Musik wird lauter") is None
+
+
+def test_voice_stop_reflex_is_exact():
+    stop = match_voice("Stopp.")
+
+    assert stop is not None
+    assert stop.tool == "voice_reflex"
+    assert stop.args == {"response": "Okay."}
+
+
+def test_voice_timer_and_volume_commands_are_narrow_and_deterministic():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = datetime(2026, 10, 14, 10, 0, tzinfo=ZoneInfo("Europe/Berlin"))
+
+    timer = match_voice("Stelle einen Timer auf fünf Minuten", now=now)
+    natural_timer = match_voice("Stelle den Timer für zwei Minuten", now=now)
+    from core.timeparse import parse_datetime
+
+    stop = match_voice("Timer abbrechen", now=now)
+    louder = match_voice("Musik lauter", now=now)
+    quieter = match_voice("leiser", now=now)
+
+    assert timer is not None and timer.tool == "set_reminder"
+    assert timer.args == {
+        "text": "Timer: 5 Minuten",
+        "at": "2026-10-14T10:05:00",
+        "kind": "timer",
+    }
+    assert parse_datetime(timer.args["at"]) is not None
+    assert natural_timer is not None and natural_timer.args == {
+        "text": "Timer: 2 Minuten",
+        "at": "2026-10-14T10:02:00",
+        "kind": "timer",
+    }
+    assert stop is not None and stop.tool == "stop_timer"
+    assert louder is not None and louder.args == {"action": "volume_up"}
+    assert quieter is not None and quieter.args == {"action": "volume_down"}
+
+
+def test_voice_music_pause_and_continue_reuse_existing_fast_commands():
+    assert match_voice("Musik Pause").args == {"action": "pause"}
+    assert match_voice("Musik weiter").args == {"action": "play"}

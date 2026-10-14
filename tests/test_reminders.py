@@ -177,8 +177,8 @@ def test_reminder_migration_is_idempotent_and_preserves_existing_rows(monkeypatc
     assert {"delivery_attempts", "retry_after", "claimed_at"} <= database.columns
     assert database.column_defaults["delivery_attempts"] == 0
     assert database.rows == [
-        {**original[0], "delivery_attempts": 0, "retry_after": None, "claimed_at": None},
-        {**original[1], "delivery_attempts": 0, "retry_after": None, "claimed_at": None},
+        {**original[0], "kind": None, "delivery_attempts": 0, "retry_after": None, "claimed_at": None},
+        {**original[1], "kind": None, "delivery_attempts": 0, "retry_after": None, "claimed_at": None},
     ]
 
 
@@ -268,6 +268,32 @@ def test_next_due_seconds_includes_a_retry_backoff_deadline(monkeypatch):
     assert ReminderStore().next_due_seconds() == 60.0
 
 
+def test_next_due_returns_text_and_timestamp_for_situation_snapshot(monkeypatch):
+    remind_at = datetime(2026, 10, 14, 14, 30)
+    monkeypatch.setattr(
+        "tools.reminders._db.query_one",
+        lambda _sql, params=(): {"id": 25, "text": "Zahnarzt anrufen", "remind_at": remind_at},
+    )
+
+    reminder = ReminderStore().next_due()
+
+    assert reminder == {"id": 25, "text": "Zahnarzt anrufen", "remind_at": remind_at}
+
+
+def test_stop_next_timer_marks_only_an_unsent_timer_as_sent(monkeypatch):
+    calls = []
+
+    def execute(sql, params=()):
+        calls.append((sql, params))
+        return 1
+
+    monkeypatch.setattr("tools.reminders._db.execute", execute)
+
+    assert ReminderStore().stop_next_timer() is True
+    assert calls[0][1] == ("timer",)
+    assert "sent = FALSE" in calls[0][0]
+
+
 def test_autopilot_retries_delivery_confirmation_without_resending_after_lease(monkeypatch):
     database = ReminderMemoryDB()
     _install_fake_db(monkeypatch, database)
@@ -322,3 +348,17 @@ def test_autopilot_retries_delivery_confirmation_without_resending_after_lease(m
     assert mark_sent_calls == [17, 17]
     assert database.rows[0]["sent"] is True
     assert database.rows[0]["claimed_at"] is None
+
+
+def test_stop_next_timer_ignores_reminders_with_timer_text_prefix(monkeypatch):
+    calls = []
+
+    def execute(sql, params=()):
+        calls.append((sql, params))
+        return 0
+
+    monkeypatch.setattr("tools.reminders._db.execute", execute)
+
+    assert ReminderStore().stop_next_timer() is False
+    assert "LIKE" not in calls[0][0]
+    assert "kind = %s" in calls[0][0]

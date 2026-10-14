@@ -12,6 +12,7 @@ venv/
 *.log
 /tmp/
 data/
+data/voice_fillers/
 data/vad/*.onnx
 data/wakeword/venv/
 data/wakeword/*.onnx

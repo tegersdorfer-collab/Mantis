@@ -33,7 +33,10 @@ _API_ERRORS = (oauth.SpotifyOAuthError, web_api.SpotifyApiError)
     {
         "action": {
             "type": "string",
-            "enum": ["play", "pause", "next", "previous", "volume", "status", "spiel"],
+            "enum": [
+                "play", "pause", "next", "previous", "volume", "volume_up", "volume_down",
+                "status", "spiel",
+            ],
             "description": "play/pause/next/previous = Playback, volume = Lautstärke setzen, "
                            "status = aktueller Track, spiel = suchen und abspielen",
         },
@@ -95,6 +98,12 @@ async def _spotify(action: str, query: str = "", volume: int = -1, typ: str = ""
                 await sp.previous_track()
                 t = await sp.current_track()
                 return f"⏮️ {t.title} — {t.artist}" if t else "⏮️ Vorheriger Track"
+        if a in {"volume_up", "volume_down"}:
+            current = await sp.get_volume()
+            delta = 10 if a == "volume_up" else -10
+            v = max(0, min(100, current + delta))
+            await sp.set_volume(v)
+            return f"🔊 Lautstärke {v} %"
         if a == "volume":
             if volume is None or volume < 0:
                 return "❌ Bitte volume 0-100 angeben."
@@ -136,7 +145,7 @@ async def _spotify(action: str, query: str = "", volume: int = -1, typ: str = ""
         if a == "spiel":
             return await _spiel(query, typ)
         return (f"❌ Unbekannte Spotify-Aktion '{action}'. Möglich: play, pause, next, "
-                f"previous, volume, status, spiel.")
+                f"previous, volume, volume_up, volume_down, status, spiel.")
     except sp.SpotifyError as e:
         log.warning("spotify fehlgeschlagen: %s", e)
         return f"❌ Spotify nicht steuerbar: {e}. Ist Spotify installiert und gestartet?"

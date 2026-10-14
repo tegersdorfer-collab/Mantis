@@ -213,6 +213,7 @@ def _content_to_anthropic(content):
 
 class ClaudeBackend(AgentBackend):
     provider_name = "Anthropic"
+    sends_full_tool_catalog = True
 
     def __init__(self, model: str | None = None, purpose: str = "chat-agent"):
         self._model = model or config.CLAUDE_CHAT_MODEL

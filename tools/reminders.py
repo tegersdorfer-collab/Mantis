@@ -42,6 +42,9 @@ class ReminderStore:
                 );
             """)
             cur.execute(
+                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS kind TEXT"
+            )
+            cur.execute(
                 "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS "
                 "delivery_attempts INTEGER NOT NULL DEFAULT 0"
             )
@@ -52,11 +55,11 @@ class ReminderStore:
                 "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ"
             )
 
-    def add(self, text: str, remind_at: datetime) -> int:
+    def add(self, text: str, remind_at: datetime, kind: str | None = None) -> int:
         with _db.cursor() as cur:
             cur.execute(
-                "INSERT INTO reminders (text, remind_at) VALUES (%s, %s) RETURNING id",
-                (text, remind_at),
+                "INSERT INTO reminders (text, remind_at, kind) VALUES (%s, %s, %s) RETURNING id",
+                (text, remind_at, kind),
             )
             rid = cur.fetchone()["id"]
         log.info(f"⏰ Reminder gesetzt: '{text}' um {remind_at.strftime('%d.%m. %H:%M')}")
@@ -125,6 +128,25 @@ class ReminderStore:
             "AND COALESCE(retry_after, remind_at) > NOW()"
         )
         return float(row["secs"]) if row and row.get("secs") is not None else None
+
+    def next_due(self) -> dict | None:
+        """Liefert Text und Zeitpunkt des nächsten ungesendeten Reminders."""
+        return _db.query_one(
+            "SELECT id, text, remind_at FROM reminders WHERE sent = FALSE "
+            "ORDER BY COALESCE(retry_after, remind_at) ASC LIMIT 1"
+        )
+
+    def stop_next_timer(self) -> bool:
+        """Beendet den nächsten offenen Voice-Timer, ohne normale Reminder anzutasten."""
+        changed = _db.execute(
+            "WITH timer AS ("
+            "SELECT id FROM reminders WHERE sent = FALSE AND kind = %s "
+            "ORDER BY remind_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+            ") UPDATE reminders SET sent = TRUE, claimed_at = NULL, retry_after = NULL "
+            "FROM timer WHERE reminders.id = timer.id",
+            ("timer",),
+        )
+        return changed > 0
 
     def close(self) -> None:
         pass  # Pool-Verwaltung übernimmt core.db

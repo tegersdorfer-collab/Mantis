@@ -14,15 +14,17 @@ import logging
 import re
 import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 
-from core import db, voice_timing
+import config
+from core import db, voice_fillers, voice_timing
 from core.voice import transcribe_audio, is_addressed_to_mantis, mark_conversation_active, _conversation_active
 from core.voice_stream import VoiceStreamSession
 from core.stream_events import StreamEvent
-from core.tts import synthesize, synthesize_stream
+from core.tts import _first_early_stream_boundary, synthesize, synthesize_stream
 
 log = logging.getLogger("mantis.api")
 
@@ -45,6 +47,8 @@ def _record_voice_latency(
     address_check_ms: float | None = None,
     first_token_ms: float | None = None,
     first_tts_block_ms: float | None = None,
+    filler: str | None = None,
+    filler_ms: float | None = None,
 ) -> dict:
     model, stage = _voice_backend_details(orch)
     detail = {
@@ -52,6 +56,8 @@ def _record_voice_latency(
         "address_check_ms": address_check_ms,
         "first_token_ms": first_token_ms,
         "first_tts_block_ms": first_tts_block_ms,
+        "filler": filler,
+        "filler_ms": filler_ms,
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
         "model": model,
         "stage": stage,
@@ -60,6 +66,11 @@ def _record_voice_latency(
     log.info("voice_latency %s", detail)
     db.log_event("voice_latency", "Voice-Turn", detail)
     return detail
+
+
+def _mark_reflex(trace) -> None:
+    if any(isinstance(item, dict) and item.get("reflex") is True for item in (trace or [])):
+        voice_timing.mark_reflex()
 
 
 async def sende_antwort(websocket, text: str, reply: str | None, audio_streaming: bool) -> None:
@@ -126,18 +137,71 @@ async def sende_streaming_antwort(
     stt_ms: float | None = None,
     address_check_ms: float | None = None,
     started_at: float | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> str | None:
     """Leitet fertige Antwortsätze parallel zur laufenden Cloud-Antwort an TTS."""
     if started_at is None:
         started_at = time.perf_counter()
     first_token_ms = None
     first_tts_block_ms = None
+    filler_kind: str | None = None
+    filler_ms: float | None = None
+    pending_filler = None
+    response_audio_ready = False
+    ack_done = not getattr(config, "VOICE_FILLERS_ENABLED", True)
     sequence = 0
     queue: asyncio.Queue[str | None] = asyncio.Queue()
+    audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+    state_changed = asyncio.Event()
     attempts: dict[str, dict[str, str | bool]] = {}
     has_queued_sentence = False
     spoken_sentences: list[str] = []
     response: list[tuple[str | None, Exception | None]] = []
+    ack_task: asyncio.Task | None = None
+
+    def request_filler(kind: str) -> None:
+        nonlocal filler_kind, pending_filler
+        timing = voice_timing.current()
+        if (
+            not getattr(config, "VOICE_FILLERS_ENABLED", True)
+            or filler_kind is not None
+            or response_audio_ready
+            or (timing is not None and timing.reflex)
+        ):
+            return
+        selected = voice_fillers.choose_cached_filler(kind)
+        if selected is None:
+            return
+        filler_kind = selected.kind
+        pending_filler = selected
+        state_changed.set()
+
+    async def send_audio_chunk(audio: bytes) -> None:
+        nonlocal sequence, first_tts_block_ms
+        if first_tts_block_ms is None:
+            first_tts_block_ms = round((time.perf_counter() - started_at) * 1000, 1)
+        await websocket.send_json({
+            "type": "audio_chunk",
+            "seq": sequence,
+            "b64": base64.b64encode(audio).decode("ascii"),
+        })
+        sequence += 1
+
+    async def send_ack_after_delay() -> None:
+        nonlocal ack_done
+        try:
+            delay_ms = max(0, int(getattr(config, "VOICE_FILLER_ACK_DELAY_MS", 800)))
+            deadline = started_at + delay_ms / 1000
+            await sleep(max(0, deadline - time.perf_counter()))
+            # Gib einem bereits fertigen TTS-Block bei gleichzeitigem Wake-up den Vorrang.
+            await asyncio.sleep(0)
+            if not response_audio_ready:
+                request_filler("ack")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            ack_done = True
+            state_changed.set()
 
     async def queue_sentence(sentence: str) -> None:
         nonlocal has_queued_sentence
@@ -153,6 +217,9 @@ async def sende_streaming_antwort(
     async def on_update(event: StreamEvent) -> None:
         nonlocal first_token_ms
         if not isinstance(event, StreamEvent):
+            return
+        if event.kind == "tool_start":
+            request_filler("tool")
             return
         if event.kind == "attempt_start":
             attempts[event.attempt_id] = {
@@ -170,6 +237,14 @@ async def sende_streaming_antwort(
             if state is None:
                 return
             pending = str(state["pending"]) + event.text_delta
+            if not state["deferred"] and not has_queued_sentence:
+                first_sentence = re.split(r"(?<=[.!?…])\s+", pending, maxsplit=1)[0]
+                boundary = _first_early_stream_boundary(first_sentence)
+                if boundary is not None:
+                    early_part = pending[:boundary].strip()
+                    if early_part:
+                        pending = pending[boundary:].lstrip()
+                        await queue_sentence(early_part)
             sentences = re.split(r"(?<=[.!?…])\s+", pending)
             if len(sentences) > 1:
                 if not state["deferred"]:
@@ -189,7 +264,8 @@ async def sende_streaming_antwort(
 
     async def produce_response() -> None:
         try:
-            reply, _trace = await orch.voice_respond(text, stream_cb=on_update)
+            reply, trace = await orch.voice_respond(text, stream_cb=on_update)
+            _mark_reflex(trace)
             reply = reply or ""
             response.append((reply or None, None))
             await queue.join()
@@ -211,54 +287,115 @@ async def sende_streaming_antwort(
             await queue.put(None)
 
     async def synthesize_sentences() -> None:
-        nonlocal sequence, first_tts_block_ms
-        while True:
-            sentence = await queue.get()
-            stream = None
-            try:
-                if sentence is None:
-                    return
-                stream = synthesize_stream(sentence).__aiter__()
-                completed = False
-                has_audio = False
-                while True:
-                    try:
-                        ogg = await anext(stream)
-                    except StopAsyncIteration:
-                        completed = True
-                        break
-                    except Exception as exc:
-                        log.error("TTS-Streaming fehlgeschlagen: %s", exc)
-                        break
-                    await websocket.send_json({
-                        "type": "audio_chunk",
-                        "seq": sequence,
-                        "b64": base64.b64encode(ogg).decode("ascii"),
-                    })
-                    has_audio = has_audio or bool(ogg)
-                    if first_tts_block_ms is None:
-                        first_tts_block_ms = round((time.perf_counter() - started_at) * 1000, 1)
-                    sequence += 1
-                if completed and has_audio:
-                    spoken_sentences.append(sentence)
-            finally:
-                if stream is not None:
-                    close = getattr(stream, "aclose", None)
-                    if close is not None:
+        nonlocal response_audio_ready
+        try:
+            while True:
+                sentence = await queue.get()
+                stream = None
+                try:
+                    if sentence is None:
+                        return
+                    stream = synthesize_stream(sentence).__aiter__()
+                    completed = False
+                    has_audio = False
+                    while True:
                         try:
-                            await close()
+                            ogg = await anext(stream)
+                        except StopAsyncIteration:
+                            completed = True
+                            break
                         except Exception as exc:
-                            log.debug("TTS-Stream konnte nicht geschlossen werden: %s", exc)
-                queue.task_done()
+                            log.error("TTS-Streaming fehlgeschlagen: %s", exc)
+                            break
+                        if ogg:
+                            if not response_audio_ready:
+                                response_audio_ready = True
+                                if ack_task is not None and not ack_task.done():
+                                    ack_task.cancel()
+                            audio_queue.put_nowait(ogg)
+                            state_changed.set()
+                            has_audio = True
+                    if completed and has_audio:
+                        spoken_sentences.append(sentence)
+                finally:
+                    if stream is not None:
+                        close = getattr(stream, "aclose", None)
+                        if close is not None:
+                            try:
+                                await close()
+                            except Exception as exc:
+                                log.debug("TTS-Stream konnte nicht geschlossen werden: %s", exc)
+                    queue.task_done()
+        finally:
+            audio_queue.put_nowait(None)
+            state_changed.set()
+
+    async def send_audio() -> None:
+        nonlocal pending_filler, filler_ms
+        response_finished = False
+        has_pending_audio = False
+        pending_audio: bytes | None = None
+        while True:
+            if pending_filler is not None:
+                selected = pending_filler
+                pending_filler = None
+                await send_audio_chunk(selected.audio)
+                filler_ms = selected.duration_ms
+                continue
+
+            if not has_pending_audio:
+                try:
+                    pending_audio = audio_queue.get_nowait()
+                    has_pending_audio = True
+                except asyncio.QueueEmpty:
+                    pass
+            if has_pending_audio:
+                audio = pending_audio
+                has_pending_audio = False
+                pending_audio = None
+                if audio is None:
+                    response_finished = True
+                elif pending_filler is not None:
+                    pending_audio = audio
+                    has_pending_audio = True
+                else:
+                    await send_audio_chunk(audio)
+                continue
+
+            if response_finished and ack_done:
+                return
+
+            state_changed.clear()
+            audio_ready = asyncio.create_task(audio_queue.get())
+            changed = asyncio.create_task(state_changed.wait())
+            wait_tasks = (audio_ready, changed)
+            try:
+                done, _pending = await asyncio.wait(
+                    wait_tasks, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if audio_ready in done:
+                    pending_audio = audio_ready.result()
+                    has_pending_audio = True
+                if changed in done:
+                    await changed
+            finally:
+                for task in wait_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*wait_tasks, return_exceptions=True)
 
     timing_token = voice_timing.start()
+    if getattr(config, "VOICE_FILLERS_ENABLED", True):
+        ack_task = asyncio.create_task(send_ack_after_delay(), name="voice-filler-ack-delay")
     responder = asyncio.create_task(produce_response())
-    sender = asyncio.create_task(synthesize_sentences())
+    synthesizer = asyncio.create_task(synthesize_sentences())
+    sender = asyncio.create_task(send_audio())
     response_error = None
     reply = None
     client_disconnected = False
     try:
-        await asyncio.gather(responder, sender)
+        tasks = (responder, synthesizer, sender, ack_task)
+        await asyncio.gather(*(task for task in tasks if task is not None))
         reply, response_error = response[0]
         await websocket.send_json({
             "text": text,
@@ -270,16 +407,22 @@ async def sende_streaming_antwort(
         client_disconnected = isinstance(
             exc, (WebSocketDisconnect, RuntimeError, asyncio.CancelledError),
         )
-        for task in (responder, sender):
-            if not task.done():
+        for task in (responder, synthesizer, sender, ack_task):
+            if task is not None and not task.done():
                 task.cancel()
-        await asyncio.gather(responder, sender, return_exceptions=True)
+        await asyncio.gather(
+            *(task for task in (responder, synthesizer, sender, ack_task) if task is not None),
+            return_exceptions=True,
+        )
         raise
     finally:
-        for task in (responder, sender):
-            if not task.done():
+        for task in (responder, synthesizer, sender, ack_task):
+            if task is not None and not task.done():
                 task.cancel()
-        await asyncio.gather(responder, sender, return_exceptions=True)
+        await asyncio.gather(
+            *(task for task in (responder, synthesizer, sender, ack_task) if task is not None),
+            return_exceptions=True,
+        )
         try:
             if not client_disconnected:
                 await websocket.send_json({"type": "audio_end", "count": sequence})
@@ -290,6 +433,8 @@ async def sende_streaming_antwort(
                     address_check_ms=address_check_ms,
                     first_token_ms=first_token_ms,
                     first_tts_block_ms=first_tts_block_ms,
+                    filler=filler_kind,
+                    filler_ms=filler_ms,
                 )
             finally:
                 voice_timing.reset(timing_token)
@@ -328,7 +473,8 @@ def build_router(orch=None) -> APIRouter:
 
             if addressed and orch is not None:
                 timing_token = voice_timing.start()
-                reply, _trace = await orch.voice_respond(text)
+                reply, trace = await orch.voice_respond(text)
+                _mark_reflex(trace)
                 mark_conversation_active()
                 try:
                     ogg = await synthesize(reply)
@@ -424,7 +570,8 @@ def build_router(orch=None) -> APIRouter:
                 try:
                     if orch is not None:
                         timing_token = voice_timing.start()
-                        reply, _trace = await orch.voice_respond(text)
+                        reply, trace = await orch.voice_respond(text)
+                        _mark_reflex(trace)
                         mark_conversation_active()
                     await sende_antwort(websocket, text, reply, audio_streaming)
                     first_tts_block_ms = (

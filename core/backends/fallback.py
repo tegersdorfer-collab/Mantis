@@ -79,6 +79,15 @@ class FallbackBackend(AgentBackend):
         return tuple(backend.model_name for backend in self._backends)
 
     @property
+    def sends_full_tool_catalog(self) -> bool:
+        """Ob der erste erreichbare Anbieter die vollständige Tool-Liste sendet."""
+        now = time.time()
+        for index, backend in enumerate(self._backends):
+            if index == len(self._backends) - 1 or now >= self._down_until[index]:
+                return bool(getattr(backend, "sends_full_tool_catalog", False))
+        return False
+
+    @property
     def stage_timeouts(self) -> tuple[float | None, ...]:
         return self._stage_timeouts
 
@@ -112,13 +121,8 @@ class FallbackBackend(AgentBackend):
         force_tool_call: bool = False,
         timeout_s: float | None = None,
         attempt_cb: AttemptEventCb | None = None,
+        tool_selection_task: asyncio.Future | asyncio.Task | None = None,
     ) -> tuple[str, list[dict]]:
-        kwargs = dict(
-            messages=messages, tools=tools,
-            temperature=temperature, max_tokens=max_tokens,
-            think=think, force_tool_call=force_tool_call,
-        )
-
         self._last_used_backend = None
         failures: list[str] = []
         call_timeout = self._total_timeout_s if timeout_s is None else timeout_s
@@ -128,6 +132,30 @@ class FallbackBackend(AgentBackend):
         for index, backend in enumerate(self._backends):
             if time.time() < self._down_until[index]:
                 continue
+            stage_tools = tools
+            stage_force_tool_call = force_tool_call
+            if (
+                tool_selection_task is not None
+                and not getattr(backend, "sends_full_tool_catalog", False)
+            ):
+                from core import tools as toolreg
+
+                selection_budget = deadline - time.monotonic() if deadline is not None else None
+                if selection_budget is not None and selection_budget <= 0:
+                    raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen")
+                try:
+                    if selection_budget is None:
+                        allowed, selected_force = await tool_selection_task
+                    else:
+                        allowed, selected_force = await asyncio.wait_for(
+                            tool_selection_task, timeout=selection_budget,
+                        )
+                except asyncio.TimeoutError as exc:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen") from exc
+                    raise
+                stage_tools = toolreg.ollama_schemas(only=allowed)
+                stage_force_tool_call = stage_force_tool_call or selected_force
             remaining = deadline - time.monotonic() if deadline is not None else None
             if remaining is not None and remaining <= 0:
                 raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen")
@@ -140,7 +168,12 @@ class FallbackBackend(AgentBackend):
                     await stream_cb(text_delta)
 
             call_kwargs = {
-                **kwargs,
+                "messages": messages,
+                "tools": stage_tools,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "think": think,
+                "force_tool_call": stage_force_tool_call,
                 "stream_cb": report_delta if attempt_cb is not None else stream_cb,
             }
 

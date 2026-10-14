@@ -714,14 +714,24 @@ class MessageHandler:
         # Deterministischer Fast-Path für kritische Fixbefehle (Licht, Not-Stopp):
         # ruft das Tool DIREKT, ohne LLM — 100% zuverlässig, sofort, modellunabhängig.
         # (Kleine Modelle täuschen sonst unter dem großen Prompt Erfolg vor.)
-        fast = fast_commands.match(text)
+        fast = fast_commands.match_voice(text) if voice_turn else fast_commands.match(text)
         if fast is not None:
+            if voice_turn:
+                voice_timing.mark_reflex()
+            if fast.tool == "voice_reflex":
+                result = fast.args["response"]
+                return result, [{
+                    "tool": fast.tool, "args": {}, "result": result[:500], "reflex": True,
+                }]
             try:
                 result = await skills.T.execute(fast.tool, fast.args)
             except Exception as e:
                 result = f"❌ {fast.tool} fehlgeschlagen: {e}"
             log.info("⚡ Fast-Path %s → %s(%s)", fast.label, fast.tool, fast.args)
-            return result, [{"tool": fast.tool, "args": fast.args, "result": result[:500]}]
+            trace = {"tool": fast.tool, "args": fast.args, "result": result[:500]}
+            if voice_turn:
+                trace["reflex"] = True
+            return result, [trace]
 
         # Skill-Factory: eigener Fast-Path, weil hier Quellcode erzeugt werden muss
         # und der Agent das Pflichtargument skill_name reproduzierbar verschluckt
@@ -744,29 +754,81 @@ class MessageHandler:
             with voice_timing.phase("context_ms"):
                 return await self.prompt_builder.build(text)
 
+        def _keyword_selection():
+            try:
+                names = skills.T.select_tools(text)
+                force = bool(names) and (
+                    skills.T.is_action(text)
+                    or any(
+                        skills.T.REGISTRY[name].category == "inbox"
+                        for name in names if name in skills.T.REGISTRY
+                    )
+                )
+                return names, force
+            except Exception as exc:
+                log.warning(
+                    "Keyword-Tool-Auswahl fehlgeschlagen (%s)", type(exc).__name__,
+                )
+                return [], False
+
         async def _timed_select():
             with voice_timing.phase("tool_select_ms"):
-                return await skills.T.select_tools_async(text)
+                try:
+                    return await skills.T.select_tools_async(text)
+                except Exception as exc:
+                    log.warning(
+                        "Tool-Auswahl fehlgeschlagen (%s) — nutze Keyword-Auswahl",
+                        type(exc).__name__,
+                    )
+                    return _keyword_selection()
 
-        system, (allowed, force_tools) = await asyncio.gather(
-            _timed_build(), _timed_select(),
+        tool_selection_task = None
+        supports_full_catalog = (
+            getattr(getattr(agent, "backend", None), "sends_full_tool_catalog", False) is True
         )
-        if voice_turn:
-            system += "\n\n" + VOICE_RESPONSE_INSTRUCTIONS
-        messages = self.kzg.recent_messages(max_tokens=3000)
-        if voice_turn:
-            messages = _messages_with_voice_reminder(messages, text)
+        if supports_full_catalog:
+            allowed, force_tools = _keyword_selection()
+            tool_selection_task = asyncio.create_task(
+                _timed_select(), name=f"tool-selection-{channel_name}",
+            )
         try:
-            return await agent.run(
+            if supports_full_catalog:
+                system = await _timed_build()
+            else:
+                system, (allowed, force_tools) = await asyncio.gather(
+                    _timed_build(), _timed_select(),
+                )
+            if voice_turn:
+                system += "\n\n" + VOICE_RESPONSE_INSTRUCTIONS
+            messages = self.kzg.recent_messages(max_tokens=3000)
+            if voice_turn:
+                messages = _messages_with_voice_reminder(messages, text)
+            run_kwargs = dict(
                 messages=messages,
                 system=system, stream_cb=stream_cb,
                 allowed_tools=allowed, force_tools=force_tools,
                 temperature=0.75, max_tokens=max_tokens,
             )
-        except Exception as e:
-            log.error("Agent-Fehler (%s): %s", channel_name, redact_error_text(e))
-            db.log_error(f"agent_turn/{channel_name}", e)
-            return "⚠️ Technisches Problem, versuch es nochmal.", []
+            if tool_selection_task is not None:
+                run_kwargs["tool_selection_task"] = tool_selection_task
+            try:
+                return await agent.run(**run_kwargs)
+            except BaseException as e:
+                if not isinstance(e, Exception):
+                    raise
+                log.error("Agent-Fehler (%s): %s", channel_name, redact_error_text(e))
+                db.log_error(f"agent_turn/{channel_name}", e)
+                return "⚠️ Technisches Problem, versuch es nochmal.", []
+        finally:
+            if tool_selection_task is not None:
+                if not tool_selection_task.done():
+                    tool_selection_task.cancel()
+                try:
+                    await tool_selection_task
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    if current_task is not None and current_task.cancelling():
+                        raise
 
     def _finish_turn(self, user_text: str, response: str, trace: list,
                      channel_name: str, agent=None, meta: dict | None = None) -> None:
@@ -778,8 +840,11 @@ class MessageHandler:
         message_meta = {"tools": tools_used, "model": agent.model_name}
         if meta:
             message_meta.update(meta)
+        reflex = any(item.get("reflex") is True for item in trace)
+        if reflex:
+            message_meta["reflex"] = True
         self._persist_msg("assistant", response, channel=channel_name, meta=message_meta)
-        if message_meta.get("use_case") != "inbox":
+        if message_meta.get("use_case") != "inbox" and not reflex:
             _safe_task(self._post_turn(user_text, response, tools_used), "post_turn")
 
     # ── Post-Turn Learning ────────────────────────────────────────────────────

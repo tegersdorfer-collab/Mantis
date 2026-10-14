@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from core import skill_md
+from core import skill_md, situation
 import config
 
 log = logging.getLogger(__name__)
@@ -177,4 +177,7 @@ class PromptBuilder:
         if dash_ctx:
             prompt += f"\n## Live-Daten (Dashboard):\n{dash_ctx}\n"
         prompt += f"\n## Aktuell:\n{now_str}\n"
+        situation_ctx = situation.prompt_context()
+        if situation_ctx:
+            prompt += f"\n{situation_ctx}\n"
         return CacheableSystemPrompt(prompt, cache_prefix=cache_prefix)

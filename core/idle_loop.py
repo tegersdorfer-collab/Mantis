@@ -6,12 +6,13 @@ import asyncio
 import logging
 from datetime import datetime
 
-from core import db, backup
+from core import db, backup, situation
 import config
 
 log = logging.getLogger(__name__)
 
 _BACKGROUND_JOB_FLAGS = (
+    ("Lagebild-Refresh", "SITUATION_ENABLED"),
     ("Insight Engine", "INSIGHTS_ENABLED"),
     ("Pattern Detection", "PATTERN_DETECTION_ENABLED"),
     ("Trainingsplan-Autogenerierung", "TRAINING_PLAN_AUTOGEN_ENABLED"),
@@ -97,6 +98,7 @@ class IdleLoop:
         self._last_insight_run: datetime | None = None
         self._last_plan_check: datetime | None = None
         self._last_news_refresh: datetime | None = None
+        self._last_situation_refresh: datetime | None = None
 
     def resume(self) -> None:
         self._state = "idle"
@@ -126,6 +128,7 @@ class IdleLoop:
             await self._tick_accountability()
 
             if not self.is_user_active():
+                await self._tick_situation()
                 await self._tick_reflection()
                 await self._tick_maintenance()
                 await self._tick_health()
@@ -144,6 +147,20 @@ class IdleLoop:
         except Exception as e:
             log.debug(f"Autopilot-Tick: {e}")
             db.log_error("Autopilot-Tick", e)
+
+    async def _tick_situation(self) -> None:
+        if not config.SITUATION_ENABLED:
+            return
+        now = datetime.now()
+        refresh_s = max(1, int(config.SITUATION_REFRESH_S))
+        if _elapsed_since(self._last_situation_refresh, now) < refresh_s:
+            return
+        self._last_situation_refresh = now
+        try:
+            await situation.refresh_snapshot(self.reminders)
+        except Exception as e:
+            log.debug(f"Lagebild-Refresh: {e}")
+            db.log_error("Lagebild-Refresh", e)
 
     async def _tick_accountability(self) -> None:
         """Accountability & Momentum (Daily Anchor + Der Block). Läuft IMMER —

@@ -23,7 +23,9 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 from pathlib import Path
 import re
+import tempfile
 import time
+import wave
 
 import config
 from core import decisions, fast
@@ -136,6 +138,23 @@ def _load_parakeet_model(model_id: str):
     return from_pretrained(model_id)
 
 
+def _warmup_parakeet(model) -> None:
+    """Kompiliert den ersten MLX-Transkriptionspfad mit einer Sekunde Stille."""
+    wav_path = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="mantis-stt-warmup-", suffix=".wav", delete=False) as wav_file:
+            wav_path = wav_file.name
+        with wave.open(wav_path, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16_000)
+            wav_file.writeframes(b"\0\0" * 16_000)
+        model.transcribe(wav_path)
+    finally:
+        if wav_path is not None:
+            Path(wav_path).unlink(missing_ok=True)
+
+
 async def preload_parakeet() -> None:
     """Lädt Parakeet im STT-Executor vor; Fehler bleiben ohne Einfluss auf den Start."""
     global _parakeet_model, _parakeet_unavailable
@@ -155,6 +174,12 @@ async def preload_parakeet() -> None:
             _parakeet_model = await loop.run_in_executor(
                 _parakeet_executor, _load_parakeet_model, model_id,
             )
+            try:
+                await loop.run_in_executor(
+                    _parakeet_executor, _warmup_parakeet, _parakeet_model,
+                )
+            except Exception as exc:
+                log.warning("Parakeet-Warmup fehlgeschlagen (%s)", type(exc).__name__)
             log.info("Parakeet-Modell im Hintergrund vorgeladen")
         except Exception as exc:
             log.warning("Parakeet-Vorladen fehlgeschlagen (%s)", type(exc).__name__)

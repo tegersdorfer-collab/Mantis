@@ -48,7 +48,11 @@ class TestVoiceSegmentEndpoint:
     def test_adressiert_ruft_agent_auf_und_liefert_antwort_plus_audio(self):
         fake_orch = MagicMock()
         fake_orch.voice_respond = AsyncMock(return_value=("Dein Schlaf war gut.", []))
-        with patch("web.routers.voice.transcribe_audio", new=AsyncMock(return_value="Wie war mein Schlaf?")), \
+        with patch(
+            "core.voice_fillers.choose_cached_filler",
+            side_effect=AssertionError("HTTP-Segmente dürfen keine Füller lesen"),
+        ), \
+             patch("web.routers.voice.transcribe_audio", new=AsyncMock(return_value="Wie war mein Schlaf?")), \
              patch("web.routers.voice.is_addressed_to_mantis", new=AsyncMock(return_value=True)), \
              patch("web.routers.voice.synthesize", new=AsyncMock(return_value=b"FAKE_OGG_BYTES")):
             client = _make_client(fake_orch)
@@ -128,3 +132,26 @@ class TestVoiceSegmentEndpoint:
         body = resp.json()
         assert body["reply"] == "Dein Schlaf war gut."
         assert body["audio_b64"] is None
+
+    def test_lokaler_voice_reflex_markiert_http_latenz(self, monkeypatch):
+        from core import voice_timing
+
+        logged = []
+        fake_orch = MagicMock()
+
+        async def reflex(_text):
+            voice_timing.mark_reflex()
+            return "Es ist 09:07 Uhr.", [{"tool": "voice_reflex", "reflex": True}]
+
+        fake_orch.voice_respond = AsyncMock(side_effect=reflex)
+        monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+        with patch("web.routers.voice.transcribe_audio", new=AsyncMock(return_value="Wie spät ist es?")), \
+             patch("web.routers.voice.is_addressed_to_mantis", new=AsyncMock(return_value=True)), \
+             patch("web.routers.voice.synthesize", new=AsyncMock(return_value=b"FAKE_OGG_BYTES")):
+            response = _make_client(fake_orch).post(
+                "/api/voice/segment",
+                files={"audio": ("segment.wav", _fake_wav_bytes(), "audio/wav")},
+            )
+
+        assert response.status_code == 200
+        assert logged[0][2]["reflex"] is True

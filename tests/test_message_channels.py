@@ -155,6 +155,33 @@ def test_voice_reminder_is_temporary_and_keeps_prompt_cache_prefix(monkeypatch):
     assert call.kwargs["system"].cache_prefix == "stable prefix"
 
 
+def test_voice_time_reflex_skips_llm_and_persists_as_reflex_turn(monkeypatch):
+    orchestrator, inserted, _idle_loop = _make_orchestrator(monkeypatch)
+    handler = orchestrator.msg_handler
+    handler.lzg.save_kzg_turn = lambda *args, **kwargs: None
+
+    response, trace = asyncio.run(orchestrator.voice_respond("Wie spät ist es?"))
+
+    assert response.startswith("Es ist ")
+    assert trace and trace[0]["reflex"] is True
+    orchestrator.voice_agent.run.assert_not_awaited()
+    handler.extractor.extract_from_exchange.assert_not_awaited()
+    assert _persisted_role_channels(inserted) == [("user", "voice"), ("assistant", "voice")]
+    assistant = next(params for _sql, params in inserted if params[0] == "assistant")
+    assert '"reflex": true' in assistant[3]
+
+
+@pytest.mark.parametrize("text", ["Wie spät ist es in Tokio?", "Wie wird mein Tag?"])
+def test_nonlocal_voice_questions_still_go_to_llm(monkeypatch, text):
+    orchestrator, _inserted, _idle_loop = _make_orchestrator(monkeypatch)
+
+    response, trace = asyncio.run(orchestrator.voice_respond(text))
+
+    assert response == "Antwort aus dem Agenten"
+    assert trace == []
+    orchestrator.voice_agent.run.assert_awaited_once()
+
+
 def test_prompt_history_filters_empty_and_whitespace_turns():
     from memory.chat_messages import filter_prompt_messages
 
