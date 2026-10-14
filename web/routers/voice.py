@@ -140,6 +140,7 @@ async def sende_streaming_antwort(
     started_at: float | None = None,
     prework=None,
     partial_runs: int = 0,
+    partial_as_final: bool = False,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> str | None:
     """Leitet fertige Antwortsätze parallel zur laufenden Cloud-Antwort an TTS."""
@@ -395,8 +396,7 @@ async def sende_streaming_antwort(
     timing_token = voice_timing.start()
     timing = voice_timing.current()
     timing.partial_runs = max(0, int(partial_runs))
-    timing.partial_reused = prework is not None
-    timing.saved_ms = float(getattr(prework, "elapsed_ms", 0.0)) if prework is not None else 0.0
+    timing.partial_as_final = bool(partial_as_final)
     if getattr(config, "VOICE_FILLERS_ENABLED", True):
         ack_task = asyncio.create_task(send_ack_after_delay(), name="voice-filler-ack-delay")
     responder = asyncio.create_task(produce_response())
@@ -579,6 +579,7 @@ def build_router(orch=None) -> APIRouter:
                             started_at=result.get("turn_started_at"),
                             prework=prework,
                             partial_runs=result.get("partial_runs", 0),
+                            partial_as_final=result.get("partial_as_final", False),
                         )
                         mark_conversation_active()
                     except (WebSocketDisconnect, RuntimeError) as e:
@@ -595,11 +596,7 @@ def build_router(orch=None) -> APIRouter:
                         timing_token = voice_timing.start()
                         timing = voice_timing.current()
                         timing.partial_runs = max(0, int(result.get("partial_runs", 0)))
-                        timing.partial_reused = prework is not None
-                        timing.saved_ms = (
-                            float(getattr(prework, "elapsed_ms", 0.0))
-                            if prework is not None else 0.0
-                        )
+                        timing.partial_as_final = bool(result.get("partial_as_final", False))
                         if prework is None:
                             reply, trace = await orch.voice_respond(text)
                         else:
@@ -630,5 +627,11 @@ def build_router(orch=None) -> APIRouter:
             log.info("Voice-WebSocket-Verbindung geschlossen")
         except Exception as e:
             log.error(f"Voice-WebSocket-Handler abgebrochen: {e}")
+        finally:
+            try:
+                await session.close()
+            finally:
+                if prework_cache is not None:
+                    await prework_cache.close()
 
     return router

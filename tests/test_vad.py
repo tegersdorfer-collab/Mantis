@@ -132,6 +132,16 @@ class TestVadSegmenter:
         assert len(emitted) == 1
         assert emitted[0].duration_ms >= 500
 
+    def test_segment_event_tracks_last_speech_sample_before_silence_padding(self):
+        probs = [0.1] * 2 + [0.9] * 10 + [0.1] * 25
+        seg = vad.VadSegmenter(FakeVAD(probs), chunk_ms=32)
+
+        emitted = [seg.process_chunk(silence_chunk()) for _ in probs]
+        segment = next(event for event in emitted if event is not None)
+
+        assert segment.last_speech_sample_index == 12 * 512
+        assert len(segment.audio) // 2 == 37 * 512
+
     def test_discards_segment_shorter_than_min_duration(self):
         # nur 200ms Sprache (< MIN_SEGMENT_MS=300) dann Stille
         probs = [0.9] * 2 + [0.1] * 9
@@ -163,10 +173,30 @@ class TestVadSegmenter:
 
         assert all(utterance_is_complete(text) for text in completed)
         seg = vad.VadSegmenter(FakeVAD([0.9] * 3 + [0.1] * 8), chunk_ms=100)
+        for _ in range(3):
+            seg.process_chunk(silence_chunk())
         seg.set_partial_transcript("mach das Licht an")
-        events = [seg.process_chunk(silence_chunk()) for _ in range(11)]
+        events = [None] * 3 + [seg.process_chunk(silence_chunk()) for _ in range(8)]
         emitted_at = next(i for i, event in enumerate(events) if event is not None) - 2
         assert emitted_at == 5
+
+    def test_complete_but_stale_partial_keeps_standard_silence(self, monkeypatch):
+        import config
+
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True)
+        monkeypatch.setattr(config, "VOICE_SILENCE_FAST_MS", 450)
+        monkeypatch.setattr(config, "VOICE_SILENCE_SLOW_MS", 1200)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800)
+        monkeypatch.setattr(config, "VOICE_PARTIAL_STALE_MS", 400, raising=False)
+        seg = vad.VadSegmenter(FakeVAD([0.9] * 16 + [0.1] * 25), chunk_ms=32)
+        for _ in range(16):
+            seg.process_chunk(silence_chunk())
+        seg.set_partial_transcript("mach das Licht an", audio_end_sample_index=0)
+
+        events = [seg.process_chunk(silence_chunk()) for _ in range(25)]
+        emitted_at = next(i for i, event in enumerate(events) if event is not None) + 1
+
+        assert emitted_at == 25
 
     def test_unfinished_german_utterances_use_slow_silence(self, monkeypatch):
         import config
@@ -212,3 +242,41 @@ class TestVadSegmenter:
         disabled.set_partial_transcript("mach das Licht an")
         events = [disabled.process_chunk(silence_chunk()) for _ in range(7)]
         assert next(i for i, event in enumerate(events) if event is not None) - 2 == 3
+
+
+def test_utterance_completion_is_conservative_for_openings_and_fragments():
+    from core.vad import utterance_is_complete
+
+    unfinished = [
+        "ich würde gerne",
+        "kannst du",
+        "Mantis kannst du",
+        "ich möchte",
+        "wie viel",
+        "was ist mit",
+    ]
+
+    assert [text for text in unfinished if utterance_is_complete(text)] == []
+
+
+def test_utterance_completion_accepts_explicitly_finished_patterns():
+    from core.vad import utterance_is_complete
+
+    completed = [
+        "Wie spät ist es?",
+        "Was steht heute an?",
+        "Wie wird das Wetter morgen?",
+        "Mach das Licht an",
+        "Schalte den Ventilator aus",
+        "Stell den Timer auf zehn Minuten",
+        "Kannst du die Aufgabe abhaken",
+        "Ich möchte die Aufgabe abhaken",
+        "Stopp",
+        "Danke",
+        "Pause",
+        "Weiter",
+        "Lauter",
+        "Leiser",
+    ]
+
+    assert [text for text in completed if not utterance_is_complete(text)] == []

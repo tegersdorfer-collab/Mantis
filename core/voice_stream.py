@@ -10,6 +10,7 @@ import tempfile
 import time
 import wave
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 
 import config
@@ -98,18 +99,27 @@ class VoiceStreamSession:
         self._partial_task: asyncio.Task | None = None
         self._partial_runs = 0
         self._partial_text = ""
+        self._partial_audio_end_sample_index: int | None = None
+        self._partial_run_generation: int | None = None
+        self._partial_ms_per_audio_second: deque[float] = deque(maxlen=5)
+        self._finalizing = False
+        self._closed = False
         self._segment_generation = 0
 
     def _reset_segment_state(self) -> None:
         self._segment_generation += 1
         self._speech_started_at = None
         self._last_partial_at = None
+        self._partial_runs = 0
+        self._partial_text = ""
+        self._partial_audio_end_sample_index = None
+        self._partial_run_generation = None
         setter = getattr(self._segmenter, "set_partial_transcript", None)
         if callable(setter):
             setter("")
 
     async def handle_chunk(self, pcm_chunk: bytes, muted: bool) -> dict | None:
-        if muted:
+        if muted or self._closed:
             return None
 
         self._vad_buffer.extend(pcm_chunk)
@@ -139,12 +149,41 @@ class VoiceStreamSession:
                 continue
 
             partial_runs = self._partial_runs
-            partial_text = self._partial_text
-            self._reset_segment_state()
             turn_started_at = time.perf_counter()
             stt_started = turn_started_at
-            text = await transcribe_pcm(segment.audio)
+            partial_text = self._partial_text
+            last_speech_sample_index = getattr(segment, "last_speech_sample_index", None)
+            if last_speech_sample_index is None:
+                last_speech_sample_index = len(segment.audio) // 2
+            task = self._partial_task
+            partial_covers_speech = (
+                task is not None
+                and self._partial_run_generation == self._segment_generation
+                and self._partial_audio_end_sample_index is not None
+                and self._partial_audio_end_sample_index >= last_speech_sample_index
+            )
+            text = None
+            partial_as_final = False
+            if partial_covers_speech:
+                self._finalizing = True
+                try:
+                    text = await task
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.debug("Teil-STT-Ergebnis konnte nicht final genutzt werden (%s)", type(exc).__name__)
+                finally:
+                    self._finalizing = False
+                if text:
+                    text = str(text).strip()
+                    partial_text = text
+                    partial_as_final = bool(text)
+
+            if not text:
+                text = await transcribe_pcm(segment.audio)
+            partial_text = self._partial_text or partial_text
             stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
+            self._reset_segment_state()
             result = {
                 "text": text,
                 "addressed": True,
@@ -152,11 +191,14 @@ class VoiceStreamSession:
                 "turn_started_at": turn_started_at,
                 "partial_runs": partial_runs,
                 "partial_text": partial_text,
+                "partial_as_final": partial_as_final,
             }
 
         return result
 
     def _maybe_start_partial(self) -> None:
+        if self._closed:
+            return
         if getattr(self._segmenter, "is_speaking", None) is not True:
             return
         if getattr(self._segmenter, "current_chunk_is_speech", None) is not True:
@@ -170,6 +212,8 @@ class VoiceStreamSession:
             self._last_partial_at = now
             self._partial_runs = 0
             self._partial_text = ""
+            self._partial_audio_end_sample_index = None
+            self._partial_run_generation = None
             self._segment_generation += 1
 
         if now - self._last_partial_at < self._partial_interval_ms / 1000:
@@ -192,35 +236,82 @@ class VoiceStreamSession:
         current_audio = getattr(self._segmenter, "current_audio", None)
         if not isinstance(current_audio, (bytes, bytearray)) or not current_audio:
             return
-        self._last_partial_at = now
-        self._partial_runs += 1
+        average_ms_per_audio_second = (
+            sum(self._partial_ms_per_audio_second) / len(self._partial_ms_per_audio_second)
+            if self._partial_ms_per_audio_second else None
+        )
+        if average_ms_per_audio_second is not None:
+            audio_seconds = len(current_audio) / (2 * SAMPLE_RATE)
+            predicted_ms = average_ms_per_audio_second * audio_seconds
+            if predicted_ms > float(getattr(config, "VOICE_PARTIAL_MAX_MS", 600)):
+                return
         generation = self._segment_generation
+        audio = bytes(current_audio)
+        audio_end_sample_index = len(audio) // 2
+        self._partial_audio_end_sample_index = audio_end_sample_index
+        self._partial_run_generation = generation
+        self._last_partial_at = now
         self._partial_task = asyncio.create_task(
-            self._run_partial(bytes(current_audio), generation),
+            self._run_partial(audio, generation, audio_end_sample_index),
             name="voice-partial-stt",
         )
+        self._partial_runs += 1
 
-    async def _run_partial(self, audio: bytes, generation: int) -> None:
+    async def _run_partial(
+        self, audio: bytes, generation: int, audio_end_sample_index: int,
+    ) -> str | None:
+        started_at = self._clock()
         try:
             text = await self._partial_transcriber(audio)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.debug("Teil-STT fehlgeschlagen (%s)", type(exc).__name__)
-            return
-        if text is None or generation != self._segment_generation:
-            return
-        if getattr(self._segmenter, "is_speaking", None) is not True:
-            return
+            return None
+        finally:
+            audio_seconds = len(audio) / (2 * SAMPLE_RATE)
+            elapsed_ms = max(0.0, (self._clock() - started_at) * 1000)
+            if audio_seconds > 0:
+                self._partial_ms_per_audio_second.append(elapsed_ms / audio_seconds)
+
+        if text is None:
+            return None
         text = str(text).strip()
         if not text:
+            return None
+        if generation == self._segment_generation and not self._closed and (
+            getattr(self._segmenter, "is_speaking", None) is True or self._finalizing
+        ):
+            self._partial_text = text
+            setter = getattr(self._segmenter, "set_partial_transcript", None)
+            if callable(setter):
+                try:
+                    setter(text, audio_end_sample_index=audio_end_sample_index)
+                except TypeError:
+                    setter(text)
+            if self._on_partial is not None:
+                try:
+                    self._on_partial(text)
+                except Exception as exc:
+                    log.debug("Voice-Vorarbeit konnte nicht starten (%s)", type(exc).__name__)
+        return text
+
+    async def close(self) -> None:
+        """Stoppt Callbacks und räumt die laufende Teil-STT-Task der Session ab."""
+        if self._closed:
             return
-        self._partial_text = text
-        setter = getattr(self._segmenter, "set_partial_transcript", None)
-        if callable(setter):
-            setter(text)
-        if self._on_partial is not None:
-            try:
-                self._on_partial(text)
-            except Exception as exc:
-                log.debug("Voice-Vorarbeit konnte nicht starten (%s)", type(exc).__name__)
+        self._closed = True
+        self._on_partial = None
+        self._segment_generation += 1
+        task = self._partial_task
+        if task is not None and not task.done():
+            task.cancel()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        self._partial_task = None
+        self._partial_text = ""
+        self._partial_audio_end_sample_index = None
+        self._partial_run_generation = None
+        self._vad_buffer.clear()
+        self._wakeword_buffer.clear()
+        self._reset_segment_state()

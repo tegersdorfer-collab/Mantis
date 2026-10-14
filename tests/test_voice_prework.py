@@ -72,6 +72,35 @@ def test_prework_cache_keeps_only_newest_pending_text_while_build_is_busy():
     assert cache.take_for("Erinner mich morgen an den Termin") is not None
 
 
+def test_prework_cache_close_cancels_work_and_rejects_later_partials():
+    started = asyncio.Event()
+    built = []
+
+    async def prepare(text):
+        built.append(text)
+        started.set()
+        await asyncio.Event().wait()
+
+    async def run():
+        cache = VoicePreworkCache(prepare)
+        cache.offer("Mantis, was steht heute an")
+        await started.wait()
+        task = cache._task
+        await cache.close()
+        cache.offer("Nach Close")
+        return cache, task
+
+    cache, task = asyncio.run(run())
+
+    assert built == ["Mantis, was steht heute an"]
+    assert task.done()
+    assert task.cancelled()
+    assert cache.latest_text == ""
+    assert cache._cache == {}
+    assert cache._pending is None
+    assert cache._task is None
+
+
 def test_partial_prework_uses_local_selection_and_context_without_cloud_or_agent(monkeypatch):
     from core import message_handler
 
@@ -100,6 +129,7 @@ def test_partial_prework_uses_local_selection_and_context_without_cloud_or_agent
 
 def test_agent_turn_reuses_matching_context_but_selects_tools_from_final_text(monkeypatch):
     from core import message_handler
+    from core import voice_timing
 
     handler = object.__new__(message_handler.MessageHandler)
     builds = []
@@ -148,19 +178,26 @@ def test_agent_turn_reuses_matching_context_but_selects_tools_from_final_text(mo
     )
 
     async def run():
-        return await handler._agent_turn(
-            "Was steht heute an, bitte",
-            channel_name="voice",
-            agent=agent,
-            prework=partial,
-        )
+        token = voice_timing.start()
+        try:
+            await handler._agent_turn(
+                "Was steht heute an, bitte",
+                channel_name="voice",
+                agent=agent,
+                prework=partial,
+            )
+            return voice_timing.snapshot()
+        finally:
+            voice_timing.reset(token)
 
-    asyncio.run(run())
+    timing = asyncio.run(run())
 
     assert builds == []
     assert "Vorgewärmter Kontext" in agent.kwargs["system"]
     assert agent.kwargs["allowed_tools"] == ["keyword-final"]
     assert agent.final_selection == (["cloud-final"], False)
+    assert timing["partial_reused"] is True
+    assert timing["saved_ms"] == 60.0
     assert selections == [
         ("keyword", "Was steht heute an, bitte"),
         ("async", "Was steht heute an, bitte"),

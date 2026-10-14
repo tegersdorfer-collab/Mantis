@@ -37,8 +37,11 @@ class VoicePreworkCache:
         self._task: asyncio.Task | None = None
         self._pending: tuple[int, str] | None = None
         self._generation = 0
+        self._closed = False
 
     def offer(self, text: str) -> None:
+        if self._closed:
+            return
         value = str(text or "").strip()
         if not value:
             return
@@ -49,7 +52,11 @@ class VoicePreworkCache:
         self._start(value, self._generation)
 
     def take_for(self, final_text: str) -> VoiceTurnPrework | None:
-        if not self.latest_text or not partial_text_matches_final(self.latest_text, final_text):
+        if (
+            self._closed
+            or not self.latest_text
+            or not partial_text_matches_final(self.latest_text, final_text)
+        ):
             return None
         return self._cache.pop(self.latest_text, None)
 
@@ -58,6 +65,19 @@ class VoicePreworkCache:
         self.latest_text = ""
         self._cache.clear()
         self._pending = None
+
+    async def close(self) -> None:
+        """Schließt den Cache der WebSocket-Session und bricht Vorarbeit ab."""
+        if self._closed:
+            return
+        self._closed = True
+        self.clear()
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        self._task = None
 
     def _start(self, text: str, generation: int) -> None:
         self._task = asyncio.create_task(self._build(text, generation))

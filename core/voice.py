@@ -58,6 +58,24 @@ VOICE_ADDRESS_TIMEOUT_S = 3.0
 _conversation_active_until = 0.0
 
 
+async def _await_worker_completion(awaitable):
+    """Hält den STT-Lock, bis ein nativer Worker-Thread wirklich fertig ist.
+
+    Das Abbrechen eines asyncio-Awaiters beendet einen bereits laufenden Thread
+    nicht. Der Thread-Future bleibt deshalb abgeschirmt und wird vor dem
+    Weiterreichen der Cancellation abgewartet.
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(task)
+        except BaseException:
+            pass
+        raise
+
+
 def mark_conversation_active() -> None:
     """Vom Voice-Router nach jeder erfolgreichen Mantis-Antwort aufzurufen."""
     global _conversation_active_until
@@ -195,13 +213,13 @@ async def preload_parakeet() -> None:
         model_id = getattr(config, "STT_PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
         try:
             loop = asyncio.get_running_loop()
-            _parakeet_model = await loop.run_in_executor(
+            _parakeet_model = await _await_worker_completion(loop.run_in_executor(
                 _parakeet_executor, _load_parakeet_model, model_id,
-            )
+            ))
             try:
-                await loop.run_in_executor(
+                await _await_worker_completion(loop.run_in_executor(
                     _parakeet_executor, _warmup_parakeet, _parakeet_model,
-                )
+                ))
             except Exception as exc:
                 log.warning("Parakeet-Warmup fehlgeschlagen (%s)", type(exc).__name__)
             log.info("Parakeet-Modell im Hintergrund vorgeladen")
@@ -228,9 +246,9 @@ async def _transcribe_parakeet(audio_path: str) -> str:
         log.info(f"🔊 Lade Parakeet-Modell '{model_id}' …")
         try:
             loop = asyncio.get_running_loop()
-            _parakeet_model = await loop.run_in_executor(
+            _parakeet_model = await _await_worker_completion(loop.run_in_executor(
                 _parakeet_executor, _load_parakeet_model, model_id,
-            )
+            ))
         except ImportError:
             log.warning("parakeet-mlx nicht installiert")
             _parakeet_unavailable = True
@@ -243,7 +261,9 @@ async def _transcribe_parakeet(audio_path: str) -> str:
 
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(_parakeet_executor, _parakeet_model.transcribe, audio_path)
+        result = await _await_worker_completion(
+            loop.run_in_executor(_parakeet_executor, _parakeet_model.transcribe, audio_path)
+        )
         return (result.text or "").strip()
     except Exception as e:
         # Laufzeitfehler (kaputte Datei o.ä.) — kein Grund, die Engine zu wechseln.
@@ -275,12 +295,14 @@ async def _transcribe_whisper_locked(audio_path: str) -> str:
     # demselben Lock, nicht nur das Laden.
     if _whisper_model is None:
         log.info("🔊 Lade whisper.cpp-Modell 'medium' …")
-        _whisper_model = await asyncio.to_thread(
-            Model, "medium", language="de", print_realtime=False, print_progress=False
-        )
+        _whisper_model = await _await_worker_completion(asyncio.to_thread(
+            Model, "medium", language="de", print_realtime=False, print_progress=False,
+        ))
 
     try:
-        segments = await asyncio.to_thread(_whisper_model.transcribe, audio_path)
+        segments = await _await_worker_completion(
+            asyncio.to_thread(_whisper_model.transcribe, audio_path)
+        )
         return " ".join(s.text for s in segments).strip()
     except Exception as e:
         log.error(f"Whisper-Transkription fehlgeschlagen: {e}")

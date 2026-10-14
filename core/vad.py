@@ -45,53 +45,123 @@ _SEPARABLE_COMMANDS = frozenset({
     "lies", "lese", "zeig", "zeige", "hol", "hole", "ruf", "rufe", "hör", "höre",
 })
 _SEPARABLE_PARTICLES = frozenset({"an", "aus", "ein", "mit", "vor", "zurück"})
-_SEPARABLE_QUESTION_VERBS = frozenset({"steht", "fängt", "kommt", "ruft", "sieht", "hört"})
 _MODAL_OR_WISH_VERBS = frozenset({
-    "wollte", "wollten", "möchte", "möchten", "muss", "musst", "müssen",
-    "müsste", "müssten", "sollte", "sollten", "könnte", "könnten", "hätte",
+    "will", "willst", "wollen", "wollt", "wollte", "wollten", "würde",
+    "würdest", "würden", "möchte", "möchtest", "möchten", "muss", "musst",
+    "müssen", "müsste", "müsstest", "müssten", "soll", "sollst", "sollte",
+    "solltest", "sollten", "kann", "kannst", "können", "könnt", "könnte",
+    "könntest", "könnten", "habe", "hast", "hat", "haben", "hatte", "bin",
+    "bist", "ist", "sind", "seid", "war", "waren", "wäre", "wären", "hätte",
+    "hättest", "hätten", "werde", "wirst", "wird", "werden", "wurde", "wurden",
+})
+_QUESTION_FUNCTION_WORDS = frozenset({
+    "ich", "du", "er", "sie", "es", "wir", "ihr", "mich", "mir", "dich",
+    "dir", "ihn", "ihm", "uns", "euch", "mein", "meine", "meinen", "meinem",
+    "meiner", "dein", "deine", "der", "die", "das", "den", "dem", "des",
+    "ein", "eine", "einen", "einem", "einer", "eines", "am", "im", "zum",
+    "zur", "mit", "von", "für", "an", "auf", "bei", "in", "über", "unter",
+})
+_COMMAND_VERBS = _SEPARABLE_COMMANDS | frozenset({
+    "spiel", "spiele", "sag", "sage", "erzähl", "erzähle", "öffne", "öffn",
+    "schließe", "schließ", "schick", "schicke",
+})
+_COMMAND_COMPLEMENTS = frozenset({"hoch", "runter", "ab"})
+_FULL_VERBS = frozenset({
+    "abhaken", "abholen", "anfangen", "ankommen", "anrufen", "aufmachen",
+    "aufräumen", "ausschalten", "einkaufen", "einschalten", "eintragen",
+    "erklären", "erinnern", "erzählen", "finden", "gehen", "hören", "kochen",
+    "lesen", "machen", "mitbringen", "öffnen", "planen", "reden", "schicken",
+    "schlafen", "schreiben", "sehen", "senden", "spielen", "stoppen", "suchen",
+    "trinken", "vorlesen", "warten", "zeigen", "zuhören",
+})
+_FINITE_FULL_VERBS = frozenset({
+    "bin", "bist", "ist", "sind", "seid", "war", "waren", "stehe", "steht",
+    "stehen", "gehe", "geht", "gehen", "komme", "kommt", "kommen", "mache",
+    "macht", "spielen", "spiele", "spielt", "schlafe", "schläft", "schlafen",
+    "warte", "wartet", "warten", "kostet", "läuft", "liege", "liegt", "schreibt",
+    "lese", "liest", "hört", "sehe", "sieht", "finde", "findet", "trinke",
+    "trinkt", "danke",
+})
+_SHORT_COMPLETE_UTTERANCES = frozenset({
+    "stopp", "stop", "danke", "pause", "weiter", "lauter", "leiser",
+})
+_CONTENT_FUNCTION_WORDS = _QUESTION_FUNCTION_WORDS | frozenset({
+    "bitte", "gerne", "gern", "vielleicht", "auch", "noch", "sehr", "mehr",
+    "weniger", "viel", "wenig",
 })
 
 
 def utterance_is_complete(text: str) -> bool:
-    """Einfache lokale Heuristik für ein wahrscheinlich abgeschlossenes Satzende."""
+    """Konservative Heuristik: FAST nur bei positiv erkannten fertigen Äußerungen."""
     value = str(text or "").strip()
     words = [word.casefold() for word in _WORD_RE.findall(value)]
     if not words:
         return False
 
     first, last = words[0], words[-1]
-    if last in _SEPARABLE_PARTICLES:
-        if first in _SEPARABLE_COMMANDS and len(words) >= 4:
-            return True
-        if first in _QUESTION_WORDS and any(
-            word in _SEPARABLE_QUESTION_VERBS for word in words[1:-1]
-        ):
-            return True
+    if " ".join(words) in _SHORT_COMPLETE_UTTERANCES:
+        return True
+
+    if first in _COMMAND_VERBS and last in _SEPARABLE_PARTICLES | _COMMAND_COMPLEMENTS:
+        return any(word not in _CONTENT_FUNCTION_WORDS for word in words[1:-1])
+    if first in _QUESTION_WORDS and last in _SEPARABLE_PARTICLES:
+        for index, word in enumerate(words[1:-1], start=1):
+            if word in _QUESTION_VERBS and any(
+                item not in _QUESTION_FUNCTION_WORDS for item in words[index + 1:-1]
+            ):
+                return True
+
     if last in _INCOMPLETE_ENDINGS:
         return False
-
     if first in _SUBORDINATORS | {"und", "oder", "aber"} and "," not in value:
         return False
 
-    if len(words) >= 2 and words[-2] in {"der", "die", "das", "ein", "eine"} and last.endswith(
-        ("e", "en", "er", "es")
-    ):
+    if first in _QUESTION_WORDS:
+        for index, word in enumerate(words[1:], start=1):
+            if word not in _QUESTION_VERBS:
+                continue
+            after_verb = words[index + 1:]
+            if any(item not in _QUESTION_FUNCTION_WORDS for item in after_verb):
+                return True
+            if words == ["wie", "spät", "ist", "es"]:
+                return True
         return False
 
-    if first in {"ich", "wir"} and any(word in _MODAL_OR_WISH_VERBS for word in words):
-        if last.endswith(("en", "ern", "eln")):
-            return False
+    if first in _COMMAND_VERBS:
+        command_content = [
+            word for word in words[1:] if word not in _CONTENT_FUNCTION_WORDS
+        ]
+        if last in _SEPARABLE_PARTICLES | _COMMAND_COMPLEMENTS:
+            return bool(command_content)
+        if first in {"spiel", "spiele"}:
+            return bool(command_content)
+        # Ein Befehl mit Zeit-/Wertangabe braucht neben dem Objekt noch einen
+        # konkreten Zusatz: "stell den Timer auf zehn Minuten".
+        return (
+            first in {"stell", "stelle"}
+            and "auf" in words[1:-1]
+            and len(command_content) >= 3
+        )
 
-    if first in _QUESTION_WORDS:
-        return any(word in _QUESTION_VERBS for word in words[1:])
+    if last in _FULL_VERBS:
+        content_before_verb = [
+            word for word in words[:-1] if word not in _CONTENT_FUNCTION_WORDS
+        ]
+        if content_before_verb:
+            return True
+        return (
+            len(words) >= 3
+            and words[0] in {"ich", "du", "er", "sie", "wir", "ihr"}
+            and any(word in _MODAL_OR_WISH_VERBS for word in words[:-1])
+        )
 
-    # Modalfragen mit abschließendem Infinitiv sind grammatisch komplett.
-    if first in {"kannst", "könnt", "können", "sollst", "soll", "willst"} and last.endswith(
-        ("en", "ern", "eln")
-    ):
-        return len(words) >= 4
+    if last in _FINITE_FULL_VERBS and last not in _MODAL_OR_WISH_VERBS:
+        return len(words) >= 2 and (
+            first in {"ich", "du", "er", "sie", "wir", "ihr"}
+            or any(word not in _CONTENT_FUNCTION_WORDS for word in words[:-1])
+        )
 
-    return True
+    return False
 
 # Silero VAD's ONNX export requires exactly this many samples per inference
 # call (32ms @ 16kHz) — confirmed empirically against the downloaded model.
@@ -160,6 +230,7 @@ class SileroVAD:
 class SegmentEvent:
     audio: bytes
     duration_ms: float
+    last_speech_sample_index: int | None = None
 
 
 class VadSegmenter:
@@ -184,8 +255,11 @@ class VadSegmenter:
         self._silence_ms = 0.0
         self._speech_ms = 0.0
         self._buffer: list[bytes] = []
+        self._buffer_samples = 0
         self._preroll: list[bytes] = []
         self._partial_transcript = ""
+        self._partial_transcript_sample_index: int | None = None
+        self._last_speech_sample_index: int | None = None
         self._current_chunk_is_speech = False
 
     @property
@@ -200,8 +274,21 @@ class VadSegmenter:
     def current_chunk_is_speech(self) -> bool:
         return self._current_chunk_is_speech
 
-    def set_partial_transcript(self, text: str) -> None:
+    @property
+    def last_speech_sample_index(self) -> int | None:
+        return self._last_speech_sample_index
+
+    def set_partial_transcript(
+        self, text: str, audio_end_sample_index: int | None = None,
+    ) -> None:
         self._partial_transcript = str(text or "").strip()
+        if not self._partial_transcript:
+            self._partial_transcript_sample_index = None
+        else:
+            self._partial_transcript_sample_index = (
+                self._last_speech_sample_index
+                if audio_end_sample_index is None else max(0, int(audio_end_sample_index))
+            )
 
     def _silence_threshold_ms(self) -> int:
         base = int(getattr(config, "VOICE_SILENCE_MS", 800))
@@ -210,7 +297,18 @@ class VadSegmenter:
         if not self._partial_transcript:
             return base
         if utterance_is_complete(self._partial_transcript):
-            return int(getattr(config, "VOICE_SILENCE_FAST_MS", 450))
+            last_speech = self._last_speech_sample_index
+            covered = self._partial_transcript_sample_index
+            max_stale_samples = int(
+                getattr(config, "VOICE_PARTIAL_STALE_MS", 400) * SAMPLE_RATE / 1000
+            )
+            if (
+                last_speech is not None
+                and covered is not None
+                and max(0, last_speech - covered) <= max_stale_samples
+            ):
+                return int(getattr(config, "VOICE_SILENCE_FAST_MS", 450))
+            return base
         return int(getattr(config, "VOICE_SILENCE_SLOW_MS", 1200))
 
     def process_chunk(self, pcm_chunk: bytes) -> SegmentEvent | None:
@@ -224,19 +322,32 @@ class VadSegmenter:
                 self._speaking = True
                 self._speech_ms = 0.0
                 self._buffer = list(self._preroll)
+                self._buffer_samples = sum(len(chunk) // 2 for chunk in self._buffer)
+                self._last_speech_sample_index = None
             self._speech_ms += self._chunk_ms
             self._buffer.append(pcm_chunk)
+            self._buffer_samples += len(pcm_chunk) // 2
+            self._last_speech_sample_index = self._buffer_samples
         elif self._speaking:
             self._buffer.append(pcm_chunk)
+            self._buffer_samples += len(pcm_chunk) // 2
             self._silence_ms += self._chunk_ms
             if self._silence_ms >= self._silence_threshold_ms():
                 self._speaking = False
                 total_ms = self._speech_ms + self._silence_ms
                 segment = b"".join(self._buffer)
+                last_speech_sample_index = self._last_speech_sample_index
                 self._buffer = []
+                self._buffer_samples = 0
                 self._partial_transcript = ""
+                self._partial_transcript_sample_index = None
+                self._last_speech_sample_index = None
                 if self._speech_ms >= MIN_SEGMENT_MS:
-                    return SegmentEvent(audio=segment, duration_ms=total_ms)
+                    return SegmentEvent(
+                        audio=segment,
+                        duration_ms=total_ms,
+                        last_speech_sample_index=last_speech_sample_index,
+                    )
                 return None
 
         preroll_chunks = max(1, int(PREROLL_MS / self._chunk_ms))

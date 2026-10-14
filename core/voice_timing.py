@@ -22,6 +22,7 @@ class TurnTiming:
         self.pending_tokens: int | None = None
         self.reflex = False
         self.partial_runs = 0
+        self.partial_as_final = False
         self.partial_reused = False
         self.saved_ms = 0.0
 
@@ -33,6 +34,7 @@ class TurnTiming:
             "tool_exec_ms": round(self.tool_exec_ms, 1),
             "reflex": self.reflex,
             "partial_runs": self.partial_runs,
+            "partial_as_final": self.partial_as_final,
             "partial_reused": self.partial_reused,
             "saved_ms": round(self.saved_ms, 1),
         }
@@ -57,6 +59,16 @@ def mark_reflex() -> None:
     timing = _current.get()
     if timing is not None:
         timing.reflex = True
+        timing.partial_reused = False
+        timing.saved_ms = 0.0
+
+
+def mark_partial_reused(saved_ms: float) -> None:
+    """Vermerkt Vorarbeit erst am tatsächlichen Verbrauchsort."""
+    timing = _current.get()
+    if timing is not None and not timing.reflex:
+        timing.partial_reused = True
+        timing.saved_ms = max(0.0, float(saved_ms))
 
 
 def snapshot() -> dict:

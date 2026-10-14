@@ -798,6 +798,7 @@ class MessageHandler:
         async def _timed_build():
             with voice_timing.phase("context_ms"):
                 if prework_matches:
+                    voice_timing.mark_partial_reused(prework.elapsed_ms)
                     return prework.system
                 return await self.prompt_builder.build(text)
 
