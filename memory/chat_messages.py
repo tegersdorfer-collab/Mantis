@@ -9,10 +9,12 @@ from typing import Any
 
 
 AGENT_REMOTE_REPLY_PREFIX = "Agent-Remote"
+# Kein literales % verwenden: Der Ausdruck wird in parametrisierte psycopg2-Abfragen
+# eingebettet, dort gilt % als Platzhalter (13.10.: KZG-Restore brach mit IndexError ab).
 PROMPT_SAFE_SQL = """
 COALESCE(lower(meta->>'untrusted'), 'false') <> 'true'
 AND COALESCE(meta->>'use_case', '') <> 'agent'
-AND NOT (role = 'assistant' AND ltrim(content) LIKE 'Agent-Remote%')
+AND NOT (role = 'assistant' AND left(ltrim(content), 12) = 'Agent-Remote')
 """
 
 
