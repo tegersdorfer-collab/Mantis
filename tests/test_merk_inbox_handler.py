@@ -528,6 +528,60 @@ def test_delete_is_not_confirmed_before_prompt_send_finishes(monkeypatch):
     assert agent.run.await_count == 1
 
 
+@pytest.mark.parametrize("interlude", ["dashboard", "telegram"])
+def test_user_turn_during_delete_prompt_send_expires_late_confirmation(monkeypatch, interlude):
+    handler, _rows, _agent, channel = _handler(monkeypatch)
+    monkeypatch.setattr("core.message_handler.inbox_service.store.resolve_item", lambda **_kw: {
+        "status": "found", "item": {"id": 42, "title": "Arrival"},
+    })
+    monkeypatch.setattr(
+        "core.message_handler.skills.T.select_tools_async",
+        AsyncMock(return_value=([], False)),
+    )
+    deleted = []
+    monkeypatch.setattr(
+        "core.message_handler.inbox_service.store.delete_item",
+        lambda **kw: _record_delete(deleted, **kw),
+    )
+
+    async def run():
+        prompt_started = asyncio.Event()
+        release_prompt = asyncio.Event()
+
+        async def delayed_send(text):
+            if "löschen? ja/nein" in text:
+                prompt_started.set()
+                await release_prompt.wait()
+                return "prompt-message-id"
+            return "regular-reply-id"
+
+        channel.send = delayed_send
+        prompt_task = asyncio.create_task(handler.handle(
+            _discord_message("Lösch #42", message_id="delete-request-pending"),
+            resume_idle_cb=None,
+        ))
+        await prompt_started.wait()
+
+        if interlude == "dashboard":
+            await handler.dashboard_respond("Eine andere Frage")
+        else:
+            await handler.handle(IncomingMessage(
+                "Eine andere Frage", "123", datetime(2026, 10, 14), channel="telegram",
+            ), resume_idle_cb=None)
+
+        release_prompt.set()
+        await prompt_task
+        await handler.handle(
+            _discord_message("ja", message_id="late-delete-yes"),
+            resume_idle_cb=None,
+        )
+
+    asyncio.run(run())
+
+    assert deleted == []
+    assert handler._pending_inbox_deletions == {}
+
+
 def test_delete_reply_requires_a_merker_confirmation_reference(monkeypatch):
     handler, _rows, agent, channel = _handler(monkeypatch)
     lookups = []

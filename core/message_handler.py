@@ -173,6 +173,15 @@ class MessageHandler:
         self._pending_inbox_deletions.clear()
         return pending
 
+    def _begin_user_turn(
+        self, sender_key: str | None = None,
+    ) -> tuple[int, PendingInboxDeletion | None]:
+        """Macht neue Benutzereingaben global sichtbar und verwirft alte Bestätigungen."""
+        self._incoming_message_sequence += 1
+        message_sequence = self._incoming_message_sequence
+        pending_deletion = self._take_pending_inbox_deletion(sender_key)
+        return message_sequence, pending_deletion
+
     # ── Verification Bump ─────────────────────────────────────────────────────
 
     def _check_verification_bump(self, text: str) -> None:
@@ -226,11 +235,9 @@ class MessageHandler:
             response_channel = self._channel_for(msg)
         is_discord = channel_name == "discord"
         sender_key = str(getattr(msg, "sender_id", "") or "")
-        self._incoming_message_sequence += 1
-        message_sequence = self._incoming_message_sequence
         # Jeder neue Benutzer-Turn verwirft alle offenen Bestätigungen, unabhängig
         # davon, über welchen Kanal er eingeht. Nur dieser Turn kann sie verbrauchen.
-        pending_deletion = self._take_pending_inbox_deletion(sender_key)
+        message_sequence, pending_deletion = self._begin_user_turn(sender_key)
         now = time.monotonic()
         pending_delete_id = None
         if (
@@ -467,7 +474,7 @@ class MessageHandler:
         resume_idle_cb=None,
     ) -> tuple[str, list]:
         self._start_turn()
-        self._take_pending_inbox_deletion()
+        self._begin_user_turn()
         try:
             self.kzg.add("user", text)
             self._persist_msg("user", text, channel=channel_name)
