@@ -25,6 +25,12 @@ class MantisSettings(BaseSettings):
     DASHBOARD_ALLOWED_ORIGINS: str = "http://localhost:1420,tauri://localhost,http://tauri.localhost,https://tauri.localhost"
     DASHBOARD_PORT: int = 7779
 
+    # ── Gym-Tracker ─────────────────────────────────────────────────────────
+    GYM_ENABLED: bool = True
+    GYM_HOST: str = "127.0.0.1"
+    GYM_PORT: int = 7782
+    GYM_SESSION_DAYS: int = 180
+
     # ── LLM ──────────────────────────────────────────────────────────────────
     OLLAMA_MODEL: str = "qwen3.5:9b"
     OLLAMA_BASE_URL: str = "http://localhost:11434"

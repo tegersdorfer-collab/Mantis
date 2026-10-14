@@ -594,6 +594,9 @@ MIGRATIONS = [
     "ALTER TABLE workout_sets ADD COLUMN IF NOT EXISTS rpe INT;",
     "ALTER TABLE workout_sets ADD COLUMN IF NOT EXISTS is_warmup BOOLEAN DEFAULT FALSE;",
     "ALTER TABLE workout_sets ADD COLUMN IF NOT EXISTS is_failure BOOLEAN DEFAULT FALSE;",
+    "ALTER TABLE workout_sets ADD COLUMN IF NOT EXISTS client_id TEXT;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS workout_sets_client_id_idx "
+    "ON workout_sets (client_id) WHERE client_id IS NOT NULL;",
     # Gym-Coach: optionale Übungsmetadaten lassen bestehende Übungen unangetastet.
     "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS exercise_type TEXT;",
     "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS equipment TEXT;",

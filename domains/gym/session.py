@@ -444,7 +444,10 @@ def _exercise_state(cur, workout_id: int, exercise_id: int) -> dict:
     }
 
 
-def add_sets(parsed, *, allow_create: bool = False, now: datetime | None = None) -> dict:
+def add_sets(
+    parsed, *, allow_create: bool = False, now: datetime | None = None,
+    client_id: str | None = None,
+) -> dict:
     """Legt Session und alle Sätze gemeinsam in einer Transaktion an."""
     moment = local_now(now)
     with db.cursor() as cur:
@@ -480,11 +483,11 @@ def add_sets(parsed, *, allow_create: bool = False, now: datetime | None = None)
             next_index += 1
             cur.execute(
                 """INSERT INTO workout_sets
-                     (workout_id, exercise_id, set_index, reps, weight_kg, is_warmup)
-                   VALUES (%s,%s,%s,%s,%s,%s)""",
+                     (workout_id, exercise_id, set_index, reps, weight_kg, client_id, is_warmup)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s)""",
                 (
                     workout["id"], exercise["id"], next_index, item.reps,
-                    item.weight_kg, item.is_warmup,
+                    item.weight_kg, client_id, item.is_warmup,
                 ),
             )
             inserted_sets.append({
