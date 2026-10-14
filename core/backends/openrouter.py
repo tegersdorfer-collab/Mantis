@@ -33,6 +33,26 @@ def _args_to_json(args) -> str:
         return "{}"
 
 
+def _content_to_openai(content):
+    if not isinstance(content, list):
+        return content or ""
+    converted = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            converted.append({"type": "text", "text": str(block.get("text", ""))})
+        elif block.get("type") == "image":
+            source = block.get("source") or {}
+            if source.get("type") == "base64" and source.get("data"):
+                media_type = source.get("media_type", "image/jpeg")
+                converted.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{source['data']}"},
+                })
+    return converted
+
+
 def _msgs_to_openai(messages: list[dict]) -> list[dict]:
     """Ollama-Messages → OpenAI-Messages.
 
@@ -46,7 +66,7 @@ def _msgs_to_openai(messages: list[dict]) -> list[dict]:
     for m in messages:
         role = m.get("role")
         if role == "assistant":
-            entry: dict = {"role": "assistant", "content": m.get("content") or ""}
+            entry: dict = {"role": "assistant", "content": _content_to_openai(m.get("content"))}
             calls = []
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function", {})
@@ -71,7 +91,7 @@ def _msgs_to_openai(messages: list[dict]) -> list[dict]:
                 pending_ids.remove(call_id)
             result.append({"role": "tool", "content": str(m.get("content", "")), "tool_call_id": call_id})
         else:
-            result.append({"role": role, "content": m.get("content", "")})
+            result.append({"role": role, "content": _content_to_openai(m.get("content", ""))})
     return result
 
 
@@ -140,6 +160,10 @@ class OpenRouterBackend(AgentBackend):
     @property
     def model_name(self) -> str:
         return self._model
+
+    @property
+    def supports_vision(self) -> bool:
+        return "gpt-6-luna" in self._model.casefold()
 
     async def warmup(self) -> None:
         return None  # Cloud — nichts vorzuladen.

@@ -148,6 +148,7 @@ TOOL_CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "productivity": "Aufgaben, Termine, Erinnerungen, Kalender anlegen, ändern oder abfragen",
     "health":       "Schlaf, Puls, HRV, Erholung, Gesundheitsdaten abfragen",
     "knowledge":    "Wissensfragen, Websuche, Wetter, Notizen im Wissenssystem (Brain) speichern oder suchen",
+    "inbox":        "Gespeicherte Merker, Links, Filme und Ideen suchen, erledigen, korrigieren oder löschen",
     "habits":       "Gewohnheiten abhaken, anlegen oder Streaks abfragen",
     "goals":        "Langfristige Ziele anlegen, ändern oder Fortschritt abfragen",
     "robot":        "Den Roboter fahren, drehen, stoppen, Sensoren lesen",

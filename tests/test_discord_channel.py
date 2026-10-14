@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from communication.base import IncomingMessage
+from communication.base import IncomingAttachment, IncomingMessage
 from communication.discord import DiscordChannel, split_discord_message
 
 
@@ -100,13 +100,28 @@ class _DiscordModule:
 
 
 class _Message:
-    def __init__(self, author, channel, *, content="hi", guild=None, attachments=()):
+    def __init__(self, author, channel, *, content="hi", guild=None, attachments=(), message_id="msg-1", reference=None):
         self.author = author
         self.channel = channel
         self.channel_id = channel.id
         self.content = content
         self.guild = guild
         self.attachments = list(attachments)
+        self.id = message_id
+        self.reference = reference
+
+
+class _Attachment:
+    def __init__(self, *, filename="image.png", content_type="image/png", size=8, data=b"png-bytes"):
+        self.filename = filename
+        self.content_type = content_type
+        self.size = size
+        self._data = data
+        self.read_count = 0
+
+    async def read(self):
+        self.read_count += 1
+        return self._data
 
 
 async def _start_channel(
@@ -258,7 +273,7 @@ def test_discord_ignores_server_messages_without_configured_channel_id():
     asyncio.run(run())
 
 
-def test_discord_attachment_gets_a_friendly_text_only_reply():
+def test_discord_non_image_attachment_gets_a_friendly_rejection():
     async def run():
         channel, client = await _start_channel()
         destination = _Destination("dm")
@@ -267,7 +282,71 @@ def test_discord_attachment_gets_a_friendly_text_only_reply():
         await client.events["on_message"](raw)
 
         assert len(destination.messages) == 1
-        assert "noch nicht" in destination.messages[0]
+        assert "Bilder" in destination.messages[0]
+        await channel.stop()
+
+    asyncio.run(run())
+
+
+def test_discord_allowed_image_attachment_is_downloaded_and_forwarded():
+    async def run():
+        channel, client = await _start_channel()
+        received = []
+
+        async def receive(incoming):
+            received.append(incoming)
+
+        channel.on_message(receive)
+        attachment = _Attachment(data=b"screen bytes")
+        message = _Message(
+            _User(123), _Destination("dm"), content="Balkon-Idee",
+            attachments=[attachment], message_id="source-42",
+            reference=SimpleNamespace(message_id="reply-12"),
+        )
+
+        await client.events["on_message"](message)
+
+        assert attachment.read_count == 1
+        assert received[0].source_message_id == "source-42"
+        assert received[0].reply_to_message_id == "reply-12"
+        assert received[0].attachments == (IncomingAttachment(
+            filename="image.png", content_type="image/png", size=12, data=b"screen bytes",
+        ),)
+        await channel.stop()
+
+    asyncio.run(run())
+
+
+def test_discord_rejects_oversized_image_before_download():
+    async def run():
+        channel, client = await _start_channel()
+        destination = _Destination("dm")
+        attachment = _Attachment(size=10 * 1024 * 1024 + 1)
+
+        await client.events["on_message"](_Message(
+            _User(123), destination, content="", attachments=[attachment],
+        ))
+
+        assert attachment.read_count == 0
+        assert "10 MiB" in destination.messages[0]
+        await channel.stop()
+
+    asyncio.run(run())
+
+
+def test_discord_does_not_download_image_for_non_allowlisted_sender():
+    async def run():
+        channel, client = await _start_channel()
+        attachment = _Attachment()
+        received = []
+        channel.on_message(received.append)
+
+        await client.events["on_message"](_Message(
+            _User(456), _Destination("dm"), attachments=[attachment],
+        ))
+
+        assert attachment.read_count == 0
+        assert received == []
         await channel.stop()
 
     asyncio.run(run())
@@ -431,6 +510,25 @@ def test_discord_typing_indicator_runs_until_the_reply_is_sent():
 
         assert destination.typing_count == 0
         assert destination.messages == ["fertige Antwort"]
+        await channel.stop()
+
+    asyncio.run(run())
+
+
+def test_discord_route_returns_the_sent_message_id_for_inbox_replies():
+    async def run():
+        channel, _client = await _start_channel()
+        destination = _Destination("dm")
+
+        async def send(_text):
+            return SimpleNamespace(id=987654321)
+
+        destination.send = send
+        route = channel.for_message(_Message(_User(123), destination))
+
+        reference_id = await route.send("📥 gemerkt: Balkon-Idee · ID 41")
+
+        assert reference_id == "987654321"
         await channel.stop()
 
     asyncio.run(run())

@@ -62,7 +62,9 @@ def _ollama_msgs_to_anthropic(messages: list[dict]) -> tuple[str | None, list[di
         if role == "assistant":
             content_parts = []
             text = m.get("content", "")
-            if text:
+            if isinstance(text, list):
+                content_parts.extend(_content_to_anthropic(text))
+            elif text:
                 content_parts.append({"type": "text", "text": text})
             # Tool-Calls aus Ollama-Format → Anthropic tool_use-Blöcke
             for tc in m.get("tool_calls", []):
@@ -84,7 +86,7 @@ def _ollama_msgs_to_anthropic(messages: list[dict]) -> tuple[str | None, list[di
             continue
 
         # user
-        result.append({"role": "user", "content": m.get("content", "")})
+        result.append({"role": "user", "content": _content_to_anthropic(m.get("content", ""))})
         i += 1
 
     return system, result
@@ -123,6 +125,29 @@ def _extract_text(response) -> str:
     return "".join(parts)
 
 
+def _content_to_anthropic(content):
+    if not isinstance(content, list):
+        return content
+    result = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            result.append({"type": "text", "text": str(block.get("text", ""))})
+        elif block.get("type") == "image":
+            source = block.get("source") or {}
+            if source.get("type") == "base64" and source.get("data"):
+                result.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": source.get("media_type", "image/jpeg"),
+                        "data": source["data"],
+                    },
+                })
+    return result
+
+
 class ClaudeBackend(AgentBackend):
     provider_name = "Anthropic"
 
@@ -134,6 +159,10 @@ class ClaudeBackend(AgentBackend):
     @property
     def model_name(self) -> str:
         return self._model
+
+    @property
+    def supports_vision(self) -> bool:
+        return "haiku" in self._model.casefold()
 
     async def call(
         self,
