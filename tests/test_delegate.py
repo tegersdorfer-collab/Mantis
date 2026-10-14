@@ -3,7 +3,6 @@ import asyncio
 import pytest
 
 from core import tools as toolreg
-from core.backends.ollama import OllamaBackend
 from tools import delegate
 
 
@@ -11,6 +10,26 @@ from tools import delegate
 def clean_registry(monkeypatch):
     monkeypatch.setattr(delegate, "_active", {})
     monkeypatch.setattr("core.agent.log_event", lambda *args, **kwargs: None)
+
+
+class FakeBackend:
+    def __init__(self, call):
+        self._call = call
+        self.model_name = "cloud-fixture"
+
+    async def call(self, messages, **kwargs):
+        return await self._call(self, messages, **kwargs)
+
+
+def _install_cloud_backend(monkeypatch, call):
+    purposes = []
+
+    def cloud_chain(purpose, **kwargs):
+        purposes.append((purpose, kwargs))
+        return FakeBackend(call)
+
+    monkeypatch.setattr(delegate, "cloud_chain", cloud_chain, raising=False)
+    return purposes
 
 
 def test_subagent_uses_real_backend_and_enforces_blocked_tools(monkeypatch):
@@ -28,12 +47,13 @@ def test_subagent_uses_real_backend_and_enforces_blocked_tools(monkeypatch):
             return messages[-1]["content"], []
         return "", [{"function": {"name": "send_telegram", "arguments": {}}}]
 
-    monkeypatch.setattr(OllamaBackend, "call", call)
+    purposes = _install_cloud_backend(monkeypatch, call)
     result = asyncio.run(delegate.run_subagent("Send", allowed_tools=["send_telegram"]))
     assert "FEHLER" in result
     assert "Subagent-Fehler" not in result
     assert "Subagent-Ausführungsfehler" not in result
     assert effects == []
+    assert purposes == [("background", {"reasoning": "low"})]
 
 
 def test_subagent_executes_permitted_tool_with_real_agent(monkeypatch):
@@ -50,7 +70,7 @@ def test_subagent_executes_permitted_tool_with_real_agent(monkeypatch):
             return messages[-1]["content"], []
         return "", [{"function": {"name": "record", "arguments": {}}}]
 
-    monkeypatch.setattr(OllamaBackend, "call", call)
+    _install_cloud_backend(monkeypatch, call)
     assert asyncio.run(delegate.run_subagent("Record", allowed_tools=["record"])) == "recorded"
     assert effects == ["recorded"]
 
@@ -59,7 +79,7 @@ def test_backend_failure_marks_subagent_as_error(monkeypatch):
     async def call(self, messages, **kwargs):
         raise RuntimeError("backend unavailable")
 
-    monkeypatch.setattr(OllamaBackend, "call", call)
+    _install_cloud_backend(monkeypatch, call)
     assert "backend unavailable" in asyncio.run(delegate.run_subagent("Work"))
     assert delegate.get_active_subagents()[0]["status"] == "error"
 

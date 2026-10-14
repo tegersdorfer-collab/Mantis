@@ -8,7 +8,7 @@ import asyncio
 import pytest
 
 from core.backends.base import AgentBackend
-from core.backends.fallback import FallbackBackend
+from core.backends.fallback import AllBackendsFailedError, FallbackBackend
 
 
 class FakeBackend(AgentBackend):
@@ -177,6 +177,28 @@ def test_three_stage_chain_falls_through_timeout_and_http_error_then_cools_down(
     assert local.calls == 2
     assert "TimeoutError" in caplog.text
     assert "HTTPStatusError" in caplog.text
+
+
+def test_single_configured_cloud_stage_can_run_without_a_fake_fallback():
+    only_provider = FakeBackend("claude", result=("cloud answer", []))
+    backend = FallbackBackend(backends=[only_provider], stage_timeouts=[0.5])
+
+    assert _call(backend) == ("cloud answer", [])
+    assert only_provider.calls == 1
+
+
+def test_all_backend_failures_raise_a_clear_exhaustion_error():
+    backend = FallbackBackend(
+        backends=[
+            FakeBackend("openrouter", error=ConnectionError("offline")),
+            FakeBackend("anthropic", error=RuntimeError("unavailable")),
+        ],
+        stage_timeouts=[0.5, 0.5],
+        cooldown_s=0,
+    )
+
+    with pytest.raises(AllBackendsFailedError, match="Alle Backend-Stufen sind fehlgeschlagen"):
+        _call(backend)
 
 
 def test_chain_uses_next_available_cloud_stage_during_primary_cooldown():

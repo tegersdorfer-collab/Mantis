@@ -6,7 +6,7 @@ der Aufrufer parkt den Task dann, statt ihn scheitern zu lassen.
 
 Alle Modelle sind am 2026-09-07 gegen die echten Anbieter geprüft worden;
 DeepSeek V4 (Zeitüberschreitung), kimi-k2.6 und nemotron-ultra-253b (404 für
-diesen Account) und gemma-4-31b (Zeitüberschreitung) stehen deshalb NICHT
+diesen Account) und ein 31B-Modell (Zeitüberschreitung) stehen deshalb NICHT
 hier drin, obwohl Kataloge sie führen.
 """
 from forge import budget

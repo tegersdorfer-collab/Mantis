@@ -16,22 +16,19 @@ import asyncio
 import logging
 import re
 
-import ollama as _ollama
-
-from core import decisions
 from core.jsonutil import extract_json
 from core.llm_gate import GATE
+from core.backends.factory import cloud_chain
+from core.backends.llm_adapter import BackendLLMAdapter
 from memory.lzg import LZG
 from memory.knowledge import KnowledgeGraph
-import config
 
 log = logging.getLogger(__name__)
 
 
 def verify_prompt(user_text: str, claim: str) -> str:
-    """Lokaler Verifier-Prompt. Der Sprecher MUSS genannt sein: Der Text ist in Ich-Form,
-    die Behauptung sagt „Timo" — ohne diesen Satz lehnte der 0.5B-Verifier gültige
-    Ich-Fakten ab (bench/jev: 4/8 → 8/8 allein durch die Sprecher-Angabe)."""
+    """Verifier-Prompt. Der Sprecher MUSS genannt sein: Der Text ist in Ich-Form,
+    die Behauptung sagt „Timo" — das macht die Zuordnung eindeutig."""
     return (
         f"Antworte NUR mit JA oder NEIN, nichts anderes.\n\n"
         f"Der Text stammt von Timo und ist in der Ich-Form geschrieben (\"ich\" = Timo).\n"
@@ -41,37 +38,22 @@ def verify_prompt(user_text: str, claim: str) -> str:
     )
 
 
-async def verify_claim(client, user_text: str, claim: str, *, allow_cloud: bool = True) -> bool:
-    """Steht die Behauptung wirklich im Text? Jev zuerst, lokal (qwen2.5:0.5b) als Fallback."""
-    async def _lokal() -> bool:
-        model = "qwen2.5:0.5b"
-        vresp = await client.chat(
-            model=model,
-            messages=[{"role": "user", "content": verify_prompt(user_text, claim)}],
-            options=config.ollama_options(
-                model, temperature=0.0, num_predict=5, keep_alive="5m"
-            ),
-            think=False,
+async def verify_claim(provider, user_text: str, claim: str) -> bool:
+    """Prüft die Behauptung mit der Fast-Cloud-Kette; Fehler lehnen sie ab."""
+    try:
+        answer = await provider.complete(
+            verify_prompt(user_text, claim), temperature=0.0, max_tokens=8,
         )
-        return (vresp.message.content or "").strip().upper().startswith("JA")
-    if not allow_cloud:
-        return await _lokal()
-    return await decisions.claim_supported(user_text, claim, _lokal)
+    except Exception as e:
+        log.debug("Claim-Verifier fehlgeschlagen: %s", e)
+        return False
+    return answer.strip().upper().startswith(("JA", "YES"))
 
 
-def make_judge(client, model: str, *, allow_cloud: bool = True):
-    """Konflikt-Judge: Jev zuerst, sonst der bisherige LLM-Judge aus memory/conflict.py."""
+def make_judge(provider):
+    """Konflikt-Judge über dieselbe Fast-Cloud-Kette wie die Extraktion."""
     from memory import conflict
-    lokal = conflict.make_llm_judge(client, model)
-
-    if not allow_cloud:
-        return lokal
-
-    async def _judge(old: str, new: str) -> bool:
-        async def _fb() -> bool:
-            return await lokal(old, new)
-        return await decisions.supersedes(old, new, _fb)
-    return _judge
+    return conflict.make_llm_judge(provider)
 
 
 # ── Extraktions-Prompt ────────────────────────────────────────────────────────
@@ -173,43 +155,24 @@ class MemoryExtractor:
         lzg: LZG,
         kg: KnowledgeGraph | None = None,
         fact_llm=None,
-        local_only: bool = False,
     ):
         self._llm = llm_provider   # nur für embed()
         self._lzg = lzg
         self._kg  = kg
-        self._fact_llm = fact_llm
-        self._local_only = local_only
-        self._client = _ollama.AsyncClient(host=config.OLLAMA_BASE_URL)
+        self._fact_llm = fact_llm or BackendLLMAdapter(
+            cloud_chain("fast", reasoning="low", timeout=8),
+        )
 
     async def _ask_json(self, prompt: str, max_tokens: int, gate_timeout_s: float) -> str | None:
-        """Nutzt den Chat-Aufgaben-Provider oder bleibt beim bisherigen lokalen Modell."""
-        if self._fact_llm is not None:
-            return await self._fact_llm.complete(
-                prompt,
-                temperature=0.1,
-                max_tokens=max_tokens,
-                format="json",
-            )
-
+        """Holt JSON aus dem Cloud-Fast-Purpose, begrenzt durch den LLM-Gate."""
         try:
             await asyncio.wait_for(GATE.acquire(), timeout=gate_timeout_s)
         except asyncio.TimeoutError:
             return None
         try:
-            response = await self._client.chat(
-                model=config.AGENT_MODEL_FAST,
-                messages=[{"role": "user", "content": prompt}],
-                options=config.ollama_options(
-                    config.AGENT_MODEL_FAST,
-                    temperature=0.1,
-                    num_predict=max_tokens,
-                    keep_alive=config.OLLAMA_KEEP_ALIVE,
-                ),
-                format="json",
-                think=False,
+            return await self._fact_llm.complete(
+                prompt, temperature=0.1, max_tokens=max_tokens, format="json",
             )
-            return response.message.content or "[]"
         finally:
             GATE.release()
 
@@ -230,7 +193,7 @@ class MemoryExtractor:
         # (verhindert dass halluzinierte Inhalte aus Mantis-Antworten ins Gedächtnis kommen)
         exchange = f"Timo sagt: {user_text}"
 
-        # ── 1. LLM-Extraktion (Fast-Modell) ───────────────────────────────
+        # ── 1. LLM-Extraktion (Fast-Purpose) ──────────────────────────────
         facts: list[dict] = []
         try:
             raw = await self._ask_json(_EXTRACT_PROMPT + exchange, 300, 8.0)
@@ -282,10 +245,10 @@ class MemoryExtractor:
                 log.debug(f"Extraktor: Text-Duplikat übersprungen: '{text[:60]}'")
                 continue
 
-            # ── 4b. Verifier: steht das wirklich im Text? (Jev, lokal 0.5B als Fallback) ──
+            # ── 4b. Verifier: steht das wirklich im Text? ────────────────────
             try:
                 if not await verify_claim(
-                    self._client, user_text, text, allow_cloud=not self._local_only
+                    self._fact_llm, user_text, text,
                 ):
                     log.debug(f"Extraktor: Verifier abgelehnt: '{text[:60]}'")
                     continue
@@ -327,10 +290,7 @@ class MemoryExtractor:
                 # Extraktion nie kippen.
                 try:
                     from memory import conflict
-                    judge = make_judge(
-                        self._client, config.AGENT_MODEL_FAST,
-                        allow_cloud=not self._local_only,
-                    )
+                    judge = make_judge(self._fact_llm)
                     await conflict.resolve(self._lzg, new_id, text, embedding, judge)
                 except Exception as e:
                     log.debug(f"Konfliktauflösung übersprungen: {e}")

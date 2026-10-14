@@ -17,7 +17,6 @@ import time
 from pathlib import Path
 
 from llm.base import LLMProvider
-from llm.local import OllamaProvider
 from core.backends.base import AgentBackend
 from memory.kzg import KZG
 from memory.lzg import LZG
@@ -29,7 +28,7 @@ from communication.base import CommunicationChannel, IncomingMessage
 from thermal import ThermalMonitor
 from proactive import ProactiveEngine, ProactiveTracker
 
-from core import db, fast, skills
+from core import db, skills
 from core.agent import Agent
 from core.skills import SkillContext
 from core.autopilot import Autopilot
@@ -99,20 +98,10 @@ class Orchestrator:
         self.kg           = KnowledgeGraph()
         self.consolidator = Consolidator(llm=bg_llm, lzg=lzg)
         self.forgetting   = ForgettingCurve()
-        # Datenschutzgrenze: Nur der Chat-Extractor verarbeitet den aktuellen Chat-Turn
-        # mit der optionalen Cloud-Kette. Dashboard-/Journal-Daten bleiben lokal.
         self.extractor    = MemoryExtractor(
             llm_provider=embed_llm,
             lzg=lzg,
             kg=self.kg,
-            fact_llm=chat_task_llm,
-        )
-        self.local_extractor = MemoryExtractor(
-            llm_provider=embed_llm,
-            lzg=lzg,
-            kg=self.kg,
-            fact_llm=bg_llm,
-            local_only=True,
         )
         self.reflection   = Reflection(llm=bg_llm, lzg=lzg)
         self.agent        = Agent(backend=agent_backend, max_steps=8)
@@ -210,8 +199,7 @@ class Orchestrator:
         )
 
     async def voice_respond(self, text: str, stream_cb=None) -> tuple[str, list]:
-        """Wie dashboard_respond, aber über das kleine, dauerhaft geladene
-        Voice-Agent-Backend statt des großen Dashboard-Agenten (Latenz)."""
+        """Wie dashboard_respond, aber über die Voice-Variante der Cloud-Kette."""
         return await self.msg_handler.dashboard_respond(
             text, stream_cb, agent=self.voice_agent, channel_name="voice",
             resume_idle_cb=self.idle_loop.resume,
@@ -259,7 +247,6 @@ class Orchestrator:
         log_observability.install()
         await self._init_skills()
         await self._restore_memory()
-        await self._warmup()
         register_message_start = getattr(self.channel, "on_message_start", None)
         if callable(register_message_start):
             register_message_start(self.begin_incoming_message)
@@ -353,15 +340,6 @@ class Orchestrator:
                 log.info(f"🧠 {len(mems)} Erinnerungen, {len(skills.T.REGISTRY)} Tools")
         except Exception:
             pass
-
-    async def _warmup(self) -> None:
-        """LLM-Modelle aufwärmen — Tasks mit Referenz speichern (kein GC-Risiko)."""
-        if isinstance(self.chat_llm, OllamaProvider):
-            await self.chat_llm.pull_if_missing()
-        self._bg_tasks += [
-            asyncio.create_task(self.agent.warmup()),
-            asyncio.create_task(fast.warmup()),
-        ]
 
     async def stop(self) -> None:
         self.idle_loop.pause()

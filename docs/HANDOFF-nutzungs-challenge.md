@@ -3,6 +3,8 @@
 > Erstellt 2026-10-13 auf dem Windows-PC, zum Weitermachen auf dem Mac.
 > **Start auf dem Mac:** `git pull`, dann in Claude Code: *„Lies docs/HANDOFF-nutzungs-challenge.md und mach da weiter."*
 
+> **Aktueller Stand 14.10.2026:** Die LLM-Route und die frühere lokale Datenschutzgrenze wurden durch `docs/specs/2026-10-14-cloud-umstellung.md` aktualisiert. Alle LLM-Aufgaben laufen über vorhandene Cloud-Backends; lokal bleibt Ollama ausschließlich für Embeddings (`qwen3-embedding:0.6b`). Die darunter datierten Beobachtungen und Entscheidungen beschreiben den damaligen Stand.
+
 ---
 
 ## 1. Ausgangslage (ehrlich)

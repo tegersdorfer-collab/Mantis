@@ -7,7 +7,7 @@ import base64
 from fastapi.testclient import TestClient
 from unittest.mock import patch
 
-from web.routers.voice import build_router, sende_antwort
+from web.routers.voice import build_router, sende_antwort, sende_streaming_antwort
 from fastapi import FastAPI
 
 
@@ -104,3 +104,60 @@ class TestSendeAntwort:
         asyncio.run(sende_antwort(ws, "nicht adressiert", None, True))
         assert ws.gesendet == [{"text": "nicht adressiert", "addressed": True,
                                 "reply": None, "audio_b64": None}]
+
+
+def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkeypatch):
+    timeline = []
+    logged = []
+    audio_ready = asyncio.Event()
+
+    class StreamingWebSocket(FakeWebSocket):
+        async def send_json(self, data):
+            await super().send_json(data)
+            if data.get("type") == "audio_chunk":
+                timeline.append(("audio", data["seq"], base64.b64decode(data["b64"])))
+                audio_ready.set()
+
+    class FakeOrchestrator:
+        voice_agent = type("Agent", (), {"backend": type("Backend", (), {
+            "model_name": "openai/gpt-6-luna", "last_used_backend": None,
+        })()})()
+
+        async def voice_respond(self, text, stream_cb=None):
+            assert callable(stream_cb)
+            await stream_cb("Erster Satz. ")
+            await audio_ready.wait()
+            timeline.append("llm-finished")
+            await stream_cb("Zweiter Satz.")
+            return "Erster Satz. Zweiter Satz.", []
+
+    async def fake_tts(sentence, **kwargs):
+        timeline.append(("tts", sentence))
+        yield f"audio-{sentence}".encode()
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+    ws = StreamingWebSocket()
+
+    asyncio.run(sende_streaming_antwort(
+        ws, "Mantis, sag etwas", FakeOrchestrator(), stt_ms=42, address_check_ms=8,
+    ))
+
+    assert timeline.index(("audio", 0, b"audio-Erster Satz.")) < timeline.index("llm-finished")
+    chunks = [msg for msg in ws.gesendet if msg.get("type") == "audio_chunk"]
+    assert [msg["seq"] for msg in chunks] == [0, 1]
+    assert [entry[1] for entry in timeline if isinstance(entry, tuple) and entry[0] == "tts"] == [
+        "Erster Satz.", "Zweiter Satz.",
+    ]
+    assert ws.gesendet[0]["audio_streaming"] is True
+    assert ws.gesendet[0]["reply"] == ""
+    assert ws.gesendet[-2]["reply"] == "Erster Satz. Zweiter Satz."
+    assert ws.gesendet[-1] == {"type": "audio_end", "count": 2}
+    assert logged[0][0:2] == ("voice_latency", "Voice-Turn")
+    assert logged[0][2]["stt_ms"] == 42
+    assert logged[0][2]["address_check_ms"] == 8
+    assert logged[0][2]["first_token_ms"] is not None
+    assert logged[0][2]["first_tts_block_ms"] is not None
+    assert logged[0][2]["total_ms"] >= logged[0][2]["first_tts_block_ms"]
+    assert logged[0][2]["model"] == "openai/gpt-6-luna"
+    assert logged[0][2]["stage"] == "Backend"

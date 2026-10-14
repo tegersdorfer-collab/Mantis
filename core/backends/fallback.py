@@ -1,14 +1,7 @@
-"""
-FallbackBackend — hält den Agenten am Leben wenn das primäre Backend ausfällt.
+"""Sequenzielle Cloud-Fallback-Kette mit Stage-Timeouts und Cooldowns.
 
-Primär: Claude API (Haiku). Fällt sie aus (Netz weg, Anthropic-Ausfall,
-Rate-Limit, Timeout), übernimmt das lokale Ollama-Backend transparent —
-Mantis bleibt offline funktionsfähig ("Lokal first").
-
-Circuit-Breaker light: Nach einem Primär-Fehler gehen Folge-Calls für
-COOLDOWN_S direkt ans Fallback, damit ein toter API-Endpunkt nicht jeden
-Turn erst um den Timeout verzögert. Danach wird das Primär-Backend wieder
-probiert.
+Jeder Call versucht die verfügbaren Anbieter der konfigurierten Reihenfolge.
+Sind alle Stufen ausgefallen, wirft die Kette eine definierte Exception.
 """
 import asyncio
 import logging
@@ -21,6 +14,15 @@ log = logging.getLogger(__name__)
 
 PRIMARY_TIMEOUT_S = 90   # pro Einzel-Call (Streaming inklusive)
 COOLDOWN_S        = 180  # nach Primär-Fehler direkt zum Fallback
+
+
+class AllBackendsFailedError(RuntimeError):
+    """Alle konfigurierten Anbieter-Stufen sind fehlgeschlagen oder im Cooldown."""
+
+    def __init__(self, failures: list[str] | None = None):
+        self.failures = tuple(failures or ())
+        detail = f" ({'; '.join(self.failures)})" if self.failures else ""
+        super().__init__(f"Alle Backend-Stufen sind fehlgeschlagen{detail}")
 
 
 class FallbackBackend(AgentBackend):
@@ -40,8 +42,8 @@ class FallbackBackend(AgentBackend):
             backends = [primary, fallback]
         elif primary is not None or fallback is not None:
             raise ValueError("primary/fallback und backends können nicht gemeinsam gesetzt werden")
-        if len(backends) < 2:
-            raise ValueError("FallbackBackend braucht mindestens zwei Backends")
+        if not backends:
+            raise ValueError("FallbackBackend braucht mindestens ein Backend")
 
         if stage_timeouts is None:
             stage_timeouts = [timeout_s] * (len(backends) - 1) + [None]
@@ -57,6 +59,7 @@ class FallbackBackend(AgentBackend):
         self._fallback = self._backends[-1]
         self._timeout_s = self._stage_timeouts[0]
         self._primary_down_until = 0.0
+        self._last_used_backend: AgentBackend | None = None
 
     @property
     def backends(self) -> tuple[AgentBackend, ...]:
@@ -69,6 +72,11 @@ class FallbackBackend(AgentBackend):
     @property
     def stage_timeouts(self) -> tuple[float | None, ...]:
         return self._stage_timeouts
+
+    @property
+    def last_used_backend(self) -> AgentBackend | None:
+        """Letzte erfolgreiche Stufe; bei einem neuen Call vorab zurückgesetzt."""
+        return self._last_used_backend
 
     @property
     def model_name(self) -> str:
@@ -100,15 +108,20 @@ class FallbackBackend(AgentBackend):
             think=think, force_tool_call=force_tool_call,
         )
 
-        for index, backend in enumerate(self._backends[:-1]):
+        self._last_used_backend = None
+        failures: list[str] = []
+        for index, backend in enumerate(self._backends):
             if time.time() < self._down_until[index]:
                 continue
             try:
                 result = backend.call(**kwargs)
                 timeout = self._stage_timeouts[index]
                 if timeout is None:
-                    return await result
-                return await asyncio.wait_for(result, timeout=timeout)
+                    outcome = await result
+                else:
+                    outcome = await asyncio.wait_for(result, timeout=timeout)
+                self._last_used_backend = backend
+                return outcome
             except Exception as e:
                 permanently_disabled = bool(getattr(e, "disable_backend", False))
                 requested_cooldown = getattr(e, "fallback_cooldown_s", None)
@@ -118,15 +131,19 @@ class FallbackBackend(AgentBackend):
                     self._primary_down_until = self._down_until[index]
                 detail = redact_error_text(e).strip()
                 failure = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
-                next_backend = self._next_available_backend(index + 1)
-                fallback_period = "bis zum Neustart" if permanently_disabled else f"für {cooldown:.0f}s"
-                log.warning(
-                    f"Backend {backend.model_name} ausgefallen ({failure}) — "
-                    f"Fallback auf {next_backend.model_name} {fallback_period}"
-                )
-                self._report_failover(e, backend, next_backend)
+                failures.append(f"{backend.model_name}: {failure}")
+                if index < len(self._backends) - 1:
+                    next_backend = self._next_available_backend(index + 1)
+                    fallback_period = "bis zum Neustart" if permanently_disabled else f"für {cooldown:.0f}s"
+                    log.warning(
+                        f"Backend {backend.model_name} ausgefallen ({failure}) — "
+                        f"Fallback auf {next_backend.model_name} {fallback_period}"
+                    )
+                    self._report_failover(e, backend, next_backend)
+                else:
+                    log.warning("Letzte Backend-Stufe %s ausgefallen (%s)", backend.model_name, failure)
 
-        return await self._backends[-1].call(**kwargs)
+        raise AllBackendsFailedError(failures)
 
     def _next_available_backend(self, start: int) -> AgentBackend:
         now = time.time()
@@ -162,7 +179,7 @@ class FallbackBackend(AgentBackend):
             pass
 
     async def warmup(self) -> None:
-        # Alle Stufen aufwärmen: lokale Fallbacks müssen im Ernstfall bereit sein.
+        # Cloud-Backends laden keine lokalen Modelle; warmup bleibt interface-kompatibel.
         await self._backends[0].warmup()
         for backend in self._backends[1:]:
             try:

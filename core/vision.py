@@ -1,41 +1,66 @@
-"""
-Vision — gemeinsame Ollama-Bildbeschreibung.
+"""Cloud-Bildanalyse für Foto-, Screen- und andere Bildaufgaben."""
+from __future__ import annotations
 
-Identisch zu dem, was communication/telegram.py bisher exklusiv für
-Foto-Nachrichten nutzte — jetzt hier zentralisiert, damit weitere Konsumenten
-(z.B. Screen-Context-Awareness in core/skills/vision.py) dieselbe Logik
-wiederverwenden statt sie zu duplizieren (analog zu core/voice.py für Whisper).
-"""
 import base64
 import logging
 
-import config
+from core.backends.factory import cloud_chain
 
 log = logging.getLogger(__name__)
+_chain = None
 
-DEFAULT_VISION_MODEL = getattr(config, "VISION_MODEL", "qwen3.5:9b")
+
+def get_backend_chain():
+    global _chain
+    if _chain is None:
+        _chain = cloud_chain("vision", reasoning="low")
+    return _chain
 
 
-async def describe_image(image_bytes: bytes, prompt: str, model: str | None = None) -> str:
-    """Beschreibt ein Bild lokal via Ollama-Vision-Modell. Gibt einen Fallback-Text
-    bei Fehlern zurück, statt eine Exception zu werfen."""
+async def ask_image(
+    image_bytes: bytes,
+    prompt: str,
+    *,
+    max_tokens: int = 512,
+    temperature: float = 0.2,
+    format: str | dict | None = None,
+) -> str:
+    """Sendet ein Bild über die Vision-Variante der zentralen Cloud-Kette."""
+    chain = get_backend_chain()
+    content = [
+        {"type": "text", "text": prompt},
+        {"type": "image", "source": {
+            "type": "base64",
+            "media_type": "image/jpeg",
+            "data": base64.b64encode(image_bytes).decode("ascii"),
+        }},
+    ]
+    messages = []
+    if format == "json":
+        messages.append({
+            "role": "system",
+            "content": "Antworte ausschließlich mit validem JSON, ohne Text drumherum.",
+        })
+    elif isinstance(format, dict):
+        messages.append({
+            "role": "system",
+            "content": "Antworte als JSON gemäß diesem Schema: " + str(format),
+        })
+    messages.append({"role": "user", "content": content})
+    answer, _ = await chain.call(
+        messages=messages,
+        tools=None,
+        stream_cb=None,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return (answer or "").strip()
+
+
+async def describe_image(image_bytes: bytes, prompt: str) -> str:
+    """Beschreibt ein Bild; Fehler bleiben für optionale UI-Kontexte lesbar."""
     try:
-        import ollama as _ollama
-        b64 = base64.standard_b64encode(image_bytes).decode()
-        client = _ollama.AsyncClient(host=config.OLLAMA_BASE_URL)
-        active_model = model or DEFAULT_VISION_MODEL
-        resp = await client.chat(
-            model=active_model,
-            messages=[{
-                "role": "user",
-                "content": prompt,
-                "images": [b64],
-            }],
-            options=config.ollama_options(active_model, num_predict=512),
-            think=False,  # qwen3.5 denkt sonst und verbraucht das Budget im Thinking
-            keep_alive=0,
-        )
-        return (resp.message.content or "").strip()
-    except Exception as e:
-        log.error(f"Ollama-Vision fehlgeschlagen: {e}")
+        return await ask_image(image_bytes, prompt)
+    except Exception as exc:
+        log.error("Cloud-Vision fehlgeschlagen: %s", exc)
         return "Konnte Bild nicht analysieren."

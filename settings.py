@@ -32,32 +32,11 @@ class MantisSettings(BaseSettings):
     GYM_SESSION_DAYS: int = 180
 
     # ── LLM ──────────────────────────────────────────────────────────────────
-    OLLAMA_MODEL: str = "qwen3.5:9b"
+    # Ollama wird ausschließlich für den lokalen Embedding-Pfad genutzt.
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_KEEP_ALIVE: str = "0"
-    # num_ctx pro Modell festlegen: wechselnde Werte würden Reloads bzw. Doppel-Loads auslösen;
-    # 8k deckt auch die zusätzlichen Vision-Tokens ab.
     OLLAMA_NUM_CTX: int = 8192
-    OLLAMA_NUM_CTX_OVERRIDES: str = "gemma4:e2b=16384"  # Modell-Tag=Kontext, kommasepariert
-    AGENT_MODEL_FAST: str = "qwen3.5:9b"
-    # Interaktiver Haupt-Agent (Telegram/Dashboard-Chat). Benchmark 2026-07-09:
-    # gemma4:e2b erreicht ~gleiche Chat-Qualität wie die 9B-Modelle, ist aber 3×
-    # schneller — und teilt sich das Modell mit dem Voice-Agent (immer warm).
-    AGENT_MODEL_STRONG: str = "gemma4:e2b"
-    # Kleines, schnelles Modell für Ja/Nein-Klassifikation (z.B. Voice-Adress-Check).
-    # Auf einem 24-Fälle-Testset verglichen: qwen3.5:2b (12/24), qwen2.5:3b-instruct
-    # (16/24, ~1.1s), qwen3.5:4b (21/24, ~3.1s), qwen3.5:9b (21/24, ~6.0s),
-    # gemma4:e2b (21/24, ~2.8s) — gemma4:e2b gewählt: gleiche Genauigkeit wie die
-    # größeren Qwen-Modelle, aber am schnellsten davon.
-    ADDRESS_CHECK_MODEL: str = "gemma4:e2b"
-    # Dediziertes, dauerhaft geladenes Modell für Voice-Antworten (nicht der große
-    # Dashboard-Agent) — gleiches Modell wie ADDRESS_CHECK_MODEL, da es schon für
-    # den Adress-Check läuft (siehe Kommentar oben) und laut Latenztest vom
-    # 2026-07-05 warm ~5.5-7.5s statt 166s (qwen3.5:9b) braucht. KEEP_ALIVE="-1"
-    # hält es dauerhaft im Speicher, statt es (wie der Haupt-Agent) nach jedem
-    # Call sofort wieder zu entladen (OLLAMA_KEEP_ALIVE="0").
-    VOICE_AGENT_MODEL: str = "gemma4:e2b"
-    VOICE_AGENT_KEEP_ALIVE: str = "-1"
+    OLLAMA_NUM_CTX_OVERRIDES: str = ""
+    VOICE_SILENCE_MS: int = 800
     # ── STT (Sprache → Text) ─────────────────────────────────────────────────
     # "parakeet" (Default seit 22.09.2026) oder "whisper" (whisper.cpp medium, der
     # vorherige Stand — bleibt als Fallback, wenn parakeet-mlx fehlt).
@@ -85,29 +64,12 @@ class MantisSettings(BaseSettings):
     CHAT_CHATGPT_PLAN_MODEL: str = "gpt-6-luna"
     CHATGPT_AUTH_FILE: str = "~/.config/mantis/chatgpt_auth.json"
     CHATGPT_AUTH_CALLBACK_PORT: int = 1456
-    # Nur Chat-nahe Aufgaben (Fact-Extraction und KZG-Checkpoint) dürfen den
-    # Chat-Cloud-Fallback nutzen. Andere Background-Jobs bleiben bei bg_llm.
-    BG_CHAT_TASKS_USE_CLOUD: bool = True
-    # Voll-lokaler Betrieb: ignoriert Cloud-Keys und nutzt für den Agenten Ollama.
+    # Legacy-Flag bleibt für bestehende .env-Dateien; alle LLM-Aufrufe bleiben Cloud.
     LLM_LOCAL_ONLY: bool = False
-    # ── Jev (TypeSafe System-One-Modell) ─────────────────────────────────────
-    # Kleine Ja/Nein- und Kategorie-Entscheidungen (Voice-Adress-Check, Tool-
-    # Auswahl, Memory-Verifier/Konflikt-Judge) laufen über Jev statt über ein
-    # lokales 9B/0.5B-Modell: kalibrierte Wahrscheinlichkeiten, ~0.4 s, hält
-    # den Ollama-GATE nicht. Benchmark 2026-09-18: 86/92 vs. 88 % lokal
-    # (bench/jev/results/report.md). Bewusst UNABHÄNGIG von LLM_LOCAL_ONLY:
-    # Timo hat dem Cloud-Call für diese Daten explizit zugestimmt (18.09.2026).
-    # Der direkte TypeSafe-Endpunkt ist der Produktionspfad; OpenRouter bleibt
-    # als explizite Vergleichs-/Fallback-Option konfigurierbar.
+    # ── Jev-Integrationen ───────────────────────────────────────────────────
     JEV_ENABLED: bool = False
-    # Lokale Label-Logits sind nur der kalibrierbare Fallback bei Jev-Ausfall.
-    LOCAL_LOGITS_ENABLED: bool = False
-    LOCAL_LOGITS_TIMEOUT_S: float = 8.0
-    # Zusätzliche Forge-Klassifikation ist separat opt-in; der bestehende
-    # Assistant-Jev darf dadurch nicht automatisch Agenten-Tasks beeinflussen.
     JEV_FORGE_GATE_ENABLED: bool = False
     JEV_PROVIDER: str = "typesafe"
-    # Leer = kompatibler Einzel-Provider aus JEV_PROVIDER; sonst Reihenfolge wie angegeben.
     JEV_PROVIDER_CHAIN: str = ""
     TYPESAFE_API_KEY: str = ""
     OPENROUTER_API_KEY: str = ""
@@ -115,46 +77,12 @@ class MantisSettings(BaseSettings):
     CLEF_MODEL: str = "clef-flash"
     CLOUDFLARE_ACCOUNT_ID: str = ""
     CLOUDFLARE_AUTH_TOKEN: str = ""
-    JEV_TIMEOUT_S: float = 3.0      # danach lokaler Fallback
-    JEV_COOLDOWN_S: float = 120.0   # nach Fehler: so lange kein Jev-Versuch
-    JEV_UI_ACT_CONFIDENCE: float = 0.55  # konservative Mindest-Confidence für UI-Aktionen
-    # JSONL-Log aller Jev-Antworten (leer = aus), z.B. data/jev_decisions.jsonl
+    JEV_TIMEOUT_S: float = 3.0
+    JEV_COOLDOWN_S: float = 120.0
+    JEV_UI_ACT_CONFIDENCE: float = 0.55
     JEV_LOG_PATH: str = ""
-    # ── Background-LLM Routing ────────────────────────────────────────────────
-    # Default: qwen3.5:9b für Memory, Review, Konsolidierung
-    BG_DEFAULT_MODEL: str = ""          # leer = OLLAMA_MODEL
-    # Reasoning-Spezialist für Briefings, Insights, Pattern-Detection.
-    # Benchmark 2026-07-09: qwen3.5:9b (8.4/10 @ 7s) schlug deepseek-r1:14b sowohl
-    # ohne (6.6 @ 70s) als auch MIT Thinking (7.2 @ 37s) — bei 4-5× weniger Latenz.
-    BG_REASONING_MODEL: str = "qwen3.5:9b"
-    # Code-Spezialist des Background-LLM. Benchmark 2026-07-09: ornith:9b war
-    # der beste Coder im Feld (8.7/10) und schneller als qwen3.5.
-    # Erreicht wird dieses Modell über die _CODE_KEYWORDS in llm/routed.py:
-    # Background-Review, Konsolidierung, idle_loop — und seit dem Fast-Path in
-    # core/skill_request.py auch die Skill-Factory. Vorher stimmte das NICHT:
-    # `create_skill` bekam `source_code` als Tool-Argument vom CHAT-Agenten
-    # (AGENT_MODEL_STRONG), der dabei reproduzierbar `skill_name` verschluckte.
-    # Die Forge läuft weiterhin über die claude-CLI, nicht über Ollama.
-    # Ersetzt 2026-09-09 durch Ornith-1.5 (Benchmark-Lauf bench/nanbeige42,
-    # n=12 — die Unterlagen liegen nur lokal und bewusst nicht im Repo, weil
-    # die COROS-Aufgabe echte Messwerte enthaelt):
-    # gleiche Code-Trefferquote (11/12), aber halbe Latenz (Median 6.3s statt
-    # 14.3s im Code-Block). NICHT das nackte ornith-1.5:9b eintragen — dessen
-    # Modelfile bringt weder SYSTEM noch Sampling-Parameter mit, was allein
-    # 11/12 auf 8/12 drückt. Der lokale Tag ornith-1.5:9b-sys backt beides aus
-    # ornith:9b ein und ist damit ein echter Drop-in (verifiziert, 11/12).
-    # Neu bauen: siehe ORNITH-1.5.md §8 in den lokalen Unterlagen.
-    BG_CODE_MODEL: str = "ornith-1.5:9b-sys"
-    # Sampling-Temperatur für die Code-Route. Der Ollama-Pfad sendet temperature
-    # immer explizit und überschreibt damit den Wert aus dem Modelfile — ohne
-    # diese Einstellung liefe der Coder auf dem generischen 0.7-Default.
-    # Messung 09.09.2026 (Code-Aufgabe des Benchmarks): 0.6 → 8/8, 0.7 → 7/8.
+    # Sampling-Temperatur für codeartige Background-Aufgaben.
     BG_CODE_TEMPERATURE: float = 0.6
-    # Vision-Modell für Foto-Analyse (Mahlzeiten, Screen-Context). Seit 22.09.2026
-    # qwen3.5:9b — kann nativ Bilder (Ollama-Capabilities: vision tools thinking),
-    # ersetzt das ältere qwen3-vl:8b → ein Modell weniger im RAM-Swap.
-    # Vision-Aufrufe MÜSSEN think=False setzen, sonst frisst das Thinking num_predict.
-    VISION_MODEL: str = "qwen3.5:9b"
 
     # ── Telegram ─────────────────────────────────────────────────────────────
     TELEGRAM_BOT_TOKEN: str = ""
@@ -290,6 +218,13 @@ class MantisSettings(BaseSettings):
         if v <= 0:
             raise ValueError("OLLAMA_NUM_CTX muss positiv sein")
         return v
+
+    @field_validator("VOICE_SILENCE_MS")
+    @classmethod
+    def positive_voice_silence_ms(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("VOICE_SILENCE_MS muss positiv sein")
+        return value
 
     @field_validator("OLLAMA_NUM_CTX_OVERRIDES")
     @classmethod

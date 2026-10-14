@@ -241,7 +241,7 @@ class TestIsAddressedToMantis:
             result = asyncio.run(voice.is_addressed_to_mantis("Ruf mir die Nacht-Zusammenfassung auf"))
         assert result is True
         mock_yes_no.assert_called_once()
-        assert mock_yes_no.call_args.kwargs["model"] == voice.config.ADDRESS_CHECK_MODEL
+        assert mock_yes_no.call_args.kwargs == {}
 
     def test_ohne_namen_faellt_auf_kleines_modell_zurueck_nein(self):
         with patch("core.fast.yes_no", new=AsyncMock(return_value=False)):
@@ -283,15 +283,29 @@ class TestConversationFollowup:
         assert result is False
 
 
-def test_address_check_nutzt_jev_vor_fast():
-    """Layer 3: Jev entscheidet; fast.yes_no ist nur noch der Fallback."""
+def test_address_check_uses_fast_cloud_variant_directly():
     from unittest.mock import AsyncMock, patch
     from core import voice
     voice._conversation_active_until = 0.0
-    with patch("core.voice.decisions.addressed", new=AsyncMock(return_value=True)) as jev, \
+    with patch("core.decisions.addressed", new=AsyncMock(return_value=True)) as jev, \
          patch("core.voice.fast.yes_no", new=AsyncMock(return_value=False)) as fast:
-        assert asyncio.run(voice.is_addressed_to_mantis("mach das Licht an")) is True
-    jev.assert_awaited_once()
-    fast.assert_not_awaited()
-    text, fallback = jev.await_args.args
-    assert text == "mach das Licht an" and callable(fallback)
+        assert asyncio.run(voice.is_addressed_to_mantis("mach das Licht an")) is False
+    jev.assert_not_awaited()
+    fast.assert_awaited_once_with(
+        "Ist dieser Satz eine Anfrage oder ein Befehl an einen persönlichen KI-Assistenten "
+        "namens Mantis (nicht nur Small Talk mit jemand anderem im Raum), auch wenn der Name "
+        "'Mantis' nicht genannt wird?\n\n\"mach das Licht an\""
+    )
+
+
+def test_address_check_timeout_fails_closed_within_three_seconds():
+    from unittest.mock import AsyncMock, patch
+    async def timeout_before_provider(coro, timeout):
+        coro.close()
+        raise TimeoutError
+
+    with patch("core.voice.fast.yes_no", new=AsyncMock()) as fast, \
+         patch("core.voice.asyncio.wait_for", side_effect=timeout_before_provider) as wait_for:
+        assert asyncio.run(voice.is_addressed_to_mantis("mach das Licht an")) is False
+    fast.assert_called_once()
+    assert wait_for.call_args.kwargs["timeout"] <= 3

@@ -105,6 +105,17 @@ class FakeVAD:
 
 
 class TestVadSegmenter:
+    def test_silence_threshold_uses_config_setting(self, monkeypatch):
+        import config
+
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 200)
+        seg = vad.VadSegmenter(FakeVAD([0.9, 0.9, 0.9, 0.1, 0.1]), chunk_ms=100)
+
+        events = [seg.process_chunk(silence_chunk()) for _ in range(5)]
+
+        assert events[-1] is not None
+        assert events[-1].duration_ms == 500
+
     def test_no_segment_while_silent(self):
         fake = FakeVAD([0.1, 0.1, 0.1])
         seg = vad.VadSegmenter(fake, chunk_ms=100)

@@ -2,13 +2,20 @@ import asyncio
 from pathlib import Path
 import secrets
 from types import SimpleNamespace
+import logging
+
+import pytest
 
 from core.backends.base import AgentBackend
 from core.backends.fallback import FallbackBackend
+from core.backends.llm_adapter import BackendLLMAdapter
 from core.backends.factory import (
+    CloudChainUnavailableError,
     build_chat_backend,
     build_chat_task_provider,
+    cloud_chain,
     describe_backend_chain,
+    warn_if_local_only,
 )
 from settings import MantisSettings
 
@@ -23,6 +30,10 @@ class FakeBackend(AgentBackend):
     @property
     def model_name(self):
         return self._model
+
+    @property
+    def supports_vision(self):
+        return self.provider_name != "OpenRouter" or "gpt-6-luna" in self._model
 
     async def call(self, messages, tools, stream_cb, temperature, max_tokens,
                    think=False, force_tool_call=False):
@@ -73,12 +84,6 @@ def _install_fake_backends(monkeypatch):
         created.append(("openrouter", backend))
         return backend
 
-    def ollama(model=None, keep_alive=None):
-        backend = FakeBackend("Ollama", model or "local-default")
-        backend.kwargs = {"keep_alive": keep_alive}
-        created.append(("ollama", backend))
-        return backend
-
     def claude(model=None, purpose="chat-agent"):
         backend = FakeBackend("Claude", model or "claude-default")
         backend.kwargs = {"purpose": purpose}
@@ -93,7 +98,6 @@ def _install_fake_backends(monkeypatch):
         return backend
 
     monkeypatch.setattr(factory, "OpenRouterBackend", openrouter)
-    monkeypatch.setattr(factory, "OllamaBackend", ollama)
     monkeypatch.setattr(factory, "ClaudeBackend", claude)
     monkeypatch.setattr(factory, "ChatGPTPlanBackend", chatgpt)
     monkeypatch.setattr(factory, "chatgpt_auth_is_configured", lambda cfg: False)
@@ -111,7 +115,6 @@ def test_chat_cloud_settings_have_benchmarked_defaults(monkeypatch):
         "CHAT_CHATGPT_PLAN_MODEL",
         "CHATGPT_AUTH_FILE",
         "CHATGPT_AUTH_CALLBACK_PORT",
-        "BG_CHAT_TASKS_USE_CLOUD",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -126,21 +129,18 @@ def test_chat_cloud_settings_have_benchmarked_defaults(monkeypatch):
     assert settings.CHAT_CHATGPT_PLAN_MODEL == "gpt-6-luna"
     assert settings.CHATGPT_AUTH_FILE == "~/.config/mantis/chatgpt_auth.json"
     assert settings.CHATGPT_AUTH_CALLBACK_PORT == 1456
-    assert settings.BG_CHAT_TASKS_USE_CLOUD is True
 
 
 def test_chat_cloud_settings_can_be_overridden_from_environment(monkeypatch):
     monkeypatch.setenv("CHAT_CLOUD_MODEL", "vendor/model-test")
     monkeypatch.setenv("CHAT_CLOUD_FALLBACK_MODEL", "")
     monkeypatch.setenv("CHAT_CLOUD_TIMEOUT_S", "17")
-    monkeypatch.setenv("BG_CHAT_TASKS_USE_CLOUD", "false")
 
     settings = MantisSettings(_env_file=None)
 
     assert settings.CHAT_CLOUD_MODEL == "vendor/model-test"
     assert settings.CHAT_CLOUD_FALLBACK_MODEL == ""
     assert settings.CHAT_CLOUD_TIMEOUT_S == 17
-    assert settings.BG_CHAT_TASKS_USE_CLOUD is False
 
 
 def test_chat_chain_settings_can_be_overridden_from_environment(monkeypatch):
@@ -159,7 +159,7 @@ def test_chat_chain_settings_can_be_overridden_from_environment(monkeypatch):
     assert settings.CHATGPT_AUTH_CALLBACK_PORT == 1457
 
 
-def test_cloud_chain_uses_primary_fallback_then_local(monkeypatch):
+def test_chat_chain_keeps_openrouter_fallback_and_has_no_local_stage(monkeypatch):
     _install_fake_backends(monkeypatch)
 
     backend = build_chat_backend(_cfg())
@@ -169,13 +169,56 @@ def test_cloud_chain_uses_primary_fallback_then_local(monkeypatch):
         "openai/gpt-6-luna",
         "google/gemini-3.1-flash-lite",
         "claude-haiku-test",
-        "local-default",
     )
-    assert backend.stage_timeouts == (30, 30, 30, None)
+    assert backend.stage_timeouts == (30, 30, 30)
     assert describe_backend_chain(backend) == (
         "OpenRouter openai/gpt-6-luna → OpenRouter google/gemini-3.1-flash-lite "
-        "→ Claude claude-haiku-test → Ollama local-default"
+        "→ Claude claude-haiku-test"
     )
+
+
+def test_cloud_chain_routes_purpose_without_local_stage(monkeypatch):
+    import core.backends.factory as factory
+
+    created = []
+
+    def openrouter(model, **kwargs):
+        backend = FakeBackend("OpenRouter", model)
+        backend.kwargs = kwargs
+        created.append(("openrouter", backend))
+        return backend
+
+    def claude(model, purpose):
+        backend = FakeBackend("Anthropic", model)
+        backend.kwargs = {"purpose": purpose}
+        created.append(("claude", backend))
+        return backend
+
+    def chatgpt(model, auth_file, purpose):
+        backend = FakeBackend("ChatGPT-Abo", model)
+        backend.kwargs = {"auth_file": auth_file, "purpose": purpose}
+        created.append(("chatgpt", backend))
+        return backend
+
+    monkeypatch.setattr(factory, "OpenRouterBackend", openrouter)
+    monkeypatch.setattr(factory, "ClaudeBackend", claude)
+    monkeypatch.setattr(factory, "ChatGPTPlanBackend", chatgpt)
+    monkeypatch.setattr(factory, "chatgpt_auth_is_configured", lambda _cfg: True)
+
+    backend = cloud_chain(
+        "voice", cfg=_cfg(CHAT_CLOUD_FALLBACK_MODEL=""),
+        reasoning="low", timeout=3,
+    )
+
+    assert isinstance(backend, FallbackBackend)
+    assert [kind for kind, _ in created] == ["openrouter", "claude", "chatgpt"]
+    assert backend.backend_chain == (
+        "openai/gpt-6-luna", "claude-haiku-test", "gpt-6-luna",
+    )
+    assert backend.stage_timeouts == (3, 3, 3)
+    assert [backend.kwargs["purpose"] for _, backend in created] == [
+        "voice", "voice", "voice",
+    ]
 
 
 def test_full_chain_orders_openrouter_anthropic_chatgpt_then_local(monkeypatch):
@@ -186,18 +229,17 @@ def test_full_chain_orders_openrouter_anthropic_chatgpt_then_local(monkeypatch):
 
     backend = build_chat_backend(_cfg())
 
-    assert [kind for kind, _ in created] == ["openrouter", "openrouter", "claude", "chatgpt", "ollama"]
+    assert [kind for kind, _ in created] == ["openrouter", "openrouter", "claude", "chatgpt"]
     assert backend.backend_chain == (
         "openai/gpt-6-luna",
         "google/gemini-3.1-flash-lite",
         "claude-haiku-test",
         "gpt-6-luna",
-        "local-default",
     )
-    assert backend.stage_timeouts == (30, 30, 30, 30, None)
+    assert backend.stage_timeouts == (30, 30, 30, 30)
     assert describe_backend_chain(backend) == (
         "OpenRouter openai/gpt-6-luna → OpenRouter google/gemini-3.1-flash-lite "
-        "→ Claude claude-haiku-test → ChatGPT-Abo gpt-6-luna → Ollama local-default"
+        "→ Claude claude-haiku-test → ChatGPT-Abo gpt-6-luna"
     )
     assert created[3][1].kwargs == {
         "auth_file": Path("/tmp/mantis-chatgpt-auth-test.json"),
@@ -205,27 +247,29 @@ def test_full_chain_orders_openrouter_anthropic_chatgpt_then_local(monkeypatch):
     }
 
 
-def test_local_only_ignores_openrouter_and_claude_keys(monkeypatch):
-    created = _install_fake_backends(monkeypatch)
+def test_local_only_flag_does_not_reintroduce_a_local_llm(monkeypatch):
+    _install_fake_backends(monkeypatch)
 
     backend = build_chat_backend(_cfg(LLM_LOCAL_ONLY=True))
 
-    assert not isinstance(backend, FallbackBackend)
-    assert backend.model_name == "local-agent"
-    assert [kind for kind, _ in created] == ["ollama"]
-    assert describe_backend_chain(backend) == "Ollama local-agent"
+    assert isinstance(backend, FallbackBackend)
+    assert backend.backend_chain == ("openai/gpt-6-luna", "google/gemini-3.1-flash-lite", "claude-haiku-test")
+    assert "Ollama" not in describe_backend_chain(backend)
 
 
-def test_local_only_also_disables_background_cloud_when_flag_is_enabled(monkeypatch):
-    created = _install_fake_backends(monkeypatch)
+def test_local_only_flag_does_not_disable_background_cloud(monkeypatch):
+    _install_fake_backends(monkeypatch)
 
     provider = build_chat_task_provider(_cfg(
         LLM_LOCAL_ONLY=True,
         BG_CHAT_TASKS_USE_CLOUD=True,
     ))
 
-    assert provider is None
-    assert created == []
+    assert isinstance(provider, BackendLLMAdapter)
+    assert isinstance(provider.backend, FallbackBackend)
+    assert provider.backend.backend_chain == (
+        "openai/gpt-6-luna", "claude-haiku-test",
+    )
 
 
 def test_missing_openrouter_key_preserves_claude_fallback(monkeypatch):
@@ -234,8 +278,8 @@ def test_missing_openrouter_key_preserves_claude_fallback(monkeypatch):
     backend = build_chat_backend(_cfg(OPENROUTER_API_KEY=""))
 
     assert isinstance(backend, FallbackBackend)
-    assert backend.backend_chain == ("claude-haiku-test", "local-default")
-    assert describe_backend_chain(backend) == "Claude claude-haiku-test → Ollama local-default"
+    assert backend.backend_chain == ("claude-haiku-test",)
+    assert describe_backend_chain(backend) == "Claude claude-haiku-test"
 
 
 def test_empty_primary_model_disables_openrouter_and_preserves_claude(monkeypatch):
@@ -244,19 +288,27 @@ def test_empty_primary_model_disables_openrouter_and_preserves_claude(monkeypatc
     backend = build_chat_backend(_cfg(CHAT_CLOUD_MODEL=""))
 
     assert isinstance(backend, FallbackBackend)
-    assert backend.backend_chain == ("claude-haiku-test", "local-default")
+    assert backend.backend_chain == ("claude-haiku-test",)
 
 
 def test_blank_openrouter_key_is_treated_as_missing(monkeypatch):
     created = _install_fake_backends(monkeypatch)
 
-    backend = build_chat_backend(_cfg(OPENROUTER_API_KEY="  ", ANTHROPIC_API_KEY=""))
+    with pytest.raises(CloudChainUnavailableError, match="Kein Cloud-LLM-Anbieter konfiguriert"):
+        build_chat_backend(_cfg(OPENROUTER_API_KEY="  ", ANTHROPIC_API_KEY=""))
 
-    assert backend.model_name == "local-agent"
-    assert [kind for kind, _ in created] == ["ollama"]
+    assert created == []
 
 
-def test_chat_task_provider_respects_cloud_flag(monkeypatch):
+def test_local_only_startup_warning_explains_that_cloud_is_still_used(caplog):
+    with caplog.at_level(logging.WARNING, logger="core.backends.factory"):
+        warn_if_local_only(_cfg(LLM_LOCAL_ONLY=True))
+
+    assert "lokale LLM-Modelle sind entfernt" in caplog.text
+    assert "Cloud-Kette" in caplog.text
+
+
+def test_chat_task_provider_ignores_removed_local_privacy_switch(monkeypatch):
     _install_fake_backends(monkeypatch)
 
     provider = build_chat_task_provider(_cfg(BG_CHAT_TASKS_USE_CLOUD=True))
@@ -265,16 +317,14 @@ def test_chat_task_provider_respects_cloud_flag(monkeypatch):
     assert provider is not None
     assert provider.backend.backend_chain == (
         "openai/gpt-6-luna",
-        "google/gemini-3.1-flash-lite",
         "claude-haiku-test",
-        "local-default",
     )
-    assert [stage.purpose for stage in provider.backend.backends[:-1]] == [
-        "background",
+    assert [stage.purpose for stage in provider.backend.backends] == [
         "background",
         "background",
     ]
-    assert disabled is None
+    assert isinstance(disabled, BackendLLMAdapter)
+    assert disabled.backend.backend_chain == provider.backend.backend_chain
 
 
 def test_background_chat_chain_includes_anthropic_and_chatgpt_in_order(monkeypatch):
@@ -287,14 +337,28 @@ def test_background_chat_chain_includes_anthropic_and_chatgpt_in_order(monkeypat
 
     assert provider.backend.backend_chain == (
         "openai/gpt-6-luna",
-        "google/gemini-3.1-flash-lite",
         "claude-haiku-test",
         "gpt-6-luna",
-        "local-default",
     )
-    assert [stage.kwargs.get("purpose", "chat-agent") for stage in provider.backend.backends[:-1]] == [
-        "background", "background", "background", "background",
+    assert [stage.kwargs.get("purpose", "chat-agent") for stage in provider.backend.backends] == [
+        "background", "background", "background",
     ]
+
+
+def test_non_chat_purposes_do_not_inherit_optional_text_chat_fallback(monkeypatch):
+    _install_fake_backends(monkeypatch)
+    import core.backends.factory as factory
+    monkeypatch.setattr(factory, "chatgpt_auth_is_configured", lambda _cfg: True)
+
+    backend = cloud_chain("vision", cfg=_cfg())
+
+    assert backend.backend_chain == (
+        "openai/gpt-6-luna", "claude-haiku-test", "gpt-6-luna",
+    )
+    chat = build_chat_backend(_cfg())
+    assert chat.backend_chain[:2] == (
+        "openai/gpt-6-luna", "google/gemini-3.1-flash-lite",
+    )
 
 
 def test_missing_chatgpt_login_is_reported_and_stage_is_skipped(monkeypatch, caplog):
@@ -304,7 +368,7 @@ def test_missing_chatgpt_login_is_reported_and_stage_is_skipped(monkeypatch, cap
     backend = build_chat_backend(_cfg())
 
     assert backend.backend_chain == (
-        "openai/gpt-6-luna", "google/gemini-3.1-flash-lite", "claude-haiku-test", "local-default",
+        "openai/gpt-6-luna", "google/gemini-3.1-flash-lite", "claude-haiku-test",
     )
     assert "ChatGPT-Abo übersprungen" in caplog.text
 
@@ -318,12 +382,10 @@ def test_chatgpt_stage_is_skipped_when_auth_scope_lacks_direct_usage(tmp_path, m
         "access_token": secrets.token_urlsafe(32), "refresh_token": secrets.token_urlsafe(32),
         "expires_at": 9999999999, "scope": "openid profile offline_access",
     })
-    backend = build_chat_backend(_cfg(
-        OPENROUTER_API_KEY="", ANTHROPIC_API_KEY="", CHATGPT_AUTH_FILE=str(path),
-    ))
-
-    assert not isinstance(backend, FallbackBackend)
-    assert backend.model_name == "local-agent"
+    with pytest.raises(CloudChainUnavailableError, match="Kein Cloud-LLM-Anbieter konfiguriert"):
+        build_chat_backend(_cfg(
+            OPENROUTER_API_KEY="", ANTHROPIC_API_KEY="", CHATGPT_AUTH_FILE=str(path),
+        ))
 
 
 def test_chat_task_provider_adapter_uses_background_chain_for_complete(monkeypatch):
@@ -347,5 +409,5 @@ def test_empty_cloud_fallback_uses_primary_then_local(monkeypatch):
 
     backend = build_chat_backend(_cfg(CHAT_CLOUD_FALLBACK_MODEL=""))
 
-    assert backend.backend_chain == ("openai/gpt-6-luna", "claude-haiku-test", "local-default")
-    assert backend.stage_timeouts == (30, 30, None)
+    assert backend.backend_chain == ("openai/gpt-6-luna", "claude-haiku-test")
+    assert backend.stage_timeouts == (30, 30)

@@ -1,5 +1,10 @@
 # Mantis — Roadmap
 
+> **Aktuelles LLM-Routing (14.10.2026):** Text-, Hintergrund-, Fast-, Voice- und Vision-Aufgaben
+> nutzen die Cloud-Backends OpenRouter → Anthropic → ChatGPT-Abo. Ollama bleibt nur für
+> `qwen3-embedding:0.6b`. Ältere Modell- und Routing-Angaben in den datierten Roadmap-Abschnitten
+> sind historische Einträge und keine aktuelle Laufzeitkonfiguration.
+
 > **Ziel**: Ein lokaler, autonomer AI-Concierge der das eigene Leben managt —
 > reaktionsschnell, proaktiv, selbst-verbessernd. *"Leben auf Autopilot."*
 

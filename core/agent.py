@@ -3,8 +3,9 @@ Agentischer Kern – ReAct-Loop mit nativem Tool-Calling.
 Das Modell entscheidet selbst, welche Tools es in welcher Reihenfolge nutzt.
 
 Backends (core/backends/) übernehmen den LLM-spezifischen Teil:
-    OllamaBackend  → Ollama-API (lokal)
-    ClaudeBackend  → Anthropic-API (Haiku)
+    OpenRouterBackend → OpenRouter Chat Completions
+    ClaudeBackend    → Anthropic Messages
+    ChatGPTPlanBackend → ChatGPT Responses
 
 Dieser Loop kennt nur backend.call() — egal welcher Anbieter dahintersteckt.
 """
@@ -27,6 +28,10 @@ class Agent:
     def __init__(self, backend: AgentBackend, max_steps: int = 8):
         self._backend = backend
         self._max_steps = max_steps
+
+    @property
+    def backend(self) -> AgentBackend:
+        return self._backend
 
     @property
     def model_name(self) -> str:

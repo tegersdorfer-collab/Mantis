@@ -87,7 +87,7 @@ class ClaudeProvider(LLMProvider):
 
     async def embed(self, text: str) -> list[float]:
         # Claude hat kein Embedding-API → Fehler werfen damit Caller
-        # auf OllamaProvider für Embeddings zurückfällt
+        # auf OllamaEmbeddingProvider für Embeddings zurückfällt
         raise NotImplementedError(
-            "Claude hat kein Embedding-API. Nutze OllamaProvider.embed()."
+            "Claude hat kein Embedding-API. Nutze OllamaEmbeddingProvider.embed()."
         )

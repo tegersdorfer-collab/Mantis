@@ -72,6 +72,26 @@ def test_responses_converters_use_standard_function_call_and_output_items():
     ]
 
 
+def test_responses_input_converts_image_blocks_to_data_urls():
+    input_items = messages_to_responses_input([{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Was ist darauf?"},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg", "data": "aW1hZ2U="
+            }},
+        ],
+    }])
+
+    assert input_items == [{
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "Was ist darauf?"},
+            {"type": "input_image", "image_url": "data:image/jpeg;base64,aW1hZ2U="},
+        ],
+    }]
+
+
 def test_responses_request_always_streams_and_disables_storage_and_tool_roundtrips(tmp_path, monkeypatch):
     seen = {}
     access_value = secrets.token_urlsafe(32)

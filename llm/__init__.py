@@ -1,5 +1,4 @@
-from .local import OllamaProvider
-from .claude import ClaudeProvider
+from .local import OllamaEmbeddingProvider, OllamaProvider
 from .base import LLMProvider, Message
 
-__all__ = ["OllamaProvider", "ClaudeProvider", "LLMProvider", "Message"]
+__all__ = ["OllamaEmbeddingProvider", "OllamaProvider", "LLMProvider", "Message"]

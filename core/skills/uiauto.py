@@ -2,10 +2,10 @@
 
 Zwei Ebenen:
 - Low-Level-Tools ui_inspect/ui_click/ui_type/ui_key (Kategorie 'uiauto_internal')
-  — NICHT für den Hauptagenten, sondern für den internen qwen-Loop.
+  — NICHT für den Hauptagenten, sondern für den internen Cloud-Agenten.
 - computer_task(goal, app) — das einzige Tool für den (kleinen) Hauptagenten.
   Es prüft das Bedienungshilfen-Recht und startet dann einen isolierten ReAct-
-  Loop auf dem STÄRKEREN Modell (qwen3.5:9b), der die Low-Level-Tools nutzt.
+  Loop auf der Background-Cloud-Kette, der die Low-Level-Tools nutzt.
 
 Sicherheit: ui_click prüft VOR dem Klick die roten Linien (tools/uiauto/safety.py)
 — destruktive/riskante Elemente und Passwortfelder werden verweigert, egal was
@@ -18,6 +18,7 @@ import logging
 
 from core import tools as T
 from core import uiauto_controller as controller
+from core.backends.factory import cloud_chain
 from tools.uiauto import engine, safety
 
 log = logging.getLogger("core.skills")
@@ -51,7 +52,7 @@ Antworte nur mit dem Feldtext, ohne Erklärung, Anführungszeichen, Markdown ode
 _WRITER_MAX_TOKENS = 160
 
 
-# ── Low-Level-Tools (für den internen qwen-Loop) ──────────────────────────────
+# ── Low-Level-Tools (für den internen Cloud-Agenten) ─────────────────────────
 
 @T.register(
     "ui_inspect",
@@ -126,15 +127,13 @@ async def _ui_key(keys: str):
     return f"✓ Taste: {keys}"
 
 
-# ── Haupt-Tool (für den gemma-Hauptagenten) ───────────────────────────────────
+# ── Haupt-Tool (für den Hauptagenten) ────────────────────────────────────────
 
 async def _write_ui_text(goal: str, state: dict[str, object]) -> str:
     """Erzeugt einmalig Feldtext ohne Zugriff auf UI- oder andere Tools."""
     from core.agent import Agent
-    from core.backends.ollama import OllamaBackend
-    from settings import cfg
 
-    backend = OllamaBackend(model=cfg.BG_REASONING_MODEL)
+    backend = cloud_chain("background", reasoning="low")
     agent = Agent(backend=backend, max_steps=1)
     context = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
     response, _trace = await agent.run(
@@ -157,7 +156,7 @@ def _default_text_writer(goal: str, state: dict[str, object]) -> str:
     return asyncio.run(_write_ui_text(goal, state))
 
 async def _run_ui_agent(goal: str, app: str) -> str:
-    """Versucht Jev zuerst; startet bei Fallback den bisherigen qwen-ReAct-Loop."""
+    """Versucht Jev zuerst; startet bei Fallback den Cloud-ReAct-Loop."""
     result = await asyncio.to_thread(
         controller.run,
         goal,
@@ -170,10 +169,8 @@ async def _run_ui_agent(goal: str, app: str) -> str:
     log.warning("Jev UI controller fallback: %s", result.reason or "unknown reason")
 
     from core.agent import Agent
-    from core.backends.ollama import OllamaBackend
-    from settings import cfg
 
-    backend = OllamaBackend(model=cfg.BG_REASONING_MODEL)
+    backend = cloud_chain("background", reasoning="low")
     agent = Agent(backend=backend, max_steps=UI_MAX_STEPS)
     app_hint = f" Ziel-App: {app}." if app else ""
     try:

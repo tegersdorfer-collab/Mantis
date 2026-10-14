@@ -1,4 +1,4 @@
-"""Jev ist Opt-in: ohne JEV_ENABLED + Key bleibt alles lokal."""
+"""Jev bleibt für Forge-Integrationen separat konfigurierbar."""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -43,7 +43,11 @@ def test_provider_chain_und_cloudflare_settings_aus_env(monkeypatch):
     assert s.CLOUDFLARE_AUTH_TOKEN == "token-test"
 
 
-def test_local_logits_sind_standardmaessig_aus_und_timeout_ist_kurz():
+def test_voice_silence_setting_defaults_to_800ms_and_requires_positive_value():
+    from pydantic import ValidationError
+    import pytest
+
     s = MantisSettings(_env_file=None)
-    assert s.LOCAL_LOGITS_ENABLED is False
-    assert s.LOCAL_LOGITS_TIMEOUT_S == 8.0
+    assert s.VOICE_SILENCE_MS == 800
+    with pytest.raises(ValidationError):
+        MantisSettings(_env_file=None, VOICE_SILENCE_MS=0)

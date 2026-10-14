@@ -71,63 +71,51 @@ async def main():
         sys.exit(1)
 
     import config as cfg
-    from llm.local import OllamaProvider
+    from llm.local import OllamaEmbeddingProvider
     from memory.lzg import LZG
     from communication.telegram import TelegramChannel
     from thermal import ThermalMonitor
     from orchestrator import Orchestrator
 
-    # Voll-lokaler Betrieb (LLM_LOCAL_ONLY) ignoriert den API-Key komplett.
-    use_claude = bool(cfg.ANTHROPIC_API_KEY) and not cfg.LLM_LOCAL_ONLY
-    if cfg.LLM_LOCAL_ONLY:
-        log.info("🔒 LLM_LOCAL_ONLY: Cloud-LLMs deaktiviert")
-
-    # ── Chat-LLM ────────────────────────────────────────────────────────────
-    if use_claude:
-        from llm.claude import ClaudeProvider
-        chat_llm = ClaudeProvider(model=cfg.CLAUDE_CHAT_MODEL)
-        log.info(f"💬 Chat-LLM: {cfg.CLAUDE_CHAT_MODEL}")
-    else:
-        chat_llm = OllamaProvider()
-        log.info(f"💬 Chat-LLM: Ollama {cfg.OLLAMA_MODEL} (lokal)")
-
-    # ── Agent-Backend: interaktiver Haupt-Agent (Telegram/Dashboard-Chat) ────────
     from core.backends.factory import (
+        CloudChainUnavailableError,
         build_chat_backend,
         build_chat_task_provider,
+        cloud_chain,
         describe_backend_chain,
+        warn_if_local_only,
     )
+    from core.backends.llm_adapter import BackendLLMAdapter
+    from core import fast, vision
+
+    warn_if_local_only(cfg)
+
+    # ── Haupt-Chat: gleiche bestehende Cloud-Kette wie der Agent ──────────────
     agent_backend = build_chat_backend(cfg)
-    log.info(f"💬 Chat-Kette: {describe_backend_chain(agent_backend)}")
+    chat_llm = BackendLLMAdapter(agent_backend)
+    log.info("LLM-Kette [chat]: %s", describe_backend_chain(agent_backend))
 
-    # ── Voice-Agent-Backend: kleines, dauerhaft geladenes Modell ────────────────
-    from core.backends.ollama import OllamaBackend
-    if use_claude:
-        from core.backends.fallback import FallbackBackend
-        from core.backends.claude import ClaudeBackend
-        voice_agent_backend = FallbackBackend(
-            primary=OllamaBackend(model=cfg.VOICE_AGENT_MODEL, keep_alive=cfg.VOICE_AGENT_KEEP_ALIVE),
-            fallback=ClaudeBackend(model=cfg.CLAUDE_CHAT_MODEL),
-        )
-        log.info(f"🎙️  Voice-Agent-Backend: Ollama {cfg.VOICE_AGENT_MODEL} (dauerhaft) → Fallback {cfg.CLAUDE_CHAT_MODEL}")
+    # ── Voice, Fast und Vision nutzen feste Varianten derselben Stufen ────────
+    voice_agent_backend = cloud_chain("voice", reasoning="low", timeout=cfg.CHAT_CLOUD_TIMEOUT_S, cfg=cfg)
+    log.info("LLM-Kette [voice]: %s", describe_backend_chain(voice_agent_backend))
+    log.info("LLM-Kette [fast]: %s", describe_backend_chain(fast.get_backend_chain()))
+    try:
+        vision_backend = vision.get_backend_chain()
+    except CloudChainUnavailableError:
+        log.warning("LLM-Kette [vision]: kein bildfähiger Cloud-Anbieter konfiguriert")
     else:
-        voice_agent_backend = OllamaBackend(model=cfg.VOICE_AGENT_MODEL, keep_alive=cfg.VOICE_AGENT_KEEP_ALIVE)
-        log.info(f"🎙️  Voice-Agent-Backend: Ollama {cfg.VOICE_AGENT_MODEL} (lokal, dauerhaft geladen)")
+        log.info("LLM-Kette [vision]: %s", describe_backend_chain(vision_backend))
 
-    # ── Background-LLM: Routed (Spezialisten je nach Aufgabe) ─────────────────
+    # ── Background-LLM: dieselbe Cloud-Kette, Sampling je Aufgabenart ─────────
     from llm.routed import RoutedLLMProvider
     bg_llm = RoutedLLMProvider()
-    log.info(f"🧠 Background-LLM: Routed (default={cfg.BG_DEFAULT_MODEL} | reasoning={cfg.BG_REASONING_MODEL} | code={cfg.BG_CODE_MODEL})")
+    log.info("LLM-Kette [background]: %s", describe_backend_chain(bg_llm._provider.backend))
 
-    # Datenschutzgrenze: Nur aktuelle Chat-Turns, deren Fact-Extraction und KZG-
-    # Summary dürfen die Cloud-Kette nutzen. Gespeicherte private Daten aus
-    # Journal-, Aufgaben-, Gesundheits- und Dashboard-Routen bleiben bei bg_llm.
     chat_task_llm = build_chat_task_provider(cfg)
-    if chat_task_llm:
-        log.info("🧠 Fact-Extraction und KZG-Checkpoint nutzen die Chat-Kette")
+    log.info("LLM-Kette [background-chat]: %s", describe_backend_chain(chat_task_llm.backend))
 
-    # ── Embed-LLM: immer Ollama (kein Embedding via Claude) ───────────────────
-    embed_llm = OllamaProvider()
+    # ── Embeddings bleiben lokal bei Ollama ──────────────────────────────────
+    embed_llm = OllamaEmbeddingProvider()
 
     lzg     = LZG()
     thermal = ThermalMonitor()

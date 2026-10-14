@@ -28,12 +28,13 @@ def _avoid_usage_database_writes(monkeypatch):
     monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: None)
 
 
-def _backend(handler) -> OpenRouterBackend:
+def _backend(handler, *, purpose="chat-agent") -> OpenRouterBackend:
     transport = httpx.MockTransport(handler)
     return OpenRouterBackend(
         model="z-ai/glm-5.3",
         api_key="sk-or-test",
         client=httpx.AsyncClient(transport=transport, base_url="https://openrouter.ai/api/v1"),
+        purpose=purpose,
     )
 
 
@@ -350,7 +351,32 @@ def test_streaming_collects_deltas_and_reports_progress():
 
     assert text == "Route gestartet."
     assert calls == []
-    assert progress[-1] == "Route gestartet."
+    assert progress == ["Route gestartet."]
+
+
+def test_voice_purpose_streams_short_deltas_as_they_arrive():
+    chunks = [
+        {"choices": [{"delta": {"content": "Erster Satz. "}}]},
+        {"choices": [{"delta": {"content": "Zweiter Satz."}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+
+    def handler(_request):
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+    progress = []
+
+    async def on_update(text):
+        progress.append(text)
+
+    text, _ = asyncio.run(_backend(handler, purpose="voice").call(
+        [{"role": "user", "content": "Sag etwas"}], tools=None, stream_cb=on_update,
+        temperature=0.2, max_tokens=80,
+    ))
+
+    assert text == "Erster Satz. Zweiter Satz."
+    assert progress[:2] == ["Erster Satz. ", "Erster Satz. Zweiter Satz."]
 
 
 def test_streaming_tolerates_null_usage_and_reads_usage_after_finish_reason(monkeypatch):

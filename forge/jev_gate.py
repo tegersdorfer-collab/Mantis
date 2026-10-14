@@ -18,7 +18,7 @@ import jevkit
 from jevkit import Choice, Noul, Score
 
 import config
-from core import decide
+from core import decide, local_decide
 from forge import spuren
 
 log = logging.getLogger(__name__)
@@ -126,8 +126,8 @@ async def _entscheide(task: dict) -> PreflightResult:
         "external": Q_EXTERNAL,
     })
     try:
-        answers = await decide.decide(_state(task), questions)
-    except decide.JevUnavailable:
+        answers = await local_decide.score(_state(task), questions)
+    except local_decide.LocalDecisionUnavailable:
         return PreflightResult(status="unavailable")
     except Exception as exc:  # Jev darf keinen Forge-Task aktiv hängen lassen.
         log.warning("Forge-Jev-Gate nicht verfügbar: %s", type(exc).__name__)

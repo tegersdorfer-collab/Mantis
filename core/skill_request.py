@@ -1,7 +1,7 @@
 """Deterministischer Fast-Path für die Skill-Factory.
 
 Warum das hier steht statt im Agenten (gemessen am laufenden System, 09.09.2026):
-Der Dashboard-Agent (gemma4:e2b) ruft `create_skill` unter dem vollen System-Prompt
+Der Dashboard-Agent ruft `create_skill` unter dem vollen System-Prompt
 mit 89 Tools reproduzierbar (3/3) OHNE das Pflichtargument `skill_name` auf —
 `FEHLER: ungültige Argumente`, keine Datei — und meldet danach trotzdem Erfolg.
 Dasselbe Modell schafft denselben Tool-Call isoliert 3/3 korrekt. Es ist also
@@ -17,9 +17,8 @@ Quellcode lässt sich nicht regelbasiert erzeugen. Die Arbeitsteilung ist deshal
   * **deterministisch** (hier, ohne LLM): Absicht erkennen, `skill_name` und die
     Beschreibung aus der Äußerung ziehen. Genau die Argumente, die der Agent
     verschluckt.
-  * **ein einziger, enger LLM-Call**: nur der Quellcode, auf BG_CODE_MODEL, mit
-    kurzem Prompt und ohne Tools — die Bedingungen, unter denen die Modelle im
-    Benchmark sauber liefern. Scheitert der Lint, bekommt das Modell den Fehler
+  * **ein einziger, enger LLM-Call**: nur der Quellcode über die Background-Cloud-Kette,
+    mit kurzem Prompt und ohne Tools. Scheitert der Lint, bekommt das Modell den Fehler
     genau einmal zurück; danach wird abgebrochen statt geraten.
 
 Designprinzip wie in fast_commands.py: **Fehlalarme sind schlimmer als
@@ -154,7 +153,7 @@ async def erzeuge(req: SkillRequest, llm) -> str:
 
     `llm` ist das Background-LLM (RoutedLLMProvider). Der Prompt enthält
     `async def` und trifft damit die _CODE_KEYWORDS in llm/routed.py — der Call
-    landet also auf BG_CODE_MODEL und erbt dessen Sampling-Defaults.
+    landet also auf der Background-Cloud-Kette und erbt deren Code-Sampling-Default.
     """
     fehler: str | None = None
     for versuch in (1, 2):

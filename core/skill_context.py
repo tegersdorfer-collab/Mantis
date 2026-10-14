@@ -19,7 +19,7 @@ log = logging.getLogger("core.skills")
 @dataclass
 class SkillContext:
     lzg: object = None          # LZG-Instanz (Memory)
-    llm: object = None          # OllamaProvider (für embed)
+    llm: object = None          # lokaler Embedding-Provider
     search: object = None       # WebSearch
     reminders: object = None    # ReminderStore
     dashboard: object = None    # DashboardReader

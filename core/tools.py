@@ -275,12 +275,12 @@ def select_tools(text: str) -> list[str]:
 
 async def select_tools_async(text: str) -> tuple[list[str], bool]:
     """
-    select_tools + Jev. Der Keyword-Pfad bleibt der Boden (er ist byte-identisch zu
-    heute), Jev legt Kategorien obendrauf, die die Keyword-Listen verpassen — das war
-    der gemma-Gotcha: „spiel [Song]" wurde von select_tools gar nicht angeboten.
+    select_tools + Cloud-Klassifikation. Der Keyword-Pfad bleibt der Boden (er ist
+    byte-identisch zu heute); die Klassifikation legt Kategorien obendrauf, die die
+    Keyword-Listen verpassen — z. B. wurde „spiel [Song]" gar nicht angeboten.
     Gibt (erlaubte Tool-Namen, force_tools) zurück.
     Jev-aktion=True erzwingt Tool-Calls; aktion=False/None ändert nichts, denn ein
-    Aktionswort im Text muss weiter ziehen (Recall vor Precision bei kleinen Modellen).
+    Aktionswort im Text muss weiter ziehen (Recall vor Precision).
     """
     names = select_tools(text)
     force = bool(names) and (

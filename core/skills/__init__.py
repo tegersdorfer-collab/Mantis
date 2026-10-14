@@ -1,6 +1,6 @@
 """
 Skill-Registrierung: verbindet alle Domänen-Funktionen mit dem Agent-Tool-Registry.
-Der Agent (Qwen3) ruft diese Tools selbstständig auf.
+Der Cloud-Agent ruft diese Tools selbstständig auf.
 
 Vor Nutzung muss bind(ctx) aufgerufen werden (im Orchestrator-Start).
 Die Tools liegen nach Kategorie in core/skills/<category>.py; der Import unten

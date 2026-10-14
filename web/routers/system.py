@@ -72,8 +72,7 @@ def build_router(orch=None) -> APIRouter:
             os.kill(pid, 0); running = True
         except Exception:
             pass
-        # Zeige das tatsächlich aktive Modell (aus .env, nicht den alten Fallback)
-        active_model = config.OLLAMA_MODEL
+        active_model = "Cloud-LLM"
         if orch is not None:
             try:
                 active_model = orch.chat_llm.model_name

@@ -1,4 +1,4 @@
-"""Gesundheitsnahe Daten aus Fitness- und Journal-Endpunkten bleiben lokal."""
+"""Hintergrundrouten nutzen die Cloud-Background-Instanz statt den Chat-Agenten."""
 import asyncio
 import json
 from types import SimpleNamespace
@@ -17,7 +17,7 @@ def _endpoint(router, path, method=None):
     )
 
 
-class _LocalLLM:
+class _BackgroundLLM:
     def __init__(self, response=""):
         self.response = response
         self.calls = []
@@ -27,13 +27,13 @@ class _LocalLLM:
         return self.response
 
 
-class _CloudLLM:
+class _ChatLLM:
     def __init__(self):
         self.calls = []
 
     async def chat(self, **kwargs):
         self.calls.append(kwargs)
-        raise AssertionError("Gesundheitsdaten dürfen nicht an chat_llm gehen")
+        raise AssertionError("Hintergrunddaten sollen nicht an das interaktive Chat-Backend gehen")
 
 
 class _Extractor:
@@ -71,9 +71,9 @@ def _request(payload, path):
     }, receive)
 
 
-def test_manual_fitness_plan_uses_local_background_llm(monkeypatch):
-    local = _LocalLLM()
-    cloud = _CloudLLM()
+def test_manual_fitness_plan_uses_background_llm(monkeypatch):
+    background = _BackgroundLLM()
+    chat = _ChatLLM()
     received = []
 
     async def generate(chat_llm, bg_llm):
@@ -82,24 +82,24 @@ def test_manual_fitness_plan_uses_local_background_llm(monkeypatch):
 
     monkeypatch.setattr(fitness_router.plan_generator, "generate_and_save", generate)
     endpoint = _endpoint(
-        fitness_router.build_router(SimpleNamespace(chat_llm=cloud, bg_llm=local)),
+        fitness_router.build_router(SimpleNamespace(chat_llm=chat, bg_llm=background)),
         "/api/fitness/plan/generate",
     )
 
     result = asyncio.run(endpoint(None))
 
     assert result == {"ok": True, "plan": {"ok": True}}
-    assert received == [(None, local)]
+    assert received == [(None, background)]
 
 
-def test_freeform_workout_import_uses_local_background_llm(monkeypatch):
-    local = _LocalLLM(
+def test_freeform_workout_import_uses_background_llm(monkeypatch):
+    background = _BackgroundLLM(
         '{"title":"Krafttraining","type":"strength","exercises":[]}'
     )
-    cloud = _CloudLLM()
+    chat = _ChatLLM()
     monkeypatch.setattr(fitness_router.fitness, "log_workout", lambda **kwargs: 42)
     endpoint = _endpoint(
-        fitness_router.build_router(SimpleNamespace(chat_llm=cloud, bg_llm=local)),
+        fitness_router.build_router(SimpleNamespace(chat_llm=chat, bg_llm=background)),
         "/api/fitness/import",
     )
 
@@ -110,33 +110,32 @@ def test_freeform_workout_import_uses_local_background_llm(monkeypatch):
     result = asyncio.run(endpoint(Request()))
 
     assert result["id"] == 42
-    assert local.calls and "Kniebeugen" in local.calls[0]["messages"][0]["content"]
+    assert background.calls and "Kniebeugen" in background.calls[0]["messages"][0]["content"]
 
 
-def test_journal_prompts_use_local_llm_for_recent_entries_and_mood(monkeypatch):
-    local = _LocalLLM("Frage eins\nFrage zwei\nFrage drei")
-    cloud = _CloudLLM()
+def test_journal_prompts_use_background_llm_for_recent_entries_and_mood(monkeypatch):
+    background = _BackgroundLLM("Frage eins\nFrage zwei\nFrage drei")
+    chat = _ChatLLM()
     monkeypatch.setattr(journal_router.journal, "recent_entries", lambda _: [{"content": "Stress nach dem Lauf"}])
     monkeypatch.setattr(journal_router.journal, "mood_trend", lambda _: [{"mood": 2}])
     endpoint = _endpoint(
-        journal_router.build_router(SimpleNamespace(chat_llm=cloud, bg_llm=local)),
+        journal_router.build_router(SimpleNamespace(chat_llm=chat, bg_llm=background)),
         "/api/journal/prompts",
     )
 
     result = asyncio.run(endpoint())
 
     assert result["prompts"] == ["Frage eins", "Frage zwei", "Frage drei"]
-    prompt = local.calls[0]["messages"][0]["content"]
+    prompt = background.calls[0]["messages"][0]["content"]
     assert "Stress nach dem Lauf" in prompt
     assert "2.0/5" in prompt
 
 
-def test_journal_extraction_uses_local_extractor_with_chat_cloud_configured(monkeypatch):
-    cloud_extractor = _Extractor()
-    local_extractor = _Extractor()
+def test_journal_extraction_uses_cloud_extractor_with_chat_cloud_configured(monkeypatch):
+    extractor = _Extractor()
     monkeypatch.setattr(journal_router.journal, "add_entry", lambda **_: 17)
     endpoint = _endpoint(journal_router.build_router(SimpleNamespace(
-        extractor=cloud_extractor, local_extractor=local_extractor,
+        extractor=extractor,
     )), "/api/journal", "POST")
 
     async def run():
@@ -148,19 +147,18 @@ def test_journal_extraction_uses_local_extractor_with_chat_cloud_configured(monk
         return result
 
     assert asyncio.run(run()) == {"id": 17}
-    assert cloud_extractor.calls == []
-    assert len(local_extractor.calls) == 1
-    assert "Fiktiver privater Eintrag" in local_extractor.calls[0][0]
-    assert "Fiktive Antwort" in local_extractor.calls[0][0]
+    assert len(extractor.calls) == 1
+    assert "Fiktiver privater Eintrag" in extractor.calls[0][0]
+    assert "Fiktive Antwort" in extractor.calls[0][0]
 
 
 def test_task_classification_uses_background_llm_for_title_and_notes(monkeypatch):
-    cloud = _CloudLLM()
-    local = _LocalLLM("MANTIS")
+    chat = _ChatLLM()
+    background = _BackgroundLLM("MANTIS")
     monkeypatch.setattr(tasks_router.tasks_d, "create_task", lambda **_: 23)
     monkeypatch.setattr(tasks_router.db, "execute", lambda *args, **kwargs: 1)
     endpoint = _endpoint(
-        tasks_router.build_router(SimpleNamespace(chat_llm=cloud, bg_llm=local)),
+        tasks_router.build_router(SimpleNamespace(chat_llm=chat, bg_llm=background)),
         "/api/tasks",
         "POST",
     )
@@ -170,16 +168,16 @@ def test_task_classification_uses_background_llm_for_title_and_notes(monkeypatch
     }, "/api/tasks")))
 
     assert result == {"id": 23}
-    assert cloud.calls == []
-    assert len(local.calls) == 1
-    prompt = local.calls[0]["messages"][0].content
+    assert chat.calls == []
+    assert len(background.calls) == 1
+    prompt = background.calls[0]["messages"][0].content
     assert "Private Aufgabe" in prompt
     assert "Vertrauliche Notiz" in prompt
 
 
 def test_task_suggestions_use_background_llm_for_lzg_context(monkeypatch):
-    cloud = _CloudLLM()
-    local = _LocalLLM("local suggestion")
+    chat = _ChatLLM()
+    background = _BackgroundLLM("background suggestion")
     lzg = object()
 
     async def suggest_one(trigger, llm, memories):
@@ -188,7 +186,7 @@ def test_task_suggestions_use_background_llm_for_lzg_context(monkeypatch):
 
     monkeypatch.setattr(tasks_router, "suggest_one", suggest_one)
     endpoint = _endpoint(
-        tasks_router.build_router(SimpleNamespace(chat_llm=cloud, bg_llm=local, lzg=lzg)),
+        tasks_router.build_router(SimpleNamespace(chat_llm=chat, bg_llm=background, lzg=lzg)),
         "/api/tasks/generate",
     )
 
@@ -198,5 +196,5 @@ def test_task_suggestions_use_background_llm_for_lzg_context(monkeypatch):
         return result
 
     assert asyncio.run(run()) == {"ok": True}
-    assert cloud.calls == []
-    assert len(local.calls) == 1
+    assert chat.calls == []
+    assert len(background.calls) == 1

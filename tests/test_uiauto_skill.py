@@ -11,7 +11,6 @@ import os
 import sys
 
 import core.agent
-import core.backends.ollama
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -128,7 +127,7 @@ def test_computer_task_runs_agent_when_trusted(monkeypatch):
 
 # ── Jev-Controller-Routing und qwen-Writer ──────────────────────────────────
 
-def test_run_ui_agent_returns_terminal_controller_result_without_qwen(monkeypatch):
+def test_run_ui_agent_returns_terminal_controller_result_without_cloud_fallback(monkeypatch):
     async def direct_to_thread(fn, *args):
         return fn(*args)
 
@@ -140,15 +139,15 @@ def test_run_ui_agent_returns_terminal_controller_result_without_qwen(monkeypatc
         )
         monkeypatch.setattr(uiauto.asyncio, "to_thread", direct_to_thread)
 
-        def qwen_must_not_start(*args, **kwargs):
-            raise AssertionError("terminal Jev result must not start qwen")
+        def cloud_must_not_start(*args, **kwargs):
+            raise AssertionError("terminal Jev result must not start a Cloud fallback")
 
-        monkeypatch.setattr(core.agent, "Agent", qwen_must_not_start)
+        monkeypatch.setattr(core.agent, "Agent", cloud_must_not_start)
 
         assert _run(uiauto._run_ui_agent("Open note", "Notes")) == text
 
 
-def test_run_ui_agent_uses_existing_qwen_path_after_controller_fallback(monkeypatch):
+def test_run_ui_agent_uses_background_cloud_after_controller_fallback(monkeypatch):
     async def direct_to_thread(fn, *args):
         return fn(*args)
 
@@ -174,10 +173,17 @@ def test_run_ui_agent_uses_existing_qwen_path_after_controller_fallback(monkeypa
             calls.append(kwargs)
             return "qwen fallback", []
 
-    monkeypatch.setattr(core.backends.ollama, "OllamaBackend", FakeBackend)
+    purposes = []
+
+    def cloud_chain(purpose, **kwargs):
+        purposes.append((purpose, kwargs))
+        return FakeBackend("cloud")
+
+    monkeypatch.setattr(uiauto, "cloud_chain", cloud_chain, raising=False)
     monkeypatch.setattr(core.agent, "Agent", FakeAgent)
 
     assert _run(uiauto._run_ui_agent("Open note", "Notes")) == "qwen fallback"
+    assert purposes == [("background", {"reasoning": "low"})]
     assert calls == [{
         "messages": [{"role": "user", "content": "Open note Ziel-App: Notes."}],
         "system": uiauto._UI_SYSTEM,
@@ -237,7 +243,9 @@ def test_offline_replay_reports_qwen_agent_calls_for_closed_choice_and_fallback(
         "ui_action",
         lambda state, criteria: type("Answer", (), {"value": next(decisions)})(),
     )
-    monkeypatch.setattr(core.backends.ollama, "OllamaBackend", FakeBackend)
+    monkeypatch.setattr(
+        uiauto, "cloud_chain", lambda purpose, **kwargs: FakeBackend("cloud"), raising=False,
+    )
     monkeypatch.setattr(core.agent, "Agent", FakeAgent)
 
     assert _run(uiauto._run_ui_agent("Open then continue", "Notes")) == "UI task completed"
@@ -278,10 +286,17 @@ def test_default_writer_uses_one_tool_free_qwen_call(monkeypatch):
             calls.append(kwargs)
             return "Timo", []
 
-    monkeypatch.setattr(core.backends.ollama, "OllamaBackend", FakeBackend)
+    purposes = []
+
+    def cloud_chain(purpose, **kwargs):
+        purposes.append((purpose, kwargs))
+        return FakeBackend("cloud")
+
+    monkeypatch.setattr(uiauto, "cloud_chain", cloud_chain, raising=False)
     monkeypatch.setattr(core.agent, "Agent", FakeAgent)
 
     assert _run(uiauto._write_ui_text("Enter your name", {"elements": []})) == "Timo"
+    assert purposes == [("background", {"reasoning": "low"})]
     assert len(calls) == 1
     assert calls[0]["use_tools"] is False
     assert calls[0]["allowed_tools"] == []

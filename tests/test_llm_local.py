@@ -1,45 +1,66 @@
-"""Tests für die reine Nachrichten-Normalisierung des Ollama-Providers
-(llm/local.py::_build_messages) — in jedem LLM-Call genutzt, kein Netzwerk.
-"""
+"""Ollama bleibt ausschließlich für den lokalen Embedding-Pfad verfügbar."""
+from __future__ import annotations
 
-import os
-import sys
+import asyncio
+from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from llm.local import OllamaProvider, _embed_cache_key
-from llm.base import Message
+from llm.local import OllamaEmbeddingProvider, _embed_cache_key
 
 
-def _provider():
-    # Konstruktor baut nur einen AsyncClient (kein Netzwerk-Call)
-    return OllamaProvider(model="test:1b", embed_model="emb:1b")
+class FakeOllamaClient:
+    def __init__(self, **kwargs):
+        self.init_kwargs = kwargs
+        self.calls = []
+
+    async def embed(self, **kwargs):
+        self.calls.append(kwargs)
+        texts = kwargs["input"]
+        count = len(texts) if isinstance(texts, list) else 1
+        return SimpleNamespace(embeddings=[[float(i), 1.0] for i in range(count)])
 
 
-def test_build_messages_prepends_system():
-    p = _provider()
-    out = p._build_messages([{"role": "user", "content": "hi"}], system="Du bist Mantis")
-    assert out[0] == {"role": "system", "content": "Du bist Mantis"}
-    assert out[1] == {"role": "user", "content": "hi"}
+def test_embedding_model_uses_local_config_and_caches_single_embeddings(monkeypatch):
+    from llm import local
+
+    client = FakeOllamaClient()
+    monkeypatch.setattr(local._ollama, "AsyncClient", lambda **kwargs: client)
+    provider = OllamaEmbeddingProvider(embed_model="qwen3-embedding:0.6b")
+
+    async def run():
+        first = await provider.embed("  ein Text  ")
+        second = await provider.embed("ein Text")
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert first == second == [0.0, 1.0]
+    assert provider.model_name == "qwen3-embedding:0.6b"
+    assert len(client.calls) == 1
+    assert client.calls[0]["model"] == "qwen3-embedding:0.6b"
+    assert client.calls[0]["input"] == "  ein Text  "
 
 
-def test_build_messages_no_system():
-    p = _provider()
-    out = p._build_messages([{"role": "user", "content": "hi"}], system=None)
-    assert len(out) == 1 and out[0]["role"] == "user"
+def test_embedding_batch_preserves_order_and_uses_one_local_call(monkeypatch):
+    from llm import local
+
+    client = FakeOllamaClient()
+    monkeypatch.setattr(local._ollama, "AsyncClient", lambda **kwargs: client)
+    provider = OllamaEmbeddingProvider(embed_model="qwen3-embedding:0.6b")
+
+    result = asyncio.run(provider.embed_batch(["eins", "zwei"]))
+
+    assert result == [[0.0, 1.0], [1.0, 1.0]]
+    assert len(client.calls) == 1
+    assert client.calls[0]["input"] == ["eins", "zwei"]
+    assert client.calls[0]["model"] == "qwen3-embedding:0.6b"
 
 
-def test_build_messages_accepts_message_objects():
-    p = _provider()
-    out = p._build_messages([Message(role="user", content="frage")], system=None)
-    assert out == [{"role": "user", "content": "frage"}]
+def test_embedding_provider_exposes_no_generation_api():
+    provider = OllamaEmbeddingProvider()
 
-
-def test_build_messages_mixed_dict_and_object():
-    p = _provider()
-    msgs = [Message(role="user", content="a"), {"role": "assistant", "content": "b"}]
-    out = p._build_messages(msgs, system=None)
-    assert [m["content"] for m in out] == ["a", "b"]
+    assert not hasattr(provider, "chat")
+    assert not hasattr(provider, "stream")
+    assert not hasattr(provider, "complete")
 
 
 def test_embed_cache_key_strips_and_truncates():

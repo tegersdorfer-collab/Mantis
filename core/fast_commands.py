@@ -1,7 +1,7 @@
 """Deterministische Fast-Path-Befehle — kritische Fixbefehle ohne LLM.
 
-Kleine Modelle (gemma4:e2b) rufen unter dem vollen System-Prompt bei Tool-Befehlen
-manchmal gar kein Tool auf, sondern täuschen Erfolg vor ("Lampe an ✓", ohne zu
+Der Agent ruft unter dem vollen System-Prompt bei einigen Tool-Befehlen
+manchmal gar kein Tool auf, sondern täuscht Erfolg vor ("Lampe an ✓", ohne zu
 schalten). Für die wenigen kritischen Fixbefehle (Licht, Roboter-Not-Stopp) ist das
 inakzeptabel. Diese Schicht erkennt sie regelbasiert und ruft das Tool DIREKT —
 100% zuverlässig, sofort, modellunabhängig.
@@ -106,9 +106,9 @@ def match(text: str) -> FastCommand | None:
         return FastCommand("robot_control", {"action": "stopp"}, "robot-stopp")
 
     # ── UI-Automatik-Entry ────────────────────────────────────────────────────
-    # gemma wählt computer_task unzuverlässig (griff im Test zu create_skill).
+    # Die Tool-Auswahl wählte computer_task unzuverlässig (griff im Test zu create_skill).
     # Enger Fast-Path: explizites „bediene/steuere … app …" → computer_task mit
-    # der ganzen Äußerung als Ziel (der qwen-Loop parst App + Aufgabe daraus).
+    # der ganzen Äußerung als Ziel (der Background-Agent parst App + Aufgabe daraus).
     if (w & _UIAUTO_VERBS) and "app" in w:
         return FastCommand("computer_task", {"goal": text.strip()}, "computer-task")
 

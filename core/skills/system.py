@@ -97,8 +97,8 @@ async def _list_dynamic_skills():
     return "Inaktive Skill-Dateien (manuelle Prüfung erforderlich):\n" + "\n".join(names) if names else "Noch keine selbst erstellten Skills."
 
 @T.register("api_costs",
-    "Zeigt Token-Verbrauch und API-Kosten deiner LLM-Calls (Claude API kostet Geld, "
-    "lokale Ollama-Modelle sind kostenlos). Nutze dies wenn Timo nach API-Kosten, "
+    "Zeigt Token-Verbrauch und Kosten deiner Cloud-LLM-Calls; lokale Ollama-Embeddings "
+    "verursachen keine Anbietergebühren. Nutze dies wenn Timo nach API-Kosten, "
     "Token-Verbrauch oder LLM-Ausgaben fragt.",
     {"days": {"type": "integer", "description": "Zeitraum in Tagen (Standard 30)"}},
     [], "system")

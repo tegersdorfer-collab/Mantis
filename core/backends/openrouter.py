@@ -1,13 +1,7 @@
-"""
-OpenRouter-Backend für den Agent-Loop (OpenAI-kompatible Chat-Completions).
+"""OpenRouter-Backend für den Agent-Loop (OpenAI-kompatible Chat-Completions).
 
-Gedacht als günstiges Cloud-Backend für Tests, bei denen der Mac nicht
-zusätzlich ein lokales Modell warmhalten soll — z.B. der iPhone-Field-Client,
-der Voice, Routing und Mantis gleichzeitig braucht. Jev bleibt davon
-unberührt (core/decide.py); hier geht es nur um die Sprachantwort des Agenten.
-
-Übersetzt das einheitliche Backend-Interface (Ollama-Format für Messages und
-Tool-Calls) verlustfrei ins OpenAI-Format und zurück. Kein SDK — httpx reicht.
+Übersetzt Messages und Tool-Calls des Agent-Interfaces ins OpenAI-Format und
+zurück. Kein SDK — httpx reicht.
 """
 import json
 import logging
@@ -54,11 +48,11 @@ def _content_to_openai(content):
 
 
 def _msgs_to_openai(messages: list[dict]) -> list[dict]:
-    """Ollama-Messages → OpenAI-Messages.
+    """Agent-Messages → OpenAI-Messages.
 
     Unterschiede: Tool-Call-Argumente müssen ein JSON-String sein, Tool-Results
     referenzieren den Call über `tool_call_id`, und jeder Tool-Call braucht eine
-    ID. Fehlt sie (Ollama vergibt keine), wird eine erzeugt und für das
+    ID. Fehlt sie (manche Anbieter vergeben keine), wird eine erzeugt und für das
     folgende Tool-Result in Aufrufreihenfolge wiederverwendet.
     """
     result: list[dict] = []
@@ -260,7 +254,8 @@ class OpenRouterBackend(AgentBackend):
                     if delta.get("content"):
                         parts.append(delta["content"])
                         full = "".join(parts)
-                        if len(full) - last_len >= 50:
+                        min_progress_chars = 1 if self._purpose == "voice" else 50
+                        if len(full) - last_len >= min_progress_chars:
                             last_len = len(full)
                             try:
                                 await stream_cb(full)
