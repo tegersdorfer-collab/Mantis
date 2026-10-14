@@ -100,8 +100,19 @@ def signal_verified_process_group(pid: int, pgid: int, kind: str, expected_ident
         return False
     if not process_group_exists(pgid):
         return True
+    # Die Identität des Gruppenleiters wurde beim Start gespeichert. Solange die Gruppe
+    # existiert, kann der Kernel die PID nicht neu vergeben; ist der Leader tot, gehört die
+    # Gruppe daher weiterhin dem verifizierten Lauf. Hält dagegen nachweislich ein anderer
+    # Prozess die PID/PGID, wird nie signalisiert.
     try:
-        if os.getpgid(pid) != pgid or process_identity(pid) != expected_identity:
+        leader_identity = process_identity(pid)
+        if leader_identity is None:
+            try:
+                if os.getpgid(pid) != pgid:
+                    return False
+            except ProcessLookupError:
+                pass
+        elif leader_identity != expected_identity or os.getpgid(pid) != pgid:
             return False
     except (ProcessLookupError, PermissionError, OSError):
         return False

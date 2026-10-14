@@ -969,8 +969,59 @@ class AgentRemoteService:
                 return True
         return False
 
-    def _audit_filter_attributes(self, repo: Path) -> None:
-        """Prüft info/attributes und alle .gitattributes im Ziel-Commit."""
+    def _resolve_main_commit(self, repo: Path) -> str:
+        """Löst main genau einmal zu einer festen Commit-SHA auf."""
+        try:
+            result = self._run_git(
+                repo,
+                ["rev-parse", "--verify", "--quiet", "main^{commit}"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise GitSafetyError("Ziel-Commit main konnte nicht aufgelöst werden.") from exc
+        sha = (result.stdout or "").strip()
+        if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+            raise GitSafetyError("Ziel-Commit main konnte nicht aufgelöst werden.")
+        return sha
+
+    def _filter_overrides(self, repo: Path) -> list[tuple[str, str]]:
+        """Neutralisiert pro konfiguriertem Filter-Treiber smudge/process/required."""
+        git = shutil.which("git", path=self._base_path())
+        if not git:
+            raise GitSafetyError("Git ist für die Filterprüfung nicht verfügbar.")
+        env = os.environ.copy()
+        env["HOME"] = str(self.home_dir)
+        env.pop("XDG_CONFIG_HOME", None)
+        try:
+            result = self._command_runner(
+                [git, "-C", str(repo), "config", "--includes", "--show-scope",
+                 "--get-regexp", r"^filter\."],
+                check=False, capture_output=True, text=True, timeout=10, env=env, shell=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise GitSafetyError("Git-Filter konnten nicht sicher ermittelt werden.") from exc
+        if result.returncode not in {0, 1}:
+            raise GitSafetyError("Git-Filter konnten nicht sicher ermittelt werden.")
+        drivers: set[str] = set()
+        for line in (result.stdout or "").splitlines():
+            _scope, _tab, rest = line.partition("\t")
+            parts = rest.partition(" ")[0].split(".")
+            if len(parts) >= 3 and parts[0].lower() == "filter":
+                drivers.add(".".join(parts[1:-1]))
+        overrides: list[tuple[str, str]] = []
+        for name in sorted(drivers):
+            overrides.extend((
+                (f"filter.{name}.smudge", ""),
+                (f"filter.{name}.process", ""),
+                (f"filter.{name}.required", "false"),
+            ))
+        return overrides
+
+    def _audit_filter_attributes(self, repo: Path, commit: str = "main") -> None:
+        """Prüft info/attributes und alle .gitattributes im festen Ziel-Commit."""
         git_dir = repo / ".git"
         if git_dir.is_symlink() or not git_dir.is_dir():
             raise GitSafetyError("Git-Konfigurationspfad ist ungültig.")
@@ -990,7 +1041,7 @@ class AgentRemoteService:
 
         tree = self._run_git(
             repo,
-            ["ls-tree", "-r", "--name-only", "-z", "main"],
+            ["ls-tree", "-r", "--name-only", "-z", commit],
             check=False,
             capture_output=True,
             text=True,
@@ -1002,7 +1053,7 @@ class AgentRemoteService:
         for path in paths:
             result = self._run_git(
                 repo,
-                ["show", f"main:{path}"],
+                ["show", f"{commit}:{path}"],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -1013,15 +1064,19 @@ class AgentRemoteService:
             if self._has_filter_attribute(result.stdout):
                 raise GitSafetyError("Git-Attribute im Ziel-Commit enthalten Filter-Einträge.")
 
-    def _audit_worktree_git_safety(self, repo: Path) -> None:
+    def _audit_worktree_git_safety(self, repo: Path) -> str:
+        """Prüft Config und Attribute; liefert die geprüfte Commit-SHA von main."""
         self._audit_git_config(repo)
-        self._audit_filter_attributes(repo)
+        commit = self._resolve_main_commit(repo)
+        self._audit_filter_attributes(repo, commit)
+        return commit
 
     def _create_worktree(self, proposal: Proposal) -> str:
         if proposal.worktree is None or proposal.branch is None:
             raise ValueError("Schreibvorschlag ohne isoliertes Ziel")
         repo = Path(proposal.repo_path).resolve(strict=True)
-        self._audit_worktree_git_safety(repo)
+        commit = self._audit_worktree_git_safety(repo)
+        overrides = self._filter_overrides(repo)
         parent = repo / ".worktrees"
         if parent.is_symlink():
             raise ValueError("Symlink-basiertes .worktrees-Verzeichnis wird abgelehnt")
@@ -1037,11 +1092,12 @@ class AgentRemoteService:
         try:
             result = self._run_git(
                 repo,
-                ["worktree", "add", "--no-checkout", "-b", proposal.branch, str(target), "main"],
+                ["worktree", "add", "-b", proposal.branch, str(target), commit],
+                config=overrides,
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=60,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError("Git konnte den Worktree nicht anlegen") from exc
@@ -1055,18 +1111,14 @@ class AgentRemoteService:
         if not self._worktree_gitdir_matches(repo, resolved_target):
             raise RuntimeError("Git-Worktree-Verweis passt nicht zum Allowlist-Repo")
         try:
-            checkout = self._run_git(
-                resolved_target,
-                ["checkout", "--no-recurse-submodules", proposal.branch],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
+            head = self._run_git(
+                resolved_target, ["rev-parse", "HEAD"],
+                check=False, capture_output=True, text=True, timeout=10,
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError("Git konnte den Worktree nicht sicher auschecken") from exc
-        if checkout.returncode != 0 or not self._worktree_gitdir_matches(repo, resolved_target):
-            raise RuntimeError("Git konnte den Worktree nicht sicher auschecken")
+            raise RuntimeError("Git konnte den Worktree nicht sicher prüfen") from exc
+        if head.returncode != 0 or (head.stdout or "").strip() != commit:
+            raise RuntimeError("Worktree basiert nicht auf dem geprüften Commit")
         return str(resolved_target)
 
     @staticmethod
@@ -1371,16 +1423,24 @@ class AgentRemoteService:
         record.ended_at = self._clock()
         self._save_run(record)
 
+    def _orphaned_group(self, record: RunRecord) -> bool:
+        """Leader tot, verifizierte Gruppe lebt: nur dann darf sie ohne Leader beendet werden."""
+        return (
+            isinstance(record.pid, int)
+            and isinstance(record.pgid, int)
+            and record.pgid == record.pid
+            and bool(record.process_identity)
+            and self._process_identity(record.pid) is None
+            and self._process_group_exists(record.pgid)
+        )
+
     async def _terminate(self, record: RunRecord, process=None) -> bool:
         if not self._identity_matches(record.pid, record.pgid, record.process_identity):
-            self._mark_lost(record)
-            return False
+            if not self._orphaned_group(record):
+                self._mark_lost(record)
+                return False
         return await self._terminate_identity(
-            record.pid,
-            record.pgid,
-            record.process_identity,
-            process,
-            allow_orphan=record.status == "cancelling",
+            record.pid, record.pgid, record.process_identity, process,
         )
 
     async def _complete_termination(self, record: RunRecord) -> None:
@@ -1408,8 +1468,6 @@ class AgentRemoteService:
         pgid,
         identity,
         process=None,
-        *,
-        allow_orphan: bool = False,
     ) -> bool:
         if not isinstance(pid, int) or not isinstance(pgid, int) or pgid != pid or not identity:
             return False
@@ -1420,7 +1478,7 @@ class AgentRemoteService:
             signal_kind = "TERM"
         elif current_identity is None and not group_alive:
             return True
-        elif current_identity is None and allow_orphan:
+        elif current_identity is None:
             signal_kind = "TERM_ORPHAN"
         else:
             return False
@@ -1561,8 +1619,18 @@ class AgentRemoteService:
                     self._track(asyncio.create_task(self._monitor_recovered(record.remote_id)))
                 else:
                     identity = self._process_identity(record.pid) if isinstance(record.pid, int) else None
-                    if identity is None and not self._process_group_exists(record.pgid):
+                    group_alive = self._process_group_exists(record.pgid)
+                    if identity is None and not group_alive:
                         self._finish_from_registry(record)
+                    elif identity is None and record.process_identity and record.pgid == record.pid:
+                        # Leader tot, verifizierte Gruppe lebt noch: beenden statt liegen lassen.
+                        record.status = "cancelling"
+                        record.termination_reason = "interrupted"
+                        self._save_run(record)
+                        if await self._terminate(record):
+                            await self._complete_termination(record)
+                        else:
+                            self._track(asyncio.create_task(self._monitor_cancelling(record.remote_id)))
                     else:
                         self._mark_lost(record)
             if record.status not in {"running", "starting", "preparing", "cancelling"}:
@@ -1721,8 +1789,10 @@ class AgentRemoteService:
         await self._reply(route, result or f"{identifier}: {(status or 'unbekannt').strip()}.")
 
     async def _cancel(self, record: RunRecord, route) -> None:
-        if record.status == "running" and not self._identity_matches(
-            record.pid, record.pgid, record.process_identity,
+        if (
+            record.status == "running"
+            and not self._identity_matches(record.pid, record.pgid, record.process_identity)
+            and not self._orphaned_group(record)
         ):
             self._mark_lost(record)
             await self._reply(route, f"Lauf {record.remote_id} ist nicht mehr sicher identifizierbar.")

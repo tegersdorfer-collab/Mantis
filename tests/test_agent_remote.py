@@ -541,7 +541,7 @@ def test_runtime_deadline_signals_only_the_recorded_process_group(git_repo, tmp_
     _run(run())
 
 
-def test_kill_does_not_signal_orphaned_group_after_leader_exits(git_repo, tmp_path, monkeypatch):
+def test_orphaned_verified_group_is_killed_after_leader_exits(git_repo, tmp_path, monkeypatch):
     import domains.agent_remote.service as service_module
 
     monkeypatch.setattr(service_module, "TERMINATION_GRACE_SECONDS", 0.15)
@@ -588,8 +588,8 @@ def test_kill_does_not_signal_orphaned_group_after_leader_exits(git_repo, tmp_pa
                 leader.pid, leader.pid, identity, leader,
             )
             leader.wait(timeout=2)
-            assert terminated is False
-            assert group_exists(leader.pid) is True
+            assert terminated is True
+            assert group_exists(leader.pid) is False
         finally:
             if group_exists(leader.pid):
                 os.killpg(leader.pid, signal.SIGKILL)
@@ -823,7 +823,7 @@ def test_symlinked_worktrees_directory_outside_repo_is_rejected(git_repo, tmp_pa
     _run(run())
 
 
-@pytest.mark.parametrize("current_identity", [None, "reused-pid-with-different-start-time"])
+@pytest.mark.parametrize("current_identity", ["reused-pid-with-different-start-time"])
 def test_unknown_or_reused_pid_is_lost_without_a_signal(git_repo, tmp_path, current_identity):
     async def run():
         service, harness = _service(git_repo, tmp_path)
@@ -849,23 +849,77 @@ def test_orphan_and_kill_signals_require_the_saved_process_identity(monkeypatch)
     monkeypatch.setattr(agent_remote_process.os, "getpgid", lambda _pid: 444)
     monkeypatch.setattr(agent_remote_process.os, "killpg", lambda *args: signals.append(args))
 
+    # Leader tot, Gruppe lebt, Identität wurde beim Start gespeichert: signalisieren erlaubt.
     monkeypatch.setattr(agent_remote_process, "process_identity", lambda _pid: None)
+    assert agent_remote_process.signal_verified_process_group(
+        444, 444, "TERM_ORPHAN", "darwin:1.000001",
+    )
+    assert agent_remote_process.signal_verified_process_group(
+        444, 444, "KILL", "darwin:1.000001",
+    )
+    assert [item[1] for item in signals] == [signal.SIGTERM, signal.SIGKILL]
+
+    # Ohne gespeicherte Identität nie.
+    signals.clear()
+    assert not agent_remote_process.signal_verified_process_group(444, 444, "KILL", "")
+
+    # Hält eine andere Identität die PID, wird nie signalisiert.
+    monkeypatch.setattr(
+        agent_remote_process, "process_identity", lambda _pid: "darwin:2.000002",
+    )
     assert not agent_remote_process.signal_verified_process_group(
         444, 444, "TERM_ORPHAN", "darwin:1.000001",
     )
     assert not agent_remote_process.signal_verified_process_group(
         444, 444, "KILL", "darwin:1.000001",
     )
-
-    monkeypatch.setattr(
-        agent_remote_process,
-        "process_identity",
-        lambda _pid: "darwin:2.000002",
-    )
-    assert not agent_remote_process.signal_verified_process_group(
-        444, 444, "TERM_ORPHAN", "darwin:1.000001",
-    )
     assert signals == []
+
+
+def test_dead_leader_with_live_verified_group_is_killed_not_lost(git_repo, tmp_path):
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = Route()
+        await _propose_and_confirm(service, route, "codex: mantis analysiere Waise")
+        record = next(iter(service.runs.values()))
+        service._process_identity = lambda _pid: None
+
+        await service.handle(_message(f"abbrechen {record.remote_id}"), route)
+
+        assert harness.signals
+        assert harness.signals[-1][2] == "KILL"
+        assert record.status == "cancelled"
+        await service.stop()
+
+    _run(run())
+
+
+def test_group_held_by_a_different_identity_is_never_signaled(git_repo, tmp_path):
+    async def run():
+        service = AgentRemoteService(
+            AgentRemoteConfig(
+                enabled=True, state_dir=tmp_path / "state", home_dir=tmp_path / "home",
+            ),
+        )
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path), "LANG": "C"}
+        leader = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env, start_new_session=True,
+        )
+        try:
+            await asyncio.sleep(0.2)
+            terminated = await service._terminate_identity(
+                leader.pid, leader.pid, "darwin:0.000000-fremde-identitaet", leader,
+            )
+            assert terminated is False
+            assert leader.poll() is None
+        finally:
+            os.killpg(leader.pid, signal.SIGKILL)
+            leader.wait(timeout=2)
+            await service.stop()
+
+    _run(run())
 
 
 def test_remote_state_files_are_private_and_do_not_store_the_prompt(git_repo, tmp_path):
@@ -1531,3 +1585,71 @@ def test_git_config_audit_with_real_git_allows_global_lfs_but_not_local(git_repo
     config_path.write_text(config_path.read_text() + '\n[filter "lfs"]\n\tclean = git-lfs clean -- %f\n')
     with pytest.raises(GitSafetyError):
         service._audit_git_config(git_repo)
+
+
+def test_worktree_is_based_on_the_audited_commit_even_if_main_moves(git_repo, tmp_path):
+    audited = _git("rev-parse", "main", cwd=git_repo)
+    moved = {"done": False}
+
+    def runner(args, **kwargs):
+        result = subprocess.run(args, **kwargs)
+        if "ls-tree" in args and not moved["done"]:
+            moved["done"] = True
+            (git_repo / ".gitattributes").write_text("*.md filter=evil\n")
+            (git_repo / "NEW.txt").write_text("nach dem Audit\n")
+            _git("add", ".", cwd=git_repo)
+            _git("commit", "-m", "main wandert nach dem Audit", cwd=git_repo)
+        return result
+
+    async def run():
+        service, _harness = _service(git_repo, tmp_path, command_runner=runner)
+        route = Route()
+        await _propose_and_confirm(service, route, "codex: mantis schreibe eine Datei")
+        record = next(iter(service.runs.values()))
+
+        assert moved["done"]
+        assert _git("rev-parse", "main", cwd=git_repo) != audited
+        assert _git("rev-parse", "HEAD", cwd=record.worktree) == audited
+        assert not (Path(record.worktree) / "NEW.txt").exists()
+        assert not (Path(record.worktree) / ".gitattributes").exists()
+        await service.stop()
+
+    _run(run())
+
+
+def test_worktree_add_neutralizes_every_configured_filter_driver(git_repo, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text(
+        '[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n'
+        '\tprocess = git-lfs filter-process\n\trequired = true\n',
+    )
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append((list(args), kwargs))
+        return subprocess.run(args, **kwargs)
+
+    async def run():
+        service, _harness = _service(git_repo, tmp_path, command_runner=runner)
+        service._create_worktree(
+            SimpleNamespace(
+                worktree=str(git_repo / ".worktrees" / "wt-filters"),
+                branch="remote/wt-filters",
+                repo_path=str(git_repo),
+            ),
+        )
+        await service.stop()
+
+    _run(run())
+    adds = [args for args, _kw in calls if "worktree" in args and "add" in args]
+    assert len(adds) == 1
+    configured = {adds[0][i + 1] for i, v in enumerate(adds[0][:-1]) if v == "-c"}
+    assert {
+        "filter.lfs.smudge=", "filter.lfs.process=", "filter.lfs.required=false",
+        "core.attributesFile=/dev/null",
+    } <= configured
+    assert adds[0][-1] == _git("rev-parse", "main", cwd=git_repo)
+    assert "--no-checkout" not in adds[0]
+    env = next(kw["env"] for args, kw in calls if args is not None and "worktree" in args and "add" in args)
+    assert env["GIT_ATTR_NOSYSTEM"] == "1"
