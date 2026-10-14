@@ -163,13 +163,29 @@ async def main():
 
     loop = asyncio.get_event_loop()
     stop_event = asyncio.Event()
+    gym_server_task: asyncio.Task[None] | None = None
+
+    async def stop_gym_server():
+        if gym_server_task is None or gym_server_task.done():
+            return
+        if not gym_server_task.cancelling():
+            gym_server_task.cancel()
+        try:
+            await gym_server_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Fehler beim Beenden des Gym-Servers")
 
     async def shutdown():
         log.info("Fährt herunter...")
         try:
             await _stop_components((("Orchestrator", orchestrator), ("Telegram-Kanal", channel)))
         finally:
-            stop_event.set()
+            try:
+                await stop_gym_server()
+            finally:
+                stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
@@ -179,7 +195,7 @@ async def main():
     log.info(f"🖥️  Dashboard läuft auf http://{dashboard_host}:{cfg.DASHBOARD_PORT} (bindet auf {dashboard_host})")
     if cfg.GYM_ENABLED:
         from web.gym_server import run_gym_server
-        asyncio.create_task(run_gym_server(cfg.GYM_HOST, cfg.GYM_PORT))
+        gym_server_task = asyncio.create_task(run_gym_server(cfg.GYM_HOST, cfg.GYM_PORT))
         log.info(f"🏋️ Gym-App: http://{cfg.GYM_HOST}:{cfg.GYM_PORT}")
     await stop_event.wait()
 

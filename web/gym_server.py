@@ -54,7 +54,35 @@ async def run_gym_server(
                 log_level="warning",
             )
             server = uvicorn.Server(config)
-            await server.serve()
+
+            async def serve():
+                try:
+                    await server.serve()
+                except SystemExit as error:
+                    return error
+                return None
+
+            serve_task = asyncio.create_task(serve())
+            try:
+                serve_error = await asyncio.shield(serve_task)
+                if isinstance(serve_error, SystemExit):
+                    raise serve_error
+            except asyncio.CancelledError:
+                server.should_exit = True
+                try:
+                    serve_error = await serve_task
+                    if isinstance(serve_error, SystemExit):
+                        log.warning(
+                            "Gym-App Server-Exit beim Herunterfahren: %s",
+                            serve_error,
+                        )
+                except Exception as error:
+                    log.warning(
+                        "Gym-App Serverfehler beim Herunterfahren (%s: %s)",
+                        type(error).__name__,
+                        error,
+                    )
+                raise
         except (SystemExit, OSError) as error:
             log.warning(
                 "Gym-App Bind-Versuch %s fehlgeschlagen (%s: %s)",

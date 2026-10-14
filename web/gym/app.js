@@ -14,13 +14,15 @@ let notice = "";
 let loginError = "";
 let loadError = "";
 let histories = {};
+let historyRequestCounter = 0;
+const historyRequestIds = new Map();
 let drafts = new Map();
 let queue = readStored("gym_queue", []);
 if (!Array.isArray(queue)) queue = [];
 queue = queue.filter((item) => item && typeof item.client_id === "string"
   && typeof item.exercise === "string" && Number.isFinite(Number(item.weight_kg))
   && Number.isInteger(Number(item.reps)));
-let flushing = false;
+let flushPromise = null;
 let timerEnd = Number(readStored("gym_timer_end", 0)) || 0;
 let timerInterval = null;
 let clientCounter = 0;
@@ -95,19 +97,44 @@ function currentExercise() {
   return appState?.exercises?.find((exercise) => exercise.name === selectedExercise) ?? null;
 }
 
+function makeDraft(weight, reps, autoFilled) {
+  const weightValue = inputWeight(weight);
+  const repsValue = String(reps ?? "");
+  return {
+    weight_kg: weightValue,
+    reps: repsValue,
+    autoFilled: autoFilled ? { weight_kg: weightValue, reps: repsValue } : null,
+    userChanged: { weight_kg: false, reps: false },
+  };
+}
+
 function draftsFor(exercise) {
   if (!drafts.has(exercise.name)) {
     const remaining = (exercise.prefill ?? []).slice((exercise.logged ?? []).length);
-    const initial = remaining.map((set) => ({
-      weight_kg: inputWeight(set.weight_kg),
-      reps: String(set.reps ?? ""),
-    }));
+    const initial = remaining.map((set) => makeDraft(set.weight_kg, set.reps, true));
     if (!initial.length && !(exercise.logged ?? []).length && !(exercise.prefill ?? []).length) {
-      initial.push({ weight_kg: "", reps: "" });
+      initial.push(makeDraft("", "", false));
     }
     drafts.set(exercise.name, initial);
   }
   return drafts.get(exercise.name);
+}
+
+function updateDraftField(exercise, index, field, value) {
+  const list = draftsFor(exercise);
+  const draft = list[index];
+  if (!draft) return;
+  const previous = draft[field];
+  if (previous === value) return;
+  draft[field] = value;
+  draft.userChanged[field] = true;
+
+  for (let nextIndex = index + 1; nextIndex < list.length; nextIndex += 1) {
+    const next = list[nextIndex];
+    if (next.userChanged[field] || next.autoFilled?.[field] !== previous || next[field] !== previous) continue;
+    next[field] = value;
+    next.autoFilled[field] = value;
+  }
 }
 
 function renderBrand() {
@@ -224,6 +251,7 @@ function renderExercise() {
   const exercise = currentExercise();
   if (!exercise) return renderHome();
   const openDrafts = draftsFor(exercise);
+  const completedLabel = exercise.logged.length === 1 ? "Satz erledigt" : "Sätze erledigt";
   const logged = exercise.logged.map(renderLoggedRow).join("");
   const draftRows = openDrafts.map((draft, index) =>
     renderDraftRow(draft, index, exercise.logged.length + index + 1)
@@ -232,7 +260,7 @@ function renderExercise() {
   return `${renderBrand()}
     <button class="back-button" type="button" data-action="back">‹ Übersicht</button>
     <h1>${escapeHtml(exercise.name)}</h1>
-    <p class="subhead">${exercise.logged.length} Sätze erledigt · ${exercise.rest_s} Sek. Pause</p>
+    <p class="subhead">${exercise.logged.length} ${completedLabel} · ${exercise.rest_s} Sek. Pause</p>
     <div class="set-heading" aria-hidden="true"><span>Nr.</span><span>Gewicht</span><span>Wiederholungen</span><span></span></div>
     <section class="set-list" aria-label="Sätze">${logged}${draftRows}</section>
     ${editPanel}
@@ -260,12 +288,13 @@ function renderLogin() {
 
 function renderSummary() {
   if (!finishSummary) return renderHome();
+  const setLabel = finishSummary.sets === 1 ? "Satz" : "Sätze";
   return `${renderBrand()}
     <section class="summary-panel">
       <h1>Training beendet</h1>
       <p class="quiet-copy">Gute Arbeit. Deine Session ist gespeichert.</p>
       <div class="summary-line"><span>Dauer</span><strong>${finishSummary.duration_min} Min.</strong></div>
-      <div class="summary-line"><span>Sätze</span><strong>${finishSummary.sets}</strong></div>
+      <div class="summary-line"><span>${setLabel}</span><strong>${finishSummary.sets}</strong></div>
       <div class="summary-line"><span>Volumen</span><strong>${Number(finishSummary.volume_kg).toLocaleString("de-DE", { maximumFractionDigits: 2 })} kg</strong></div>
       <div class="summary-actions"><button class="button button-primary" type="button" data-action="back-home">Zur Übersicht</button></div>
     </section>`;
@@ -428,9 +457,9 @@ function keepSavedSet(item, saved) {
 async function refreshState() {
   try {
     const response = await fetch("/api/state", { cache: "no-store" });
-    if (response.status === 401) {
-      appState = null;
+    if (response.status === 401 || response.status === 403) {
       screenMode = "login";
+      loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
       render();
       return false;
     }
@@ -443,6 +472,7 @@ async function refreshState() {
       histories = {};
       editingSet = null;
     }
+    restoreExerciseView();
     hydrateQueue();
     return true;
   } catch (_error) {
@@ -450,88 +480,144 @@ async function refreshState() {
   }
 }
 
+function restoreExerciseView() {
+  if (!appState?.session) {
+    selectedExercise = null;
+    removeStored("gym_view");
+    return;
+  }
+  if (selectedExercise && appState.exercises.some((exercise) => exercise.name === selectedExercise)) return;
+  const savedExercise = readStored("gym_view", null);
+  selectedExercise = typeof savedExercise === "string"
+    && appState.exercises.some((exercise) => exercise.name === savedExercise)
+    ? savedExercise
+    : null;
+  if (!selectedExercise) removeStored("gym_view");
+}
+
 async function loadState() {
   screenMode = "loading";
   render();
   try {
     const response = await fetch("/api/state", { cache: "no-store" });
-    if (response.status === 401) {
+    if (response.status === 401 || response.status === 403) {
       screenMode = "login";
+      loginError = "Bitte melde dich an, um dein Training zu öffnen.";
       render();
-      return;
+      return false;
     }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const previousSessionId = appState?.session?.id ?? null;
     appState = await response.json();
     screenMode = "app";
-    drafts = new Map();
-    histories = {};
+    const nextSessionId = appState?.session?.id ?? null;
+    if (previousSessionId !== nextSessionId) {
+      drafts = new Map();
+      histories = {};
+      editingSet = null;
+    }
+    restoreExerciseView();
     loadError = "";
     hydrateQueue();
     render();
+    if (selectedExercise) void loadHistory(selectedExercise);
     void flushQueue();
+    return true;
   } catch (_error) {
     screenMode = "error";
     loadError = "Der Server ist gerade nicht erreichbar.";
     render();
+    return false;
   }
 }
 
-async function flushQueue() {
-  if (flushing || !queue.length || screenMode !== "app") return;
-  flushing = true;
-  let serverChanged = false;
-  while (queue.length) {
-    const item = queue[0];
-    let response;
-    try {
-      response = await fetch("/api/sets", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(item),
-      });
-    } catch (_error) {
-      notice = "Keine Verbindung. Deine Sätze warten auf den nächsten Sync.";
+function flushQueue() {
+  if (flushPromise) return flushPromise;
+  if (!queue.length) return Promise.resolve(true);
+  if (screenMode !== "app") return Promise.resolve(false);
+
+  flushPromise = (async () => {
+    let serverChanged = false;
+    let validationRejected = false;
+    while (queue.length) {
+      const item = queue[0];
+      let response;
+      try {
+        response = await fetch("/api/sets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(item),
+        });
+      } catch (_error) {
+        notice = "Keine Verbindung. Deine Sätze warten auf den nächsten Sync.";
+        break;
+      }
+
+      if (response.ok) {
+        const saved = await response.json().catch(() => null);
+        if (!saved?.id) {
+          notice = "Der Satz konnte nicht bestätigt werden und bleibt für den nächsten Sync gespeichert.";
+          break;
+        }
+        queue = queue.slice(1);
+        writeStored("gym_queue", queue);
+        keepSavedSet(item, saved);
+        serverChanged = true;
+        continue;
+      }
+
+      if (response.status === 401 || response.status === 403) {
+        screenMode = "login";
+        loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
+        notice = "";
+        break;
+      }
+
+      const failure = await response.json().catch(() => ({}));
+      if ([400, 404, 409, 422].includes(response.status)) {
+        queue = queue.slice(1);
+        writeStored("gym_queue", queue);
+        removePending(item.client_id);
+        notice = failure.error || failure.detail || "Der Satz war ungültig und wurde verworfen.";
+        validationRejected = true;
+        continue;
+      }
+
+      notice = response.status >= 500
+        ? "Der Server ist gerade nicht erreichbar. Deine Sätze bleiben gespeichert."
+        : "Der Satz konnte nicht synchronisiert werden und bleibt gespeichert.";
       break;
     }
 
-    if (response.ok) {
-      const saved = await response.json().catch(() => null);
-      queue = queue.slice(1);
-      writeStored("gym_queue", queue);
-      keepSavedSet(item, saved);
-      serverChanged = true;
-      continue;
+    if (serverChanged) {
+      await refreshState();
+      if (screenMode === "app" && selectedExercise) await loadHistory(selectedExercise);
     }
-
-    if (response.status >= 500) {
-      notice = "Der Server ist gerade nicht erreichbar. Deine Sätze bleiben gespeichert.";
-      break;
-    }
-
-    const failure = await response.json().catch(() => ({}));
-    queue = queue.slice(1);
-    writeStored("gym_queue", queue);
-    removePending(item.client_id);
-    notice = failure.error || failure.detail || "Der Satz wurde abgelehnt und aus der Warteschlange entfernt.";
-  }
-
-  if (serverChanged) await refreshState();
-  flushing = false;
-  render();
+    return queue.length === 0 && !validationRejected && screenMode === "app";
+  })().finally(() => {
+    flushPromise = null;
+    render();
+  });
+  return flushPromise;
 }
 
 async function loadHistory(exercise) {
+  const requestId = ++historyRequestCounter;
+  historyRequestIds.set(exercise, requestId);
   histories[exercise] = undefined;
   render();
   try {
     const query = new URLSearchParams({ exercise, limit: "5" });
     const response = await fetch(`/api/history?${query.toString()}`);
     if (!response.ok) throw new Error("Verlauf konnte nicht geladen werden.");
-    histories[exercise] = await response.json();
+    const result = await response.json();
+    if (historyRequestIds.get(exercise) === requestId) histories[exercise] = result;
   } catch (_error) {
-    histories[exercise] = { error: "Verlauf ist gerade nicht verfügbar." };
+    if (historyRequestIds.get(exercise) === requestId) {
+      histories[exercise] = { error: "Verlauf nicht verfügbar." };
+    }
   }
-  if (selectedExercise === exercise) render();
+  if (selectedExercise === exercise && historyRequestIds.get(exercise) === requestId) render();
 }
 
 function addDraft() {
@@ -542,10 +628,7 @@ function addDraft() {
     ?? exercise.logged[exercise.logged.length - 1]
     ?? exercise.prefill[exercise.prefill.length - 1]
     ?? { weight_kg: "", reps: "" };
-  list.push({
-    weight_kg: inputWeight(source.weight_kg),
-    reps: String(source.reps ?? ""),
-  });
+  list.push(makeDraft(source.weight_kg, source.reps, true));
   notice = "";
   render();
 }
@@ -570,8 +653,50 @@ async function logDraft(index) {
     weight_kg: weight,
     reps,
   };
+
+  if (!writeStored("gym_queue", [...queue, item])) {
+    try {
+      const response = await fetch("/api/sets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(item),
+      });
+      if (response.status === 401 || response.status === 403) {
+        screenMode = "login";
+        loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
+        notice = "Satz nicht gespeichert. Bitte nach der Anmeldung erneut abhaken.";
+        render();
+        return;
+      }
+      if (!response.ok) {
+        const failure = await response.json().catch(() => ({}));
+        const detail = failure.error || failure.detail;
+        notice = detail
+          ? `Satz nicht gespeichert. ${detail}`
+          : "Satz nicht gespeichert. Bitte Verbindung prüfen und erneut abhaken.";
+        render();
+        return;
+      }
+
+      const saved = await response.json().catch(() => null);
+      if (!saved?.id) {
+        notice = "Satz nicht gespeichert. Die Serverbestätigung fehlt; bitte erneut abhaken.";
+        render();
+        return;
+      }
+      keepSavedSet(item, saved);
+      list.splice(index, 1);
+      notice = "Satz synchronisiert. Die lokale Offline-Speicherung ist nicht verfügbar.";
+      startTimer(exercise.rest_s);
+      if (selectedExercise) await loadHistory(selectedExercise);
+    } catch (_error) {
+      notice = "Satz nicht gespeichert. Bitte Verbindung prüfen und erneut abhaken.";
+    }
+    render();
+    return;
+  }
+
   queue.push(item);
-  writeStored("gym_queue", queue);
   exercise.logged.push({
     id: `pending:${clientId}`,
     weight_kg: weight,
@@ -649,12 +774,19 @@ async function deleteEdit() {
 
 async function finishTraining() {
   if (!window.confirm("Training beenden und Session speichern?")) return;
+  const synchronized = await flushQueue();
+  if (!synchronized || queue.length) {
+    if (!notice) notice = "Erst synchronisieren, bevor du das Training beendest.";
+    render();
+    return;
+  }
   try {
     const { response, payload } = await requestJson("/api/finish", "POST");
     if (!response.ok) throw new Error(payload?.error || payload?.detail || "Training konnte nicht beendet werden.");
     finishSummary = payload;
     screenMode = "summary";
     selectedExercise = null;
+    removeStored("gym_view");
     notice = "";
   } catch (error) {
     notice = error.message || "Training konnte nicht beendet werden.";
@@ -666,8 +798,7 @@ document.addEventListener("input", (event) => {
   const input = event.target;
   if (input.matches("[data-draft-input]")) {
     const exercise = currentExercise();
-    const draft = exercise && draftsFor(exercise)[Number(input.dataset.index)];
-    if (draft) draft[input.dataset.field] = input.value;
+    if (exercise) updateDraftField(exercise, Number(input.dataset.index), input.dataset.field, input.value);
   } else if (input.matches("[data-edit-input]") && editingSet) {
     editingSet[input.dataset.field] = input.value;
   }
@@ -681,7 +812,9 @@ document.addEventListener("submit", async (event) => {
   try {
     const { response, payload } = await requestJson("/auth/session", "POST", { token });
     if (!response.ok) throw new Error(payload?.detail || payload?.error || "Anmeldung fehlgeschlagen.");
-    window.location.reload();
+    screenMode = "loading";
+    await loadState();
+    if (screenMode === "app") await flushQueue();
   } catch (error) {
     loginError = error.message || "Anmeldung fehlgeschlagen.";
     render();
@@ -696,11 +829,13 @@ document.addEventListener("click", async (event) => {
 
   if (action === "open-exercise") {
     selectedExercise = button.dataset.exercise;
+    writeStored("gym_view", selectedExercise);
     editingSet = null;
     render();
     void loadHistory(selectedExercise);
   } else if (action === "back") {
     selectedExercise = null;
+    removeStored("gym_view");
     editingSet = null;
     notice = "";
     render();
@@ -708,6 +843,7 @@ document.addEventListener("click", async (event) => {
     screenMode = "app";
     finishSummary = null;
     selectedExercise = null;
+    removeStored("gym_view");
     await refreshState();
     render();
   } else if (action === "add-draft") {
@@ -718,9 +854,9 @@ document.addEventListener("click", async (event) => {
     const exercise = currentExercise();
     const draft = exercise && draftsFor(exercise)[Number(button.dataset.index)];
     if (draft) {
-      draft[button.dataset.field] = changedValue(
+      updateDraftField(exercise, Number(button.dataset.index), button.dataset.field, changedValue(
         draft[button.dataset.field], button.dataset.field, Number(button.dataset.step),
-      );
+      ));
       render();
     }
   } else if (action === "edit-set") {

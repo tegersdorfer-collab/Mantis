@@ -140,3 +140,60 @@ def test_backoff_remains_capped_after_many_retries(monkeypatch):
 
     assert len(delays) == 1099
     assert delays[-1] == 300
+
+
+def test_cancellation_requests_server_shutdown_and_waits_for_listener_close(monkeypatch):
+    class FakeServer:
+        def __init__(self, _config):
+            self.shutdown_requested = asyncio.Event()
+            self.serve_started = asyncio.Event()
+            self.serve_finished = asyncio.Event()
+            self.listeners_closed = False
+            self._should_exit = False
+
+        @property
+        def should_exit(self):
+            return self._should_exit
+
+        @should_exit.setter
+        def should_exit(self, value):
+            self._should_exit = value
+            if value:
+                self.shutdown_requested.set()
+
+        async def serve(self):
+            self.serve_started.set()
+            await self.shutdown_requested.wait()
+            self.listeners_closed = True
+            self.serve_finished.set()
+
+    servers = []
+
+    def server_factory(config):
+        server = FakeServer(config)
+        servers.append(server)
+        return server
+
+    _patch_uvicorn(monkeypatch, server_factory)
+
+    async def scenario():
+        task = asyncio.create_task(gym_server.run_gym_server("127.0.0.1", 7782))
+        server = None
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if servers:
+                server = servers[0]
+                if server.serve_started.is_set():
+                    break
+        assert server is not None
+        assert server.serve_started.is_set()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert server.should_exit is True
+        assert server.serve_finished.is_set()
+        assert server.listeners_closed is True
+
+    asyncio.run(scenario())
