@@ -816,7 +816,9 @@ class MessageHandler:
                 try:
                     await tool_selection_task
                 except asyncio.CancelledError:
-                    pass
+                    current_task = asyncio.current_task()
+                    if current_task is not None and current_task.cancelling():
+                        raise
 
     def _finish_turn(self, user_text: str, response: str, trace: list,
                      channel_name: str, agent=None, meta: dict | None = None) -> None:

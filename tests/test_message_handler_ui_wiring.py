@@ -4,6 +4,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asyncio
+import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -207,6 +208,51 @@ class TestDashboardRespondUiWiring:
                         await asyncio.gather(task, return_exceptions=True)
 
         assert asyncio.run(run()) == (True, True, True, True)
+
+    def test_dashboard_elternabbruch_waehrend_toolauswahl_cleanup_wird_propagiert(
+        self, monkeypatch,
+    ):
+        handler = _make_handler()
+        handler.agent.backend = SimpleNamespace(sends_full_tool_catalog=True)
+        auswahl_gestartet = asyncio.Event()
+        cleanup_gestartet = asyncio.Event()
+        cleanup_beendet = asyncio.Event()
+
+        async def select(_text):
+            auswahl_gestartet.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_gestartet.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup_beendet.set()
+
+        async def run_agent(**_kwargs):
+            await auswahl_gestartet.wait()
+            return "Antwort", []
+
+        handler.agent.run = run_agent
+        handler._persist_msg = MagicMock()
+        handler._finish_turn = MagicMock()
+        monkeypatch.setattr("core.message_handler.fast_commands.match", lambda _: None)
+        monkeypatch.setattr("core.message_handler.skill_request.match", lambda _: None)
+        monkeypatch.setattr("core.message_handler.skills.T.select_tools_async", select)
+
+        async def run():
+            parent = asyncio.create_task(handler.dashboard_respond("Hallo"))
+            await cleanup_gestartet.wait()
+            assert not parent.done()
+            parent.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await parent
+
+            assert cleanup_beendet.is_set()
+            handler._finish_turn.assert_not_called()
+
+        asyncio.run(run())
 
     def test_toolauswahl_wird_bei_fehler_in_recent_messages_abgebrochen_und_abgewartet(self, monkeypatch):
         handler = _make_handler()
