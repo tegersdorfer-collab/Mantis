@@ -1,31 +1,8 @@
-"""
-TTS — Text-to-Speech, lokal. Seit 22.09.2026 Kokoro (deutsche Stimme "Martin"),
-Piper bleibt als Fallback.
+"""Cartesia Sonic 3.6 als TTS mit lokalem Kokoro/Piper-Fallback.
 
-Gibt OGG/Opus-Bytes zurück die direkt als Telegram-Sprachnachricht verschickt
-werden können. Lazy-loaded beim ersten Aufruf, dann im RAM gecacht.
-
-**Kokoro kommt damit zurück** — es war früher ausgeschieden, weil es kein Deutsch
-konnte (nur en/ja/zh/es/fr/hi/it/pt). Inzwischen gibt es deutsche Finetunes; dieser
-hier bringt die männliche Stimme "Martin" mit, also dieselbe Rolle wie Piper-Thorsten.
-
-Modellvergleich 22.09.2026 (voller Report: bench/TTS-2026-09-22.md), gemessen als
-Streaming: Zeit bis zum ERSTEN Ton, nicht Gesamtlatenz — das ist, was man hört.
-
-    Kokoro Martin      0,52 s   RTF 0,21   0,62 GB   Verständlichkeit 3,3 %
-    Piper Thorsten     1,06 s   RTF 0,35   0,03 GB                    1,6 %
-    Qwen3-TTS (Klon)   0,64 s   RTF 0,59   2,40 GB                    8,9 %
-    Kartoffelbox-Turbo 2,85 s   RTF 1,20   2,50 GB                    1,7 %
-    Chatterbox ML      4,76 s   RTF 1,46   3,23 GB                    0,0 %
-
-Entscheidend ist RTF < 1: darüber generiert das Modell langsamer als die Wiedergabe,
-der Puffer läuft leer und es stottert — daran scheitern alle autoregressiven Modelle
-(Chatterbox, Orpheus, Kartoffelbox). Kokoro ist wie Piper nicht-autoregressiv und
-erzeugt die Sequenz in einem Durchlauf; daher der Geschwindigkeitsvorsprung trotz
-neuronaler Prosodie.
-
-**Braucht espeak-ng** für die deutsche Phonemisierung (`brew install espeak-ng`).
-Fehlt es, fällt die Synthese automatisch auf Piper zurück.
+Alle öffentlichen Funktionen liefern Telegram-kompatible OGG/Opus-Bytes. Cartesia
+liefert WAV, das über dieselbe ffmpeg-Konvertierung wie der lokale Pfad umgewandelt
+wird. Lokale Modelle werden erst geladen, wenn Cartesia nicht verfügbar ist.
 """
 from __future__ import annotations
 import asyncio
@@ -34,12 +11,15 @@ import logging
 import re
 import subprocess
 import tempfile
+import time
 import wave
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import config
 from core import db
+from core.error_redaction import redact_error_text
+import httpx
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +27,12 @@ _MODEL_DIR = Path(__file__).parent.parent / "data" / "tts" / "piper"
 _KOKORO_DIR = Path(__file__).parent.parent / "data" / "tts" / "kokoro"
 _ESPEAK_LIB = "/opt/homebrew/lib/libespeak-ng.dylib"
 _ESPEAK_DATA = "/opt/homebrew/share/espeak-ng-data"
+_CARTESIA_URL = "https://api.cartesia.ai/tts/bytes"
+_CARTESIA_VERSION = "2025-04-16"
+_CARTESIA_TIMEOUT_S = 5.0
+_CARTESIA_PAUSE_S = 30 * 60
+_CARTESIA_PAUSE_STATUSES = {401, 402, 403, 429}
+_CARTESIA_CHARS_PRICE_PER_MILLION = 49.0
 
 VOICE_MODELS: dict[str, str] = {
     "thorsten-high": "de_DE-thorsten-high",
@@ -65,11 +51,21 @@ _kokoro: object | None = None
 # Modell, fehlendes espeak-ng). Danach geht alles über Piper, statt bei jeder
 # Antwort erneut in denselben Fehler zu laufen.
 _kokoro_unavailable = False
+_cartesia_paused_until = 0.0
+_cartesia_pause_warned = False
 _lock = asyncio.Lock()
 
 
 def _engine() -> str:
-    return getattr(config, "TTS_ENGINE", "kokoro")
+    return getattr(config, "TTS_ENGINE", "cartesia")
+
+
+def _cartesia_key() -> str:
+    return str(getattr(config, "CARTESIA_API_KEY", "") or "").strip()
+
+
+def _cartesia_is_paused() -> bool:
+    return time.monotonic() < _cartesia_paused_until
 
 
 def _kokoro_paths() -> tuple[Path, Path]:
@@ -134,7 +130,9 @@ def _active_voice_name() -> str:
 
 def is_available() -> bool:
     """True, wenn IRGENDEINE Engine sprechen kann — Kokoro oder Piper."""
-    if _engine() == "kokoro" and not _kokoro_unavailable:
+    if _engine() == "cartesia" and _cartesia_key() and not _cartesia_is_paused():
+        return True
+    if _engine() in {"kokoro", "cartesia"} and not _kokoro_unavailable:
         onnx, voices = _kokoro_paths()
         if onnx.exists() and voices.exists():
             return True
@@ -216,6 +214,89 @@ def _wav_to_ogg(wav_bytes: bytes) -> bytes:
         Path(ogg_path).unlink(missing_ok=True)
 
 
+async def _cartesia_synthesize(text: str) -> bytes:
+    """Ruft Cartesia auf und liefert WAV-Bytes für die vorhandene OGG-Konvertierung."""
+    api_key = _cartesia_key()
+    payload = {
+        "model_id": config.TTS_CARTESIA_MODEL,
+        "transcript": text,
+        "voice": {"mode": "id", "id": config.TTS_CARTESIA_VOICE},
+        "language": config.TTS_CARTESIA_LANGUAGE,
+        "output_format": {
+            "container": "wav",
+            "encoding": "pcm_s16le",
+            "sample_rate": 44100,
+        },
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Cartesia-Version": _CARTESIA_VERSION,
+    }
+    async with httpx.AsyncClient(timeout=_CARTESIA_TIMEOUT_S) as client:
+        response = await client.post(_CARTESIA_URL, headers=headers, json=payload)
+    response.raise_for_status()
+    return response.content
+
+
+def _record_cartesia_usage(text: str) -> None:
+    chars = len(text)
+    estimated_cost = chars * _CARTESIA_CHARS_PRICE_PER_MILLION / 1_000_000
+    try:
+        from core import llm_usage
+
+        llm_usage.record(
+            "cartesia",
+            config.TTS_CARTESIA_MODEL,
+            chars,
+            0,
+            purpose="tts",
+            actual_cost=estimated_cost,
+        )
+    except Exception as exc:
+        log.debug("Cartesia-Usage konnte nicht erfasst werden: %s", redact_error_text(exc))
+
+
+def _pause_cartesia(status: int) -> None:
+    global _cartesia_paused_until, _cartesia_pause_warned
+    _cartesia_paused_until = time.monotonic() + _CARTESIA_PAUSE_S
+    if not _cartesia_pause_warned:
+        log.warning(
+            "Cartesia TTS pausiert nach HTTP %s für 30 Minuten; nutze lokales TTS",
+            status,
+        )
+        _cartesia_pause_warned = True
+
+
+async def _try_cartesia(text: str) -> bytes | None:
+    """Gibt Cartesia-Audio oder None zurück, wenn der lokale Fallback übernehmen soll."""
+    if not _cartesia_key() or _cartesia_is_paused():
+        return None
+    try:
+        wav = await _cartesia_synthesize(text)
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in _CARTESIA_PAUSE_STATUSES:
+            _pause_cartesia(status)
+        else:
+            log.warning("Cartesia TTS HTTP %s; nutze lokales TTS", status)
+        return None
+    except Exception as exc:
+        # Ausnahme-Texte von HTTP-Clients können Request-Details enthalten.
+        log.warning("Cartesia TTS fehlgeschlagen (%s); nutze lokales TTS", type(exc).__name__)
+        return None
+
+    _record_cartesia_usage(text)
+    return wav
+
+
+async def _synthesize_local(text: str, speed: float) -> bytes:
+    """Lokaler Fallback: Kokoro lazy laden, bei dessen Nichtverfügbarkeit Piper nutzen."""
+    if _engine() in {"kokoro", "cartesia"} and not _kokoro_unavailable:
+        if await asyncio.to_thread(_load_kokoro) is not None:
+            return await asyncio.to_thread(_synth_kokoro, text, speed)
+    return await asyncio.to_thread(_synth, text, speed)
+
+
 async def synthesize(
     text: str,
     voice: str = DEFAULT_VOICE,
@@ -224,8 +305,8 @@ async def synthesize(
 ) -> bytes:
     """Text → OGG/Opus-Bytes (Telegram voice message format).
 
-    `voice` bleibt aus API-Kompatibilitätsgründen erhalten, wird aktuell aber
-    ignoriert — es ist nur eine deutsche Piper-Stimme geladen.
+    `voice` bleibt aus API-Kompatibilitätsgründen erhalten. Cartesia nutzt die
+    konfigurierte Stimme; beim lokalen Fallback gelten die vorhandenen Stimmen.
     Kürzt automatisch auf max_chars um Timeouts zu vermeiden.
     Gibt leere Bytes zurück wenn TTS nicht verfügbar.
     """
@@ -242,17 +323,14 @@ async def synthesize(
 
     async with _lock:
         try:
-            wav = None
-            if _engine() == "kokoro" and not _kokoro_unavailable:
-                if await asyncio.to_thread(_load_kokoro) is not None:
-                    wav = await asyncio.to_thread(_synth_kokoro, text, speed)
+            wav = await _try_cartesia(text) if _engine() == "cartesia" else None
             if wav is None:
-                wav = await asyncio.to_thread(_synth, text, speed)
+                wav = await _synthesize_local(text, speed)
             ogg = await asyncio.to_thread(_wav_to_ogg, wav)
             log.info(f"🔊 TTS: {len(text)} Zeichen → {len(ogg)//1024}KB OGG")
             return ogg
         except Exception as e:
-            log.error(f"TTS fehlgeschlagen: {e}")
+            log.error("TTS fehlgeschlagen: %s", redact_error_text(e))
             return b""
 
 
@@ -338,17 +416,15 @@ async def synthesize_stream(
 
     stuecke = _split_for_streaming(text)
     async with _lock:
-        nutze_kokoro = False
-        if _engine() == "kokoro" and not _kokoro_unavailable:
-            nutze_kokoro = await asyncio.to_thread(_load_kokoro) is not None
         for i, stueck in enumerate(stuecke):
             try:
-                wav = await asyncio.to_thread(
-                    _synth_kokoro if nutze_kokoro else _synth, stueck, speed)
+                wav = await _try_cartesia(stueck) if _engine() == "cartesia" else None
+                if wav is None:
+                    wav = await _synthesize_local(stueck, speed)
                 ogg = await asyncio.to_thread(_wav_to_ogg, wav)
             except Exception as e:
                 # Ein kaputtes Stück darf die restliche Antwort nicht verschlucken.
-                log.error(f"TTS-Stück {i} fehlgeschlagen: {e}")
+                log.error("TTS-Stück %s fehlgeschlagen: %s", i, redact_error_text(e))
                 continue
             log.info(f"🔊 TTS-Stück {i + 1}/{len(stuecke)}: {len(stueck)} Zeichen → {len(ogg) // 1024}KB")
             yield ogg
@@ -358,6 +434,8 @@ async def list_voices() -> list[str]:
     """Gibt die verfügbaren Stimmen zurück."""
     if not is_available():
         return []
+    if _engine() == "cartesia":
+        return [config.TTS_CARTESIA_VOICE]
     if _engine() == "kokoro" and not _kokoro_unavailable:
         return [config.TTS_KOKORO_VOICE]
     return [DEFAULT_VOICE]

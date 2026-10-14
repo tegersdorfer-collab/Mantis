@@ -47,10 +47,13 @@ class MantisSettings(BaseSettings):
     #   whisper turbo   ... 22 %, 1,06 s/Clip
     # Ganze Sätze transkribieren alle drei fehlerfrei; der Unterschied liegt bei
     # kurzen Äußerungen und Eigennamen — genau dem Voice-Alltag.
-    # TTS: "kokoro" (Default seit 22.09.2026, deutsche Stimme Martin) oder "piper".
-    # Kokoro braucht espeak-ng (brew install espeak-ng); fehlt es, greift Piper.
-    TTS_ENGINE: str = "kokoro"
+    # TTS: Cartesia Sonic 3.6; bei Fehlern fällt Mantis lokal auf Kokoro/Piper zurück.
+    TTS_ENGINE: str = "cartesia"
     TTS_KOKORO_VOICE: str = "dm_martin"
+    CARTESIA_API_KEY: str = ""
+    TTS_CARTESIA_MODEL: str = "sonic-3.6"
+    TTS_CARTESIA_VOICE: str = "afa425cf-5489-4a09-8a3f-d3cb1f82150d"
+    TTS_CARTESIA_LANGUAGE: str = "de"
     STT_ENGINE: str = "parakeet"
     STT_PARAKEET_MODEL: str = "mlx-community/parakeet-tdt-0.6b-v3"
     ANTHROPIC_API_KEY: str = ""
