@@ -177,6 +177,10 @@ async def main():
     await orchestrator.start()
     asyncio.create_task(api_server.serve())
     log.info(f"🖥️  Dashboard läuft auf http://{dashboard_host}:{cfg.DASHBOARD_PORT} (bindet auf {dashboard_host})")
+    if cfg.GYM_ENABLED:
+        from web.gym_server import run_gym_server
+        asyncio.create_task(run_gym_server(cfg.GYM_HOST, cfg.GYM_PORT))
+        log.info(f"🏋️ Gym-App: http://{cfg.GYM_HOST}:{cfg.GYM_PORT}")
     await stop_event.wait()
 
 
