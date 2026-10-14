@@ -39,6 +39,19 @@ def _ollama_tools_to_anthropic(tools: list[dict]) -> list[dict]:
     return result
 
 
+def _stable_anthropic_tool_schemas(tools: list[dict]) -> list[dict]:
+    """Nutzt für Anthropic den vollständigen, stabil sortierten Tool-Katalog."""
+    from core import tools as toolreg
+
+    schemas = toolreg.ollama_schemas()
+    if not schemas:
+        schemas = tools
+    return sorted(
+        schemas,
+        key=lambda tool: str((tool.get("function") or tool).get("name", "")),
+    )
+
+
 def _anthropic_system_content(system: str) -> str | list[dict]:
     """Markiert nur den stabilen Prompt-Präfix für Anthropic Prompt Caching."""
     cache_prefix = getattr(system, "cache_prefix", None)
@@ -236,7 +249,9 @@ class ClaudeBackend(AgentBackend):
         if system:
             kwargs["system"] = _anthropic_system_content(system)
         if tools:
-            kwargs["tools"] = _ollama_tools_to_anthropic(tools)
+            kwargs["tools"] = _ollama_tools_to_anthropic(
+                _stable_anthropic_tool_schemas(tools),
+            )
         if force_tool_call and tools:
             kwargs["tool_choice"] = {"type": "any"}
 

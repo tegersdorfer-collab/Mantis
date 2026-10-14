@@ -43,6 +43,7 @@ _whisper_lock = asyncio.Lock()
 _parakeet_unavailable = False
 _MANTIS_MISHEARINGS = frozenset({
     "mantasy", "bantas", "mantes", "mantiss", "mentis", "mandis",
+    "mäntis", "mantus", "mandes",
 })
 _INITIAL_WORD_RE = re.compile(r"^(?P<prefix>\s*(?:hey\b[\s,!?-]*)?)(?P<word>[^\W_]+)", re.IGNORECASE)
 
@@ -84,9 +85,9 @@ async def transcribe_audio(audio_path: str) -> str:
     return _normalize_voice_transcript(await _transcribe_whisper(audio_path))
 
 
-def _edit_distance_at_most_two(left: str, right: str) -> int:
-    if abs(len(left) - len(right)) > 2:
-        return 3
+def _edit_distance_at_most_one(left: str, right: str) -> int:
+    if abs(len(left) - len(right)) > 1:
+        return 2
     previous = list(range(len(right) + 1))
     for row, left_char in enumerate(left, start=1):
         current = [row]
@@ -96,8 +97,8 @@ def _edit_distance_at_most_two(left: str, right: str) -> int:
                 previous[column] + 1,
                 previous[column - 1] + (left_char != right_char),
             ))
-        if min(current) > 2:
-            return 3
+        if min(current) > 1:
+            return 2
         previous = current
     return previous[-1]
 
@@ -112,11 +113,7 @@ def _normalize_voice_transcript(text: str) -> str:
     if not 5 <= len(normalized) <= 8:
         return text
     if normalized not in _MANTIS_MISHEARINGS:
-        if _edit_distance_at_most_two(normalized, "mantis") > 2:
-            return text
-        # Mantis endet hörbar auf „is“. Die Endungsprüfung hält Wörter wie
-        # „Mantel“ trotz des Edit-Abstands von zwei unverändert.
-        if _edit_distance_at_most_two(normalized[-2:], "is") > 1:
+        if _edit_distance_at_most_one(normalized, "mantis") > 1:
             return text
     return f"{match.group('prefix')}Mantis{text[match.end('word'):]}"
 
