@@ -444,3 +444,19 @@ def test_pinned_http_backend_connects_to_checked_ip_and_rejects_other_host():
             await pinned.connect_tcp("attacker.example", 443)
 
     asyncio.run(run())
+
+
+def test_wikipedia_title_fallback_from_url_without_network():
+    from domains.inbox.metadata import _title_from_url
+    assert _title_from_url("https://de.wikipedia.org/wiki/Gottesanbeterin")["title"] == "Gottesanbeterin – Wikipedia"
+    assert _title_from_url("https://en.wikipedia.org/wiki/Praying_mantis")["title"] == "Praying mantis – Wikipedia"
+    assert _title_from_url("https://de.wikipedia.org/wiki/Spezial:Suche") == {}
+    assert _title_from_url("https://example.org/wiki/X") == {}
+
+
+def test_large_html_pages_are_read_partially_not_rejected():
+    import inspect
+    from domains.inbox import metadata
+    source = inspect.getsource(metadata)
+    assert 'content-length") or 0) > _MAX_HTML_BYTES' not in source
+    assert "remaining = _MAX_HTML_BYTES - size" in source

@@ -11,7 +11,7 @@ import signal
 import socket
 import sys
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpcore
 import httpx
@@ -21,6 +21,8 @@ from domains.inbox.capture import platform_for_url
 
 _METADATA_TIMEOUT_S = 8.0
 _MAX_HTML_BYTES = 512 * 1024
+# Wikipedia & Co. sperren zu generische Agents (HTTP 403); beschreibender UA ohne persönliche Daten.
+_USER_AGENT = "Mantis-Inbox/1.0 (private personal assistant; link preview)"
 _MAX_METADATA_BYTES = 1_000_000
 _MAX_STDERR_BYTES = 64 * 1024
 _http_client_factory = httpx.AsyncClient
@@ -257,13 +259,32 @@ async def fetch_metadata(url: str, *, timeout_s: float = _METADATA_TIMEOUT_S) ->
         )
 
     try:
-        return await asyncio.wait_for(fetch(), timeout=budget)
+        result = await asyncio.wait_for(fetch(), timeout=budget)
     except (asyncio.TimeoutError, httpx.HTTPError, OSError, ValueError, json.JSONDecodeError):
-        return {}
+        result = {}
     except Exception:
         # Fremde Webseiten und yt-dlp-Versionen liefern uneinheitliche Fehler.
         # Fehlertexte können vollständige URLs enthalten und werden nicht geloggt.
+        result = {}
+    return result or _title_from_url(url)
+
+
+def _title_from_url(url: str) -> dict:
+    """Rückfall ohne Netz: Wikipedia-Artikeltitel stehen im Pfad (Wikipedia lehnt
+    anonyme User-Agents mit 403 ab, eine Kontaktangabe senden wir bewusst nicht)."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
         return {}
+    host = (parsed.hostname or "").casefold()
+    if not (host == "wikipedia.org" or host.endswith(".wikipedia.org")):
+        return {}
+    if not parsed.path.startswith("/wiki/"):
+        return {}
+    title = unquote(parsed.path[len("/wiki/"):]).replace("_", " ").strip()
+    if not title or ":" in title:
+        return {}
+    return {"type": "article", "title": _clean(f"{title} – Wikipedia", 500), "platform": "article"}
 
 
 class _OutputTooLarge(Exception):
@@ -431,7 +452,7 @@ async def _fetch_article(
             timeout=httpx.Timeout(min(timeout_s, 5.0)),
             follow_redirects=False,
             trust_env=False,
-            headers={"User-Agent": "Mantis-Inbox/1.0", "Accept": "text/html,application/xhtml+xml"},
+            headers={"User-Agent": _USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
         ) as client:
             async with client.stream("GET", current) as response:
                 if response.status_code in {301, 302, 303, 307, 308}:
@@ -444,15 +465,16 @@ async def _fetch_article(
                 content_type = response.headers.get("content-type", "").casefold()
                 if "html" not in content_type:
                     return {}
-                if int(response.headers.get("content-length") or 0) > _MAX_HTML_BYTES:
-                    return {}
+                # Große Seiten nicht verwerfen: Titel und Meta-Tags stehen im <head>,
+                # daher nur die ersten _MAX_HTML_BYTES lesen und dann abbrechen.
                 chunks = []
                 size = 0
                 async for chunk in response.aiter_bytes():
-                    size += len(chunk)
-                    if size > _MAX_HTML_BYTES:
-                        return {}
-                    chunks.append(chunk)
+                    remaining = _MAX_HTML_BYTES - size
+                    chunks.append(chunk[:remaining])
+                    size += min(len(chunk), remaining)
+                    if size >= _MAX_HTML_BYTES:
+                        break
                 html = b"".join(chunks).decode("utf-8", errors="replace")
                 parser = _HeadMetadataParser()
                 parser.feed(html)
