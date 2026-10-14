@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 _MESSAGE_LIMIT = 4096
 
 
-# ── Ollama-Vision (für Fotos) ─────────────────────────────────────────────────
+# ── Cloud-Vision (für Fotos) ─────────────────────────────────────────────────
 
 _VISION_PROMPT = (
     "Beschreibe dieses Bild kurz auf Deutsch. "
@@ -36,7 +36,7 @@ _VISION_PROMPT = (
 
 
 async def _describe_image(image_bytes: bytes) -> str:
-    """Beschreibt ein Bild lokal via Ollama-Vision. Erkennt Mahlzeiten für Tracking."""
+    """Beschreibt ein Bild über die Vision-Cloud-Kette, inklusive Mahlzeiten-Erkennung."""
     return await _describe_image_raw(image_bytes, _VISION_PROMPT)
 
 

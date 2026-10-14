@@ -9,7 +9,7 @@
 ## Kontext in einem Absatz
 
 `apps/desktop` ist ein **reiner Client** (Tauri v2, Rust + Vite/TypeScript-Frontend).
-Das gesamte Backend (Whisper/Piper/Ollama/Postgres/FastAPI) läuft zentral auf Timos
+Das gesamte Backend (Whisper/Piper/Ollama-Embeddings/Postgres/FastAPI) läuft zentral auf Timos
 **Mac** und wird NICHT auf Windows gestartet. Der Windows-Client redet nur über HTTP/WS
 mit dem Mac-Backend übers Tailnet. Holographic-HUD-Stil, generatives UI (Backend wählt
 Layout + Widgets). Voller Architektur-Spec:

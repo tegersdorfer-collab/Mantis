@@ -6,6 +6,7 @@ docs/superpowers/specs/2026-07-05-vad-wakeword-streaming-design.md)."""
 from __future__ import annotations
 
 import tempfile
+import time
 import wave
 from typing import Callable
 
@@ -85,7 +86,15 @@ class VoiceStreamSession:
             if not wake_fired and not self._conversation_active_fn():
                 continue
 
+            turn_started_at = time.perf_counter()
+            stt_started = turn_started_at
             text = await transcribe_pcm(segment.audio)
-            result = {"text": text, "addressed": True}
+            stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
+            result = {
+                "text": text,
+                "addressed": True,
+                "stt_ms": stt_ms,
+                "turn_started_at": turn_started_at,
+            }
 
         return result

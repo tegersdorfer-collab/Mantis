@@ -1,7 +1,7 @@
 # Mantis Desktop
 
 Tauri-Desktop-Client für Mantis (Windows + macOS aus einer Codebasis) — reiner Client,
-das Backend (Whisper/Piper/Ollama/DB) läuft zentral auf dem Mac. Holographic-HUD-Stil,
+das Backend (Whisper/Piper/Ollama-Embeddings/DB) läuft zentral auf dem Mac. Holographic-HUD-Stil,
 generatives UI (Mantis wählt Layout + Widgets selbst).
 
 Architektur: `docs/superpowers/specs/2026-07-04-multi-device-jarvis-ui-design.md`.

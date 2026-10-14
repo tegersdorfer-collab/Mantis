@@ -19,7 +19,7 @@ wird es nicht benutzt.
 Gym-Tracker, Ernährung und Health-Daten in einer App.
 - **Training:** Mantis generiert die Session (3-Tage-Zyklus Upper/Jog/Lower)
   basierend auf HRV + Schlaf. RPE-Feedback pro Übung, Rest-Timer.
-- **Ernährung:** Foto → `qwen3-vl:8b`-Analyse → Makros bestätigen. Makro-Ringe,
+- **Ernährung:** Foto → Cloud-Bildanalyse → Makros bestätigen. Makro-Ringe,
   adaptive Kalorienziele.
 - **Health:** HealthKit-Background-Push (Schritte, HRV, Schlaf, Gewicht) an Mantis.
 - **Endpoints:** `/api/fitness/{today-plan,exercises,log-rpe}`,

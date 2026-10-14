@@ -175,6 +175,25 @@ def tools_to_responses(tools: list[dict]) -> list[dict]:
 
 def messages_to_responses_input(messages: list[dict]) -> list[dict]:
     """Konvertiert Mantis-Messages in Responses-Messages und Call/Output-Items."""
+    def content_to_responses(content):
+        if not isinstance(content, list):
+            return content or ""
+        result = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                result.append({"type": "input_text", "text": str(block.get("text", ""))})
+            elif block.get("type") == "image":
+                source = block.get("source") or {}
+                if source.get("type") == "base64" and source.get("data"):
+                    media_type = source.get("media_type", "image/jpeg")
+                    result.append({
+                        "type": "input_image",
+                        "image_url": f"data:{media_type};base64,{source['data']}",
+                    })
+        return result
+
     result = []
     pending_ids: list[str] = []
     for message in messages:
@@ -205,7 +224,7 @@ def messages_to_responses_input(messages: list[dict]) -> list[dict]:
                 "output": str(message.get("content", "")),
             })
         else:
-            result.append({"role": role, "content": message.get("content", "")})
+            result.append({"role": role, "content": content_to_responses(message.get("content", ""))})
     return result
 
 
@@ -291,6 +310,10 @@ class ChatGPTPlanBackend(AgentBackend):
     @property
     def model_name(self) -> str:
         return self._model
+
+    @property
+    def supports_vision(self) -> bool:
+        return True
 
     async def warmup(self) -> None:
         return None
@@ -419,7 +442,7 @@ class ChatGPTPlanBackend(AgentBackend):
                         text_parts.append(delta)
                         if stream_cb:
                             try:
-                                await stream_cb("".join(text_parts))
+                                await stream_cb(delta)
                             except Exception:
                                 pass
                     elif event_type == "response.output_item.done":
@@ -448,7 +471,7 @@ class ChatGPTPlanBackend(AgentBackend):
                         if not text and text_parts:
                             text = "".join(text_parts)
                         record_usage_once()
-                        if stream_cb and text and text != "".join(text_parts):
+                        if stream_cb and text and not text_parts:
                             try:
                                 await stream_cb(text)
                             except Exception:

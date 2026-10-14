@@ -8,7 +8,8 @@ import asyncio
 import pytest
 
 from core.backends.base import AgentBackend
-from core.backends.fallback import FallbackBackend
+from core.backends.fallback import AllBackendsFailedError, FallbackBackend
+from core.agent import Agent
 
 
 class FakeBackend(AgentBackend):
@@ -80,6 +81,44 @@ class TestFailover:
         fb = FallbackBackend(primary, fallback, timeout_s=0.05)
         text, _ = _call(fb)
         assert text == "von qwen"
+
+    def test_stream_failover_aborts_old_attempt_and_starts_a_new_one(self):
+        class PartialFailure(FakeBackend):
+            async def call(self, messages, tools, stream_cb, temperature, max_tokens,
+                           think=False, force_tool_call=False):
+                self.calls += 1
+                await stream_cb("Unfertiger Entwurf")
+                raise ConnectionError("provider abgebrochen")
+
+        class StreamSuccess(FakeBackend):
+            async def call(self, messages, tools, stream_cb, temperature, max_tokens,
+                           think=False, force_tool_call=False):
+                self.calls += 1
+                await stream_cb("Fertige Antwort.")
+                return "Fertige Antwort.", []
+
+        fb = FallbackBackend(
+            PartialFailure("openrouter"), StreamSuccess("anthropic"), cooldown_s=0,
+        )
+        events = []
+
+        async def collect(event):
+            events.append(event)
+
+        answer, _ = asyncio.run(Agent(fb).run(
+            [{"role": "user", "content": "sag etwas"}], system="s",
+            use_tools=False, stream_cb=collect,
+        ))
+
+        assert answer == "Fertige Antwort."
+        assert [getattr(event, "kind", None) for event in events] == [
+            "attempt_start", "delta", "attempt_abort",
+            "attempt_start", "delta", "attempt_end",
+        ]
+        assert events[1].text_delta == "Unfertiger Entwurf"
+        assert events[4].text_delta == "Fertige Antwort."
+        assert events[0].attempt_id != events[3].attempt_id
+        assert events[-1].final is True
 
     def test_cooldown_skips_primary(self):
         primary = FakeBackend("claude", error=ConnectionError("api down"))
@@ -177,6 +216,60 @@ def test_three_stage_chain_falls_through_timeout_and_http_error_then_cools_down(
     assert local.calls == 2
     assert "TimeoutError" in caplog.text
     assert "HTTPStatusError" in caplog.text
+
+
+def test_single_configured_cloud_stage_can_run_without_a_fake_fallback():
+    only_provider = FakeBackend("claude", result=("cloud answer", []))
+    backend = FallbackBackend(backends=[only_provider], stage_timeouts=[0.5])
+
+    assert _call(backend) == ("cloud answer", [])
+    assert only_provider.calls == 1
+
+
+def test_all_backend_failures_raise_a_clear_exhaustion_error():
+    backend = FallbackBackend(
+        backends=[
+            FakeBackend("openrouter", error=ConnectionError("offline")),
+            FakeBackend("anthropic", error=RuntimeError("unavailable")),
+        ],
+        stage_timeouts=[0.5, 0.5],
+        cooldown_s=0,
+    )
+
+    with pytest.raises(AllBackendsFailedError, match="Alle Backend-Stufen sind fehlgeschlagen"):
+        _call(backend)
+
+
+def test_empty_visible_answer_uses_next_provider():
+    empty = FakeBackend("openrouter", result=("", []))
+    fallback = FakeBackend("anthropic", result=("sichtbare Antwort", []))
+    backend = FallbackBackend(
+        backends=[empty, fallback], stage_timeouts=[0.5, 0.5], cooldown_s=60,
+    )
+
+    assert _call(backend) == ("sichtbare Antwort", [])
+    assert empty.calls == 1
+    assert fallback.calls == 1
+
+
+def test_anthropic_unsupported_parameter_400_falls_through_without_permanent_disable():
+    import httpx
+
+    error = httpx.HTTPStatusError(
+        "temperature is deprecated for this model",
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        response=httpx.Response(400),
+    )
+    anthropic = FakeBackend("claude-haiku-5-5", error=error)
+    fallback = FakeBackend("chatgpt-plan", result=("fallback", []))
+    backend = FallbackBackend(
+        backends=[anthropic, fallback], stage_timeouts=[0.5, 0.5], cooldown_s=180,
+    )
+
+    assert _call(backend) == ("fallback", [])
+    assert anthropic.calls == 1
+    assert fallback.calls == 1
+    assert backend._down_until[0] != float("inf")
 
 
 def test_chain_uses_next_available_cloud_stage_during_primary_cooldown():

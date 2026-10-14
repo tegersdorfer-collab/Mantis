@@ -14,6 +14,7 @@ from communication.base import IncomingMessage
 from core.background_review import run_background_review
 from memory.chat_messages import is_safe_for_prompt
 from core.status import BUS
+from core.stream_events import StreamEvent
 from core import skills, db, ui_state, fast_commands, skill_request
 from core.error_redaction import redact_error_text
 from domains.gym.coach import GymCoach, GymResult
@@ -754,7 +755,29 @@ class MessageHandler:
         msg_id = await channel.start_message("💭 …")
         last_edit = [0.0]
 
-        async def stream_cb(full: str):
+        partials: dict[str, str] = {}
+        current_attempt = [None]
+
+        async def stream_cb(event: StreamEvent | str):
+            if isinstance(event, StreamEvent):
+                if event.kind == "attempt_start":
+                    current_attempt[0] = event.attempt_id
+                    partials[event.attempt_id] = ""
+                    last_edit[0] = 0.0
+                    return
+                if event.kind == "attempt_abort":
+                    partials.pop(event.attempt_id, None)
+                    if current_attempt[0] == event.attempt_id:
+                        current_attempt[0] = None
+                        last_edit[0] = 0.0
+                        await channel.edit_message(msg_id, "💭 …")
+                    return
+                if event.kind != "delta" or current_attempt[0] != event.attempt_id:
+                    return
+                partials[event.attempt_id] += event.text_delta
+                full = partials[event.attempt_id]
+            else:
+                full = str(event)
             now = time.time()
             if now - last_edit[0] < 0.8:
                 return

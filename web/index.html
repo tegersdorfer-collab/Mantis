@@ -386,8 +386,6 @@ const STATUS_ICONS={thinking:'💭',tool:'🔧',memory:'🧠',learning:'💡',id
 const STATUS_LABELS={thinking:'Denkt…',tool:'Tool',memory:'Erinnerung',learning:'Lernt',idle:'Bereit',autopilot:'Autopilot',error:'Fehler',task_working:'Arbeitet…'};
 const MODEL_BADGES={
   'claude-haiku-4-5-20251001':'<span style="font-size:10px;background:rgba(0,229,160,.1);color:#00e5a0;padding:1px 8px;border-radius:99px;margin-left:6px;border:1px solid rgba(0,229,160,.2);font-family:var(--mono)">HAIKU</span>',
-  'gemma4:31b-mlx':'<span style="font-size:10px;background:rgba(99,102,241,.1);color:#6366f1;padding:1px 8px;border-radius:99px;margin-left:6px;border:1px solid rgba(99,102,241,.2);font-family:var(--mono)">GEMMA4</span>',
-  'qwen3.5:9b':'<span style="font-size:10px;background:rgba(124,92,252,.1);color:#7c5cfc;padding:1px 8px;border-radius:99px;margin-left:6px;border:1px solid rgba(124,92,252,.2);font-family:var(--mono)">QWEN</span>',
 };
 function modelBadge(m){return MODEL_BADGES[m]||'';}
 let _activeModel='';

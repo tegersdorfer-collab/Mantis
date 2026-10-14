@@ -1,6 +1,6 @@
 """News-Geolokalisierung — Schlagzeile → Ort → Koordinaten.
 
-Der Ort wird vom lokalen Reasoning-Modell (qwen) aus der Schlagzeile extrahiert
+Der Ort wird über die schnelle Cloud-Kette aus der Schlagzeile extrahiert
 (robuster als Regex/Gazetteer) und dann über Nominatim geocodiert. Ergebnis pro
 Schlagzeile gecacht (kein doppelter LLM-Call). Test-Seams: _extract_place (LLM)
 und nominatim.geocode.
@@ -12,7 +12,6 @@ import logging
 import os
 
 from core import fast
-from settings import cfg
 from tools.geo import nominatim
 
 log = logging.getLogger("core.news")
@@ -43,13 +42,13 @@ def _save_cache() -> None:
 
 
 async def _extract_place(text: str) -> str:  # pragma: no cover - live-only
-    """Hauptort einer Schlagzeile via qwen (leerer String, wenn keiner erkennbar)."""
+    """Hauptort einer Schlagzeile (leerer String, wenn keiner erkennbar)."""
     prompt = (
         "Nenne den EINEN geografischen Hauptort (Stadt oder Land) dieser Schlagzeile "
         "als ganz kurze Antwort, ohne Zusatz. Gibt es keinen klaren Ort, antworte NONE.\n\n"
         f"Schlagzeile: {text}"
     )
-    out = await fast.ask(prompt, max_tokens=12, model=cfg.BG_REASONING_MODEL)
+    out = await fast.ask(prompt, max_tokens=12)
     out = (out or "").strip().strip('."„“ ')
     return "" if not out or out.upper() == "NONE" else out
 

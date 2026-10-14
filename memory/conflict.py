@@ -16,8 +16,6 @@ import asyncio
 import logging
 from typing import Awaitable, Callable
 
-import config
-
 log = logging.getLogger(__name__)
 
 # Distanz-Band (cosine): nah genug fürs selbe Thema, aber nicht ~identisch.
@@ -72,19 +70,16 @@ _JUDGE_PROMPT = (
 )
 
 
-def make_llm_judge(chat_client, model: str) -> Judge:
-    """Baut einen Judge aus einem ollama-AsyncClient (streng, Default NEIN)."""
+def make_llm_judge(llm_provider) -> Judge:
+    """Baut einen strengen Cloud-Judge (bei Fehlern gilt konservativ NEIN)."""
     async def _judge(old: str, new: str) -> bool:
         try:
-            resp = await chat_client.chat(
-                model=model,
-                messages=[{"role": "user", "content": _JUDGE_PROMPT.format(old=old, new=new)}],
-                options=config.ollama_options(
-                    model, temperature=0.0, num_predict=3, keep_alive="5m"
-                ),
-                think=False,
+            answer = await llm_provider.complete(
+                _JUDGE_PROMPT.format(old=old, new=new),
+                temperature=0.0,
+                max_tokens=8,
             )
-            return (resp.message.content or "").strip().upper().startswith("JA")
+            return answer.strip().upper().startswith(("JA", "YES"))
         except Exception:
             return False  # im Zweifel NICHT abwerten
     return _judge

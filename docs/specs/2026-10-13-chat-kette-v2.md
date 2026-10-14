@@ -1,5 +1,9 @@
 # Spec: Chat-Kette v2 (Haiku 5.5 + ChatGPT-Abo)
 
+> **Überholt seit 2026-10-14:** Diese Spec dokumentiert die frühere Chat-Migration. Die aktuelle
+> [`Cloud-Umstellung`](2026-10-14-cloud-umstellung.md) entfernt lokale LLM-Stufen für alle Zwecke;
+> lokal bleiben ausschließlich Ollama-Embeddings.
+
 Stand 2026-10-13. Baut auf Teil 2 von `docs/specs/2026-10-13-mantis-gesund.md` auf.
 Entscheidung Timo: Reihenfolge
 

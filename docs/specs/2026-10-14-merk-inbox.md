@@ -72,8 +72,8 @@ in Timos Claude-/Codex-Agentengedächtnis.
   Attachment-Feld (communication/base.py:11-20). Für Bilder muss der Discord-Eingang
   ausgewählte Bildanhänge aus message.attachments lesen, Größe und MIME-Typ prüfen und
   die Bytes oder ein geprüftes Analyse-Ergebnis in den Turn weiterreichen.
-- Die bestehende gemeinsame Vision-Funktion sendet Bilder an Ollama lokal
-  (core/vision.py:19-41); auch Telegram-Fotos benutzen diesen lokalen Pfad
+- Die gemeinsame Vision-Funktion sendet Bilder an die bildfähigen Stufen der Cloud-Kette
+  (`core/vision.py`); auch Telegram-Fotos und Inbox-Bilder nutzen diesen Pfad
   (communication/telegram.py:326-380). Die Chat-Backends übergeben derzeit Textinhalte
   (core/backends/openrouter.py:36-75, core/backends/claude.py:30-67,
   core/backends/chatgpt_plan.py:176-209). Ein Vision-Aufruf über die Chat-Kette benötigt
@@ -157,9 +157,9 @@ Statusnachricht.
 ### Bilder und Screenshots
 
 Nur Bildanhänge (gängige Bild-MIME-Typen) werden in v1 unterstützt. Discord lädt sie nur
-für den erlaubten Absender herunter; maximal vier Bilder mit jeweils höchstens 10 MiB pro
-Nachricht. Nicht-Bild-Anhänge und Sprachnachrichten behalten eine kurze verständliche
-Ablehnung.
+für den erlaubten Absender herunter; maximal vier Bilder mit jeweils höchstens 7,5 MB
+Rohdaten pro Nachricht, damit jedes Bild nach Base64-Kodierung unter 10 MB bleibt.
+Nicht-Bild-Anhänge und Sprachnachrichten behalten eine kurze verständliche Ablehnung.
 
 Der Anhang und optionale Caption werden an eine multimodale Vision-Stufe der Chat-Kette
 übergeben. Sie erkennt OCR-Text, sichtbare Titel/Marken/Orte sowie eine kurze neutrale

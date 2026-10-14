@@ -225,9 +225,11 @@ class TestTranscribeAudio:
 
 class TestIsAddressedToMantis:
     def test_namensnennung_liefert_true_ohne_llm_call(self):
-        with patch("core.fast.yes_no", new=AsyncMock()) as mock_yes_no:
+        with patch("core.decisions.voice_address", new=AsyncMock()) as mock_jev, \
+             patch("core.fast.yes_no", new=AsyncMock()) as mock_yes_no:
             result = asyncio.run(voice.is_addressed_to_mantis("Mantis, wie wird das Wetter morgen?"))
         assert result is True
+        mock_jev.assert_not_awaited()
         mock_yes_no.assert_not_called()
 
     def test_namensnennung_gross_klein_unabhaengig(self):
@@ -241,7 +243,48 @@ class TestIsAddressedToMantis:
             result = asyncio.run(voice.is_addressed_to_mantis("Ruf mir die Nacht-Zusammenfassung auf"))
         assert result is True
         mock_yes_no.assert_called_once()
-        assert mock_yes_no.call_args.kwargs["model"] == voice.config.ADDRESS_CHECK_MODEL
+        assert mock_yes_no.call_args.kwargs == {}
+
+    def test_jev_entscheidet_vor_dem_cloud_fallback(self):
+        jev = AsyncMock(return_value=True)
+        with patch("core.decisions.voice_address", new=jev), \
+             patch("core.fast.yes_no", new=AsyncMock()) as fast:
+            result = asyncio.run(voice.is_addressed_to_mantis("Ruf mir die Nacht-Zusammenfassung auf"))
+        assert result is True
+        jev.assert_awaited_once_with("Ruf mir die Nacht-Zusammenfassung auf")
+        fast.assert_not_awaited()
+
+    def test_jev_unsicherheit_faellt_auf_die_bestehende_cloud_kette_zurueck(self):
+        jev = AsyncMock(return_value=None)
+        fast = AsyncMock(return_value=False)
+        with patch("core.decisions.voice_address", new=jev), \
+             patch("core.fast.yes_no", new=fast):
+            result = asyncio.run(voice.is_addressed_to_mantis("Ich rede mit jemand anderem"))
+        assert result is False
+        jev.assert_awaited_once()
+        fast.assert_awaited_once()
+
+    def test_jev_und_cloud_fallback_teilen_sich_eine_deadline(self, monkeypatch):
+        monkeypatch.setattr(voice, "VOICE_ADDRESS_TIMEOUT_S", 0.04, raising=False)
+        calls = []
+
+        async def slow_jev(_text):
+            calls.append("jev")
+            await asyncio.sleep(0.03)
+            return None
+
+        async def slow_cloud(_question):
+            calls.append("cloud")
+            await asyncio.sleep(0.03)
+            return True
+
+        monkeypatch.setattr("core.decisions.voice_address", slow_jev)
+        monkeypatch.setattr("core.fast.yes_no", slow_cloud)
+
+        result = asyncio.run(voice.is_addressed_to_mantis("Bitte hilf mir"))
+
+        assert result is False
+        assert calls == ["jev", "cloud"]
 
     def test_ohne_namen_faellt_auf_kleines_modell_zurueck_nein(self):
         with patch("core.fast.yes_no", new=AsyncMock(return_value=False)):
@@ -283,15 +326,30 @@ class TestConversationFollowup:
         assert result is False
 
 
-def test_address_check_nutzt_jev_vor_fast():
-    """Layer 3: Jev entscheidet; fast.yes_no ist nur noch der Fallback."""
+def test_address_check_uses_fast_cloud_variant_directly():
     from unittest.mock import AsyncMock, patch
     from core import voice
     voice._conversation_active_until = 0.0
-    with patch("core.voice.decisions.addressed", new=AsyncMock(return_value=True)) as jev, \
+    with patch("core.decisions.addressed", new=AsyncMock(return_value=True)) as jev, \
          patch("core.voice.fast.yes_no", new=AsyncMock(return_value=False)) as fast:
-        assert asyncio.run(voice.is_addressed_to_mantis("mach das Licht an")) is True
-    jev.assert_awaited_once()
+        assert asyncio.run(voice.is_addressed_to_mantis("mach das Licht an")) is False
+    jev.assert_not_awaited()
+    fast.assert_awaited_once_with(
+        "Ist dieser Satz eine Anfrage oder ein Befehl an einen persönlichen KI-Assistenten "
+        "namens Mantis (nicht nur Small Talk mit jemand anderem im Raum), auch wenn der Name "
+        "'Mantis' nicht genannt wird?\n\n\"mach das Licht an\""
+    )
+
+
+def test_address_check_timeout_during_jev_fails_closed(monkeypatch):
+    monkeypatch.setattr(voice, "VOICE_ADDRESS_TIMEOUT_S", 0.01, raising=False)
+
+    async def slow_jev(_text):
+        await asyncio.sleep(0.05)
+
+    fast = AsyncMock(return_value=True)
+    monkeypatch.setattr("core.decisions.voice_address", slow_jev)
+    monkeypatch.setattr("core.voice.fast.yes_no", fast)
+
+    assert asyncio.run(voice.is_addressed_to_mantis("mach das Licht an")) is False
     fast.assert_not_awaited()
-    text, fallback = jev.await_args.args
-    assert text == "mach das Licht an" and callable(fallback)

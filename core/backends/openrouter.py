@@ -1,13 +1,7 @@
-"""
-OpenRouter-Backend für den Agent-Loop (OpenAI-kompatible Chat-Completions).
+"""OpenRouter-Backend für den Agent-Loop (OpenAI-kompatible Chat-Completions).
 
-Gedacht als günstiges Cloud-Backend für Tests, bei denen der Mac nicht
-zusätzlich ein lokales Modell warmhalten soll — z.B. der iPhone-Field-Client,
-der Voice, Routing und Mantis gleichzeitig braucht. Jev bleibt davon
-unberührt (core/decide.py); hier geht es nur um die Sprachantwort des Agenten.
-
-Übersetzt das einheitliche Backend-Interface (Ollama-Format für Messages und
-Tool-Calls) verlustfrei ins OpenAI-Format und zurück. Kein SDK — httpx reicht.
+Übersetzt Messages und Tool-Calls des Agent-Interfaces ins OpenAI-Format und
+zurück. Kein SDK — httpx reicht.
 """
 import json
 import logging
@@ -22,6 +16,7 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://openrouter.ai/api/v1"
 TIMEOUT_S = config.CHAT_CLOUD_TIMEOUT_S
+FAST_REASONING_TOKEN_RESERVE = 8
 
 
 def _args_to_json(args) -> str:
@@ -54,11 +49,11 @@ def _content_to_openai(content):
 
 
 def _msgs_to_openai(messages: list[dict]) -> list[dict]:
-    """Ollama-Messages → OpenAI-Messages.
+    """Agent-Messages → OpenAI-Messages.
 
     Unterschiede: Tool-Call-Argumente müssen ein JSON-String sein, Tool-Results
     referenzieren den Call über `tool_call_id`, und jeder Tool-Call braucht eine
-    ID. Fehlt sie (Ollama vergibt keine), wird eine erzeugt und für das
+    ID. Fehlt sie (manche Anbieter vergeben keine), wird eine erzeugt und für das
     folgende Tool-Result in Aufrufreihenfolge wiederverwendet.
     """
     result: list[dict] = []
@@ -169,11 +164,17 @@ class OpenRouterBackend(AgentBackend):
         return None  # Cloud — nichts vorzuladen.
 
     def _payload(self, messages, tools, temperature, max_tokens, force_tool_call) -> dict:
+        # Im Fast-Pfad gilt max_tokens als sichtbares Antwortbudget. OpenRouter
+        # zählt Reasoning- und Antworttokens meist gemeinsam; ein kleiner Puffer
+        # hält Labels und kurze JSON-Antworten trotz minimalem Reasoning lesbar.
+        request_max_tokens = max_tokens
+        if self._purpose == "fast" and self._reasoning_effort:
+            request_max_tokens += FAST_REASONING_TOKEN_RESERVE
         payload: dict = {
             "model": self._model,
             "messages": _msgs_to_openai(messages),
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_tokens": request_max_tokens,
             "usage": {"include": True},
         }
         if tools:
@@ -212,7 +213,6 @@ class OpenRouterBackend(AgentBackend):
         calls_by_index: dict[int, dict] = {}
         usage = None
         generation_id = None
-        last_len = 0
         completed = False
         finish_reason = None
 
@@ -259,13 +259,10 @@ class OpenRouterBackend(AgentBackend):
                         raise RuntimeError("OpenRouter-Stream enthält ein ungültiges Delta")
                     if delta.get("content"):
                         parts.append(delta["content"])
-                        full = "".join(parts)
-                        if len(full) - last_len >= 50:
-                            last_len = len(full)
-                            try:
-                                await stream_cb(full)
-                            except Exception:
-                                pass
+                        try:
+                            await stream_cb(delta["content"])
+                        except Exception:
+                            pass
                     for frag in delta.get("tool_calls") or []:
                         idx = frag.get("index", 0)
                         slot = calls_by_index.setdefault(idx, {"id": "", "name": "", "arguments": ""})
@@ -299,11 +296,6 @@ class OpenRouterBackend(AgentBackend):
             raise
 
         self._record_usage(usage, generation_id)
-        if full and not tool_calls:
-            try:
-                await stream_cb(full)
-            except Exception:
-                pass
         return full, tool_calls
 
     def _record_usage(self, usage: dict | None, generation_id: str | None = None) -> None:

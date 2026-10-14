@@ -20,6 +20,8 @@ import time
 from contextvars import ContextVar
 from typing import Optional
 
+from core.backends.factory import cloud_chain
+
 log = logging.getLogger(__name__)
 
 # Tools die in Subagenten nicht verfügbar sind (Sicherheit + keine Endlosrekursion)
@@ -118,8 +120,6 @@ async def _execute_subagent(
     """Baut isolierten Agent-Context und führt ReAct-Loop aus."""
     from core import tools as T
     from core.agent import Agent
-    from core.backends.ollama import OllamaBackend
-    import config
 
     # Tool-Set: alle nicht-geblockten, oder explizite Liste
     if allowed_tools is not None:
@@ -129,8 +129,8 @@ async def _execute_subagent(
 
     _active[sub_id]["tool_count"] = len(tool_names)
 
-    # Frischer LLM (eigene Connection, kein State)
-    agent = Agent(backend=OllamaBackend(model=config.OLLAMA_MODEL))
+    # Frische Cloud-Kette für den isolierten Agentenlauf.
+    agent = Agent(backend=cloud_chain("background", reasoning="low"))
 
     system = f"""Du bist ein spezialisierter Unteragent von Mantis.
 

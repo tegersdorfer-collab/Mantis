@@ -1,9 +1,9 @@
-"""Provider-Kette für Mantis-Entscheidungen, mit lokalem Fallback bei Ausfällen.
+"""Cloud-Provider-Kette für Jev-Entscheidungen.
 
 Cloudflare Clef wird zuerst versucht, danach die konfigurierten Jev-Provider. Eine
 leere ``JEV_PROVIDER_CHAIN`` verwendet aus Rückwärtskompatibilität ausschließlich
 ``JEV_PROVIDER``. ``decide()`` liefert vollständige Antworten oder wirft
-``JevUnavailable``; die Aufrufer in ``core/decisions.py`` fallen dann lokal zurück.
+``JevUnavailable``; die Aufrufer in ``core/decisions.py`` fragen dann die Fast-Cloud-Kette.
 Jeder Provider hat einen eigenen Circuit-Breaker. Pro Versuch gilt
 ``JEV_TIMEOUT_S``, über alle Versuche zusammen höchstens das Doppelte.
 """
@@ -216,8 +216,8 @@ async def decide(state: str | dict | list, questions: dict[str, Noul | Choice | 
         return {qid: Answer.from_jevkit(a, model=d.model) for qid, a in d.answers.items()}
 
     if attempted:
-        log.info("Jev-Providerwechsel: %s → lokaler Fallback (%s)", last_provider, switch_reason)
-        _active_provider = "local"
+        log.info("Jev-Providerwechsel: %s → Fast-Cloud-Fallback (%s)", last_provider, switch_reason)
+        _active_provider = "cloud"
     raise JevUnavailable("Alle Jev-Provider sind fehlgeschlagen oder nicht verfügbar")
 
 

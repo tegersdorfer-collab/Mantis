@@ -10,9 +10,9 @@ from pathlib import Path
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-import config
 from core import db
 from core.jsonutil import extract_json
+from core import vision
 from domains import nutrition
 
 from web.routers._helpers import _jsonable
@@ -58,13 +58,8 @@ _BG_TASKS: set = set()
 
 
 async def _run_analysis(meal_id: int, image_bytes: bytes, annotation: str) -> None:
-    """Hintergrund: Vision-Modell laufen lassen und die Pending-Mahlzeit füllen."""
-    import base64 as _b64
+    """Hintergrund: Cloud-Vision ausführen und die Pending-Mahlzeit füllen."""
     try:
-        import ollama as _ollama
-        b64 = _b64.standard_b64encode(image_bytes).decode()
-        _client = _ollama.AsyncClient(host=config.OLLAMA_BASE_URL)
-        vision_model = getattr(config, "VISION_MODEL", "qwen3.5:9b")
         prompt = (
             "Du bist ein Ernährungsexperte. Schätze die Nährwerte dieses Essens/Getränks "
             "so genau wie möglich.\n"
@@ -78,18 +73,10 @@ async def _run_analysis(meal_id: int, image_bytes: bytes, annotation: str) -> No
             '{"items":[{"name":"...","grams":0,"calories":0,"protein":0,"carbs":0,"fat":0}],'
             '"food_name":"Gesamtgericht","portion":"z.B. 1 großer Teller","confidence":0.0}'
         )
-        # KEIN format="json" — das ließ qwen3-vl:8b leer antworten; der Prompt erzwingt JSON,
-        # extract_json holt es robust raus. think=False: qwen3.5 würde sonst das
-        # num_predict-Budget im Thinking verbrauchen und leeren Content liefern.
-        resp = await _client.chat(
-            model=vision_model,
-            messages=[{"role": "user", "content": prompt, "images": [b64]}],
-            options=config.ollama_options(
-                vision_model, num_predict=600, temperature=0.2
-            ),
-            think=False,
-            keep_alive=0)
-        data = _sum_food_items(extract_json((resp.message.content or "").strip(), default={}))
+        response = await vision.ask_image(
+            image_bytes, prompt, max_tokens=600, temperature=0.2, format="json",
+        )
+        data = _sum_food_items(extract_json(response, default={}))
         if not data or not data.get("calories"):
             nutrition.fail_meal(meal_id)
             return

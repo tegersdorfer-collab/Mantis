@@ -8,9 +8,18 @@ import logging
 import anthropic
 
 from core.backends.base import AgentBackend, StreamCb
+from core.anthropic_models import ensure_anthropic_model_allowed
 import config
 
 log = logging.getLogger(__name__)
+
+_TEMPERATURE_UNSUPPORTED_MODEL_PREFIXES = ("claude-haiku-5-5",)
+
+
+def _supports_temperature(model: str) -> bool:
+    """Gibt die Temperatur nur an Modellfamilien weiter, die sie akzeptieren."""
+    normalized = model.casefold().strip()
+    return not normalized.startswith(_TEMPERATURE_UNSUPPORTED_MODEL_PREFIXES)
 
 
 def _ollama_tools_to_anthropic(tools: list[dict]) -> list[dict]:
@@ -153,6 +162,7 @@ class ClaudeBackend(AgentBackend):
 
     def __init__(self, model: str | None = None, purpose: str = "chat-agent"):
         self._model = model or config.CLAUDE_CHAT_MODEL
+        ensure_anthropic_model_allowed(self._model)
         self._purpose = purpose
         self._client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
@@ -174,14 +184,16 @@ class ClaudeBackend(AgentBackend):
         think: bool = False,
         force_tool_call: bool = False,
     ) -> tuple[str, list[dict]]:
+        ensure_anthropic_model_allowed(self._model)
         system, anthropic_msgs = _ollama_msgs_to_anthropic(messages)
 
         kwargs: dict = dict(
             model=self._model,
             max_tokens=max_tokens,
             messages=anthropic_msgs,
-            temperature=temperature,
         )
+        if _supports_temperature(self._model):
+            kwargs["temperature"] = temperature
         if system:
             kwargs["system"] = system
         if tools:
@@ -202,7 +214,7 @@ class ClaudeBackend(AgentBackend):
                     ):
                         collected += event.delta.text
                         try:
-                            await stream_cb(collected)
+                            await stream_cb(event.delta.text)
                         except Exception:
                             pass
             final = await stream.get_final_message()

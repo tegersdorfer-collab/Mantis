@@ -1,47 +1,79 @@
-"""Extractor-Verifier & Konflikt-Judge gehen über Jev; lokal ist Fallback — und der lokale
-Prompt nennt jetzt den Sprecher (Text „ich" ≠ Behauptung „Timo" war ein stiller Ablehnungsgrund)."""
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
+"""Memory-Verifier und Konflikt-Judge laufen über den Cloud-Provider."""
 import asyncio
-from unittest.mock import AsyncMock, patch
 
 from memory import extractor as ex
 
 
-def test_verify_claim_fragt_jev_mit_fallback():
-    with patch("memory.extractor.decisions.claim_supported", new=AsyncMock(return_value=False)) as jev:
-        ok = asyncio.run(ex.verify_claim(object(), "Ich war beim Zahnarzt", "Timo hat Angst"))
-    assert ok is False
-    text, claim, fallback = jev.await_args.args
-    assert (text, claim) == ("Ich war beim Zahnarzt", "Timo hat Angst") and callable(fallback)
+class FakeProvider:
+    def __init__(self, answer="JA", failure=None):
+        self.answer = answer
+        self.failure = failure
+        self.calls = []
+
+    async def complete(self, prompt, **kwargs):
+        self.calls.append((prompt, kwargs))
+        if self.failure:
+            raise self.failure
+        return self.answer
 
 
-def test_lokaler_verifier_prompt_nennt_sprecher():
+def test_verify_claim_uses_cloud_provider_and_names_speaker():
+    provider = FakeProvider("NEIN")
+
+    result = asyncio.run(ex.verify_claim(provider, "Ich war beim Zahnarzt", "Timo hat Angst"))
+
+    assert result is False
+    prompt, kwargs = provider.calls[0]
+    assert "Text stammt von Timo" in prompt
+    assert "Ich war beim Zahnarzt" in prompt and "Timo hat Angst" in prompt
+    assert kwargs == {"temperature": 0.0, "max_tokens": 8}
+
+
+def test_verify_claim_uses_jev_before_cloud(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    provider = FakeProvider("NEIN")
+    jev = AsyncMock(return_value=True)
+    monkeypatch.setattr("core.decisions.fact_supported", jev)
+
+    result = asyncio.run(ex.verify_claim(provider, "Ich wohne hier", "Timo wohnt hier"))
+
+    assert result is True
+    jev.assert_awaited_once_with("Ich wohne hier", "Timo wohnt hier")
+    assert provider.calls == []
+
+
+def test_verify_claim_uses_cloud_when_jev_is_uncertain(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    provider = FakeProvider("NEIN")
+    jev = AsyncMock(return_value=None)
+    monkeypatch.setattr("core.decisions.fact_supported", jev)
+
+    result = asyncio.run(ex.verify_claim(provider, "Ich wohne hier", "Timo wohnt hier"))
+
+    assert result is False
+    jev.assert_awaited_once()
+    assert len(provider.calls) == 1
+
+
+def test_verifier_prompt_uses_explicit_speaker_context():
     prompt = ex.verify_prompt("Ich war beim Zahnarzt", "Timo war beim Zahnarzt")
     assert "Timo" in prompt and "Ich-Form" in prompt
     assert prompt.startswith("Antworte NUR mit JA oder NEIN")
 
 
-def test_lokaler_verifier_fallback_parst_ja():
-    class Msg:  content = "JA"
-    class Resp: message = Msg()
-    client = type("C", (), {"chat": AsyncMock(return_value=Resp())})()
+def test_verify_claim_cloud_failure_is_conservative():
+    provider = FakeProvider(failure=RuntimeError("offline"))
 
-    async def _rufe_fallback(t, c, fb):
-        # AsyncMock awaited einen sync-lambda-side_effect nicht selbst (fb() bliebe
-        # ein ungestartetes Coroutine-Objekt) — darum hier ein async side_effect.
-        return await fb()
-
-    with patch("memory.extractor.decisions.claim_supported",
-               new=AsyncMock(side_effect=_rufe_fallback)):
-        assert asyncio.run(ex.verify_claim(client, "Ich war beim Zahnarzt", "Timo war beim Zahnarzt")) is True
-    assert client.chat.await_args.kwargs["model"] == "qwen2.5:0.5b"
+    assert asyncio.run(ex.verify_claim(provider, "Ich wohne hier", "Timo wohnt hier")) is False
+    assert len(provider.calls) == 1
 
 
-def test_judge_geht_ueber_jev():
-    with patch("memory.extractor.decisions.supersedes", new=AsyncMock(return_value=True)) as jev:
-        judge = ex.make_judge(object(), "qwen3.5:9b")
-        assert asyncio.run(judge("wohnt in Leipzig", "nach Halle gezogen")) is True
-    old, new, fallback = jev.await_args.args
-    assert (old, new) == ("wohnt in Leipzig", "nach Halle gezogen") and callable(fallback)
+def test_judge_uses_cloud_provider():
+    provider = FakeProvider("JA")
+    judge = ex.make_judge(provider)
+
+    assert asyncio.run(judge("wohnt in Leipzig", "nach Halle gezogen")) is True
+    assert "alte aussage" in provider.calls[0][0].lower()
+    assert "neue aussage" in provider.calls[0][0].lower()

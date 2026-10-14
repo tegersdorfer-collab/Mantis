@@ -43,6 +43,7 @@ _parakeet_unavailable = False
 # "zeig mir das" oder "und morgen?" (kein Name, kein eindeutiger Befehl) ignorieren,
 # weil jede Äußerung isoliert bewertet wird statt als Teil eines laufenden Gesprächs.
 CONVERSATION_FOLLOWUP_WINDOW_S = 15
+VOICE_ADDRESS_TIMEOUT_S = 3.0
 _conversation_active_until = 0.0
 
 
@@ -143,12 +144,8 @@ async def is_addressed_to_mantis(text: str) -> bool:
     Drei Layer: (1) Keyword-Vorfilter — wird "Mantis" explizit genannt, sofort JA
     ohne LLM-Call (Latenz ~0). (2) Konversations-Fortsetzung — läuft gerade ein
     Gespräch (siehe mark_conversation_active()), gilt jede Folge-Äußerung als
-    adressiert, auch ohne Namen oder klaren Befehl. (3) Sonst entscheidet ein
-    kleines dediziertes Modell (core.fast mit ADDRESS_CHECK_MODEL statt dem großen
-    AGENT_MODEL_FAST), ob es sich auch ohne Namensnennung um eine an Mantis
-    gerichtete Anfrage handelt (Spec: "nicht nur Wake-Word"). Seit 18.09.2026 fragt
-    Layer 3 zuerst Jev (core/decisions.addressed, Benchmark 14/14 statt 88 %); das
-    lokale Modell ist Fallback bei Ausfall oder Unsicherheit."""
+    adressiert. (3) Sonst fragt der Check zuerst Jev und bei Unsicherheit die
+    kurze Fast-Variante der Cloud-Kette; Fehler entscheiden konservativ mit NEIN."""
     stripped = text.strip()
     if not stripped:
         return False
@@ -157,11 +154,21 @@ async def is_addressed_to_mantis(text: str) -> bool:
     if time.monotonic() < _conversation_active_until:
         return True
 
-    async def _lokal() -> bool:
-        return await fast.yes_no(
-            f"Ist dieser Satz eine Anfrage oder ein Befehl an einen persönlichen KI-Assistenten "
-            f"namens Mantis (nicht nur Small Talk mit jemand anderem im Raum), auch wenn der Name "
-            f"'Mantis' nicht genannt wird?\n\n\"{stripped}\"",
-            model=config.ADDRESS_CHECK_MODEL,
-        )
-    return await decisions.addressed(stripped, _lokal)
+    prompt = (
+        f"Ist dieser Satz eine Anfrage oder ein Befehl an einen persönlichen KI-Assistenten "
+        f"namens Mantis (nicht nur Small Talk mit jemand anderem im Raum), auch wenn der Name "
+        f"'Mantis' nicht genannt wird?\n\n\"{stripped}\""
+    )
+    try:
+        async with asyncio.timeout(VOICE_ADDRESS_TIMEOUT_S):
+            try:
+                jev_answer = await decisions.voice_address(stripped)
+            except Exception as e:
+                log.debug("Jev-Voice-Adresscheck fehlgeschlagen: %s", e)
+                jev_answer = None
+            if jev_answer is not None:
+                return jev_answer
+            return await fast.yes_no(prompt)
+    except Exception as e:
+        log.debug("Voice-Adress-Check fehlgeschlagen: %s", e)
+        return False

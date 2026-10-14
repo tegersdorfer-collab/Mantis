@@ -28,12 +28,13 @@ def _avoid_usage_database_writes(monkeypatch):
     monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: None)
 
 
-def _backend(handler) -> OpenRouterBackend:
+def _backend(handler, *, purpose="chat-agent") -> OpenRouterBackend:
     transport = httpx.MockTransport(handler)
     return OpenRouterBackend(
         model="z-ai/glm-5.3",
         api_key="sk-or-test",
         client=httpx.AsyncClient(transport=transport, base_url="https://openrouter.ai/api/v1"),
+        purpose=purpose,
     )
 
 
@@ -350,7 +351,32 @@ def test_streaming_collects_deltas_and_reports_progress():
 
     assert text == "Route gestartet."
     assert calls == []
-    assert progress[-1] == "Route gestartet."
+    assert progress == ["Route ", "gestartet."]
+
+
+def test_voice_purpose_streams_short_deltas_as_they_arrive():
+    chunks = [
+        {"choices": [{"delta": {"content": "Es ist son"}}]},
+        {"choices": [{"delta": {"content": "nig."}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+
+    def handler(_request):
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+    progress = []
+
+    async def on_update(text):
+        progress.append(text)
+
+    text, _ = asyncio.run(_backend(handler, purpose="voice").call(
+        [{"role": "user", "content": "Sag etwas"}], tools=None, stream_cb=on_update,
+        temperature=0.2, max_tokens=80,
+    ))
+
+    assert text == "Es ist sonnig."
+    assert progress == ["Es ist son", "nig."]
 
 
 def test_streaming_tolerates_null_usage_and_reads_usage_after_finish_reason(monkeypatch):
@@ -685,6 +711,34 @@ def test_reasoning_effort_can_be_disabled_or_changed():
     asyncio.run(backend.call([{"role": "user", "content": "hi"}], tools=None, stream_cb=None,
                              temperature=0.5, max_tokens=10))
     assert seen["body"]["reasoning"] == {"effort": "medium"}
+
+
+def test_fast_purpose_uses_minimal_reasoning_and_reserves_visible_answer_tokens():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_completion(content="JA"))
+
+    backend = OpenRouterBackend(
+        model="openai/gpt-6-luna",
+        api_key="sk-or-test",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="https://openrouter.ai/api/v1",
+        ),
+        reasoning_effort="minimal",
+        purpose="fast",
+    )
+
+    text, calls = asyncio.run(backend.call(
+        [{"role": "user", "content": "Klassifiziere"}],
+        tools=None, stream_cb=None, temperature=0.1, max_tokens=10,
+    ))
+
+    assert (text, calls) == ("JA", [])
+    assert seen["body"]["reasoning"] == {"effort": "minimal"}
+    assert seen["body"]["max_tokens"] == 18
 
 
 def test_model_name_and_requires_api_key():

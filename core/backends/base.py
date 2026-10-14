@@ -1,12 +1,15 @@
-"""
-Abstrakte Schnittstelle für Agent-Backends.
-Jedes Backend implementiert genau einen LLM-Anbieter (Ollama, Claude, …).
-Der Agent-Loop in agent.py kennt nur dieses Interface.
+"""Abstrakte Schnittstelle für Agent-Backends.
+
+Jedes Backend implementiert einen Anbieter; der Agent-Loop kennt nur dieses
+Interface.
 """
 from abc import ABC, abstractmethod
 from typing import Awaitable, Callable
 
+from core.stream_events import StreamEvent
+
 StreamCb = Callable[[str], Awaitable[None]]
+AttemptEventCb = Callable[[StreamEvent], Awaitable[None]]
 
 
 class AgentBackend(ABC):

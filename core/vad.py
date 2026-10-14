@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import config
 
 SAMPLE_RATE = 16000
-SILENCE_MS_TO_STOP = 800
 MIN_SEGMENT_MS = 300
 PREROLL_MS = 400
 
@@ -122,7 +122,7 @@ class VadSegmenter:
         elif self._speaking:
             self._buffer.append(pcm_chunk)
             self._silence_ms += self._chunk_ms
-            if self._silence_ms >= SILENCE_MS_TO_STOP:
+            if self._silence_ms >= config.VOICE_SILENCE_MS:
                 self._speaking = False
                 total_ms = self._speech_ms + self._silence_ms
                 segment = b"".join(self._buffer)

@@ -75,7 +75,7 @@ async def run_background_review(
 ) -> None:
     """
     Läuft als Daemon nach jedem Turn. Non-blocking.
-    bg_llm: das Background-LLM (Ollama lokal)
+    bg_llm: das Background-LLM über die Cloud-Kette
     lzg: Long-Term Memory für Save-Memory
     """
     if not config.BACKGROUND_REVIEW_ENABLED:

@@ -9,6 +9,7 @@ from datetime import datetime
 from communication.base import (
     CommunicationChannel, IncomingAttachment, IncomingMessage, MessageHandler as MH,
 )
+from core.vision import MAX_IMAGE_RAW_BYTES
 import config
 
 log = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ _UNSUPPORTED_ATTACHMENT = (
     "Sprachnachrichten schreib mir den Inhalt bitte als Text."
 )
 _SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_IMAGE_BYTES = MAX_IMAGE_RAW_BYTES
 _MAX_IMAGES = 4
 _CODE_BLOCK = re.compile(r"(```[^\n]*\n.*?```)", re.DOTALL)
 
@@ -390,7 +391,7 @@ class DiscordChannel(CommunicationChannel):
 
         if raw_attachments and not incoming_attachments:
             notice = (
-                "Bilder dürfen höchstens 10 MiB groß sein."
+                "Bilder dürfen höchstens 7,5 MB Rohdaten groß sein (10 MB nach Base64)."
                 if oversized else _UNSUPPORTED_ATTACHMENT
             )
             await route.send(notice)
@@ -402,7 +403,7 @@ class DiscordChannel(CommunicationChannel):
         if rejected:
             parts = []
             if oversized:
-                parts.append("Bilder über 10 MiB wurden ignoriert")
+                parts.append("Bilder über 7,5 MB Rohdaten wurden ignoriert")
             if rejected and not oversized:
                 parts.append("Nicht-Bild-Anhänge oder zusätzliche Bilder wurden ignoriert")
             notice = "; ".join(parts) + "."

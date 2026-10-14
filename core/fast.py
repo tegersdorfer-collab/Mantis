@@ -1,52 +1,46 @@
-"""
-Schneller Hilfs-LLM für günstige Entscheidungen:
-Klassifikation, Ja/Nein-Urteile, kurze Zusammenfassungen.
-Nutzt AGENT_MODEL_FAST (standardmäßig qwen3.5:9b via .env) – gleiches Modell wie Hauptgespräche, kein extra RAM.
-"""
+"""Kurze Klassifikationen und Entscheidungen über die Cloud-Kette."""
 import logging
 
-import ollama as _ollama
-
-from core.llm_gate import GATE
-import config
+from core.backends.factory import cloud_chain
+from core.backends.llm_adapter import BackendLLMAdapter
 
 log = logging.getLogger(__name__)
-_client = _ollama.AsyncClient(host=config.OLLAMA_BASE_URL)
+_provider: BackendLLMAdapter | None = None
 
 
-async def ask(prompt: str, max_tokens: int = 20, temperature: float = 0.1, model: str | None = None) -> str:
+def _get_provider() -> BackendLLMAdapter:
+    global _provider
+    if _provider is None:
+        _provider = BackendLLMAdapter(
+            cloud_chain("fast", reasoning="minimal", timeout=3, total_timeout=9),
+        )
+    return _provider
+
+
+def get_backend_chain():
+    """Gibt die initialisierte Fast-Cloud-Kette für das Startlog zurück."""
+    return _get_provider().backend
+
+
+async def ask(
+    prompt: str,
+    max_tokens: int = 20,
+    temperature: float = 0.1,
+    format: str | dict | None = None,
+) -> str:
+    """Gibt bei einem Cloud-Fehler eine leere Antwort zurück."""
     try:
-        active_model = model or config.AGENT_MODEL_FAST
-        async with GATE:
-            resp = await _client.chat(
-                model=active_model,
-                messages=[{"role": "user", "content": prompt}],
-                options=config.ollama_options(
-                    active_model, temperature=temperature, num_predict=max_tokens
-                ),
-                keep_alive=config.OLLAMA_KEEP_ALIVE,
-                think=False,  # Reasoning-Modelle (z.B. qwen3.5) verbrauchen sonst das
-                              # ganze num_predict-Budget für <think>, message.content bleibt leer
-            )
-        return (resp.message.content or "").strip()
+        return (await _get_provider().complete(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            format=format,
+        )).strip()
     except Exception as e:
-        log.debug(f"fast.ask fehlgeschlagen: {e}")
+        log.debug("fast.ask fehlgeschlagen: %s", e)
         return ""
 
 
-async def yes_no(question: str, model: str | None = None) -> bool:
-    out = await ask(f"{question}\n\nAntworte NUR mit JA oder NEIN.", max_tokens=5, model=model)
-    return out.strip().upper().startswith("JA") or out.strip().upper().startswith("YES")
-
-
-async def warmup() -> None:
-    try:
-        await _client.chat(
-            model=config.AGENT_MODEL_FAST,
-            messages=[{"role": "user", "content": "ok"}],
-            options=config.ollama_options(config.AGENT_MODEL_FAST, num_predict=1),
-            keep_alive=config.OLLAMA_KEEP_ALIVE,
-        )
-        log.info(f"🔥 Schnellmodell {config.AGENT_MODEL_FAST} aufgewärmt")
-    except Exception as e:
-        log.debug(f"Fast-Warmup fehlgeschlagen: {e}")
+async def yes_no(question: str) -> bool:
+    out = await ask(f"{question}\n\nAntworte NUR mit JA oder NEIN.", max_tokens=5)
+    return out.strip().upper().startswith(("JA", "YES"))

@@ -1,26 +1,33 @@
-"""
-FallbackBackend — hält den Agenten am Leben wenn das primäre Backend ausfällt.
+"""Sequenzielle Cloud-Fallback-Kette mit Stage-Timeouts und Cooldowns.
 
-Primär: Claude API (Haiku). Fällt sie aus (Netz weg, Anthropic-Ausfall,
-Rate-Limit, Timeout), übernimmt das lokale Ollama-Backend transparent —
-Mantis bleibt offline funktionsfähig ("Lokal first").
-
-Circuit-Breaker light: Nach einem Primär-Fehler gehen Folge-Calls für
-COOLDOWN_S direkt ans Fallback, damit ein toter API-Endpunkt nicht jeden
-Turn erst um den Timeout verzögert. Danach wird das Primär-Backend wieder
-probiert.
+Jeder Call versucht die verfügbaren Anbieter der konfigurierten Reihenfolge.
+Sind alle Stufen ausgefallen, wirft die Kette eine definierte Exception.
 """
 import asyncio
 import logging
 import time
 
-from core.backends.base import AgentBackend, StreamCb
+from core.backends.base import AgentBackend, AttemptEventCb, StreamCb
 from core.error_redaction import redact_error_text
+from core.stream_events import StreamEvent, new_attempt_id
 
 log = logging.getLogger(__name__)
 
 PRIMARY_TIMEOUT_S = 90   # pro Einzel-Call (Streaming inklusive)
 COOLDOWN_S        = 180  # nach Primär-Fehler direkt zum Fallback
+
+
+class AllBackendsFailedError(RuntimeError):
+    """Alle konfigurierten Anbieter-Stufen sind fehlgeschlagen oder im Cooldown."""
+
+    def __init__(self, failures: list[str] | None = None):
+        self.failures = tuple(failures or ())
+        detail = f" ({'; '.join(self.failures)})" if self.failures else ""
+        super().__init__(f"Alle Backend-Stufen sind fehlgeschlagen{detail}")
+
+
+class EmptyBackendResponseError(RuntimeError):
+    """Ein Anbieter lieferte weder sichtbaren Text noch einen Tool-Call."""
 
 
 class FallbackBackend(AgentBackend):
@@ -33,6 +40,7 @@ class FallbackBackend(AgentBackend):
         *,
         backends: list[AgentBackend] | None = None,
         stage_timeouts: list[float | None] | None = None,
+        total_timeout_s: float | None = None,
     ):
         if backends is None:
             if primary is None or fallback is None:
@@ -40,8 +48,8 @@ class FallbackBackend(AgentBackend):
             backends = [primary, fallback]
         elif primary is not None or fallback is not None:
             raise ValueError("primary/fallback und backends können nicht gemeinsam gesetzt werden")
-        if len(backends) < 2:
-            raise ValueError("FallbackBackend braucht mindestens zwei Backends")
+        if not backends:
+            raise ValueError("FallbackBackend braucht mindestens ein Backend")
 
         if stage_timeouts is None:
             stage_timeouts = [timeout_s] * (len(backends) - 1) + [None]
@@ -50,6 +58,9 @@ class FallbackBackend(AgentBackend):
 
         self._backends = tuple(backends)
         self._stage_timeouts = tuple(stage_timeouts)
+        if total_timeout_s is not None and total_timeout_s <= 0:
+            raise ValueError("total_timeout_s muss positiv sein")
+        self._total_timeout_s = total_timeout_s
         self._cooldown_s = cooldown_s
         self._down_until = [0.0] * len(self._backends)
         # Aliase für bestehende Integrationen, die noch das Zweiermodell erwarten.
@@ -57,6 +68,7 @@ class FallbackBackend(AgentBackend):
         self._fallback = self._backends[-1]
         self._timeout_s = self._stage_timeouts[0]
         self._primary_down_until = 0.0
+        self._last_used_backend: AgentBackend | None = None
 
     @property
     def backends(self) -> tuple[AgentBackend, ...]:
@@ -69,6 +81,11 @@ class FallbackBackend(AgentBackend):
     @property
     def stage_timeouts(self) -> tuple[float | None, ...]:
         return self._stage_timeouts
+
+    @property
+    def last_used_backend(self) -> AgentBackend | None:
+        """Letzte erfolgreiche Stufe; bei einem neuen Call vorab zurückgesetzt."""
+        return self._last_used_backend
 
     @property
     def model_name(self) -> str:
@@ -93,23 +110,69 @@ class FallbackBackend(AgentBackend):
         max_tokens: int,
         think: bool = False,
         force_tool_call: bool = False,
+        timeout_s: float | None = None,
+        attempt_cb: AttemptEventCb | None = None,
     ) -> tuple[str, list[dict]]:
         kwargs = dict(
-            messages=messages, tools=tools, stream_cb=stream_cb,
+            messages=messages, tools=tools,
             temperature=temperature, max_tokens=max_tokens,
             think=think, force_tool_call=force_tool_call,
         )
 
-        for index, backend in enumerate(self._backends[:-1]):
+        self._last_used_backend = None
+        failures: list[str] = []
+        call_timeout = self._total_timeout_s if timeout_s is None else timeout_s
+        if call_timeout is not None and call_timeout <= 0:
+            raise ValueError("timeout_s muss positiv sein")
+        deadline = time.monotonic() + call_timeout if call_timeout is not None else None
+        for index, backend in enumerate(self._backends):
             if time.time() < self._down_until[index]:
                 continue
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen")
+            attempt_id = new_attempt_id() if attempt_cb is not None else None
+
+            async def report_delta(text_delta: str) -> None:
+                if attempt_cb is not None and attempt_id is not None:
+                    await attempt_cb(StreamEvent("delta", attempt_id, text_delta=text_delta))
+                if stream_cb is not None:
+                    await stream_cb(text_delta)
+
+            call_kwargs = {
+                **kwargs,
+                "stream_cb": report_delta if attempt_cb is not None else stream_cb,
+            }
+
+            async def abort_attempt() -> None:
+                if attempt_cb is not None and attempt_id is not None:
+                    try:
+                        await attempt_cb(StreamEvent("attempt_abort", attempt_id))
+                    except Exception:
+                        pass
+
             try:
-                result = backend.call(**kwargs)
+                if attempt_cb is not None and attempt_id is not None:
+                    await attempt_cb(StreamEvent("attempt_start", attempt_id))
+                result = backend.call(**call_kwargs)
                 timeout = self._stage_timeouts[index]
+                if remaining is not None:
+                    stage_budget = remaining / (len(self._backends) - index)
+                    timeout = stage_budget if timeout is None else min(timeout, stage_budget)
                 if timeout is None:
-                    return await result
-                return await asyncio.wait_for(result, timeout=timeout)
+                    outcome = await result
+                else:
+                    outcome = await asyncio.wait_for(result, timeout=timeout)
+                text, tool_calls = outcome
+                if not tool_calls and not str(text or "").strip():
+                    raise EmptyBackendResponseError("Backend lieferte keine sichtbare Antwort")
+                self._last_used_backend = backend
+                return outcome
+            except asyncio.CancelledError:
+                await abort_attempt()
+                raise
             except Exception as e:
+                await abort_attempt()
                 permanently_disabled = bool(getattr(e, "disable_backend", False))
                 requested_cooldown = getattr(e, "fallback_cooldown_s", None)
                 cooldown = self._cooldown_s if requested_cooldown is None else max(0.0, float(requested_cooldown))
@@ -118,15 +181,25 @@ class FallbackBackend(AgentBackend):
                     self._primary_down_until = self._down_until[index]
                 detail = redact_error_text(e).strip()
                 failure = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
-                next_backend = self._next_available_backend(index + 1)
-                fallback_period = "bis zum Neustart" if permanently_disabled else f"für {cooldown:.0f}s"
-                log.warning(
-                    f"Backend {backend.model_name} ausgefallen ({failure}) — "
-                    f"Fallback auf {next_backend.model_name} {fallback_period}"
-                )
-                self._report_failover(e, backend, next_backend)
+                failures.append(f"{backend.model_name}: {failure}")
+                if index < len(self._backends) - 1:
+                    next_backend = self._next_available_backend(index + 1)
+                    fallback_period = "bis zum Neustart" if permanently_disabled else f"für {cooldown:.0f}s"
+                    log.warning(
+                        f"Backend {backend.model_name} ausgefallen ({failure}) — "
+                        f"Fallback auf {next_backend.model_name} {fallback_period}"
+                    )
+                    self._report_failover(e, backend, next_backend)
+                else:
+                    log.warning("Letzte Backend-Stufe %s ausgefallen (%s)", backend.model_name, failure)
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen") from e
 
-        return await self._backends[-1].call(**kwargs)
+        raise AllBackendsFailedError(failures)
+
+    async def call_with_timeout(self, *, timeout_s: float, **kwargs) -> tuple[str, list[dict]]:
+        """Wendet ein einzelnes Aufrufbudget an und behält dabei den Provider-Cooldown."""
+        return await self.call(**kwargs, timeout_s=timeout_s)
 
     def _next_available_backend(self, start: int) -> AgentBackend:
         now = time.time()
@@ -162,7 +235,7 @@ class FallbackBackend(AgentBackend):
             pass
 
     async def warmup(self) -> None:
-        # Alle Stufen aufwärmen: lokale Fallbacks müssen im Ernstfall bereit sein.
+        # Cloud-Backends laden keine lokalen Modelle; warmup bleibt interface-kompatibel.
         await self._backends[0].warmup()
         for backend in self._backends[1:]:
             try:

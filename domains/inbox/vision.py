@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
+
+from core.vision import MAX_IMAGE_RAW_BYTES, validate_image_payload
 
 
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 MAX_IMAGES = 4
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
+# 7.5 MB rohe Bytes ergeben höchstens 10 MB nach Base64-Kodierung.
+MAX_IMAGE_BYTES = MAX_IMAGE_RAW_BYTES
+# Anthropic begrenzt den ganzen Request auf 32 MB. 2 MB bleiben für Modell,
+# Systemtext und weitere Felder der jeweiligen Backend-Payload reserviert.
+MAX_REQUEST_PAYLOAD_BYTES = 30_000_000
 VISION_TIMEOUT_S = 8.0
 
 
@@ -19,6 +26,16 @@ def _stages(backend):
 
 def has_vision_backend(backend) -> bool:
     return any(bool(getattr(stage, "supports_vision", False)) for stage in _stages(backend))
+
+
+def _request_payload_size(content: list[dict]) -> int:
+    payload = {
+        "messages": [{"role": "user", "content": content}],
+        "tools": None,
+        "temperature": 0.1,
+        "max_tokens": 500,
+    }
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
 async def describe_images(
@@ -45,14 +62,23 @@ async def describe_images(
             continue
         if content_type not in SUPPORTED_IMAGE_TYPES:
             continue
-        content.append({
+        try:
+            content_type = validate_image_payload(bytes(data))
+        except ValueError:
+            continue
+        if content_type not in SUPPORTED_IMAGE_TYPES:
+            continue
+        image_block = {
             "type": "image",
             "source": {
                 "type": "base64",
                 "media_type": content_type,
                 "data": base64.b64encode(data).decode("ascii"),
             },
-        })
+        }
+        if _request_payload_size([*content, image_block]) > MAX_REQUEST_PAYLOAD_BYTES:
+            continue
+        content.append(image_block)
     if len(content) == 1:
         return None
 

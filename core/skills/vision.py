@@ -3,9 +3,8 @@ Screen-Context-Awareness — Mantis kann sich einen Screenshot machen und
 beschreiben lassen, um kontextbezogen zu helfen (z.B. "was siehst du gerade
 auf meinem Bildschirm?", "hilf mir bei diesem Fehler").
 
-Nutzt macOS' eingebautes `screencapture` (kein Zusatz-Paket nötig) + das
-bereits bestehende Ollama-Vision-Modell aus core/vision.py (dasselbe, das
-Telegram-Fotos beschreibt).
+Nutzt macOS' eingebautes `screencapture` (kein Zusatz-Paket nötig) + die
+gemeinsame Vision-Cloud-Kette aus core/vision.py.
 """
 import asyncio
 import logging

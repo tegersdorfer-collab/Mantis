@@ -125,7 +125,7 @@ def build_prompt(profile: dict, last_exercises: list[str], muscle_volume: dict) 
 
 
 async def generate_and_save(chat_llm, bg_llm=None) -> dict | None:
-    """Generiert einen Plan via LLM (Claude→qwen Fallback), validiert, speichert.
+    """Generiert einen Plan über Chat- und Background-Cloud-Ketten, validiert, speichert.
     Gibt den gespeicherten Plan zurück oder None (dann bleibt der alte Plan aktiv)."""
     from domains import fitness
     from core.jsonutil import extract_json

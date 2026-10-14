@@ -6,7 +6,7 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16+pgvector-blue)
 ![Swift](https://img.shields.io/badge/SwiftUI-iOS-orange)
 
-**Persönlicher, autonomer AI-Concierge** — lokal betreibbar auf Apple Silicon, mit optionalen Cloud-LLMs. Erreichbar über Telegram, ein PWA-Dashboard, einen Tauri-Desktop-Client und drei native iOS-Apps.
+**Persönlicher, autonomer AI-Concierge** — lokal betreibbar auf Apple Silicon, mit Cloud-LLMs und lokalen Embeddings. Erreichbar über Telegram, ein PWA-Dashboard, einen Tauri-Desktop-Client und drei native iOS-Apps.
 
 Mantis ist ein Eigenprojekt, das ich vollständig allein konzipiert, entwickelt und in Produktion betrieben habe. Keine Tutorials, kein Starter-Template — von der Gedächtnisarchitektur bis zum BLE-Roboterprotokoll selbst erarbeitet.
 
@@ -20,7 +20,7 @@ Mantis ist ein Eigenprojekt, das ich vollständig allein konzipiert, entwickelt 
 | Agent-Tools | Tool-Registry mit semantischem Routing und geprüften Ausführungsrechten |
 | Tests | 1.100+ Python-Tests und 130+ Desktop-Tests; externe Dienste in Tests ersetzt |
 | Laufzeit | 24/7 auf MacBook Air M4 via launchd |
-| LLM-Backends | OpenRouter · Anthropic API (Haiku 5.5) · ChatGPT-Abo · Ollama lokal |
+| LLM-Backends | OpenRouter → Anthropic API (Haiku 5.5) → ChatGPT-Abo · Ollama lokal nur für Embeddings |
 | DB | PostgreSQL 16 + pgvector (Vektorsuche) |
 | iOS-Apps | 3 SwiftUI-Apps gegen dieselbe FastAPI |
 
@@ -30,9 +30,9 @@ Mantis ist ein Eigenprojekt, das ich vollständig allein konzipiert, entwickelt 
 
 ### Agent-Kern
 - **ReAct-Loop** mit Tool-Registry, mehrstufiger Ausführung und sequenziellen Tool-Aufrufen; erlaubte Tools werden bei jedem Aufruf geprüft
-- **LLM-Backends**: Chat über OpenRouter, Anthropic Haiku 5.5, optional ChatGPT-Abo und lokales Ollama; Sonnet bleibt für komplexe Tasks verfügbar
+- **LLM-Backends**: Chat und Hintergrundaufgaben über OpenRouter, Anthropic Haiku 5.5 und ChatGPT-Abo; Ollama bleibt nur für lokale Embeddings
 - **Subagent-Delegation**: `delegate_task` startet Kind-Agenten mit eigenem Gesprächskontext und eingeschränkten Tools; bis zu drei gleichzeitige Delegationen, keine rekursive Delegation. Die Agents teilen denselben Prozess
-- **LLM-Fallback**: OpenRouter → Anthropic → ChatGPT-Abo → Ollama, mit Timeout und Cooldown je Cloud-Stufe
+- **LLM-Fallback**: OpenRouter → Anthropic → ChatGPT-Abo, mit Timeout und Cooldown je Cloud-Stufe
 - **Token-Streaming** an Telegram + Dashboard (SSE)
 
 ### Gedächtnis-Architektur
@@ -117,17 +117,17 @@ Drei fokussierte Apps gegen dieselbe FastAPI (`:7779`), erreichbar über Tailsca
 | Schicht | Technologie |
 |---------|------------|
 | Sprache | Python 3.14 (asyncio) · Swift (SwiftUI) · JavaScript |
-| LLM | OpenRouter · Anthropic API · ChatGPT-Abo · Ollama (qwen3.5:9b) · MLX |
+| LLM | OpenRouter → Anthropic API → ChatGPT-Abo · lokale Ollama-Embeddings (`qwen3-embedding:0.6b`) |
 | DB | PostgreSQL 16 + pgvector |
 | Backend | FastAPI + uvicorn |
 | Frontend | Vanilla JS PWA (Chart.js, vis.js, marked.js, globe.gl, Leaflet) |
 | iOS-Apps | 3 × SwiftUI — BodyOS / BrainOS / FlowOS |
-| Kommunikation | python-telegram-bot · Voice (Whisper lokal + Piper TTS) · Foto-Analyse (llava:7b) |
+| Kommunikation | python-telegram-bot · Voice (Parakeet lokal + Kokoro/Piper lokal) · Cloud-Bildanalyse |
 | Health-Import | Swift-App → HealthKit Background Delivery → HTTP Push |
 | Prozess-Management | launchd + KeepAlive (Auto-Restart nach Crash) |
 | CI | GitHub Actions (ruff lint + pytest, Python 3.14) |
 
-Jev ist ein optionales Entscheidungsmodell für mehrdeutige Fälle (Werkzeugauswahl, Sprecher-Adressierung, Anspruchs-Prüfung) und ergänzt das lokale Modell statt es zu ersetzen. Mit gesetzter `JEV_PROVIDER_CHAIN` (zum Beispiel `cloudflare,openrouter,typesafe`) werden Provider der Reihe nach versucht; leer bleibt die bisherige Auswahl über `JEV_PROVIDER` aktiv. Cloudflare Clef benötigt `CLOUDFLARE_ACCOUNT_ID` und `CLOUDFLARE_AUTH_TOKEN`; `CLEF_MODEL=clef-flash` ist der Default. TypeSafe und OpenRouter verwenden weiter `JEV_MODEL=jev-latest` und ihren jeweiligen API-Key. Ohne nutzbaren Provider läuft Mantis lokal weiter. Alle Fragen und Schwellenwerte stehen gebündelt in `core/decisions.py`, der zugehörige Benchmark liegt in `bench/jev/`. `JEV_ENABLED` ist bewusst unabhängig von `LLM_LOCAL_ONLY` — die Cloud-Entscheidungen brauchen eine explizite eigene Zustimmung. Nach jeder Änderung an der `.env` muss Mantis neu gestartet werden, damit sie wirkt.
+Werkzeugauswahl, Sprecher-Adressierung und Memory-Prüfungen laufen über die gemeinsame Cloud-Kette. Das optionale Forge-Vorgate bleibt über `JEV_FORGE_GATE_ENABLED` und `JEV_ENABLED` abschaltbar und nutzt dieselbe schnelle Cloud-Variante. Die Fragen und Schwellenwerte stehen in `core/decisions.py`; `JEV_LOG_PATH` behält das bisherige JevKit-Logformat für Auswertungen bei.
 
 ---
 
@@ -239,7 +239,7 @@ Mantis/
 ├── domains/                 # Health, Fitness, Body, Ernährung, Habits, Tasks,
 │                            # Journal, Ziele, Second Brain, Calendar, Weather, Gmail…
 │
-├── llm/                     # Ollama / Claude Provider (austauschbar über base.py)
+├── llm/                     # Cloud-LLM-Adapter + lokaler Ollama-Embedding-Provider
 ├── communication/           # Telegram-Channel
 ├── tools/                   # WebSearch, DashboardReader, Delegate, Robot, Flipper, Spotify…
 │
@@ -263,7 +263,7 @@ Mantis/
 
 ## Architektur-Prinzipien
 
-1. **Datenrouting** — Der interaktive Chat darf gemäß expliziter Konfiguration den Gesprächskontext an seine Cloud-Kette senden. Dashboard- und Hintergrundrouten mit gespeicherten Privatdaten bleiben lokal.
+1. **Datenrouting** — Alle LLM-Aufrufe laufen über die Cloud-Kette; nur Embeddings bleiben lokal über Ollama.
 2. **Modulare Backends** — LLM, DB, Kommunikation sind austauschbar
 3. **Kein Over-Engineering** — einfacher Code > komplexe Abstraktionen
 4. **Mantis soll lernen** — jede Interaktion macht ihn besser, nicht nur reaktiver

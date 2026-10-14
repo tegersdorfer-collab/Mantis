@@ -7,6 +7,57 @@ import httpx
 import pytest
 
 from core.backends.claude import ClaudeBackend, _extract_tool_calls
+from llm.claude import ClaudeProvider
+
+
+def test_anthropic_model_allowlist_defaults_to_haiku_55(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_ALLOWED_MODELS", raising=False)
+    monkeypatch.delenv("CLAUDE_CHAT_MODEL", raising=False)
+
+    from settings import MantisSettings
+
+    settings = MantisSettings(_env_file=None)
+
+    assert settings.ANTHROPIC_ALLOWED_MODELS == ["claude-haiku-5-5"]
+    assert settings.CLAUDE_CHAT_MODEL == "claude-haiku-5-5"
+
+
+@pytest.mark.parametrize("provider", [ClaudeBackend, ClaudeProvider])
+def test_anthropic_constructors_reject_models_outside_allowlist(monkeypatch, provider):
+    import config
+
+    monkeypatch.setattr(config, "ANTHROPIC_ALLOWED_MODELS", ["claude-haiku-5-5"], raising=False)
+
+    with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
+        provider(model="claude-opus-4-6")
+
+
+def test_backend_rechecks_allowlist_before_each_api_call(monkeypatch):
+    import config
+
+    backend = object.__new__(ClaudeBackend)
+    backend._model = "claude-haiku-5-5"
+    monkeypatch.setattr(config, "ANTHROPIC_ALLOWED_MODELS", ["claude-opus-4-6"], raising=False)
+
+    with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
+        asyncio.run(backend.call([], None, None, 0.2, 100))
+
+
+def test_llm_provider_rechecks_allowlist_before_chat_and_stream(monkeypatch):
+    import config
+
+    provider = object.__new__(ClaudeProvider)
+    provider._model = "claude-haiku-5-5"
+    monkeypatch.setattr(config, "ANTHROPIC_ALLOWED_MODELS", ["claude-opus-4-6"], raising=False)
+
+    with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
+        asyncio.run(provider.chat([]))
+
+    async def consume_stream():
+        return [chunk async for chunk in provider.stream([])]
+
+    with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
+        asyncio.run(consume_stream())
 
 
 def test_claude_tool_use_requires_object_arguments():
@@ -36,7 +87,7 @@ def test_haiku_55_cost_uses_explicit_estimated_price_table_entry():
     assert cost_usd("claude-haiku-5-5", 1_000_000, 1_000_000) == 6.0
 
 
-def _sdk_message_events(*, include_message_stop):
+def _sdk_message_events(*, include_message_stop, text_deltas=("answer",)):
     events = [
         {
             "type": "message_start",
@@ -56,11 +107,14 @@ def _sdk_message_events(*, include_message_stop):
             "index": 0,
             "content_block": {"type": "text", "text": ""},
         },
-        {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "answer"},
-        },
+        *[
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            }
+            for text in text_deltas
+        ],
         {
             "type": "content_block_stop",
             "index": 0,
@@ -79,11 +133,13 @@ def _sdk_message_events(*, include_message_stop):
     )
 
 
-def _call_claude_with_sdk_events(*, include_message_stop):
+def _call_claude_with_sdk_events(*, include_message_stop, text_deltas=("answer",)):
     async def call():
         transport = httpx.MockTransport(lambda _request: httpx.Response(
             200,
-            content=_sdk_message_events(include_message_stop=include_message_stop),
+            content=_sdk_message_events(
+                include_message_stop=include_message_stop, text_deltas=text_deltas,
+            ),
             headers={"content-type": "text/event-stream"},
         ))
         async with httpx.AsyncClient(transport=transport) as http_client:
@@ -120,6 +176,15 @@ def test_haiku_stream_accepts_sdk_stream_ending_with_message_stop():
     assert collected == ["answer"]
 
 
+def test_haiku_stream_reports_exact_text_deltas():
+    result, collected = _call_claude_with_sdk_events(
+        include_message_stop=True, text_deltas=("Es ist son", "nig."),
+    )
+
+    assert result == ("Es ist sonnig.", [])
+    assert collected == ["Es ist son", "nig."]
+
+
 def test_haiku_tool_use_rejects_missing_required_arguments():
     response = SimpleNamespace(content=[SimpleNamespace(
         type="tool_use", id="toolu-1", name="lookup", input={"extra": "x"},
@@ -130,3 +195,47 @@ def test_haiku_tool_use_rejects_missing_required_arguments():
 
     with pytest.raises(ValueError, match="Pflichtargumente.*query"):
         _extract_tool_calls(response, tools)
+
+
+def _claude_request_payload(model):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": model,
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+    async def call():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            backend = object.__new__(ClaudeBackend)
+            backend._model = model
+            backend._purpose = "chat-agent"
+            backend._client = anthropic.AsyncAnthropic(api_key="test", http_client=http_client)
+            backend._record_usage = lambda _response: None
+            result = await backend.call(
+                [{"role": "user", "content": "hi"}], None, None, 0.2, 100,
+            )
+        return result
+
+    assert asyncio.run(call()) == ("ok", [])
+    return seen["body"]
+
+
+def test_haiku_55_omits_unsupported_temperature_parameter():
+    payload = _claude_request_payload("claude-haiku-5-5")
+
+    assert "temperature" not in payload
+    assert "thinking" not in payload
+
+
+def test_unallowed_haiku_45_is_rejected_before_request():
+    with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
+        _claude_request_payload("claude-haiku-4-5-20251001")

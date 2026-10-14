@@ -1,6 +1,8 @@
+"""Memory-Extraktion, Verifier und Konflikt-Judge verwenden die Cloud-Kette."""
 import asyncio
 
-from memory.extractor import MemoryExtractor
+from core.backends.base import AgentBackend
+from memory.extractor import MemoryExtractor, make_judge, verify_claim
 
 
 class FakeFactProvider:
@@ -13,29 +15,31 @@ class FakeFactProvider:
         return self.answer
 
 
-class FakeLocalClient:
-    def __init__(self):
-        self.calls = []
-
-    async def chat(self, **kwargs):
-        self.calls.append(kwargs)
-        raise AssertionError("Cloud-Aufgaben dürfen hier nicht Ollama aufrufen")
-
-
 class FakeLZG:
     pass
 
 
-def test_fact_extraction_uses_cloud_provider_and_only_sends_user_text(monkeypatch):
-    import memory.extractor as extractor_module
+class FakeCloudBackend(AgentBackend):
+    def __init__(self):
+        self.calls = []
 
-    local_client = FakeLocalClient()
-    monkeypatch.setattr(extractor_module._ollama, "AsyncClient", lambda **_: local_client)
+    @property
+    def model_name(self):
+        return "fake-cloud"
+
+    async def call(self, messages, tools, stream_cb, temperature, max_tokens,
+                   think=False, force_tool_call=False):
+        self.calls.append({"messages": messages, "tools": tools, "max_tokens": max_tokens})
+        return "[]", []
+
+    async def warmup(self):
+        return None
+
+
+def test_fact_extraction_sends_only_user_words_to_cloud_provider():
     provider = FakeFactProvider()
     extractor = MemoryExtractor(
-        llm_provider=object(),
-        lzg=FakeLZG(),
-        fact_llm=provider,
+        llm_provider=object(), lzg=FakeLZG(), fact_llm=provider,
     )
 
     result = asyncio.run(extractor.extract_from_exchange("hallo", "Antwort mit Zusatz"))
@@ -46,14 +50,37 @@ def test_fact_extraction_uses_cloud_provider_and_only_sends_user_text(monkeypatc
     assert prompt.endswith("Timo sagt: hallo")
     assert "Antwort mit Zusatz" not in prompt
     assert kwargs["format"] == "json"
-    assert local_client.calls == []
 
 
-def test_entity_extraction_uses_cloud_provider(monkeypatch):
+def test_default_fact_extractor_uses_fast_cloud_chain(monkeypatch):
     import memory.extractor as extractor_module
 
-    local_client = FakeLocalClient()
-    monkeypatch.setattr(extractor_module._ollama, "AsyncClient", lambda **_: local_client)
+    backend = FakeCloudBackend()
+    purposes = []
+
+    def cloud_chain(purpose, **kwargs):
+        purposes.append((purpose, kwargs))
+        return backend
+
+    class LocalClient:
+        async def chat(self, **kwargs):
+            return type("Response", (), {"message": type("Message", (), {"content": "[]"})()})()
+
+    if hasattr(extractor_module, "_ollama"):
+        monkeypatch.setattr(extractor_module._ollama, "AsyncClient", lambda **_: LocalClient())
+
+    monkeypatch.setattr(extractor_module, "cloud_chain", cloud_chain, raising=False)
+    extractor = MemoryExtractor(llm_provider=object(), lzg=FakeLZG())
+
+    result = asyncio.run(extractor._ask_json("Extract JSON", 70, 8.0))
+
+    assert result == "[]"
+    assert purposes == [("fast", {"reasoning": "low", "timeout": 8})]
+    assert backend.calls[0]["tools"] is None
+    assert backend.calls[0]["max_tokens"] == 70
+
+
+def test_entity_extraction_uses_cloud_provider():
     provider = FakeFactProvider()
 
     class FakeKG:
@@ -61,56 +88,27 @@ def test_entity_extraction_uses_cloud_provider(monkeypatch):
             return 1
 
     extractor = MemoryExtractor(
-        llm_provider=object(),
-        lzg=FakeLZG(),
-        kg=FakeKG(),
-        fact_llm=provider,
+        llm_provider=object(), lzg=FakeLZG(), kg=FakeKG(), fact_llm=provider,
     )
 
     asyncio.run(extractor._extract_entities("hallo"))
 
     assert len(provider.calls) == 1
     assert "Nachricht: hallo" in provider.calls[0][0]
-    assert local_client.calls == []
 
 
-def test_local_extractor_verifier_bypasses_jev(monkeypatch):
-    import memory.extractor as extractor_module
+def test_claim_verifier_uses_cloud_provider_without_jev_or_local_client():
+    provider = FakeFactProvider("JA")
 
-    class LocalClient:
-        def __init__(self):
-            self.calls = []
-
-        async def chat(self, **kwargs):
-            self.calls.append(kwargs)
-            return type("Response", (), {
-                "message": type("Message", (), {"content": "JA"})(),
-            })()
-
-    async def jev_must_not_run(*_args, **_kwargs):
-        raise AssertionError("Lokale Journaldaten dürfen Jev nicht erreichen")
-
-    client = LocalClient()
-    monkeypatch.setattr(extractor_module.decisions, "claim_supported", jev_must_not_run)
-
-    assert asyncio.run(extractor_module.verify_claim(
-        client, "Ich wohne in Nürnberg", "Timo wohnt in Nürnberg.", allow_cloud=False
-    ))
-    assert len(client.calls) == 1
+    assert asyncio.run(verify_claim(provider, "Ich wohne in Nürnberg", "Timo wohnt in Nürnberg."))
+    assert len(provider.calls) == 1
+    assert provider.calls[0][1]["max_tokens"] <= 12
 
 
-def test_local_extractor_conflict_judge_bypasses_jev(monkeypatch):
-    import memory.conflict as conflict_module
-    import memory.extractor as extractor_module
+def test_conflict_judge_uses_cloud_provider():
+    provider = FakeFactProvider("JA")
+    judge = make_judge(provider)
 
-    async def local_judge(old, new):
-        return old == "alter Fakt" and new == "neuer Fakt"
-
-    async def jev_must_not_run(*_args, **_kwargs):
-        raise AssertionError("Lokale LZG-Daten dürfen Jev nicht erreichen")
-
-    monkeypatch.setattr(conflict_module, "make_llm_judge", lambda *_: local_judge)
-    monkeypatch.setattr(extractor_module.decisions, "supersedes", jev_must_not_run)
-    judge = extractor_module.make_judge(object(), "local-model", allow_cloud=False)
-
-    assert asyncio.run(judge("alter Fakt", "neuer Fakt"))
+    assert asyncio.run(judge("alter Fakt", "neuer Fakt")) is True
+    assert "alte aussage" in provider.calls[0][0].lower()
+    assert "neue aussage" in provider.calls[0][0].lower()

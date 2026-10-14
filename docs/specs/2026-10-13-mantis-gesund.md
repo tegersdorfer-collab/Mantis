@@ -1,5 +1,9 @@
 # Spec: Mantis gesund machen (Nutzungs-Challenge, Phase 3a)
 
+> **Überholt seit 2026-10-14:** Diese Spec hält den damaligen Stand fest. Die Cloud-Migration
+> [`2026-10-14-cloud-umstellung.md`](2026-10-14-cloud-umstellung.md) ersetzt die lokalen
+> LLM-Fallbacks und die lokale Datenschutzgrenze; nur Embeddings bleiben lokal.
+
 Stand 2026-10-13. Kontext: `docs/HANDOFF-nutzungs-challenge.md`. Timo nutzt Mantis nicht; Mantis
 beschäftigt sich vor allem mit sich selbst (~1000 Hintergrund-LLM-Calls in 8 Wochen, 1986 Fehler),
 und Chats werden nach 3 Tagen gelöscht, sodass Nutzung nicht messbar ist.

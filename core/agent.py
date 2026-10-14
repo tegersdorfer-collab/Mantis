@@ -3,24 +3,26 @@ Agentischer Kern – ReAct-Loop mit nativem Tool-Calling.
 Das Modell entscheidet selbst, welche Tools es in welcher Reihenfolge nutzt.
 
 Backends (core/backends/) übernehmen den LLM-spezifischen Teil:
-    OllamaBackend  → Ollama-API (lokal)
-    ClaudeBackend  → Anthropic-API (Haiku)
+    OpenRouterBackend → OpenRouter Chat Completions
+    ClaudeBackend    → Anthropic Messages
+    ChatGPTPlanBackend → ChatGPT Responses
 
 Dieser Loop kennt nur backend.call() — egal welcher Anbieter dahintersteckt.
 """
 import json
 import logging
 import re
-from typing import Awaitable, Callable
 
 from core import tools as toolreg
 from core.db import log_event
 from core.status import BUS
-from core.backends.base import AgentBackend
+from core.backends.base import AgentBackend, AttemptEventCb
+from core.backends.fallback import FallbackBackend
+from core.stream_events import StreamEvent, new_attempt_id
 
 log = logging.getLogger(__name__)
 
-StreamCb = Callable[[str], Awaitable[None]]
+StreamCb = AttemptEventCb
 
 
 class Agent:
@@ -29,8 +31,76 @@ class Agent:
         self._max_steps = max_steps
 
     @property
+    def backend(self) -> AgentBackend:
+        return self._backend
+
+    @property
     def model_name(self) -> str:
         return self._backend.model_name
+
+    async def _call_backend(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None,
+        stream_cb: StreamCb | None,
+        temperature: float,
+        max_tokens: int,
+        think: bool = False,
+        force_tool_call: bool = False,
+    ) -> tuple[str, list[dict], str | None]:
+        if stream_cb is None:
+            content, tool_calls = await self._backend.call(
+                messages, tools=tools, stream_cb=None,
+                temperature=temperature, max_tokens=max_tokens,
+                think=think, force_tool_call=force_tool_call,
+            )
+            return content, tool_calls, None
+
+        if isinstance(self._backend, FallbackBackend):
+            active_attempt_id: list[str | None] = [None]
+
+            async def report_event(event: StreamEvent) -> None:
+                if event.kind == "attempt_start":
+                    active_attempt_id[0] = event.attempt_id
+                elif event.kind == "attempt_abort" and active_attempt_id[0] == event.attempt_id:
+                    active_attempt_id[0] = None
+                await stream_cb(event)
+
+            content, tool_calls = await self._backend.call(
+                messages, tools=tools, stream_cb=None,
+                temperature=temperature, max_tokens=max_tokens,
+                think=think, force_tool_call=force_tool_call,
+                attempt_cb=report_event,
+            )
+            return content, tool_calls, active_attempt_id[0]
+
+        attempt_id = new_attempt_id()
+        await stream_cb(StreamEvent("attempt_start", attempt_id))
+
+        async def report_delta(text_delta: str) -> None:
+            await stream_cb(StreamEvent("delta", attempt_id, text_delta=text_delta))
+
+        try:
+            content, tool_calls = await self._backend.call(
+                messages, tools=tools, stream_cb=report_delta,
+                temperature=temperature, max_tokens=max_tokens,
+                think=think, force_tool_call=force_tool_call,
+            )
+        except BaseException:
+            try:
+                await stream_cb(StreamEvent("attempt_abort", attempt_id))
+            except Exception:
+                pass
+            raise
+        return content, tool_calls, attempt_id
+
+    @staticmethod
+    async def _end_attempt(
+        stream_cb: StreamCb | None, attempt_id: str | None, *, final: bool,
+    ) -> None:
+        if stream_cb is not None and attempt_id is not None:
+            await stream_cb(StreamEvent("attempt_end", attempt_id, final=final))
 
     async def run(
         self,
@@ -77,8 +147,7 @@ class Agent:
             is_first = step == 0
             force = force_tools and is_first and bool(schemas)
             BUS.emit("thinking", "Denke nach…", detail=self._backend.model_name)
-
-            content, tool_calls = await self._backend.call(
+            content, tool_calls, attempt_id = await self._call_backend(
                 msgs,
                 tools=schemas,
                 stream_cb=stream_cb,
@@ -94,6 +163,7 @@ class Agent:
                     t["tool"] == "calculate" for t in trace
                 ):
                     log.debug("Math-Guard: erzwinge calculate-Tool-Call")
+                    await self._end_attempt(stream_cb, attempt_id, final=False)
                     msgs.append({"role": "assistant", "content": content or ""})
                     msgs.append({
                         "role": "user",
@@ -101,42 +171,44 @@ class Agent:
                                    "Das ist verboten. Rufe jetzt calculate mit dem korrekten Ausdruck auf "
                                    "und gib danach die korrigierte Antwort.",
                     })
-                    content, tool_calls = await self._backend.call(
-                        msgs, tools=schemas, stream_cb=None,
+                    content, tool_calls, attempt_id = await self._call_backend(
+                        msgs, tools=schemas, stream_cb=stream_cb,
                         temperature=0.2, max_tokens=300,
                     )
                     msgs = msgs[:-2]
                     if not tool_calls:
+                        await self._end_attempt(stream_cb, attempt_id, final=True)
                         return content.strip(), trace
+                    await self._end_attempt(stream_cb, attempt_id, final=False)
                     # tool_calls erhalten → unten direkt ausführen (kein continue:
                     # das würde sie verwerfen und einen zweiten LLM-Call machen)
 
                 # Kein Tool-Call obwohl erwartet → einmal retry
                 elif force_tools and is_first and schemas:
                     log.debug("Kein Tool-Call trotz force_tools – retry")
+                    await self._end_attempt(stream_cb, attempt_id, final=False)
                     msgs.append({"role": "assistant", "content": content or ""})
                     msgs.append({
                         "role": "user",
                         "content": "[SYSTEM] Du hast gerade KEIN Tool aufgerufen. "
                                    "Rufe jetzt sofort das passende Tool auf – antworte nicht mit Text.",
                     })
-                    content, tool_calls = await self._backend.call(
-                        msgs, tools=schemas, stream_cb=None,
+                    content, tool_calls, attempt_id = await self._call_backend(
+                        msgs, tools=schemas, stream_cb=stream_cb,
                         temperature=0.3, max_tokens=200,
                     )
                     if not tool_calls:
+                        await self._end_attempt(stream_cb, attempt_id, final=True)
                         return content.strip() or (msgs[-2].get("content", "")).strip(), trace
+                    await self._end_attempt(stream_cb, attempt_id, final=False)
                     msgs = msgs[:-2]
                 else:
+                    await self._end_attempt(stream_cb, attempt_id, final=True)
                     return content.strip(), trace
+            else:
+                await self._end_attempt(stream_cb, attempt_id, final=False)
 
             # Tool-Calls ausführen
-            if stream_cb:
-                try:
-                    await stream_cb("🔧 …")
-                except Exception:
-                    pass
-
             msgs.append({
                 "role": "assistant",
                 "content": content or "",
@@ -174,10 +246,11 @@ class Agent:
                 })
 
         # Max-Steps erreicht
-        content, _ = await self._backend.call(
+        content, _tool_calls, attempt_id = await self._call_backend(
             msgs, tools=None, stream_cb=stream_cb,
             temperature=temperature, max_tokens=max_tokens,
         )
+        await self._end_attempt(stream_cb, attempt_id, final=True)
         return content.strip(), trace
 
     async def warmup(self) -> None:
