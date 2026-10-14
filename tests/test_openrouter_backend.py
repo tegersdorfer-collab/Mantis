@@ -351,13 +351,13 @@ def test_streaming_collects_deltas_and_reports_progress():
 
     assert text == "Route gestartet."
     assert calls == []
-    assert progress == ["Route gestartet."]
+    assert progress == ["Route ", "gestartet."]
 
 
 def test_voice_purpose_streams_short_deltas_as_they_arrive():
     chunks = [
-        {"choices": [{"delta": {"content": "Erster Satz. "}}]},
-        {"choices": [{"delta": {"content": "Zweiter Satz."}}]},
+        {"choices": [{"delta": {"content": "Es ist son"}}]},
+        {"choices": [{"delta": {"content": "nig."}}]},
         {"choices": [{"delta": {}, "finish_reason": "stop"}]},
     ]
     body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
@@ -375,8 +375,8 @@ def test_voice_purpose_streams_short_deltas_as_they_arrive():
         temperature=0.2, max_tokens=80,
     ))
 
-    assert text == "Erster Satz. Zweiter Satz."
-    assert progress[:2] == ["Erster Satz. ", "Erster Satz. Zweiter Satz."]
+    assert text == "Es ist sonnig."
+    assert progress == ["Es ist son", "nig."]
 
 
 def test_streaming_tolerates_null_usage_and_reads_usage_after_finish_reason(monkeypatch):

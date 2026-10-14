@@ -7,8 +7,9 @@ import asyncio
 import logging
 import time
 
-from core.backends.base import AgentBackend, StreamCb
+from core.backends.base import AgentBackend, AttemptEventCb, StreamCb
 from core.error_redaction import redact_error_text
+from core.stream_events import StreamEvent, new_attempt_id
 
 log = logging.getLogger(__name__)
 
@@ -110,9 +111,10 @@ class FallbackBackend(AgentBackend):
         think: bool = False,
         force_tool_call: bool = False,
         timeout_s: float | None = None,
+        attempt_cb: AttemptEventCb | None = None,
     ) -> tuple[str, list[dict]]:
         kwargs = dict(
-            messages=messages, tools=tools, stream_cb=stream_cb,
+            messages=messages, tools=tools,
             temperature=temperature, max_tokens=max_tokens,
             think=think, force_tool_call=force_tool_call,
         )
@@ -129,8 +131,30 @@ class FallbackBackend(AgentBackend):
             remaining = deadline - time.monotonic() if deadline is not None else None
             if remaining is not None and remaining <= 0:
                 raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen")
+            attempt_id = new_attempt_id() if attempt_cb is not None else None
+
+            async def report_delta(text_delta: str) -> None:
+                if attempt_cb is not None and attempt_id is not None:
+                    await attempt_cb(StreamEvent("delta", attempt_id, text_delta=text_delta))
+                if stream_cb is not None:
+                    await stream_cb(text_delta)
+
+            call_kwargs = {
+                **kwargs,
+                "stream_cb": report_delta if attempt_cb is not None else stream_cb,
+            }
+
+            async def abort_attempt() -> None:
+                if attempt_cb is not None and attempt_id is not None:
+                    try:
+                        await attempt_cb(StreamEvent("attempt_abort", attempt_id))
+                    except Exception:
+                        pass
+
             try:
-                result = backend.call(**kwargs)
+                if attempt_cb is not None and attempt_id is not None:
+                    await attempt_cb(StreamEvent("attempt_start", attempt_id))
+                result = backend.call(**call_kwargs)
                 timeout = self._stage_timeouts[index]
                 if remaining is not None:
                     stage_budget = remaining / (len(self._backends) - index)
@@ -144,7 +168,11 @@ class FallbackBackend(AgentBackend):
                     raise EmptyBackendResponseError("Backend lieferte keine sichtbare Antwort")
                 self._last_used_backend = backend
                 return outcome
+            except asyncio.CancelledError:
+                await abort_attempt()
+                raise
             except Exception as e:
+                await abort_attempt()
                 permanently_disabled = bool(getattr(e, "disable_backend", False))
                 requested_cooldown = getattr(e, "fallback_cooldown_s", None)
                 cooldown = self._cooldown_s if requested_cooldown is None else max(0.0, float(requested_cooldown))

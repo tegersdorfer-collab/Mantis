@@ -6,7 +6,10 @@ Interface.
 from abc import ABC, abstractmethod
 from typing import Awaitable, Callable
 
+from core.stream_events import StreamEvent
+
 StreamCb = Callable[[str], Awaitable[None]]
+AttemptEventCb = Callable[[StreamEvent], Awaitable[None]]
 
 
 class AgentBackend(ABC):

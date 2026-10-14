@@ -21,6 +21,7 @@ from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 from core import db
 from core.voice import transcribe_audio, is_addressed_to_mantis, mark_conversation_active, _conversation_active
 from core.voice_stream import VoiceStreamSession
+from core.stream_events import StreamEvent
 from core.tts import synthesize, synthesize_stream
 
 log = logging.getLogger("mantis.api")
@@ -108,17 +109,12 @@ async def sende_antwort(websocket, text: str, reply: str | None, audio_streaming
     await websocket.send_json({"type": "audio_end", "count": seq})
 
 
-def _update_delta(current: str, update: str) -> tuple[str, str]:
-    """Leitet neue Zeichen aus kumulativen Updates derselben Modellrunde ab."""
-    if update.startswith(current):
-        return update, update[len(current):]
-    if current.startswith(update):
-        return current, ""
-    return update, update
-
-
 def _sentence_complete(text: str) -> bool:
     return bool(re.search(r"[.!?…][\"'»”’)}\]]*$", text.strip()))
+
+
+def _normalized_speech(text: str) -> str:
+    return " ".join(text.split())
 
 
 async def sende_streaming_antwort(
@@ -137,69 +133,98 @@ async def sende_streaming_antwort(
     first_tts_block_ms = None
     sequence = 0
     queue: asyncio.Queue[str | None] = asyncio.Queue()
-    stream_state = {"round_id": None, "full": "", "pending": ""}
+    attempts: dict[str, dict[str, str | bool]] = {}
+    has_queued_sentence = False
+    spoken_sentences: list[str] = []
     response: list[tuple[str | None, Exception | None]] = []
 
-    async def flush_round(*, final: bool = False) -> None:
-        pending = stream_state["pending"].strip()
-        if pending and (final or _sentence_complete(pending)):
-            await queue.put(pending)
-        stream_state["full"] = ""
-        stream_state["pending"] = ""
+    async def queue_sentence(sentence: str) -> None:
+        nonlocal has_queued_sentence
+        sentence = sentence.strip()
+        if sentence:
+            await queue.put(sentence)
+            has_queued_sentence = True
 
-    async def on_update(update: str) -> None:
+    async def queue_final_text(final_text: str) -> None:
+        for sentence in re.split(r"(?<=[.!?…])\s+", final_text):
+            await queue_sentence(sentence)
+
+    async def on_update(event: StreamEvent) -> None:
         nonlocal first_token_ms
-        if not update or update.startswith("🔧"):
+        if not isinstance(event, StreamEvent):
             return
-        round_id = getattr(update, "round_id", None)
-        if round_id is not None:
-            previous_round = stream_state["round_id"]
-            if previous_round is not None and round_id != previous_round:
-                await flush_round()
-            stream_state["round_id"] = round_id
-        if first_token_ms is None:
-            first_token_ms = round((time.perf_counter() - started_at) * 1000, 1)
-        stream_state["full"], delta = _update_delta(stream_state["full"], str(update))
-        if not delta:
+        if event.kind == "attempt_start":
+            attempts[event.attempt_id] = {
+                "pending": "",
+                "deferred": has_queued_sentence,
+            }
             return
-        if stream_state["pending"] and delta and not stream_state["pending"][-1].isspace() and not delta[0].isspace():
-            delta = " " + delta
-        stream_state["pending"] += delta
-        sentences = re.split(r"(?<=[.!?…])\s+", stream_state["pending"])
-        if len(sentences) > 1:
-            for sentence in sentences[:-1]:
-                if sentence.strip():
-                    await queue.put(sentence.strip())
-            stream_state["pending"] = sentences[-1]
+        if event.kind == "attempt_abort":
+            attempts.pop(event.attempt_id, None)
+            return
+        if event.kind == "delta":
+            if first_token_ms is None and event.text_delta:
+                first_token_ms = round((time.perf_counter() - started_at) * 1000, 1)
+            state = attempts.get(event.attempt_id)
+            if state is None:
+                return
+            pending = str(state["pending"]) + event.text_delta
+            sentences = re.split(r"(?<=[.!?…])\s+", pending)
+            if len(sentences) > 1:
+                if not state["deferred"]:
+                    for sentence in sentences[:-1]:
+                        await queue_sentence(sentence)
+                state["pending"] = sentences[-1]
+            else:
+                state["pending"] = pending
+            return
+        if event.kind == "attempt_end":
+            state = attempts.pop(event.attempt_id, None)
+            if state is None:
+                return
+            pending = str(state["pending"])
+            if _sentence_complete(pending) and not state["deferred"]:
+                await queue_sentence(pending)
 
     async def produce_response() -> None:
         try:
             reply, _trace = await orch.voice_respond(text, stream_cb=on_update)
             reply = reply or ""
-            if not stream_state["full"] or reply.startswith(stream_state["full"]):
-                await on_update(reply)
-            await flush_round(final=True)
             response.append((reply or None, None))
+            await queue.join()
+            spoken_text = _normalized_speech(" ".join(spoken_sentences))
+            final_text = _normalized_speech(reply)
+            if not final_text:
+                remainder = ""
+            elif final_text.startswith(spoken_text):
+                remainder = final_text[len(spoken_text):].strip()
+            else:
+                remainder = f"Korrektur: {reply}".strip()
+            if remainder:
+                await queue_final_text(remainder)
+            await queue.join()
         except Exception as exc:
             response.append((None, exc))
             log.error("Voice-Cloud-Antwort fehlgeschlagen: %s", exc)
         finally:
-            if stream_state["pending"].strip():
-                await flush_round(final=True)
             await queue.put(None)
 
     async def synthesize_sentences() -> None:
         nonlocal sequence, first_tts_block_ms
         while True:
             sentence = await queue.get()
-            if sentence is None:
-                return
-            stream = synthesize_stream(sentence).__aiter__()
+            stream = None
             try:
+                if sentence is None:
+                    return
+                stream = synthesize_stream(sentence).__aiter__()
+                completed = False
+                has_audio = False
                 while True:
                     try:
                         ogg = await anext(stream)
                     except StopAsyncIteration:
+                        completed = True
                         break
                     except Exception as exc:
                         log.error("TTS-Streaming fehlgeschlagen: %s", exc)
@@ -209,16 +234,21 @@ async def sende_streaming_antwort(
                         "seq": sequence,
                         "b64": base64.b64encode(ogg).decode("ascii"),
                     })
+                    has_audio = has_audio or bool(ogg)
                     if first_tts_block_ms is None:
                         first_tts_block_ms = round((time.perf_counter() - started_at) * 1000, 1)
                     sequence += 1
+                if completed and has_audio:
+                    spoken_sentences.append(sentence)
             finally:
-                close = getattr(stream, "aclose", None)
-                if close is not None:
-                    try:
-                        await close()
-                    except Exception as exc:
-                        log.debug("TTS-Stream konnte nicht geschlossen werden: %s", exc)
+                if stream is not None:
+                    close = getattr(stream, "aclose", None)
+                    if close is not None:
+                        try:
+                            await close()
+                        except Exception as exc:
+                            log.debug("TTS-Stream konnte nicht geschlossen werden: %s", exc)
+                queue.task_done()
 
     responder = asyncio.create_task(produce_response())
     sender = asyncio.create_task(synthesize_sentences())

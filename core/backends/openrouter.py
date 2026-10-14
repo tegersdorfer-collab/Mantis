@@ -213,7 +213,6 @@ class OpenRouterBackend(AgentBackend):
         calls_by_index: dict[int, dict] = {}
         usage = None
         generation_id = None
-        last_len = 0
         completed = False
         finish_reason = None
 
@@ -260,14 +259,10 @@ class OpenRouterBackend(AgentBackend):
                         raise RuntimeError("OpenRouter-Stream enthält ein ungültiges Delta")
                     if delta.get("content"):
                         parts.append(delta["content"])
-                        full = "".join(parts)
-                        min_progress_chars = 1 if self._purpose == "voice" else 50
-                        if len(full) - last_len >= min_progress_chars:
-                            last_len = len(full)
-                            try:
-                                await stream_cb(full)
-                            except Exception:
-                                pass
+                        try:
+                            await stream_cb(delta["content"])
+                        except Exception:
+                            pass
                     for frag in delta.get("tool_calls") or []:
                         idx = frag.get("index", 0)
                         slot = calls_by_index.setdefault(idx, {"id": "", "name": "", "arguments": ""})
@@ -301,11 +296,6 @@ class OpenRouterBackend(AgentBackend):
             raise
 
         self._record_usage(usage, generation_id)
-        if full and not tool_calls:
-            try:
-                await stream_cb(full)
-            except Exception:
-                pass
         return full, tool_calls
 
     def _record_usage(self, usage: dict | None, generation_id: str | None = None) -> None:

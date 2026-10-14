@@ -67,10 +67,10 @@ class BackendLLMAdapter(LLMProvider):
         temperature: float = 0.7,
         max_tokens: int = 1024,
     ) -> AsyncIterator[str]:
-        latest = [""]
+        parts: list[str] = []
 
-        async def on_progress(text: str) -> None:
-            latest[0] = text
+        async def on_progress(text_delta: str) -> None:
+            parts.append(text_delta)
 
         text, _ = await self.backend.call(
             messages=self._messages(messages, system, None),
@@ -79,7 +79,7 @@ class BackendLLMAdapter(LLMProvider):
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        yield text or latest[0]
+        yield text or "".join(parts)
 
     async def embed(self, text: str) -> list[float]:
         raise NotImplementedError("Agent-Backends unterstützen keine Embeddings")

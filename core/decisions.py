@@ -298,18 +298,31 @@ async def tool_categories(text: str) -> tuple[set[str], bool | None] | None:
         for cat, desc in TOOL_CATEGORY_DESCRIPTIONS.items()
     }
     questions["aktion"] = Q_ACTION
-    answers = await _jev_then_cloud_answers(text, questions)
+    answers = await _jev_answers(text, questions)
+    # Auf dem Jev-Erfolgspfad gelten die eigenen p-Schwellen unten direkt.
+    # Nur bei Cloud-Fallback müssen die Kategorieantworten im ACT-Band liegen;
+    # eine unsichere Aktionsantwort blockiert erkannte Kategorien nicht.
+    from_jev = answers is not None and set(answers) == set(questions) and not any(
+        not isinstance(answer, decide.Answer) or answer.kind != "noul"
+        for answer in answers.values()
+    )
+    if not from_jev:
+        answers = await _cloud_answers(text, questions)
     if answers is None or set(answers) != set(questions):
+        return None
+    if not from_jev and any(
+        not _answer_is_act(name, answers[name], question)
+        for name, question in questions.items()
+        if name != "aktion"
+    ):
         return None
     for name, ans in answers.items():
         if not isinstance(ans, decide.Answer) or ans.kind != "noul":
             return None
         if name == "aktion":
-            continue  # Unsichere Aktionswerte blockieren sicher erkannte Kategorien nicht.
+            continue
         b = band(_jev_answer(ans), BANDS.get(name, _DEFAULT))
         await asyncio.to_thread(_log, name, ans, b, text)
-        if b is not Band.ACT:
-            return None
     cats = {cat for cat in TOOL_CATEGORY_DESCRIPTIONS if answers[f"cat:{cat}"].p >= TOOL_CATEGORY_P}
     a = answers["aktion"]
     aktion: bool | None = None

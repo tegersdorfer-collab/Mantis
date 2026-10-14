@@ -87,7 +87,7 @@ def test_tool_call_then_answer(echo_tool):
     assert "tool" in roles
 
 
-def test_stream_updates_carry_the_agent_model_round(echo_tool):
+def test_stream_events_mark_tool_rounds_as_nonfinal(echo_tool):
     class StreamingBackend(FakeBackend):
         def __init__(self):
             super().__init__([("", [_tc("echo", {"text": "hi"})]), ("Fertig.", [])])
@@ -105,13 +105,92 @@ def test_stream_updates_carry_the_agent_model_round(echo_tool):
     received = []
 
     async def collect(update):
-        received.append((str(update), getattr(update, "round_id", None)))
+        received.append(update)
 
     asyncio.run(Agent(backend).run(
         [{"role": "user", "content": "hi"}], system="s", stream_cb=collect,
     ))
 
-    assert received == [("Zwischenstand", 0), ("🔧 …", 0), ("Fertig.", 1)]
+    assert [event.kind for event in received] == [
+        "attempt_start", "delta", "attempt_end",
+        "attempt_start", "delta", "attempt_end",
+    ]
+    assert [event.text_delta for event in received if event.kind == "delta"] == [
+        "Zwischenstand", "Fertig.",
+    ]
+    starts = [event for event in received if event.kind == "attempt_start"]
+    assert starts[0].attempt_id != starts[1].attempt_id
+    assert [event.final for event in received if event.kind == "attempt_end"] == [False, True]
+
+
+def test_math_guard_retry_streams_with_a_new_attempt_id(echo_tool):
+    class StreamingBackend(FakeBackend):
+        def __init__(self):
+            super().__init__([
+                ("Der Mittelwert ~ 73 pro Tag", []),
+                ("Die geprüfte Antwort ist 73.", []),
+            ])
+            self.stream_callbacks = []
+
+        async def call(self, messages, tools=None, stream_cb=None,
+                       temperature=0.7, max_tokens=1500, think=False,
+                       force_tool_call=False):
+            self.stream_callbacks.append(stream_cb)
+            response = self.responses.pop(0)
+            if stream_cb is not None:
+                await stream_cb(response[0])
+            return response
+
+    backend = StreamingBackend()
+    events = []
+
+    async def collect(event):
+        events.append(event)
+
+    text, _ = asyncio.run(Agent(backend).run(
+        [{"role": "user", "content": "rechne"}], system="s", stream_cb=collect,
+    ))
+
+    assert text == "Die geprüfte Antwort ist 73."
+    assert all(callback is not None for callback in backend.stream_callbacks)
+    starts = [event for event in events if getattr(event, "kind", None) == "attempt_start"]
+    assert len(starts) == 2
+    assert len({event.attempt_id for event in starts}) == 2
+    assert [(event.kind, event.final) for event in events if getattr(event, "kind", None) == "attempt_end"] == [
+        ("attempt_end", False), ("attempt_end", True),
+    ]
+
+
+def test_tool_round_streams_have_distinct_attempt_ids(echo_tool):
+    class StreamingBackend(FakeBackend):
+        async def call(self, messages, tools=None, stream_cb=None,
+                       temperature=0.7, max_tokens=1500, think=False,
+                       force_tool_call=False):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            response = self.responses.pop(0)
+            if stream_cb is not None:
+                await stream_cb("Suche abgeschlossen." if response[1] else response[0])
+            return response
+
+    backend = StreamingBackend([
+        ("", [_tc("echo", {"text": "hi"})]),
+        ("Fertig.", []),
+    ])
+    events = []
+
+    async def collect(event):
+        events.append(event)
+
+    asyncio.run(Agent(backend).run(
+        [{"role": "user", "content": "x"}], system="s", stream_cb=collect,
+    ))
+
+    starts = [event for event in events if getattr(event, "kind", None) == "attempt_start"]
+    assert len(starts) == 2
+    assert len({event.attempt_id for event in starts}) == 2
+    assert [(event.kind, event.final) for event in events if getattr(event, "kind", None) == "attempt_end"] == [
+        ("attempt_end", False), ("attempt_end", True),
+    ]
 
 
 def test_math_guard_executes_retry_tool_calls(echo_tool):

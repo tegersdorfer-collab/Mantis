@@ -4,13 +4,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import asyncio
 import base64
 import time
-import pytest
 
 from fastapi.testclient import TestClient
 from unittest.mock import patch
 from starlette.websockets import WebSocketDisconnect
 
-from core.agent import StreamUpdate
+from core.stream_events import StreamEvent
 from web.routers.voice import build_router, sende_antwort, sende_streaming_antwort
 from fastapi import FastAPI
 
@@ -44,6 +43,22 @@ class FakeWebSocket:
 
     async def send_json(self, data):
         self.gesendet.append(data)
+
+
+def attempt_start(attempt_id):
+    return StreamEvent("attempt_start", attempt_id)
+
+
+def delta(attempt_id, text_delta):
+    return StreamEvent("delta", attempt_id, text_delta=text_delta)
+
+
+def attempt_end(attempt_id, final):
+    return StreamEvent("attempt_end", attempt_id, final=final)
+
+
+def attempt_abort(attempt_id):
+    return StreamEvent("attempt_abort", attempt_id)
 
 
 class TestSendeAntwort:
@@ -129,10 +144,12 @@ def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkey
 
         async def voice_respond(self, text, stream_cb=None):
             assert callable(stream_cb)
-            await stream_cb("Erster Satz. ")
+            await stream_cb(attempt_start("voice-1"))
+            await stream_cb(delta("voice-1", "Erster Satz. "))
             await audio_ready.wait()
             timeline.append("llm-finished")
-            await stream_cb("Zweiter Satz.")
+            await stream_cb(delta("voice-1", "Zweiter Satz."))
+            await stream_cb(attempt_end("voice-1", final=True))
             return "Erster Satz. Zweiter Satz.", []
 
     async def fake_tts(sentence, **kwargs):
@@ -167,23 +184,16 @@ def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkey
     assert logged[0][2]["stage"] == "Backend"
 
 
-@pytest.mark.parametrize(
-    ("updates", "expected"),
-    [
-        (["Es", "Es ist sonnig."], "Es ist sonnig."),
-        (["Es", "sag sonnig."], "Es sag sonnig."),
-    ],
-)
-def test_voice_stream_emits_each_same_round_sentence_once(
-    monkeypatch, updates, expected,
-):
+def test_voice_stream_appends_real_deltas_without_splitting_words(monkeypatch):
     spoken = []
 
     class FakeOrchestrator:
         async def voice_respond(self, _text, stream_cb=None):
-            for update in updates:
-                await stream_cb(update)
-            return expected, []
+            await stream_cb(attempt_start("weather-1"))
+            await stream_cb(delta("weather-1", "Es ist son"))
+            await stream_cb(delta("weather-1", "nig."))
+            await stream_cb(attempt_end("weather-1", final=True))
+            return "Es ist sonnig.", []
 
     async def fake_tts(sentence, **_kwargs):
         spoken.append(sentence)
@@ -194,22 +204,72 @@ def test_voice_stream_emits_each_same_round_sentence_once(
 
     asyncio.run(sende_streaming_antwort(FakeWebSocket(), "Wetter?", FakeOrchestrator()))
 
-    assert spoken == [expected]
+    assert spoken == ["Es ist sonnig."]
 
 
-def test_voice_stream_keeps_legitimate_repetitions_between_model_rounds(monkeypatch):
+def test_voice_stream_discards_unfinished_provider_attempt_on_fallback(monkeypatch):
     spoken = []
-
-    class RoundUpdate(str):
-        def __new__(cls, text, round_id):
-            update = super().__new__(cls, text)
-            update.round_id = round_id
-            return update
 
     class FakeOrchestrator:
         async def voice_respond(self, _text, stream_cb=None):
-            await stream_cb(RoundUpdate("Zur Probe: Los.", 0))
-            await stream_cb(RoundUpdate("Los. Los!", 1))
+            await stream_cb(attempt_start("openrouter-1"))
+            await stream_cb(delta("openrouter-1", "Unfertiger Entwurf"))
+            await stream_cb(attempt_abort("openrouter-1"))
+            await stream_cb(attempt_start("anthropic-2"))
+            await stream_cb(delta("anthropic-2", "Fertige Antwort."))
+            await stream_cb(attempt_end("anthropic-2", final=True))
+            return "Fertige Antwort.", []
+
+    async def fake_tts(sentence, **_kwargs):
+        spoken.append(sentence)
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+
+    asyncio.run(sende_streaming_antwort(FakeWebSocket(), "Sag etwas", FakeOrchestrator()))
+
+    assert spoken == ["Fertige Antwort."]
+
+
+def test_voice_stream_speaks_correction_when_math_guard_changes_answer(monkeypatch):
+    spoken = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            await stream_cb(attempt_start("math-draft"))
+            await stream_cb(delta("math-draft", "Das Ergebnis ist 4."))
+            await stream_cb(attempt_end("math-draft", final=False))
+            await stream_cb(attempt_start("math-retry"))
+            await stream_cb(delta("math-retry", "Das Ergebnis ist 5."))
+            await stream_cb(attempt_end("math-retry", final=True))
+            return "Das Ergebnis ist 5.", []
+
+    async def fake_tts(sentence, **_kwargs):
+        spoken.append(sentence)
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+
+    ws = FakeWebSocket()
+    asyncio.run(sende_streaming_antwort(ws, "Rechne", FakeOrchestrator()))
+
+    assert spoken == ["Das Ergebnis ist 4.", "Korrektur: Das Ergebnis ist 5."]
+    assert ws.gesendet[-2]["reply"] == "Das Ergebnis ist 5."
+
+
+def test_voice_stream_preserves_legitimate_repetition_across_attempts(monkeypatch):
+    spoken = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            await stream_cb(attempt_start("tool-round"))
+            await stream_cb(delta("tool-round", "Los."))
+            await stream_cb(attempt_end("tool-round", final=False))
+            await stream_cb(attempt_start("final-round"))
+            await stream_cb(delta("final-round", "Los!"))
+            await stream_cb(attempt_end("final-round", final=True))
             return "Los. Los!", []
 
     async def fake_tts(sentence, **_kwargs):
@@ -221,29 +281,7 @@ def test_voice_stream_keeps_legitimate_repetitions_between_model_rounds(monkeypa
 
     asyncio.run(sende_streaming_antwort(FakeWebSocket(), "Sag los", FakeOrchestrator()))
 
-    assert spoken == ["Zur Probe: Los.", "Los.", "Los!"]
-
-
-def test_voice_stream_discards_incomplete_cumulative_text_from_prior_rounds(monkeypatch):
-    spoken = []
-
-    class FakeOrchestrator:
-        async def voice_respond(self, _text, stream_cb=None):
-            await stream_cb(StreamUpdate("E", 0))
-            await stream_cb(StreamUpdate("Es", 1))
-            await stream_cb(StreamUpdate("Es ist sonnig.", 2))
-            return "Es ist sonnig.", []
-
-    async def fake_tts(sentence, **_kwargs):
-        spoken.append(sentence)
-        yield b"audio"
-
-    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
-    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
-
-    asyncio.run(sende_streaming_antwort(FakeWebSocket(), "Wie wird das Wetter?", FakeOrchestrator()))
-
-    assert spoken == ["Es ist sonnig."]
+    assert spoken == ["Los.", "Los!"]
 
 
 def test_voice_stream_disconnect_cancels_agent_generation(monkeypatch):
@@ -259,7 +297,8 @@ def test_voice_stream_disconnect_cancels_agent_generation(monkeypatch):
     class SlowOrchestrator:
         async def voice_respond(self, _text, stream_cb=None):
             try:
-                await stream_cb("Ein Satz. ")
+                await stream_cb(attempt_start("disconnect"))
+                await stream_cb(delta("disconnect", "Ein Satz. "))
                 await never.wait()
             except asyncio.CancelledError:
                 cancelled.set()

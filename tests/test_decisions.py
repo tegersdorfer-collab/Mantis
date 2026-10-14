@@ -252,6 +252,34 @@ def test_tool_categories_jev_down_ist_none():
         assert asyncio.run(decisions.tool_categories("x")) is None
 
 
+@pytest.mark.parametrize(
+    ("category_p", "action_p", "expected_action"),
+    [(0.65, 0.9, True), (0.95, 0.55, None)],
+)
+def test_tool_category_threshold_is_independent_of_action_uncertainty(
+    monkeypatch, category_p, action_p, expected_action,
+):
+    answers = {
+        f"cat:{category}": _noul(0.02)
+        for category in decisions.TOOL_CATEGORY_DESCRIPTIONS
+    }
+    answers["cat:flipper"] = _noul(category_p)
+    answers["aktion"] = _noul(action_p)
+
+    async def jev(_state, questions):
+        return {name: answer for name, answer in answers.items() if name in questions}
+
+    async def cloud_unavailable(_state, _questions):
+        raise local_decide.LocalDecisionUnavailable("Cloud ausgefallen")
+
+    monkeypatch.setattr(decisions.decide, "decide", jev)
+    monkeypatch.setattr(local_decide, "score", cloud_unavailable)
+
+    assert asyncio.run(decisions.tool_categories("Lampe")) == (
+        {"flipper"}, expected_action,
+    )
+
+
 def test_beschreibungen_decken_registry_kategorien():
     """Jede Tool-Kategorie in der REGISTRY braucht eine Beschreibung, sonst kann Jev sie nie wählen."""
     import core.skills  # noqa: F401  (registriert alle Tools)

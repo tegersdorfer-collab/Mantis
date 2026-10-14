@@ -214,7 +214,7 @@ class ClaudeBackend(AgentBackend):
                     ):
                         collected += event.delta.text
                         try:
-                            await stream_cb(collected)
+                            await stream_cb(event.delta.text)
                         except Exception:
                             pass
             final = await stream.get_final_message()

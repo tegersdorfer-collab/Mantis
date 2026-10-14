@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from core import db
 from core.status import BUS
+from core.stream_events import StreamEvent
 
 from web.routers._helpers import _jsonable
 
@@ -44,8 +45,18 @@ def build_router(orch=None) -> APIRouter:
             return JSONResponse({"error": "kein Kern"}, 503)
         q: asyncio.Queue = asyncio.Queue()
 
-        async def cb(full):
-            await q.put({"partial": full})
+        partials: dict[str, str] = {}
+
+        async def cb(event: StreamEvent):
+            if event.kind == "attempt_start":
+                partials[event.attempt_id] = ""
+                await q.put({"partial": ""})
+            elif event.kind == "delta":
+                partials[event.attempt_id] = partials.get(event.attempt_id, "") + event.text_delta
+                await q.put({"partial": partials[event.attempt_id]})
+            elif event.kind == "attempt_abort":
+                partials.pop(event.attempt_id, None)
+                await q.put({"partial": ""})
 
         async def run():
             try:

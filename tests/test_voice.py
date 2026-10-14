@@ -264,6 +264,28 @@ class TestIsAddressedToMantis:
         jev.assert_awaited_once()
         fast.assert_awaited_once()
 
+    def test_jev_und_cloud_fallback_teilen_sich_eine_deadline(self, monkeypatch):
+        monkeypatch.setattr(voice, "VOICE_ADDRESS_TIMEOUT_S", 0.04, raising=False)
+        calls = []
+
+        async def slow_jev(_text):
+            calls.append("jev")
+            await asyncio.sleep(0.03)
+            return None
+
+        async def slow_cloud(_question):
+            calls.append("cloud")
+            await asyncio.sleep(0.03)
+            return True
+
+        monkeypatch.setattr("core.decisions.voice_address", slow_jev)
+        monkeypatch.setattr("core.fast.yes_no", slow_cloud)
+
+        result = asyncio.run(voice.is_addressed_to_mantis("Bitte hilf mir"))
+
+        assert result is False
+        assert calls == ["jev", "cloud"]
+
     def test_ohne_namen_faellt_auf_kleines_modell_zurueck_nein(self):
         with patch("core.fast.yes_no", new=AsyncMock(return_value=False)):
             result = asyncio.run(voice.is_addressed_to_mantis("Ich rede gerade mit jemand anderem"))
@@ -319,14 +341,15 @@ def test_address_check_uses_fast_cloud_variant_directly():
     )
 
 
-def test_address_check_timeout_fails_closed_within_three_seconds():
-    from unittest.mock import AsyncMock, patch
-    async def timeout_before_provider(coro, timeout):
-        coro.close()
-        raise TimeoutError
+def test_address_check_timeout_during_jev_fails_closed(monkeypatch):
+    monkeypatch.setattr(voice, "VOICE_ADDRESS_TIMEOUT_S", 0.01, raising=False)
 
-    with patch("core.voice.fast.yes_no", new=AsyncMock()) as fast, \
-         patch("core.voice.asyncio.wait_for", side_effect=timeout_before_provider) as wait_for:
-        assert asyncio.run(voice.is_addressed_to_mantis("mach das Licht an")) is False
-    fast.assert_called_once()
-    assert wait_for.call_args.kwargs["timeout"] <= 3
+    async def slow_jev(_text):
+        await asyncio.sleep(0.05)
+
+    fast = AsyncMock(return_value=True)
+    monkeypatch.setattr("core.decisions.voice_address", slow_jev)
+    monkeypatch.setattr("core.voice.fast.yes_no", fast)
+
+    assert asyncio.run(voice.is_addressed_to_mantis("mach das Licht an")) is False
+    fast.assert_not_awaited()

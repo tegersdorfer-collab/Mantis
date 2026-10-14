@@ -442,7 +442,7 @@ class ChatGPTPlanBackend(AgentBackend):
                         text_parts.append(delta)
                         if stream_cb:
                             try:
-                                await stream_cb("".join(text_parts))
+                                await stream_cb(delta)
                             except Exception:
                                 pass
                     elif event_type == "response.output_item.done":
@@ -471,7 +471,7 @@ class ChatGPTPlanBackend(AgentBackend):
                         if not text and text_parts:
                             text = "".join(text_parts)
                         record_usage_once()
-                        if stream_cb and text and text != "".join(text_parts):
+                        if stream_cb and text and not text_parts:
                             try:
                                 await stream_cb(text)
                             except Exception:

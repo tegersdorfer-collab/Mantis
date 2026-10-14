@@ -9,6 +9,7 @@ import pytest
 
 from core.backends.base import AgentBackend
 from core.backends.fallback import AllBackendsFailedError, FallbackBackend
+from core.agent import Agent
 
 
 class FakeBackend(AgentBackend):
@@ -80,6 +81,44 @@ class TestFailover:
         fb = FallbackBackend(primary, fallback, timeout_s=0.05)
         text, _ = _call(fb)
         assert text == "von qwen"
+
+    def test_stream_failover_aborts_old_attempt_and_starts_a_new_one(self):
+        class PartialFailure(FakeBackend):
+            async def call(self, messages, tools, stream_cb, temperature, max_tokens,
+                           think=False, force_tool_call=False):
+                self.calls += 1
+                await stream_cb("Unfertiger Entwurf")
+                raise ConnectionError("provider abgebrochen")
+
+        class StreamSuccess(FakeBackend):
+            async def call(self, messages, tools, stream_cb, temperature, max_tokens,
+                           think=False, force_tool_call=False):
+                self.calls += 1
+                await stream_cb("Fertige Antwort.")
+                return "Fertige Antwort.", []
+
+        fb = FallbackBackend(
+            PartialFailure("openrouter"), StreamSuccess("anthropic"), cooldown_s=0,
+        )
+        events = []
+
+        async def collect(event):
+            events.append(event)
+
+        answer, _ = asyncio.run(Agent(fb).run(
+            [{"role": "user", "content": "sag etwas"}], system="s",
+            use_tools=False, stream_cb=collect,
+        ))
+
+        assert answer == "Fertige Antwort."
+        assert [getattr(event, "kind", None) for event in events] == [
+            "attempt_start", "delta", "attempt_abort",
+            "attempt_start", "delta", "attempt_end",
+        ]
+        assert events[1].text_delta == "Unfertiger Entwurf"
+        assert events[4].text_delta == "Fertige Antwort."
+        assert events[0].attempt_id != events[3].attempt_id
+        assert events[-1].final is True
 
     def test_cooldown_skips_primary(self):
         primary = FakeBackend("claude", error=ConnectionError("api down"))

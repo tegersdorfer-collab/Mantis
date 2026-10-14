@@ -43,6 +43,7 @@ _parakeet_unavailable = False
 # "zeig mir das" oder "und morgen?" (kein Name, kein eindeutiger Befehl) ignorieren,
 # weil jede Äußerung isoliert bewertet wird statt als Teil eines laufenden Gesprächs.
 CONVERSATION_FOLLOWUP_WINDOW_S = 15
+VOICE_ADDRESS_TIMEOUT_S = 3.0
 _conversation_active_until = 0.0
 
 
@@ -153,20 +154,21 @@ async def is_addressed_to_mantis(text: str) -> bool:
     if time.monotonic() < _conversation_active_until:
         return True
 
-    try:
-        jev_answer = await decisions.voice_address(stripped)
-        if jev_answer is not None:
-            return jev_answer
-    except Exception as e:
-        log.debug("Jev-Voice-Adresscheck fehlgeschlagen: %s", e)
-
     prompt = (
         f"Ist dieser Satz eine Anfrage oder ein Befehl an einen persönlichen KI-Assistenten "
         f"namens Mantis (nicht nur Small Talk mit jemand anderem im Raum), auch wenn der Name "
         f"'Mantis' nicht genannt wird?\n\n\"{stripped}\""
     )
     try:
-        return await asyncio.wait_for(fast.yes_no(prompt), timeout=3.0)
+        async with asyncio.timeout(VOICE_ADDRESS_TIMEOUT_S):
+            try:
+                jev_answer = await decisions.voice_address(stripped)
+            except Exception as e:
+                log.debug("Jev-Voice-Adresscheck fehlgeschlagen: %s", e)
+                jev_answer = None
+            if jev_answer is not None:
+                return jev_answer
+            return await fast.yes_no(prompt)
     except Exception as e:
         log.debug("Voice-Adress-Check fehlgeschlagen: %s", e)
         return False

@@ -456,3 +456,33 @@ def test_store_false_stream_uses_output_item_done_when_completed_output_is_empty
                       "function": {"name": "lookup", "arguments": {"query": "zahnarzt"}}}]
     text, calls = run(text_events, False)
     assert text == "Hallo!" and calls == []
+
+
+def test_responses_stream_reports_exact_text_deltas(tmp_path, monkeypatch):
+    events = [
+        {"type": "response.output_text.delta", "delta": "Es ist son"},
+        {"type": "response.output_text.delta", "delta": "nig."},
+        {"type": "response.completed", "response": {"status": "completed", "output": []}},
+    ]
+    from core import llm_usage
+    monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: None)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200, content=_sse(*events), headers={"content-type": "text/event-stream"},
+        ),
+    ))
+    backend = ChatGPTPlanBackend(
+        model="gpt-6-luna", auth_file=_auth_file(tmp_path), client=client,
+    )
+    progress = []
+
+    async def stream_cb(text_delta):
+        progress.append(text_delta)
+
+    text, calls = asyncio.run(backend.call(
+        [{"role": "user", "content": "Wie ist das Wetter?"}], None,
+        stream_cb, 0.3, 100,
+    ))
+
+    assert text == "Es ist sonnig." and calls == []
+    assert progress == ["Es ist son", "nig."]

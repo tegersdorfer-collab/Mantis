@@ -87,7 +87,7 @@ def test_haiku_55_cost_uses_explicit_estimated_price_table_entry():
     assert cost_usd("claude-haiku-5-5", 1_000_000, 1_000_000) == 6.0
 
 
-def _sdk_message_events(*, include_message_stop):
+def _sdk_message_events(*, include_message_stop, text_deltas=("answer",)):
     events = [
         {
             "type": "message_start",
@@ -107,11 +107,14 @@ def _sdk_message_events(*, include_message_stop):
             "index": 0,
             "content_block": {"type": "text", "text": ""},
         },
-        {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": "answer"},
-        },
+        *[
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            }
+            for text in text_deltas
+        ],
         {
             "type": "content_block_stop",
             "index": 0,
@@ -130,11 +133,13 @@ def _sdk_message_events(*, include_message_stop):
     )
 
 
-def _call_claude_with_sdk_events(*, include_message_stop):
+def _call_claude_with_sdk_events(*, include_message_stop, text_deltas=("answer",)):
     async def call():
         transport = httpx.MockTransport(lambda _request: httpx.Response(
             200,
-            content=_sdk_message_events(include_message_stop=include_message_stop),
+            content=_sdk_message_events(
+                include_message_stop=include_message_stop, text_deltas=text_deltas,
+            ),
             headers={"content-type": "text/event-stream"},
         ))
         async with httpx.AsyncClient(transport=transport) as http_client:
@@ -169,6 +174,15 @@ def test_haiku_stream_accepts_sdk_stream_ending_with_message_stop():
 
     assert result == ("answer", [])
     assert collected == ["answer"]
+
+
+def test_haiku_stream_reports_exact_text_deltas():
+    result, collected = _call_claude_with_sdk_events(
+        include_message_stop=True, text_deltas=("Es ist son", "nig."),
+    )
+
+    assert result == ("Es ist sonnig.", [])
+    assert collected == ["Es ist son", "nig."]
 
 
 def test_haiku_tool_use_rejects_missing_required_arguments():
