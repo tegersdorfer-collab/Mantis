@@ -14,6 +14,7 @@ import config
 
 log = logging.getLogger(__name__)
 
+_FAST_PURPOSES = ("voice", "fast")
 _TEMPERATURE_UNSUPPORTED_MODEL_PREFIXES = ("claude-haiku-5-5",)
 
 
@@ -255,6 +256,12 @@ class ClaudeBackend(AgentBackend):
             )
         if force_tool_call and tools:
             kwargs["tool_choice"] = {"type": "any"}
+        if self._purpose in _FAST_PURPOSES and self._model.casefold().startswith("claude-haiku-5-5"):
+            # Haiku 5.5 denkt standardmäßig adaptiv (+0,3–0,5 s). "disabled" ist nur bei
+            # Effort <= high erlaubt; "low" ist der Voice-Standard.
+            if config.ANTHROPIC_FAST_THINKING_DISABLED:
+                kwargs["thinking"] = {"type": "disabled"}
+            kwargs["output_config"] = {"effort": config.ANTHROPIC_FAST_EFFORT}
 
         if stream_cb:
             collected = ""
@@ -305,6 +312,8 @@ class ClaudeBackend(AgentBackend):
             from core import llm_usage
             u = getattr(response, "usage", None)
             if u:
+                from core import voice_timing
+                voice_timing.note_output_tokens(getattr(u, "output_tokens", None))
                 llm_usage.record("claude", self._model,
                                  getattr(u, "input_tokens", 0) or 0,
                                  getattr(u, "output_tokens", 0) or 0,

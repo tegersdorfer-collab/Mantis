@@ -14,6 +14,7 @@ import logging
 import re
 
 from core import tools as toolreg
+from core import voice_timing
 from core.db import log_event
 from core.status import BUS
 from core.backends.base import AgentBackend, AttemptEventCb
@@ -49,6 +50,27 @@ class Agent:
         think: bool = False,
         force_tool_call: bool = False,
     ) -> tuple[str, list[dict], str | None]:
+        timer = voice_timing.LlmCall()
+        content, tool_calls, attempt_id = await self._call_backend_inner(
+            messages, tools=tools, stream_cb=stream_cb, temperature=temperature,
+            max_tokens=max_tokens, think=think, force_tool_call=force_tool_call,
+            timer=timer,
+        )
+        timer.finish(tool_calls)
+        return content, tool_calls, attempt_id
+
+    async def _call_backend_inner(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None,
+        stream_cb: StreamCb | None,
+        temperature: float,
+        max_tokens: int,
+        think: bool = False,
+        force_tool_call: bool = False,
+        timer: "voice_timing.LlmCall",
+    ) -> tuple[str, list[dict], str | None]:
         if stream_cb is None:
             content, tool_calls = await self._backend.call(
                 messages, tools=tools, stream_cb=None,
@@ -61,6 +83,8 @@ class Agent:
             active_attempt_id: list[str | None] = [None]
 
             async def report_event(event: StreamEvent) -> None:
+                if event.kind == "delta" and event.text_delta:
+                    timer.mark_first_token()
                 if event.kind == "attempt_start":
                     active_attempt_id[0] = event.attempt_id
                 elif event.kind == "attempt_abort" and active_attempt_id[0] == event.attempt_id:
@@ -79,6 +103,8 @@ class Agent:
         await stream_cb(StreamEvent("attempt_start", attempt_id))
 
         async def report_delta(text_delta: str) -> None:
+            if text_delta:
+                timer.mark_first_token()
             await stream_cb(StreamEvent("delta", attempt_id, text_delta=text_delta))
 
         try:
@@ -230,7 +256,8 @@ class Agent:
                 elif dry_run_tools:
                     result = f"[Eval-Dry-Run] Tool '{name}' würde ausgeführt (Argumente akzeptiert)."
                 else:
-                    result = await toolreg.execute(name, args)
+                    with voice_timing.phase("tool_exec_ms"):
+                        result = await toolreg.execute(name, args)
                 trace.append({"tool": name, "args": args, "result": result[:500]})
                 if not dry_run_tools:
                     if name.startswith("inbox_"):

@@ -372,3 +372,33 @@ def test_voice_stream_latency_uses_turn_start_before_stt(monkeypatch):
     ))
 
     assert logged[0][2]["total_ms"] >= 80
+
+
+def test_voice_latency_event_contains_phase_timings(monkeypatch):
+    logged = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            from core import voice_timing
+            timing = voice_timing.current()
+            timing.tool_select_ms = 12.0
+            timing.context_ms = 30.0
+            timing.tool_exec_ms = 5.0
+            timing.llm_calls.append({
+                "ms_to_first_token": 100.0, "ms_total": 200.0,
+                "output_tokens": 9, "had_tool_calls": False,
+            })
+            return "Hallo.", []
+
+    async def fake_tts(sentence, **_kwargs):
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+    asyncio.run(sende_streaming_antwort(FakeWebSocket(), "Hi", FakeOrchestrator(), stt_ms=1, address_check_ms=1))
+
+    detail = logged[0][2]
+    for key in ("tool_select_ms", "context_ms", "tool_exec_ms"):
+        assert isinstance(detail[key], (int, float))
+    assert detail["context_ms"] == 30.0
+    assert detail["llm_calls"][0]["output_tokens"] == 9

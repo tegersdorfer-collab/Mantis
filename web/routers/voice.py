@@ -18,7 +18,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 
-from core import db
+from core import db, voice_timing
 from core.voice import transcribe_audio, is_addressed_to_mantis, mark_conversation_active, _conversation_active
 from core.voice_stream import VoiceStreamSession
 from core.stream_events import StreamEvent
@@ -55,6 +55,7 @@ def _record_voice_latency(
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
         "model": model,
         "stage": stage,
+        **voice_timing.snapshot(),
     }
     log.info("voice_latency %s", detail)
     db.log_event("voice_latency", "Voice-Turn", detail)
@@ -250,6 +251,7 @@ async def sende_streaming_antwort(
                             log.debug("TTS-Stream konnte nicht geschlossen werden: %s", exc)
                 queue.task_done()
 
+    voice_timing.start()
     responder = asyncio.create_task(produce_response())
     sender = asyncio.create_task(synthesize_sentences())
     response_error = None
@@ -321,6 +323,7 @@ def build_router(orch=None) -> APIRouter:
                 addressed = False
 
             if addressed and orch is not None:
+                voice_timing.start()
                 reply, _trace = await orch.voice_respond(text)
                 mark_conversation_active()
                 try:
@@ -410,6 +413,7 @@ def build_router(orch=None) -> APIRouter:
                 first_tts_block_ms = None
                 reply = None
                 if orch is not None:
+                    voice_timing.start()
                     reply, _trace = await orch.voice_respond(text)
                     mark_conversation_active()
 

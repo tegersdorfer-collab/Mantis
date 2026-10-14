@@ -16,7 +16,7 @@ from core.background_review import run_background_review
 from memory.chat_messages import is_safe_for_prompt
 from core.status import BUS
 from core.stream_events import StreamEvent
-from core import skills, db, ui_state, fast_commands, skill_request
+from core import skills, db, ui_state, fast_commands, skill_request, voice_timing
 from core.error_redaction import redact_error_text
 from domains.gym.coach import GymCoach, GymResult
 from core.skill_context import INBOX_TURN_CONTEXT, InboxTurnContext
@@ -740,9 +740,16 @@ class MessageHandler:
 
         # Parallel statt sequenziell: der Jev-Roundtrip in select_tools_async läuft
         # während der Prompt gebaut wird, statt hinterherzuhängen.
+        async def _timed_build():
+            with voice_timing.phase("context_ms"):
+                return await self.prompt_builder.build(text)
+
+        async def _timed_select():
+            with voice_timing.phase("tool_select_ms"):
+                return await skills.T.select_tools_async(text)
+
         system, (allowed, force_tools) = await asyncio.gather(
-            self.prompt_builder.build(text),
-            skills.T.select_tools_async(text),
+            _timed_build(), _timed_select(),
         )
         if voice_turn:
             system += "\n\n" + VOICE_RESPONSE_INSTRUCTIONS
