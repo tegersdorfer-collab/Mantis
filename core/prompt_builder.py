@@ -11,6 +11,14 @@ import config
 
 log = logging.getLogger(__name__)
 
+_RECALLLESS_ACKNOWLEDGEMENTS = frozenset({"ja", "nein", "ok", "okay", "mhm", "hm"})
+
+
+def _is_recallless_acknowledgement(text: str) -> bool:
+    """Erkennt knappe Bestätigungen, für die semantischer LZG-Recall nichts ergänzt."""
+    normalized = text.strip().casefold().rstrip(".,!?;:… ")
+    return normalized in _RECALLLESS_ACKNOWLEDGEMENTS
+
 
 class CacheableSystemPrompt(str):
     """Systemtext mit Metadaten, wo der stabile, cachebare Präfix endet."""
@@ -101,7 +109,7 @@ class PromptBuilder:
 
     async def build(self, user_text: str) -> str:
         async def _embed_and_mem():
-            if self.recall_gate(user_text):
+            if _is_recallless_acknowledgement(user_text) or self.recall_gate(user_text):
                 return "—"
             try:
                 embedding = await self.embed_llm.embed(user_text)

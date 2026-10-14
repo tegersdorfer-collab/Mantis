@@ -189,6 +189,7 @@ def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkey
     assert logged[0][2]["address_check_ms"] == 8
     assert logged[0][2]["first_token_ms"] is not None
     assert logged[0][2]["first_tts_block_ms"] is not None
+    assert logged[0][2]["first_answer_audio_ms"] is not None
     assert logged[0][2]["total_ms"] >= logged[0][2]["first_tts_block_ms"]
     assert logged[0][2]["model"] == "openai/gpt-6-luna"
     assert logged[0][2]["stage"] == "Backend"
@@ -288,6 +289,9 @@ def test_ack_filler_uses_fake_clock_precedes_answer_and_is_not_text(monkeypatch)
     assert "Mhm." not in ws.gesendet[-2]["reply"]
     assert logged[0][2]["filler"] == "ack"
     assert logged[0][2]["filler_ms"] == 1000.0
+    assert logged[0][2]["first_tts_block_ms"] is not None
+    # Zeitwerte sind auf 0,1 ms gerundet; die Chunk-Reihenfolge oben prüft den Ablauf.
+    assert logged[0][2]["first_answer_audio_ms"] >= logged[0][2]["first_tts_block_ms"]
 
 
 def test_tool_filler_is_queued_before_answer_and_only_one_filler_is_used(monkeypatch):

@@ -73,6 +73,10 @@ class TestSelectTools:
         names = T.select_tools("Wie ist das Wetter heute?")
         assert "get_weather" in names
 
+    def test_wettervorhersage_fuer_morgen_liefert_wetter_tool(self, registry):
+        names = T.select_tools("Wie wird das Wetter morgen?")
+        assert "get_weather" in names
+
     def test_api_kosten_frage_liefert_system_tools(self, registry):
         names = T.select_tools("Was haben deine API-Kosten diesen Monat verursacht?")
         assert "api_costs" in names

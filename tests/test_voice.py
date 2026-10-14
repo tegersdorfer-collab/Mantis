@@ -487,6 +487,39 @@ class TestIsAddressedToMantis:
         assert result is True
         mock_yes_no.assert_not_called()
 
+    @pytest.mark.parametrize("text", [
+        "Mäntis, wie spät ist es?", "Mann das wie spät ist es?", "Man tis, wie spät ist es?",
+        "Mentis wie spät ist es?", "Manthis wie spät ist es?",
+        "Hey Mantis, wie spät ist es?", "Okay Mantis wie spät ist es?",
+    ])
+    def test_asr_wakeword_varianten_adressieren_ohne_cloud_check(self, text):
+        with patch("core.decisions.voice_address", new=AsyncMock(return_value=None)) as mock_jev, \
+             patch("core.fast.yes_no", new=AsyncMock(return_value=False)) as mock_yes_no:
+            result = asyncio.run(voice.is_addressed_to_mantis(text))
+
+        assert result is True
+        mock_jev.assert_not_awaited()
+        mock_yes_no.assert_not_awaited()
+
+    def test_mantas_is_not_a_wakeword_and_uses_the_normal_address_check(self):
+        text = "Mantas, wie spät ist es?"
+        with patch("core.decisions.voice_address", new=AsyncMock(return_value=None)) as mock_jev, \
+             patch("core.fast.yes_no", new=AsyncMock(return_value=False)) as mock_yes_no:
+            result = asyncio.run(voice.is_addressed_to_mantis(text))
+
+        assert result is False
+        mock_jev.assert_awaited_once_with(text)
+        mock_yes_no.assert_awaited_once()
+
+    def test_mehrdeutiges_mann_das_bleibt_beim_normalen_adresscheck(self):
+        with patch("core.decisions.voice_address", new=AsyncMock(return_value=None)) as mock_jev, \
+             patch("core.fast.yes_no", new=AsyncMock(return_value=False)) as mock_yes_no:
+            result = asyncio.run(voice.is_addressed_to_mantis("Mann, das ist blöd"))
+
+        assert result is False
+        mock_jev.assert_awaited_once()
+        mock_yes_no.assert_awaited_once()
+
     def test_ohne_namen_faellt_auf_kleines_modell_zurueck_ja(self):
         with patch("core.fast.yes_no", new=AsyncMock(return_value=True)) as mock_yes_no:
             result = asyncio.run(voice.is_addressed_to_mantis("Ruf mir die Nacht-Zusammenfassung auf"))
