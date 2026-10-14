@@ -218,12 +218,10 @@ def _warmup_parakeet(model) -> None:
             wav_file.setframerate(16_000)
             wav_file.writeframes(b"\0\0" * 16_000)
         started_at = time.perf_counter()
-        try:
-            model.transcribe(wav_path)
-        finally:
-            stt_runtime.record_stt_runtime(
-                1.0, max(0.0, (time.perf_counter() - started_at) * 1000),
-            )
+        model.transcribe(wav_path)
+        stt_runtime.record_stt_runtime(
+            1.0, max(0.0, (time.perf_counter() - started_at) * 1000),
+        )
     finally:
         if wav_path is not None:
             Path(wav_path).unlink(missing_ok=True)
@@ -335,12 +333,10 @@ async def _transcribe_whisper_locked(audio_path: str) -> str:
 
     try:
         started_at = time.perf_counter()
-        try:
-            segments = await _await_worker_completion(
-                asyncio.to_thread(_whisper_model.transcribe, audio_path)
-            )
-        finally:
-            _record_stt_runtime(audio_path, started_at)
+        segments = await _await_worker_completion(
+            asyncio.to_thread(_whisper_model.transcribe, audio_path)
+        )
+        _record_stt_runtime(audio_path, started_at)
         return " ".join(s.text for s in segments).strip()
     except Exception as e:
         log.error(f"Whisper-Transkription fehlgeschlagen: {e}")

@@ -122,6 +122,15 @@ _DETERMINERS = frozenset({
     "dieser", "diese", "dieses", "diesen", "diesem", "welcher", "welche",
     "welches", "welchen", "welchem",
 })
+_OPEN_PREPOSITIONS = frozenset({
+    "an", "auf", "aus", "bei", "durch", "für", "gegen", "hinter", "in",
+    "neben", "ohne", "über", "um", "unter", "von", "vor", "zwischen",
+    "mit", "nach", "zu", "ab",
+})
+_OPEN_CONJUNCTIONS = _SUBORDINATORS | frozenset({"und", "oder", "aber", "denn"})
+_OPEN_FILLERS = _COMMAND_FILLERS | frozenset({
+    "ähm", "hm", "also", "vielleicht", "gerne", "gern", "danach", "viel", "wieviel",
+})
 _ATTRIBUTIVE_ADJECTIVES = frozenset({
     "beste", "besten", "bester", "bestes", "bestem", "gut", "gute", "guten",
     "guter", "gutes", "gutem", "neu", "neue", "neuen", "neuer", "neues",
@@ -162,6 +171,63 @@ def _has_modal_without_full_verb(words: list[str]) -> bool:
     )
 
 
+def _is_complete_command_particle(words: list[str]) -> bool:
+    return (
+        words[0] in _SEPARABLE_COMMANDS
+        and words[-1] in _SEPARABLE_PARTICLES | _COMMAND_COMPLEMENTS
+        and any(
+            word not in _CONTENT_FUNCTION_WORDS | _COMMAND_FILLERS
+            for word in words[1:-1]
+        )
+    )
+
+
+def _is_closed_question_pronoun(words: list[str]) -> bool:
+    if words[0] not in _QUESTION_WORDS:
+        return False
+    for index, word in enumerate(words[1:], start=1):
+        after_verb = words[index + 1:]
+        if (
+            word in _QUESTION_VERBS
+            and after_verb
+            and after_verb[-1] in _QUESTION_PRONOUNS
+            and all(item in _QUESTION_FUNCTION_WORDS for item in after_verb)
+        ):
+            return True
+    return False
+
+
+def _is_closed_question_particle(words: list[str]) -> bool:
+    if words[0] not in _QUESTION_WORDS or words[-1] not in _SEPARABLE_PARTICLES:
+        return False
+    return any(
+        word in _QUESTION_VERBS
+        and any(item not in _QUESTION_FUNCTION_WORDS for item in words[index + 1:-1])
+        for index, word in enumerate(words[1:-1], start=1)
+    )
+
+
+def _has_open_ending(value: str, words: list[str]) -> bool:
+    first, last = words[0], words[-1]
+    if first in _SUBORDINATORS | {"und", "oder", "aber"} and "," not in value:
+        return True
+    if last in _OPEN_CONJUNCTIONS:
+        return True
+    if _has_modal_without_full_verb(words):
+        return True
+    if _ends_in_open_question_phrase(words):
+        return True
+    if last in _OPEN_PREPOSITIONS:
+        return not (_is_complete_command_particle(words) or _is_closed_question_particle(words))
+    if last in _DETERMINERS and not _is_closed_question_pronoun(words):
+        return True
+    if last in _OPEN_FILLERS and words != ["wie", "bitte"]:
+        return True
+    if last in _MODAL_OR_WISH_VERBS:
+        return True
+    return False
+
+
 def classify_utterance(text: str) -> UtteranceStatus:
     """Ordnet Teiltexte nur bei klaren Mustern COMPLETE oder INCOMPLETE zu."""
     value = str(text or "").strip()
@@ -170,15 +236,11 @@ def classify_utterance(text: str) -> UtteranceStatus:
         return UtteranceStatus.UNKNOWN
 
     first, last = words[0], words[-1]
+    if _has_open_ending(value, words):
+        return UtteranceStatus.INCOMPLETE
+
     if " ".join(words) in _SHORT_COMPLETE_UTTERANCES:
         return UtteranceStatus.COMPLETE
-
-    if first in _SUBORDINATORS | {"und", "oder", "aber"} and "," not in value:
-        return UtteranceStatus.INCOMPLETE
-    if _has_modal_without_full_verb(words):
-        return UtteranceStatus.INCOMPLETE
-    if first in _QUESTION_WORDS and _ends_in_open_question_phrase(words):
-        return UtteranceStatus.INCOMPLETE
 
     if first in _COMMAND_VERBS and last in _SEPARABLE_PARTICLES | _COMMAND_COMPLEMENTS:
         if any(
@@ -187,12 +249,8 @@ def classify_utterance(text: str) -> UtteranceStatus:
         ):
             return UtteranceStatus.COMPLETE
         return UtteranceStatus.INCOMPLETE
-    if first in _QUESTION_WORDS and last in _SEPARABLE_PARTICLES:
-        for index, word in enumerate(words[1:-1], start=1):
-            if word in _QUESTION_VERBS and any(
-                item not in _QUESTION_FUNCTION_WORDS for item in words[index + 1:-1]
-            ):
-                return UtteranceStatus.COMPLETE
+    if _is_closed_question_particle(words):
+        return UtteranceStatus.COMPLETE
 
     if first in _QUESTION_WORDS:
         for index, word in enumerate(words[1:], start=1):
@@ -257,9 +315,6 @@ def classify_utterance(text: str) -> UtteranceStatus:
             or any(word not in _CONTENT_FUNCTION_WORDS for word in words[:-1])
         ):
             return UtteranceStatus.COMPLETE
-
-    if _ends_in_determiner_adjective(words):
-        return UtteranceStatus.INCOMPLETE
 
     if last in _QUESTION_PRONOUNS:
         return UtteranceStatus.UNKNOWN

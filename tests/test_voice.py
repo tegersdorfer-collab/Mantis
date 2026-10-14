@@ -216,9 +216,15 @@ class TestTranscribeParakeet:
 
     def test_warmup_fehler_laesst_vorgeladenes_modell_verfuegbar(self, monkeypatch):
         from concurrent.futures import ThreadPoolExecutor
+        from core import stt_runtime
 
         monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
         monkeypatch.setattr(voice.config, "STT_PRELOAD", True, raising=False)
+        recorded_runtimes = []
+        monkeypatch.setattr(
+            stt_runtime, "record_stt_runtime",
+            lambda duration_s, elapsed_ms: recorded_runtimes.append((duration_s, elapsed_ms)),
+        )
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-parakeet")
         monkeypatch.setattr(voice, "_parakeet_executor", executor)
         model = MagicMock()
@@ -233,6 +239,7 @@ class TestTranscribeParakeet:
         assert voice._parakeet_model is model
         assert voice._parakeet_unavailable is False
         model.transcribe.assert_called_once()
+        assert recorded_runtimes == []
 
     def test_vorladen_ist_per_setting_abschaltbar(self, monkeypatch):
         monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
@@ -433,6 +440,48 @@ def test_failed_parakeet_inference_does_not_record_stt_runtime(monkeypatch):
     )
 
     assert asyncio.run(voice._transcribe_parakeet("/tmp/fake.wav")) == ""
+    assert recorded == []
+
+
+def test_cancelled_whisper_transcription_does_not_record_stt_runtime(monkeypatch):
+    import threading
+    import time
+    from types import ModuleType
+
+    from core import stt_runtime
+
+    package = ModuleType("pywhispercpp")
+    package.__path__ = []
+    model_module = ModuleType("pywhispercpp.model")
+    model_module.Model = object
+    monkeypatch.setitem(sys.modules, "pywhispercpp", package)
+    monkeypatch.setitem(sys.modules, "pywhispercpp.model", model_module)
+
+    started = threading.Event()
+
+    def transcribe(_audio_path):
+        started.set()
+        time.sleep(0.02)
+        return [MagicMock(text="fertig")]
+
+    model = MagicMock()
+    model.transcribe.side_effect = transcribe
+    monkeypatch.setattr(voice, "_whisper_model", model)
+    recorded = []
+    monkeypatch.setattr(
+        stt_runtime, "record_stt_runtime",
+        lambda duration_s, elapsed_ms: recorded.append((duration_s, elapsed_ms)),
+    )
+
+    async def cancel_after_transcription_starts():
+        task = asyncio.create_task(voice._transcribe_whisper("/tmp/fake.wav"))
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_after_transcription_starts())
+
     assert recorded == []
 
 
