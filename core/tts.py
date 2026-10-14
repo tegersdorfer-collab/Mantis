@@ -32,7 +32,6 @@ _CARTESIA_VERSION = "2025-04-16"
 _CARTESIA_TIMEOUT_S = 5.0
 _CARTESIA_PAUSE_S = 30 * 60
 _CARTESIA_PAUSE_STATUSES = {401, 402, 403, 429}
-_CARTESIA_CHARS_PRICE_PER_MILLION = 49.0
 
 VOICE_MODELS: dict[str, str] = {
     "thorsten-high": "de_DE-thorsten-high",
@@ -240,7 +239,7 @@ async def _cartesia_synthesize(text: str) -> bytes:
 
 def _record_cartesia_usage(text: str) -> None:
     chars = len(text)
-    estimated_cost = chars * _CARTESIA_CHARS_PRICE_PER_MILLION / 1_000_000
+    estimated_cost = chars * float(config.TTS_CARTESIA_USD_PER_MILLION_CHARS) / 1_000_000
     try:
         from core import llm_usage
 
@@ -289,6 +288,26 @@ async def _try_cartesia(text: str) -> bytes | None:
     return wav
 
 
+async def _try_cartesia_ogg(text: str) -> bytes | None:
+    """Cartesia-Audio als OGG oder None (Ausfall ODER nicht konvertierbares Audio).
+
+    Kaputtes/leeres WAV bei HTTP 200 ist kein Auth-/Kontingentproblem: kein Pausieren,
+    nur Warnung und lokaler Fallback für genau dieses Stück.
+    """
+    wav = await _try_cartesia(text)
+    if wav is None:
+        return None
+    try:
+        ogg = await asyncio.to_thread(_wav_to_ogg, wav)
+    except Exception as exc:
+        log.warning("Cartesia-Audio nicht konvertierbar (%s); nutze lokales TTS", type(exc).__name__)
+        return None
+    if not ogg:
+        log.warning("Cartesia-Audio ergab leeres OGG; nutze lokales TTS")
+        return None
+    return ogg
+
+
 async def _synthesize_local(text: str, speed: float) -> bytes:
     """Lokaler Fallback: Kokoro lazy laden, bei dessen Nichtverfügbarkeit Piper nutzen."""
     if _engine() in {"kokoro", "cartesia"} and not _kokoro_unavailable:
@@ -323,10 +342,10 @@ async def synthesize(
 
     async with _lock:
         try:
-            wav = await _try_cartesia(text) if _engine() == "cartesia" else None
-            if wav is None:
+            ogg = await _try_cartesia_ogg(text) if _engine() == "cartesia" else None
+            if ogg is None:
                 wav = await _synthesize_local(text, speed)
-            ogg = await asyncio.to_thread(_wav_to_ogg, wav)
+                ogg = await asyncio.to_thread(_wav_to_ogg, wav)
             log.info(f"🔊 TTS: {len(text)} Zeichen → {len(ogg)//1024}KB OGG")
             return ogg
         except Exception as e:
@@ -418,10 +437,10 @@ async def synthesize_stream(
     async with _lock:
         for i, stueck in enumerate(stuecke):
             try:
-                wav = await _try_cartesia(stueck) if _engine() == "cartesia" else None
-                if wav is None:
+                ogg = await _try_cartesia_ogg(stueck) if _engine() == "cartesia" else None
+                if ogg is None:
                     wav = await _synthesize_local(stueck, speed)
-                ogg = await asyncio.to_thread(_wav_to_ogg, wav)
+                    ogg = await asyncio.to_thread(_wav_to_ogg, wav)
             except Exception as e:
                 # Ein kaputtes Stück darf die restliche Antwort nicht verschlucken.
                 log.error("TTS-Stück %s fehlgeschlagen: %s", i, redact_error_text(e))
