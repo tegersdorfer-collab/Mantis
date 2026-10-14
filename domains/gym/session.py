@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from core import db
 from domains import fitness
 from domains.gym.aliases import is_pullup_name, normalize_alias, split_equipment_variant
-from domains.gym.legacy import legacy_exercise
+from domains.gym.legacy import legacy_exercise, legacy_exercise_for_alias
 from domains.gym.progression import personal_records, progression_set_count, recommend_next
 
 
@@ -147,26 +147,41 @@ def _equipment_variant_name(cur, name: str, equipment: str | None, load_mode: st
     equipment = equipment or embedded_equipment
     if not equipment:
         return name
-    label = {
+    long_label = {
         "dumbbell": "Kurzhantel",
         "barbell": "Langhantel",
         "ez_bar": "SZ-Stange",
         "machine": "Maschine",
     }.get(equipment)
-    if not label:
+    if not long_label:
         return name
-    variant = f"{name} ({label})"
+    legacy = legacy_exercise_for_alias(name)
+    short_label = {
+        "dumbbell": "KH",
+        "barbell": "LH",
+        "ez_bar": "SZ",
+        "machine": "Kabel",
+    }.get(equipment)
+    variant = f"{name} ({short_label if legacy else long_label})"
     rows = _fetchall(cur, "SELECT id,name,equipment,load_mode FROM exercises")
+    has_legacy_base = False
     for row in rows:
         row_base, name_equipment = split_equipment_variant(row["name"])
-        if normalize_alias(row_base) != normalize_alias(name):
+        same_name = normalize_alias(row_base) == normalize_alias(name)
+        same_legacy = bool(
+            legacy and legacy_exercise_for_alias(row_base) == legacy
+        )
+        has_legacy_base = has_legacy_base or same_legacy
+        if not same_name and not same_legacy:
             continue
         effective_equipment = row.get("equipment") or name_equipment or _exercise_defaults(
             row_base, None, row.get("load_mode") or load_mode
         )["equipment"]
         if effective_equipment == equipment:
             return row["name"]
-    if any(normalize_alias(row["name"]) == normalize_alias(name) for row in rows):
+    if legacy or has_legacy_base or any(
+        normalize_alias(row["name"]) == normalize_alias(name) for row in rows
+    ):
         return variant
     return name
 
@@ -183,7 +198,7 @@ def _ensure_exercise(cur, name: str, alias: str | None, equipment: str | None,
            FROM exercises WHERE LOWER(name)=LOWER(%s) LIMIT 1""",
         (storage_name,),
     )
-    if not row and alias and not equipment:
+    if not row and alias and not equipment and not legacy_exercise_for_alias(name):
         row = _fetchone(
             cur,
             """SELECT e.id, e.name, e.exercise_type, e.equipment, e.rep_min, e.rep_max,
@@ -306,15 +321,82 @@ def _planned_set_count(cur, exercise_name: str) -> int | None:
 
 
 def _exercise_rows(cur, exercise_id: int) -> list[dict]:
+    exercise_rows = _fetchall(cur, "SELECT id, name, equipment FROM exercises")
+    source = next((row for row in exercise_rows if row["id"] == exercise_id), None)
+    if source:
+        _base, embedded_equipment = split_equipment_variant(source["name"])
+        requested_equipment = source.get("equipment") or embedded_equipment
+        duplicate_ids = _legacy_duplicate_ids(
+            exercise_rows, source["name"], requested_equipment,
+        )
+    else:
+        duplicate_ids = []
+    exercise_ids = duplicate_ids or [exercise_id]
     return _fetchall(
         cur,
         """SELECT w.id AS workout_id, w.created_at, ws.set_index, ws.reps,
                   ws.weight_kg, COALESCE(ws.is_warmup,FALSE) AS is_warmup
            FROM workout_sets ws JOIN workouts w ON w.id=ws.workout_id
-           WHERE ws.exercise_id=%s AND w.type IN ('strength','gym')
+           WHERE ws.exercise_id = ANY(%s) AND w.type IN ('strength','gym')
            ORDER BY w.date ASC, w.created_at ASC, w.id ASC, ws.set_index ASC, ws.id ASC""",
-        (exercise_id,),
+        (exercise_ids,),
     )
+
+
+def _legacy_duplicate_ids(
+    exercise_rows: list[dict], exercise_name: str, equipment: str | None = None,
+) -> list[int]:
+    """Liest gleichbedeutende, gleich ausgestattete Legacy-Zeilen zusammen."""
+    base, embedded_equipment = split_equipment_variant(exercise_name)
+    entry = legacy_exercise_for_alias(base)
+    if not entry:
+        return []
+    requested_equipment = equipment or embedded_equipment
+    if requested_equipment and requested_equipment != entry.equipment:
+        return []
+
+    legacy_names = {
+        normalize_alias(value) for value in (entry.name, *entry.aliases)
+    }
+    exercise_ids = []
+    for row in exercise_rows:
+        row_base, row_embedded_equipment = split_equipment_variant(row["name"])
+        if normalize_alias(row_base) not in legacy_names:
+            continue
+        row_equipment = row.get("equipment") or row_embedded_equipment
+        if row_equipment is not None and row_equipment != entry.equipment:
+            continue
+        exercise_ids.append(row["id"])
+    return list(dict.fromkeys(exercise_ids))
+
+
+def legacy_equipment_variants(exercise_name: str, equipment: str) -> list[str]:
+    """Findet gespeicherte Legacy-Varianten, auch wenn sie noch keine Sätze haben."""
+    base, _embedded_equipment = split_equipment_variant(exercise_name)
+    entry = legacy_exercise_for_alias(base)
+    if not entry or not equipment:
+        return []
+    try:
+        rows = db.query("SELECT name, equipment, load_mode FROM exercises ORDER BY id")
+    except Exception:
+        return []
+
+    variants = []
+    for row in rows:
+        name = (row.get("name") or row.get("exercise") or "").strip()
+        if not name:
+            continue
+        row_base, embedded_equipment = split_equipment_variant(name)
+        if legacy_exercise_for_alias(row_base) != entry:
+            continue
+        effective_equipment = row.get("equipment") or embedded_equipment
+        if effective_equipment is None:
+            effective_equipment = _exercise_defaults(
+                row_base, None, row.get("load_mode") or "external",
+            )["equipment"]
+        if effective_equipment == equipment:
+            variants.append(name)
+    return list(dict.fromkeys(variants))
 
 
 def _exercise_state(cur, workout_id: int, exercise_id: int) -> dict:
@@ -623,10 +705,18 @@ def _variant_exercise_ids(name: str) -> list[int]:
 
 
 def exercise_history(exercise_name: str, limit: int = 5) -> list[dict]:
-    rows = db.query(
-        _HISTORY_SELECT + "\n           WHERE LOWER(e.name)=LOWER(%s)" + _HISTORY_ORDER,
-        (exercise_name,),
-    )
+    exercise_rows = db.query("SELECT id, name, equipment FROM exercises")
+    exercise_ids = _legacy_duplicate_ids(exercise_rows, exercise_name)
+    if exercise_ids:
+        rows = db.query(
+            _HISTORY_SELECT + "\n           WHERE e.id = ANY(%s)" + _HISTORY_ORDER,
+            (exercise_ids,),
+        )
+    else:
+        rows = db.query(
+            _HISTORY_SELECT + "\n           WHERE LOWER(e.name)=LOWER(%s)" + _HISTORY_ORDER,
+            (exercise_name,),
+        )
     if not rows:
         ids = _variant_exercise_ids(exercise_name)
         if ids:

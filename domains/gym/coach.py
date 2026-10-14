@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -14,8 +14,9 @@ from domains import fitness
 from domains.gym import session
 from domains.gym.aliases import (
     builtin_aliases, is_pullup_name, load_aliases, normalize_alias, resolve_alias,
+    split_equipment_variant,
 )
-from domains.gym.legacy import legacy_exercise
+from domains.gym.legacy import legacy_exercise, legacy_exercise_for_alias
 from domains.gym.parser import ParsedLog, ParsedSet, has_non_exercise_start, parse_set_message
 from domains.gym.progression import estimate_1rm
 
@@ -139,6 +140,43 @@ def _format_reps(values: list[int] | tuple[int, ...]) -> str:
 def _history_target(sets: list[dict]) -> str:
     values = [int(row.get("reps") or 0) for row in sets]
     return _format_reps(values)
+
+
+def _explicit_legacy_variant(parsed: ParsedLog) -> GymIntent | None:
+    """Trennt explizite Geräteangaben von einer unpassenden Legacy-Historie."""
+    if not parsed.equipment:
+        return None
+    base, _embedded_equipment = split_equipment_variant(parsed.exercise or "")
+    entry = legacy_exercise_for_alias(base) or legacy_exercise_for_alias(parsed.alias)
+    if not entry or entry.equipment == parsed.equipment:
+        return None
+
+    variants = session.legacy_equipment_variants(entry.name, parsed.equipment)
+    if len(variants) == 1:
+        return GymIntent(
+            "set_logged",
+            parsed=replace(parsed, exercise=variants[0], known=True, ambiguous=()),
+        )
+    if len(variants) > 1:
+        return GymIntent(
+            "ambiguous_exercise",
+            parsed=replace(parsed, exercise=None, known=False, ambiguous=tuple(variants)),
+        )
+
+    short_name = entry.display_name or entry.name
+    equipment_tag = {
+        "dumbbell": "KH",
+        "barbell": "LH",
+        "ez_bar": "SZ",
+        "machine": "Kabel",
+    }.get(parsed.equipment)
+    if not equipment_tag:
+        return None
+    variant = f"{short_name} ({equipment_tag})"
+    return GymIntent(
+        "confirm_new_exercise",
+        parsed=replace(parsed, exercise=variant, known=False, ambiguous=()),
+    )
 
 
 class GymCoach:
@@ -373,6 +411,9 @@ class GymCoach:
             return None
         parsed = parse_set_message(text, aliases)
         if parsed:
+            variant_intent = _explicit_legacy_variant(parsed)
+            if variant_intent:
+                return variant_intent
             if parsed.ambiguous:
                 return GymIntent("ambiguous_exercise", parsed=parsed)
             if parsed.known:
@@ -433,6 +474,16 @@ class GymCoach:
             parsed = intent.parsed
             candidate = _parsed_payload(parsed)
             pending = self._pending("new_exercise", candidate, now)
+            base, equipment = split_equipment_variant(parsed.exercise or "")
+            if (
+                equipment
+                and legacy_exercise_for_alias(base)
+                and equipment != legacy_exercise_for_alias(base).equipment
+            ):
+                return GymResult(
+                    f"Neue Variante „{parsed.exercise}“ anlegen? ja/nein",
+                    action, pending,
+                )
             return GymResult(
                 f"Neue Übung ‚{parsed.exercise}‘ anlegen? Ich speichere sie und übernehme den Satz nach deiner Bestätigung.",
                 action, pending,

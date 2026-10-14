@@ -115,7 +115,10 @@ def load_aliases() -> dict[str, list[str]]:
                WHERE ea.exercise_id IS NOT NULL"""
         )
         exercise_rows = db.query(
-            "SELECT id AS exercise_id, name AS alias, name AS exercise, equipment FROM exercises"
+            """SELECT e.id AS exercise_id, e.name AS alias, e.name AS exercise,
+                      e.equipment, COUNT(ws.id) AS set_count
+               FROM exercises e LEFT JOIN workout_sets ws ON ws.exercise_id=e.id
+               GROUP BY e.id, e.name, e.equipment"""
         )
     except Exception:
         return result
@@ -128,6 +131,7 @@ def load_aliases() -> dict[str, list[str]]:
         identity = str(row.get("exercise_id") or normalize_alias(name))
         records[identity] = {
             "name": name, "equipment": row.get("equipment"), "aliases": {name},
+            "set_count": row.get("set_count"),
         }
     for row in alias_rows:
         name = (row.get("exercise") or "").strip()
@@ -137,6 +141,7 @@ def load_aliases() -> dict[str, list[str]]:
         identity = str(row.get("exercise_id") or normalize_alias(name))
         record = records.setdefault(identity, {
             "name": name, "equipment": row.get("equipment"), "aliases": {name},
+            "set_count": row.get("set_count"),
         })
         record["aliases"].add(alias)
 
@@ -194,27 +199,68 @@ def load_aliases() -> dict[str, list[str]]:
         unique_choices = list(dict.fromkeys(choices))
         result[base] = unique_choices
 
-    # Bestandsübungen aus dem AlphaProgression-Import: ihr Name ist kanonisch,
-    # deutsche Namen und Abkürzungen sind Aliasse darauf.
-    by_name = {normalize_alias(record["name"]): record["name"] for record in records.values()}
+    # Bestandsübungen aus dem AlphaProgression-Import: gleichbedeutende deutsche
+    # Zeilen werden auf den Legacy-Namen gebündelt. Nur benutzte, explizit
+    # anders ausgestattete Übungen bleiben eigene Varianten.
     for entry in LEGACY_EXERCISES:
-        stored = by_name.get(normalize_alias(entry.name))
-        if stored is None:
+        entry_name = normalize_alias(entry.name)
+        entry_aliases = {normalize_alias(value) for value in (entry.name, *entry.aliases)}
+        matching = []
+        for record in records.values():
+            base, embedded_equipment = split_equipment_variant(record["name"])
+            if (
+                normalize_alias(record["name"]) != entry_name
+                and normalize_alias(base) not in entry_aliases
+            ):
+                continue
+            matching.append(record)
+        if not matching:
             continue
-        base_name, _equipment = split_equipment_variant(stored)
-        legacy_choices = list(dict.fromkeys(
-            variants_by_base.get(normalize_alias(base_name), [stored])
-        ))
+
+        stored = next(
+            (record["name"] for record in matching
+             if normalize_alias(record["name"]) == entry_name
+             and (record.get("equipment") or split_equipment_variant(record["name"])[1])
+             in (None, entry.equipment)),
+            entry.name,
+        )
+        variant_records: dict[str, list[dict]] = {}
+        duplicate_aliases = set(entry_aliases)
+        has_legacy_candidate = False
+        for record in matching:
+            base, embedded_equipment = split_equipment_variant(record["name"])
+            equipment = record.get("equipment") or embedded_equipment
+            if equipment is None or equipment == entry.equipment:
+                has_legacy_candidate = True
+                duplicate_aliases.update(normalize_alias(value) for value in record["aliases"])
+                duplicate_aliases.add(normalize_alias(record["name"]))
+                continue
+            count = record.get("set_count")
+            if count is not None and int(count) == 0:
+                continue
+            variant_records.setdefault(equipment, []).append(record)
+
+        legacy_choices = [stored] if entry.equipment or has_legacy_candidate else []
+        for variants in variant_records.values():
+            representative = max(
+                variants,
+                key=lambda record: (
+                    int(record.get("set_count") or 0), record["name"].casefold(),
+                ),
+            )
+            choice = _variant_choice(representative["name"], representative["equipment"])
+            if choice not in legacy_choices:
+                legacy_choices.append(choice)
+        if not legacy_choices:
+            continue
+
+        for key in duplicate_aliases:
+            if key:
+                result[key] = legacy_choices.copy()
         for alias in (entry.name, *entry.aliases):
             key = normalize_alias(alias)
             if key:
-                existing = result.get(key, [])
-                if len(existing) > 1:
-                    for choice in legacy_choices:
-                        if choice not in existing:
-                            existing.append(choice)
-                else:
-                    result[key] = legacy_choices.copy()
+                result[key] = legacy_choices.copy()
     return result
 
 

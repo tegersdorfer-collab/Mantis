@@ -210,7 +210,7 @@ def test_existing_database_alias_points_to_its_unchanged_exercise_name(monkeypat
     assert parsed.known is True
 
 
-def test_built_in_alias_is_ambiguous_when_multiple_existing_exercises_match(monkeypatch):
+def test_german_bank_names_with_the_same_meaning_resolve_to_the_legacy_exercise(monkeypatch):
     def query(sql, _params=()):
         if "exercise_aliases" in sql:
             return []
@@ -225,8 +225,8 @@ def test_built_in_alias_is_ambiguous_when_multiple_existing_exercises_match(monk
     parsed = parse_set_message("BD 80 8", aliases)
 
     assert parsed is not None
-    assert parsed.exercise is None
-    assert set(parsed.ambiguous) == {"Bank", "Bankdrücken"}
+    assert parsed.exercise == "Bench Press"
+    assert parsed.ambiguous == ()
 
 
 def test_parser_and_alias_resolution_stay_under_300ms_p95():

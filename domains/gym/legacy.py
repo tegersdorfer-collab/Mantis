@@ -17,17 +17,19 @@ class LegacyExercise:
     exercise_type: str
     aliases: tuple[str, ...]
     load_mode: str | None = None
+    display_name: str | None = None
 
 
-def _ex(name, equipment, exercise_type, *aliases, load_mode=None):
-    return LegacyExercise(name, equipment, exercise_type, aliases, load_mode)
+def _ex(name, equipment, exercise_type, *aliases, load_mode=None, display_name=None):
+    return LegacyExercise(name, equipment, exercise_type, aliases, load_mode, display_name)
 
 
 # Aliasse dürfen nicht mit KH/LH/SZ/Kabel/Maschine beginnen: Das Parser-Präfix
 # wird vor der Aliassuche abgetrennt.
 LEGACY_EXERCISES: tuple[LegacyExercise, ...] = (
     _ex("Bench Press", "barbell", "compound",
-        "Bank", "Bankdrücken", "BD", "Bench", "Flachbank", "Flachbankdrücken"),
+        "Bank", "Bankdrücken", "BD", "Bench", "Flachbank", "Flachbankdrücken",
+        display_name="Bankdrücken"),
     _ex("Incline Bench Press", None, "compound",
         "Schrägbank", "Schrägbankdrücken", "Incline", "Incline Bench", "Incline Press"),
     _ex("Lateral Raises", "dumbbell", "isolation",
@@ -60,7 +62,7 @@ LEGACY_EXERCISES: tuple[LegacyExercise, ...] = (
     _ex("Seated Shoulder Press", None, "compound",
         "Schulterdrücken sitzend", "Schulterdrücken im Sitzen", "Seated OHP"),
     _ex("Shoulder Press", None, "compound",
-        "Schulterdrücken", "OHP", "Overhead Press"),
+        "Schulterdrücken", "OHP", "Overhead Press", display_name="Schulterdrücken"),
     _ex("Standing Shoulder Press", None, "compound",
         "Schulterdrücken stehend", "Standing OHP"),
     _ex("Arnold Press", "dumbbell", "compound", "Arnold"),
@@ -116,7 +118,17 @@ LEGACY_EXERCISES: tuple[LegacyExercise, ...] = (
 )
 
 LEGACY_BY_NAME = {item.name.casefold(): item for item in LEGACY_EXERCISES}
+LEGACY_BY_ALIAS = {
+    value.casefold(): item
+    for item in LEGACY_EXERCISES
+    for value in (item.name, *item.aliases)
+}
 
 
 def legacy_exercise(name: str | None) -> LegacyExercise | None:
     return LEGACY_BY_NAME.get(str(name or "").strip().casefold())
+
+
+def legacy_exercise_for_alias(name: str | None) -> LegacyExercise | None:
+    """Gibt die Legacy-Übung für ihren kanonischen oder deutschen Namen zurück."""
+    return LEGACY_BY_ALIAS.get(str(name or "").strip().casefold())
