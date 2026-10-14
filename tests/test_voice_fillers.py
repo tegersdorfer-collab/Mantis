@@ -210,4 +210,3 @@ def test_preload_does_not_wait_for_response_tts_lock(tmp_path, monkeypatch):
 
     assert synthesized == ["Mhm."]
     assert next(tmp_path.glob("*.ogg")).read_bytes() == b"OGG"
-

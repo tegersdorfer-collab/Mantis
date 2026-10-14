@@ -707,6 +707,60 @@ def test_streaming_reflex_trace_sets_voice_latency_flag(monkeypatch):
     assert voice_timing.current() is None
 
 
+def test_reflex_turn_does_not_choose_filler_while_tts_is_slow(monkeypatch):
+    from core.message_handler import MessageHandler
+    from core.voice_fillers import VoiceFiller
+
+    ack_waiting = asyncio.Event()
+    release_ack = asyncio.Event()
+    tts_started = asyncio.Event()
+    release_tts = asyncio.Event()
+    chosen = []
+    handler = object.__new__(MessageHandler)
+
+    class ReflexOrchestrator:
+        async def voice_respond(self, text, stream_cb=None):
+            return await handler._agent_turn(text, channel_name="voice", agent=object())
+
+    async def hold_ack(_seconds):
+        ack_waiting.set()
+        await release_ack.wait()
+
+    async def slow_tts(_sentence, **_kwargs):
+        tts_started.set()
+        await release_tts.wait()
+        yield b"reflex-answer"
+
+    def choose(kind):
+        chosen.append(kind)
+        return VoiceFiller(kind, "Mhm.", b"filler-audio", 500.0)
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", slow_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+    monkeypatch.setattr("core.voice_fillers.choose_cached_filler", choose)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 800)
+    ws = FakeWebSocket()
+
+    async def run():
+        task = asyncio.create_task(sende_streaming_antwort(
+            ws, "Wie spät ist es?", ReflexOrchestrator(), sleep=hold_ack,
+        ))
+        await ack_waiting.wait()
+        await tts_started.wait()
+        release_ack.set()
+        # Der Ack-Timer muss seine Entscheidung treffen, während TTS noch wartet.
+        await asyncio.sleep(0.01)
+        release_tts.set()
+        await task
+
+    asyncio.run(run())
+
+    chunks = [message for message in ws.gesendet if message.get("type") == "audio_chunk"]
+    assert [base64.b64decode(message["b64"]) for message in chunks] == [b"reflex-answer"]
+    assert chosen == []
+
+
 def test_disabled_fillers_still_send_audio_end(monkeypatch):
     monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", False)
     monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
@@ -802,6 +856,79 @@ def test_tool_filler_is_suppressed_after_response_audio_started(monkeypatch):
     assert audio == [b"audio:Ich bin dran.", b"audio:Es wird sonnig."]
     assert chosen == []
     assert logged[0][2]["filler"] is None
+
+
+def test_turn_cancellation_cleans_up_audio_wait_helpers(monkeypatch):
+    ack_waiting = asyncio.Event()
+    waiting_for_ack = asyncio.Event()
+    real_wait = asyncio.wait
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            return "Antwort ohne Audio.", []
+
+    async def never_finish_ack(_seconds):
+        ack_waiting.set()
+        await asyncio.Future()
+
+    async def no_audio_tts(_sentence, **_kwargs):
+        if False:
+            yield b""
+
+    async def observe_audio_wait(tasks, **kwargs):
+        tasks = tuple(tasks)
+        active_names = {
+            getattr(task.get_coro(), "__qualname__", "")
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        }
+        helper_names = {
+            getattr(task.get_coro(), "__qualname__", "")
+            for task in tasks
+            if not task.done()
+        }
+        if (
+            not any(name.endswith("produce_response") for name in active_names)
+            and not any(name.endswith("synthesize_sentences") for name in active_names)
+            and any(name.endswith("Queue.get") for name in helper_names)
+            and any(name.endswith("Event.wait") for name in helper_names)
+        ):
+            waiting_for_ack.set()
+        return await real_wait(tasks, **kwargs)
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", no_audio_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr("web.routers.voice.asyncio.wait", observe_audio_wait)
+
+    async def run():
+        turn = asyncio.create_task(sende_streaming_antwort(
+            FakeWebSocket(), "Sag etwas", FakeOrchestrator(), sleep=never_finish_ack,
+        ))
+        await ack_waiting.wait()
+        await waiting_for_ack.wait()
+        helpers = {
+            task for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and not task.done()
+            and getattr(task.get_coro(), "__qualname__", "").endswith(
+                ("Queue.get", "Event.wait"),
+            )
+        }
+        assert any(task.get_coro().__qualname__.endswith("Queue.get") for task in helpers)
+        assert any(task.get_coro().__qualname__.endswith("Event.wait") for task in helpers)
+
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+        leftovers = {
+            task for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        }
+        assert leftovers == set()
+
+    asyncio.run(run())
 
 
 def test_ack_deadline_is_relative_to_turn_start_not_after_stt(monkeypatch):

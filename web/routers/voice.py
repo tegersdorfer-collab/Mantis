@@ -161,10 +161,12 @@ async def sende_streaming_antwort(
 
     def request_filler(kind: str) -> None:
         nonlocal filler_kind, pending_filler
+        timing = voice_timing.current()
         if (
             not getattr(config, "VOICE_FILLERS_ENABLED", True)
             or filler_kind is not None
             or response_audio_ready
+            or (timing is not None and timing.reflex)
         ):
             return
         selected = voice_fillers.choose_cached_filler(kind)
@@ -366,17 +368,21 @@ async def sende_streaming_antwort(
             state_changed.clear()
             audio_ready = asyncio.create_task(audio_queue.get())
             changed = asyncio.create_task(state_changed.wait())
-            done, pending = await asyncio.wait(
-                (audio_ready, changed), return_when=asyncio.FIRST_COMPLETED,
-            )
-            if audio_ready in done:
-                pending_audio = audio_ready.result()
-                has_pending_audio = True
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            if changed in done:
-                await changed
+            wait_tasks = (audio_ready, changed)
+            try:
+                done, _pending = await asyncio.wait(
+                    wait_tasks, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if audio_ready in done:
+                    pending_audio = audio_ready.result()
+                    has_pending_audio = True
+                if changed in done:
+                    await changed
+            finally:
+                for task in wait_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*wait_tasks, return_exceptions=True)
 
     timing_token = voice_timing.start()
     if getattr(config, "VOICE_FILLERS_ENABLED", True):
