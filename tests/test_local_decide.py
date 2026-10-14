@@ -42,6 +42,7 @@ def _install_cloud(monkeypatch, answer, *, delay=0):
         return backend
 
     monkeypatch.setattr(local_decide, "cloud_chain", cloud_chain)
+    monkeypatch.setattr(local_decide, "_provider", None, raising=False)
     return backend, purposes
 
 
@@ -59,7 +60,7 @@ def test_score_uses_one_fast_cloud_call_for_all_typed_questions(monkeypatch):
 
     answers = asyncio.run(local_decide.score({"untrusted_text": "Licht an"}, questions))
 
-    assert purposes == [("fast", {"reasoning": "low", "timeout": 3.0})]
+    assert purposes == [("fast", {"reasoning": "minimal", "total_timeout": 3.0})]
     assert len(backend.calls) == 1
     assert backend.calls[0]["tools"] is None
     assert "Antworte ausschließlich mit validem JSON" in backend.calls[0]["messages"][0]["content"]
@@ -105,3 +106,43 @@ def test_cloud_timeout_is_reported_as_decision_unavailable(monkeypatch):
 
     with pytest.raises(local_decide.LocalDecisionUnavailable, match="timeout"):
         asyncio.run(local_decide.score("Text", {"q": Noul("?")}, timeout_s=0.001))
+
+
+def test_score_reuses_provider_chain_and_its_cooldowns(monkeypatch):
+    backend, purposes = _install_cloud(monkeypatch, '{"q":{"A":0.8,"B":0.2}}')
+    question = {"q": Noul("Ist es wahr?")}
+
+    asyncio.run(local_decide.score("Text", question))
+    asyncio.run(local_decide.score("Text", question))
+
+    assert len(purposes) == 1
+    assert len(backend.calls) == 2
+
+
+def test_score_stage_timeout_leaves_time_for_fallback_within_total_timeout(monkeypatch):
+    from core.backends.fallback import FallbackBackend
+
+    first = FakeCloudBackend("", delay=0.1)
+    fallback = FakeCloudBackend('{"q":{"A":0.8,"B":0.2}}')
+    configured = []
+
+    def cloud_chain(purpose, **kwargs):
+        configured.append((purpose, kwargs))
+        stage_timeout = kwargs.get("timeout", kwargs["total_timeout"] / 2)
+        return FallbackBackend(
+            backends=[first, fallback],
+            stage_timeouts=[stage_timeout, stage_timeout],
+            total_timeout_s=kwargs["total_timeout"],
+        )
+
+    monkeypatch.setattr(local_decide, "cloud_chain", cloud_chain)
+    monkeypatch.setattr(local_decide, "_provider", None, raising=False)
+
+    answers = asyncio.run(local_decide.score(
+        "Text", {"q": Noul("Ist es wahr?")}, timeout_s=0.06,
+    ))
+
+    assert answers["q"].value is True
+    assert first.calls == [] or len(first.calls) == 1
+    assert len(fallback.calls) == 1
+    assert configured == [("fast", {"reasoning": "minimal", "total_timeout": 0.06})]

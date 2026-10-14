@@ -17,6 +17,8 @@ from core.backends.openrouter import OpenRouterBackend
 
 log = logging.getLogger(__name__)
 
+DEFAULT_CLOUD_CHAIN_ORDER = ("openrouter", "anthropic", "chatgpt-plan")
+
 
 class CloudChainUnavailableError(RuntimeError):
     """Kein Cloud-Anbieter ist für die angeforderte LLM-Kette konfiguriert."""
@@ -50,15 +52,15 @@ def chatgpt_auth_is_configured(cfg) -> bool:
 
 
 def _cloud_backends(cfg, purpose: str, reasoning: str | None) -> list:
-    stages = []
+    stage_groups = {"openrouter": [], "anthropic": [], "chatgpt-plan": []}
     models = _openrouter_models(cfg)
     if purpose != "chat-agent":
         models = models[:1]
     if models:
-        effort = reasoning if reasoning is not None else getattr(
-            cfg, "CHAT_CLOUD_REASONING_EFFORT", "low"
+        effort = "minimal" if purpose == "fast" else (
+            reasoning if reasoning is not None else getattr(cfg, "CHAT_CLOUD_REASONING_EFFORT", "low")
         )
-        stages.extend(
+        stage_groups["openrouter"].extend(
             OpenRouterBackend(
                 model=model,
                 api_key=cfg.OPENROUTER_API_KEY,
@@ -73,7 +75,7 @@ def _cloud_backends(cfg, purpose: str, reasoning: str | None) -> list:
     anthropic_model = str(getattr(cfg, "CHAT_ANTHROPIC_MODEL", "claude-haiku-5-5") or "").strip()
     anthropic_key = str(getattr(cfg, "ANTHROPIC_API_KEY", "") or "").strip()
     if anthropic_key and anthropic_model:
-        stages.append(ClaudeBackend(model=anthropic_model, purpose=purpose))
+        stage_groups["anthropic"].append(ClaudeBackend(model=anthropic_model, purpose=purpose))
     else:
         log.info("Anthropic-Stufe übersprungen (API-Key oder CHAT_ANTHROPIC_MODEL fehlt)")
 
@@ -86,7 +88,19 @@ def _cloud_backends(cfg, purpose: str, reasoning: str | None) -> list:
     elif not chatgpt_auth_is_configured(cfg):
         log.info("ChatGPT-Abo übersprungen (kein gültiger Login in CHATGPT_AUTH_FILE)")
     else:
-        stages.append(ChatGPTPlanBackend(model=plan_model, auth_file=auth_file, purpose=purpose))
+        stage_groups["chatgpt-plan"].append(
+            ChatGPTPlanBackend(model=plan_model, auth_file=auth_file, purpose=purpose)
+        )
+
+    order_setting = {"fast": "FAST_CHAIN_ORDER", "voice": "VOICE_CHAIN_ORDER"}.get(purpose)
+    order = getattr(cfg, order_setting, DEFAULT_CLOUD_CHAIN_ORDER) if order_setting else DEFAULT_CLOUD_CHAIN_ORDER
+    if isinstance(order, str):
+        raise ValueError(f"{order_setting} muss eine Liste von Cloud-Stufen sein")
+    order = tuple(str(stage).strip().casefold() for stage in order)
+    allowed = set(stage_groups)
+    if not order or any(stage not in allowed for stage in order) or len(order) != len(set(order)):
+        raise ValueError(f"Ungültige Cloud-Kettenreihenfolge für Zweck {purpose!r}")
+    stages = [backend for stage in order for backend in stage_groups[stage]]
     if purpose == "vision":
         stages = [stage for stage in stages if stage.supports_vision]
     return stages
@@ -97,6 +111,7 @@ def cloud_chain(
     *,
     reasoning: str | None = None,
     timeout: float | None = None,
+    total_timeout: float | None = None,
     cfg=config,
 ) -> FallbackBackend:
     """Baut OpenRouter → Anthropic → ChatGPT-Abo ohne lokale LLM-Stufe."""
@@ -105,12 +120,18 @@ def cloud_chain(
         raise CloudChainUnavailableError(
             "Kein Cloud-LLM-Anbieter konfiguriert (OpenRouter, Anthropic oder ChatGPT-Abo)."
         )
-    stage_timeout = float(
-        getattr(cfg, "CHAT_CLOUD_TIMEOUT_S", 30) if timeout is None else timeout
-    )
+    if timeout is None:
+        configured_stage_timeout = float(getattr(cfg, "CHAT_CLOUD_TIMEOUT_S", 30))
+        stage_timeout = (
+            min(configured_stage_timeout, float(total_timeout) / len(stages))
+            if total_timeout is not None else configured_stage_timeout
+        )
+    else:
+        stage_timeout = float(timeout)
     return FallbackBackend(
         backends=stages,
         stage_timeouts=[stage_timeout] * len(stages),
+        total_timeout_s=total_timeout,
     )
 
 

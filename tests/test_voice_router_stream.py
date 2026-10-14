@@ -3,9 +3,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asyncio
 import base64
+import time
+import pytest
 
 from fastapi.testclient import TestClient
 from unittest.mock import patch
+from starlette.websockets import WebSocketDisconnect
 
 from web.routers.voice import build_router, sende_antwort, sende_streaming_antwort
 from fastapi import FastAPI
@@ -149,10 +152,10 @@ def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkey
     assert [entry[1] for entry in timeline if isinstance(entry, tuple) and entry[0] == "tts"] == [
         "Erster Satz.", "Zweiter Satz.",
     ]
-    assert ws.gesendet[0]["audio_streaming"] is True
-    assert ws.gesendet[0]["reply"] == ""
     assert ws.gesendet[-2]["reply"] == "Erster Satz. Zweiter Satz."
     assert ws.gesendet[-1] == {"type": "audio_end", "count": 2}
+    segment_results = [message for message in ws.gesendet if "addressed" in message]
+    assert segment_results == [ws.gesendet[-2]]
     assert logged[0][0:2] == ("voice_latency", "Voice-Turn")
     assert logged[0][2]["stt_ms"] == 42
     assert logged[0][2]["address_check_ms"] == 8
@@ -161,3 +164,97 @@ def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkey
     assert logged[0][2]["total_ms"] >= logged[0][2]["first_tts_block_ms"]
     assert logged[0][2]["model"] == "openai/gpt-6-luna"
     assert logged[0][2]["stage"] == "Backend"
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected"),
+    [
+        (["Es", "Es ist sonnig."], "Es ist sonnig."),
+        (["Es ist", "ist sonnig."], "Es ist sonnig."),
+        (["Es", "sag sonnig."], "Es sag sonnig."),
+    ],
+)
+def test_voice_stream_deduplicates_overlapping_updates_across_model_rounds(
+    monkeypatch, updates, expected,
+):
+    spoken = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            for update in updates:
+                await stream_cb(update)
+            return expected, []
+
+    async def fake_tts(sentence, **_kwargs):
+        spoken.append(sentence)
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+
+    asyncio.run(sende_streaming_antwort(FakeWebSocket(), "Wetter?", FakeOrchestrator()))
+
+    assert spoken == [expected]
+
+
+def test_voice_stream_disconnect_cancels_agent_generation(monkeypatch):
+    cancelled = asyncio.Event()
+    never = asyncio.Event()
+
+    class DisconnectedWebSocket(FakeWebSocket):
+        async def send_json(self, data):
+            if data.get("type") == "audio_chunk":
+                raise WebSocketDisconnect(code=1000)
+            await super().send_json(data)
+
+    class SlowOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            try:
+                await stream_cb("Ein Satz. ")
+                await never.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+
+    async def run():
+        try:
+            await asyncio.wait_for(
+                sende_streaming_antwort(DisconnectedWebSocket(), "Mantis, antworte", SlowOrchestrator()),
+                timeout=0.1,
+            )
+        except WebSocketDisconnect:
+            return
+        except TimeoutError as exc:
+            raise AssertionError("Cloud-Generierung lief nach Socket-Disconnect weiter") from exc
+        raise AssertionError("Sendefehler wurde verschluckt")
+
+    asyncio.run(run())
+    assert cancelled.is_set()
+
+
+def test_voice_stream_latency_uses_turn_start_before_stt(monkeypatch):
+    logged = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            return "Antwort.", []
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+    turn_started_at = time.perf_counter() - 0.08
+
+    asyncio.run(sende_streaming_antwort(
+        FakeWebSocket(), "Mantis", FakeOrchestrator(), stt_ms=80,
+        started_at=turn_started_at,
+    ))
+
+    assert logged[0][2]["total_ms"] >= 80

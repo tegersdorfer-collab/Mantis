@@ -108,6 +108,23 @@ async def sende_antwort(websocket, text: str, reply: str | None, audio_streaming
     await websocket.send_json({"type": "audio_end", "count": seq})
 
 
+def _merge_stream_update(current: str, update: str) -> tuple[str, str]:
+    """Führt kumulative Provider-Texte aus aufeinanderfolgenden Runden zusammen."""
+    if update.startswith(current):
+        return update, update[len(current):]
+    if current.startswith(update):
+        return current, ""
+    overlap = min(len(current), len(update))
+    while overlap and current[-overlap:] != update[:overlap]:
+        overlap -= 1
+    if overlap < 3:
+        overlap = 0
+    delta = update[overlap:]
+    if current and delta and not current[-1].isspace() and not delta[0].isspace():
+        delta = " " + delta
+    return current + delta, delta
+
+
 async def sende_streaming_antwort(
     websocket,
     text: str,
@@ -115,9 +132,11 @@ async def sende_streaming_antwort(
     *,
     stt_ms: float | None = None,
     address_check_ms: float | None = None,
+    started_at: float | None = None,
 ) -> str | None:
     """Leitet fertige Antwortsätze parallel zur laufenden Cloud-Antwort an TTS."""
-    started_at = time.perf_counter()
+    if started_at is None:
+        started_at = time.perf_counter()
     first_token_ms = None
     first_tts_block_ms = None
     sequence = 0
@@ -125,29 +144,15 @@ async def sende_streaming_antwort(
     stream_state = {"full": "", "pending": ""}
     response: list[tuple[str | None, Exception | None]] = []
 
-    await websocket.send_json({
-        "text": text,
-        "addressed": True,
-        "reply": "",
-        "audio_b64": None,
-        "audio_streaming": True,
-    })
-
     async def on_update(update: str) -> None:
         nonlocal first_token_ms
         if not update or update.startswith("🔧"):
             return
         if first_token_ms is None:
             first_token_ms = round((time.perf_counter() - started_at) * 1000, 1)
-        current = stream_state["full"]
-        if update.startswith(current):
-            delta = update[len(current):]
-            stream_state["full"] = update
-        elif current.startswith(update):
+        stream_state["full"], delta = _merge_stream_update(stream_state["full"], update)
+        if not delta:
             return
-        else:
-            delta = update
-            stream_state["full"] = current + update
         stream_state["pending"] += delta
         sentences = re.split(r"(?<=[.!?…])\s+", stream_state["pending"])
         if len(sentences) > 1:
@@ -160,13 +165,8 @@ async def sende_streaming_antwort(
         try:
             reply, _trace = await orch.voice_respond(text, stream_cb=on_update)
             reply = reply or ""
-            current = stream_state["full"]
-            if not current:
-                stream_state["full"] = reply
-                stream_state["pending"] = reply
-            elif reply.startswith(current):
-                stream_state["pending"] += reply[len(current):]
-                stream_state["full"] = reply
+            stream_state["full"], delta = _merge_stream_update(stream_state["full"], reply)
+            stream_state["pending"] += delta
             response.append((reply or None, None))
         except Exception as exc:
             response.append((None, exc))
@@ -183,23 +183,37 @@ async def sende_streaming_antwort(
             sentence = await queue.get()
             if sentence is None:
                 return
+            stream = synthesize_stream(sentence).__aiter__()
             try:
-                async for ogg in synthesize_stream(sentence):
-                    if first_tts_block_ms is None:
-                        first_tts_block_ms = round((time.perf_counter() - started_at) * 1000, 1)
+                while True:
+                    try:
+                        ogg = await anext(stream)
+                    except StopAsyncIteration:
+                        break
+                    except Exception as exc:
+                        log.error("TTS-Streaming fehlgeschlagen: %s", exc)
+                        break
                     await websocket.send_json({
                         "type": "audio_chunk",
                         "seq": sequence,
                         "b64": base64.b64encode(ogg).decode("ascii"),
                     })
+                    if first_tts_block_ms is None:
+                        first_tts_block_ms = round((time.perf_counter() - started_at) * 1000, 1)
                     sequence += 1
-            except Exception as exc:
-                log.error("TTS-Streaming fehlgeschlagen: %s", exc)
+            finally:
+                close = getattr(stream, "aclose", None)
+                if close is not None:
+                    try:
+                        await close()
+                    except Exception as exc:
+                        log.debug("TTS-Stream konnte nicht geschlossen werden: %s", exc)
 
     responder = asyncio.create_task(produce_response())
     sender = asyncio.create_task(synthesize_sentences())
     response_error = None
     reply = None
+    client_disconnected = False
     try:
         await asyncio.gather(responder, sender)
         reply, response_error = response[0]
@@ -209,9 +223,23 @@ async def sende_streaming_antwort(
             "reply": reply,
             "audio_b64": None,
         })
+    except BaseException as exc:
+        client_disconnected = isinstance(
+            exc, (WebSocketDisconnect, RuntimeError, asyncio.CancelledError),
+        )
+        for task in (responder, sender):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(responder, sender, return_exceptions=True)
+        raise
     finally:
+        for task in (responder, sender):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(responder, sender, return_exceptions=True)
         try:
-            await websocket.send_json({"type": "audio_end", "count": sequence})
+            if not client_disconnected:
+                await websocket.send_json({"type": "audio_end", "count": sequence})
         finally:
             _record_voice_latency(
                 orch, started_at, stt_ms=stt_ms,
@@ -327,7 +355,9 @@ def build_router(orch=None) -> APIRouter:
                 if audio_streaming and orch is not None:
                     try:
                         await sende_streaming_antwort(
-                            websocket, text, orch, stt_ms=result.get("stt_ms"),
+                            websocket, text, orch,
+                            stt_ms=result.get("stt_ms"),
+                            started_at=result.get("turn_started_at"),
                         )
                         mark_conversation_active()
                     except (WebSocketDisconnect, RuntimeError) as e:
@@ -335,7 +365,7 @@ def build_router(orch=None) -> APIRouter:
                         break
                     continue
 
-                started_at = time.perf_counter()
+                started_at = result.get("turn_started_at", time.perf_counter())
                 first_tts_block_ms = None
                 reply = None
                 if orch is not None:

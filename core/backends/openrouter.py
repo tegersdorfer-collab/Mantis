@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://openrouter.ai/api/v1"
 TIMEOUT_S = config.CHAT_CLOUD_TIMEOUT_S
+FAST_REASONING_TOKEN_RESERVE = 8
 
 
 def _args_to_json(args) -> str:
@@ -163,11 +164,17 @@ class OpenRouterBackend(AgentBackend):
         return None  # Cloud — nichts vorzuladen.
 
     def _payload(self, messages, tools, temperature, max_tokens, force_tool_call) -> dict:
+        # Im Fast-Pfad gilt max_tokens als sichtbares Antwortbudget. OpenRouter
+        # zählt Reasoning- und Antworttokens meist gemeinsam; ein kleiner Puffer
+        # hält Labels und kurze JSON-Antworten trotz minimalem Reasoning lesbar.
+        request_max_tokens = max_tokens
+        if self._purpose == "fast" and self._reasoning_effort:
+            request_max_tokens += FAST_REASONING_TOKEN_RESERVE
         payload: dict = {
             "model": self._model,
             "messages": _msgs_to_openai(messages),
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_tokens": request_max_tokens,
             "usage": {"include": True},
         }
         if tools:

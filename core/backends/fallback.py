@@ -25,6 +25,10 @@ class AllBackendsFailedError(RuntimeError):
         super().__init__(f"Alle Backend-Stufen sind fehlgeschlagen{detail}")
 
 
+class EmptyBackendResponseError(RuntimeError):
+    """Ein Anbieter lieferte weder sichtbaren Text noch einen Tool-Call."""
+
+
 class FallbackBackend(AgentBackend):
     def __init__(
         self,
@@ -35,6 +39,7 @@ class FallbackBackend(AgentBackend):
         *,
         backends: list[AgentBackend] | None = None,
         stage_timeouts: list[float | None] | None = None,
+        total_timeout_s: float | None = None,
     ):
         if backends is None:
             if primary is None or fallback is None:
@@ -52,6 +57,9 @@ class FallbackBackend(AgentBackend):
 
         self._backends = tuple(backends)
         self._stage_timeouts = tuple(stage_timeouts)
+        if total_timeout_s is not None and total_timeout_s <= 0:
+            raise ValueError("total_timeout_s muss positiv sein")
+        self._total_timeout_s = total_timeout_s
         self._cooldown_s = cooldown_s
         self._down_until = [0.0] * len(self._backends)
         # Aliase für bestehende Integrationen, die noch das Zweiermodell erwarten.
@@ -110,16 +118,28 @@ class FallbackBackend(AgentBackend):
 
         self._last_used_backend = None
         failures: list[str] = []
+        deadline = (
+            time.monotonic() + self._total_timeout_s
+            if self._total_timeout_s is not None else None
+        )
         for index, backend in enumerate(self._backends):
             if time.time() < self._down_until[index]:
                 continue
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen")
             try:
                 result = backend.call(**kwargs)
                 timeout = self._stage_timeouts[index]
+                if remaining is not None:
+                    timeout = remaining if timeout is None else min(timeout, remaining)
                 if timeout is None:
                     outcome = await result
                 else:
                     outcome = await asyncio.wait_for(result, timeout=timeout)
+                text, tool_calls = outcome
+                if not tool_calls and not str(text or "").strip():
+                    raise EmptyBackendResponseError("Backend lieferte keine sichtbare Antwort")
                 self._last_used_backend = backend
                 return outcome
             except Exception as e:
@@ -142,6 +162,8 @@ class FallbackBackend(AgentBackend):
                     self._report_failover(e, backend, next_backend)
                 else:
                     log.warning("Letzte Backend-Stufe %s ausgefallen (%s)", backend.model_name, failure)
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen") from e
 
         raise AllBackendsFailedError(failures)
 

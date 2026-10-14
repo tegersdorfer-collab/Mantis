@@ -713,6 +713,34 @@ def test_reasoning_effort_can_be_disabled_or_changed():
     assert seen["body"]["reasoning"] == {"effort": "medium"}
 
 
+def test_fast_purpose_uses_minimal_reasoning_and_reserves_visible_answer_tokens():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_completion(content="JA"))
+
+    backend = OpenRouterBackend(
+        model="openai/gpt-6-luna",
+        api_key="sk-or-test",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="https://openrouter.ai/api/v1",
+        ),
+        reasoning_effort="minimal",
+        purpose="fast",
+    )
+
+    text, calls = asyncio.run(backend.call(
+        [{"role": "user", "content": "Klassifiziere"}],
+        tools=None, stream_cb=None, temperature=0.1, max_tokens=10,
+    ))
+
+    assert (text, calls) == ("JA", [])
+    assert seen["body"]["reasoning"] == {"effort": "minimal"}
+    assert seen["body"]["max_tokens"] == 18
+
+
 def test_model_name_and_requires_api_key():
     backend = OpenRouterBackend(model="z-ai/glm-5.3", api_key="k")
     assert backend.model_name == "z-ai/glm-5.3"

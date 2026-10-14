@@ -60,6 +60,12 @@ class MantisSettings(BaseSettings):
     CHAT_CLOUD_FALLBACK_MODEL: str = ""
     CHAT_CLOUD_REASONING_EFFORT: str = "low"
     CHAT_CLOUD_TIMEOUT_S: float = 30.0
+    FAST_CHAIN_ORDER: list[str] = Field(
+        default_factory=lambda: ["openrouter", "anthropic", "chatgpt-plan"],
+    )
+    VOICE_CHAIN_ORDER: list[str] = Field(
+        default_factory=lambda: ["openrouter", "anthropic", "chatgpt-plan"],
+    )
     CHAT_CHATGPT_PLAN_ENABLED: bool = True
     CHAT_CHATGPT_PLAN_MODEL: str = "gpt-6-luna"
     CHATGPT_AUTH_FILE: str = "~/.config/mantis/chatgpt_auth.json"
@@ -225,6 +231,19 @@ class MantisSettings(BaseSettings):
         if value <= 0:
             raise ValueError("VOICE_SILENCE_MS muss positiv sein")
         return value
+
+    @field_validator("FAST_CHAIN_ORDER", "VOICE_CHAIN_ORDER")
+    @classmethod
+    def valid_cloud_chain_order(cls, value: list[str]) -> list[str]:
+        allowed = {"openrouter", "anthropic", "chatgpt-plan"}
+        normalized = [str(stage).strip().casefold() for stage in value]
+        if not normalized or any(stage not in allowed for stage in normalized):
+            raise ValueError(
+                "Cloud-Kettenreihenfolge darf nur openrouter, anthropic und chatgpt-plan enthalten"
+            )
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Cloud-Kettenreihenfolge darf keine Stufe doppelt enthalten")
+        return normalized
 
     @field_validator("OLLAMA_NUM_CTX_OVERRIDES")
     @classmethod

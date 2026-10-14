@@ -46,7 +46,9 @@ def test_fast_ask_uses_fast_cloud_chain_and_forwards_json_format(monkeypatch):
     answer = asyncio.run(fast.ask("Klassifiziere", max_tokens=9, format="json"))
 
     assert answer == "JA"
-    assert setup == [("fast", {"reasoning": "low", "timeout": 3})]
+    assert setup == [("fast", {
+        "reasoning": "minimal", "timeout": 3, "total_timeout": 9,
+    })]
     assert backend.calls[0]["max_tokens"] == 9
     assert "Antworte ausschließlich mit validem JSON" in backend.calls[0]["messages"][0]["content"]
     assert local_calls == []

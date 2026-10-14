@@ -23,6 +23,21 @@ class LocalDecisionUnavailable(RuntimeError):
     """Die Cloud-Kette lieferte keine auswertbare Entscheidung."""
 
 
+_provider: BackendLLMAdapter | None = None
+
+
+def _get_provider(total_timeout_s: float) -> BackendLLMAdapter:
+    """Erstellt die Fast-Kette einmal, damit Stage-Cooldowns erhalten bleiben."""
+    global _provider
+    if _provider is None:
+        _provider = BackendLLMAdapter(cloud_chain(
+            "fast",
+            reasoning="minimal",
+            total_timeout=total_timeout_s,
+        ))
+    return _provider
+
+
 def _render(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -173,9 +188,7 @@ async def score(
         + "\n\n".join(sections)
     )
     try:
-        provider = BackendLLMAdapter(
-            cloud_chain("fast", reasoning="low", timeout=timeout_s),
-        )
+        provider = _get_provider(timeout_s)
         async with asyncio.timeout(timeout_s):
             async with GATE:
                 response = await provider.complete(

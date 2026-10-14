@@ -321,14 +321,14 @@ def test_discord_rejects_oversized_image_before_download():
     async def run():
         channel, client = await _start_channel()
         destination = _Destination("dm")
-        attachment = _Attachment(size=10 * 1024 * 1024 + 1)
+        attachment = _Attachment(size=7_500_001)
 
         await client.events["on_message"](_Message(
             _User(123), destination, content="", attachments=[attachment],
         ))
 
         assert attachment.read_count == 0
-        assert "10 MiB" in destination.messages[0]
+        assert "7,5 MB Rohdaten" in destination.messages[0]
         await channel.stop()
 
     asyncio.run(run())

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import struct
 from unittest.mock import AsyncMock
 
 import httpx
@@ -11,6 +12,14 @@ from core.backends.claude import ClaudeBackend, _ollama_msgs_to_anthropic
 from core.backends.fallback import FallbackBackend
 from core.backends.openrouter import OpenRouterBackend
 from domains.inbox.vision import describe_images
+
+
+def _png_bytes(width=1, height=1):
+    return (
+        b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"
+        + struct.pack(">II", width, height) + b"\x08\x02\x00\x00\x00"
+        + b"\x00\x00\x00\x00"
+    )
 
 
 def _image_block(data=b"png-data", mime="image/png"):
@@ -86,8 +95,9 @@ def test_describe_images_sends_only_caption_and_image_to_cloud_backend():
     backend.model_name = "openai/gpt-6-luna"
     backend.call.return_value = ("Screenshot mit Text: Wochenplan", [])
 
+    image_bytes = _png_bytes()
     result = asyncio.run(describe_images(
-        [{"data": b"image bytes", "content_type": "image/jpeg"}],
+        [{"data": image_bytes, "content_type": "image/jpeg"}],
         caption="Für später ansehen",
         backend=backend,
     ))
@@ -99,9 +109,25 @@ def test_describe_images_sends_only_caption_and_image_to_cloud_backend():
     assert content[0]["type"] == "text"
     assert "Für später ansehen" in content[0]["text"]
     assert "OCR" in content[0]["text"]
-    assert content[1]["source"]["data"] == base64.b64encode(b"image bytes").decode("ascii")
+    assert content[1]["source"]["data"] == base64.b64encode(image_bytes).decode("ascii")
     assert kwargs["tools"] is None
     assert kwargs["stream_cb"] is None
+    assert content[1]["source"]["media_type"] == "image/png"
+
+
+def test_describe_images_rejects_oversized_dimensions_before_provider_call():
+    backend = AsyncMock()
+    backend.supports_vision = True
+    backend.model_name = "claude-haiku-5-5"
+
+    result = asyncio.run(describe_images(
+        [{"data": _png_bytes(8001, 1), "content_type": "image/png"}],
+        caption="",
+        backend=backend,
+    ))
+
+    assert result is None
+    backend.call.assert_not_awaited()
 
 
 def test_no_cloud_vision_stage_returns_none_without_trying_local_backend():
@@ -136,7 +162,7 @@ def test_cloud_failure_falls_to_another_vision_stage_but_never_to_local():
     )
 
     result = asyncio.run(describe_images(
-        [{"data": b"image bytes", "content_type": "image/webp"}],
+        [{"data": _png_bytes(), "content_type": "image/webp"}],
         caption="Restaurant",
         backend=backend,
     ))
@@ -155,6 +181,21 @@ def test_unsupported_image_mime_is_not_sent_to_any_model(content_type):
 
     result = asyncio.run(describe_images(
         [{"data": b"not-a-supported-image", "content_type": content_type}],
+        caption="",
+        backend=backend,
+    ))
+
+    assert result is None
+    backend.call.assert_not_awaited()
+
+
+def test_image_with_base64_payload_over_claude_limit_is_not_sent_to_cloud():
+    backend = AsyncMock()
+    backend.supports_vision = True
+    backend.model_name = "claude-haiku-5-5"
+
+    result = asyncio.run(describe_images(
+        [{"data": b"x" * 7_500_001, "content_type": "image/png"}],
         caption="",
         backend=backend,
     ))

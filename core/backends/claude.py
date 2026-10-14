@@ -12,6 +12,14 @@ import config
 
 log = logging.getLogger(__name__)
 
+_TEMPERATURE_UNSUPPORTED_MODEL_PREFIXES = ("claude-haiku-5-5",)
+
+
+def _supports_temperature(model: str) -> bool:
+    """Gibt die Temperatur nur an Modellfamilien weiter, die sie akzeptieren."""
+    normalized = model.casefold().strip()
+    return not normalized.startswith(_TEMPERATURE_UNSUPPORTED_MODEL_PREFIXES)
+
 
 def _ollama_tools_to_anthropic(tools: list[dict]) -> list[dict]:
     """Konvertiert Ollama/OpenAI Tool-Schema → Anthropic Tool-Schema."""
@@ -180,8 +188,9 @@ class ClaudeBackend(AgentBackend):
             model=self._model,
             max_tokens=max_tokens,
             messages=anthropic_msgs,
-            temperature=temperature,
         )
+        if _supports_temperature(self._model):
+            kwargs["temperature"] = temperature
         if system:
             kwargs["system"] = system
         if tools:

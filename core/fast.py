@@ -12,7 +12,7 @@ def _get_provider() -> BackendLLMAdapter:
     global _provider
     if _provider is None:
         _provider = BackendLLMAdapter(
-            cloud_chain("fast", reasoning="low", timeout=3),
+            cloud_chain("fast", reasoning="minimal", timeout=3, total_timeout=9),
         )
     return _provider
 

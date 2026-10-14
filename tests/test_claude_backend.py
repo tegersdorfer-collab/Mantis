@@ -130,3 +130,48 @@ def test_haiku_tool_use_rejects_missing_required_arguments():
 
     with pytest.raises(ValueError, match="Pflichtargumente.*query"):
         _extract_tool_calls(response, tools)
+
+
+def _claude_request_payload(model):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": model,
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+    async def call():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            backend = object.__new__(ClaudeBackend)
+            backend._model = model
+            backend._purpose = "chat-agent"
+            backend._client = anthropic.AsyncAnthropic(api_key="test", http_client=http_client)
+            backend._record_usage = lambda _response: None
+            result = await backend.call(
+                [{"role": "user", "content": "hi"}], None, None, 0.2, 100,
+            )
+        return result
+
+    assert asyncio.run(call()) == ("ok", [])
+    return seen["body"]
+
+
+def test_haiku_55_omits_unsupported_temperature_parameter():
+    payload = _claude_request_payload("claude-haiku-5-5")
+
+    assert "temperature" not in payload
+    assert "thinking" not in payload
+
+
+def test_supported_haiku_45_chat_keeps_temperature_parameter():
+    payload = _claude_request_payload("claude-haiku-4-5-20251001")
+
+    assert payload["temperature"] == 0.2

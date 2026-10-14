@@ -86,9 +86,15 @@ class VoiceStreamSession:
             if not wake_fired and not self._conversation_active_fn():
                 continue
 
-            stt_started = time.perf_counter()
+            turn_started_at = time.perf_counter()
+            stt_started = turn_started_at
             text = await transcribe_pcm(segment.audio)
             stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
-            result = {"text": text, "addressed": True, "stt_ms": stt_ms}
+            result = {
+                "text": text,
+                "addressed": True,
+                "stt_ms": stt_ms,
+                "turn_started_at": turn_started_at,
+            }
 
         return result

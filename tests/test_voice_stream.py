@@ -67,6 +67,7 @@ class TestVoiceStreamSession:
 
         assert result["text"] == "hallo mantis" and result["addressed"] is True
         assert isinstance(result["stt_ms"], float) and result["stt_ms"] >= 0
+        assert isinstance(result["turn_started_at"], float)
 
     def test_segment_during_active_conversation_triggers_even_without_wakeword(self, monkeypatch):
         import core.voice_stream as vs

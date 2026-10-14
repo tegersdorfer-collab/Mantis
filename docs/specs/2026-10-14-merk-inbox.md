@@ -157,9 +157,9 @@ Statusnachricht.
 ### Bilder und Screenshots
 
 Nur Bildanhänge (gängige Bild-MIME-Typen) werden in v1 unterstützt. Discord lädt sie nur
-für den erlaubten Absender herunter; maximal vier Bilder mit jeweils höchstens 10 MiB pro
-Nachricht. Nicht-Bild-Anhänge und Sprachnachrichten behalten eine kurze verständliche
-Ablehnung.
+für den erlaubten Absender herunter; maximal vier Bilder mit jeweils höchstens 7,5 MB
+Rohdaten pro Nachricht, damit jedes Bild nach Base64-Kodierung unter 10 MB bleibt.
+Nicht-Bild-Anhänge und Sprachnachrichten behalten eine kurze verständliche Ablehnung.
 
 Der Anhang und optionale Caption werden an eine multimodale Vision-Stufe der Chat-Kette
 übergeben. Sie erkennt OCR-Text, sichtbare Titel/Marken/Orte sowie eine kurze neutrale

@@ -110,6 +110,8 @@ def test_chat_cloud_settings_have_benchmarked_defaults(monkeypatch):
         "CHAT_CLOUD_FALLBACK_MODEL",
         "CHAT_CLOUD_REASONING_EFFORT",
         "CHAT_CLOUD_TIMEOUT_S",
+        "FAST_CHAIN_ORDER",
+        "VOICE_CHAIN_ORDER",
         "CHAT_ANTHROPIC_MODEL",
         "CHAT_CHATGPT_PLAN_ENABLED",
         "CHAT_CHATGPT_PLAN_MODEL",
@@ -124,6 +126,8 @@ def test_chat_cloud_settings_have_benchmarked_defaults(monkeypatch):
     assert settings.CHAT_CLOUD_FALLBACK_MODEL == ""
     assert settings.CHAT_CLOUD_REASONING_EFFORT == "low"
     assert settings.CHAT_CLOUD_TIMEOUT_S == 30
+    assert settings.FAST_CHAIN_ORDER == ["openrouter", "anthropic", "chatgpt-plan"]
+    assert settings.VOICE_CHAIN_ORDER == ["openrouter", "anthropic", "chatgpt-plan"]
     assert settings.CHAT_ANTHROPIC_MODEL == "claude-haiku-5-5"
     assert settings.CHAT_CHATGPT_PLAN_ENABLED is True
     assert settings.CHAT_CHATGPT_PLAN_MODEL == "gpt-6-luna"
@@ -157,6 +161,70 @@ def test_chat_chain_settings_can_be_overridden_from_environment(monkeypatch):
     assert settings.CHAT_CHATGPT_PLAN_MODEL == "gpt-custom"
     assert settings.CHATGPT_AUTH_FILE == "/tmp/chatgpt-auth.json"
     assert settings.CHATGPT_AUTH_CALLBACK_PORT == 1457
+
+
+def test_fast_and_voice_chain_orders_accept_provider_stage_lists(monkeypatch):
+    monkeypatch.setenv("FAST_CHAIN_ORDER", '["anthropic", "openrouter", "chatgpt-plan"]')
+    monkeypatch.setenv("VOICE_CHAIN_ORDER", '["chatgpt-plan", "anthropic"]')
+
+    settings = MantisSettings(_env_file=None)
+
+    assert settings.FAST_CHAIN_ORDER == ["anthropic", "openrouter", "chatgpt-plan"]
+    assert settings.VOICE_CHAIN_ORDER == ["chatgpt-plan", "anthropic"]
+
+
+def test_custom_fast_chain_order_reorders_provider_stages(monkeypatch):
+    import core.backends.factory as factory
+
+    created = _install_fake_backends(monkeypatch)
+    monkeypatch.setattr(factory, "chatgpt_auth_is_configured", lambda _cfg: True)
+
+    backend = cloud_chain(
+        "fast",
+        reasoning="minimal",
+        cfg=_cfg(
+            FAST_CHAIN_ORDER=["anthropic", "chatgpt-plan", "openrouter"],
+            CHAT_CLOUD_FALLBACK_MODEL="",
+        ),
+    )
+
+    assert backend.backend_chain == ("claude-haiku-test", "gpt-6-luna", "openai/gpt-6-luna")
+    assert [stage.provider_name for stage in backend.backends] == [
+        "Claude", "ChatGPT-Abo", "OpenRouter",
+    ]
+    assert created[0][1].kwargs["reasoning_effort"] == "minimal"
+
+
+def test_custom_voice_chain_order_reorders_provider_stages(monkeypatch):
+    import core.backends.factory as factory
+
+    _install_fake_backends(monkeypatch)
+    monkeypatch.setattr(factory, "chatgpt_auth_is_configured", lambda _cfg: True)
+
+    backend = cloud_chain(
+        "voice",
+        cfg=_cfg(
+            VOICE_CHAIN_ORDER=["chatgpt-plan", "anthropic", "openrouter"],
+            CHAT_CLOUD_FALLBACK_MODEL="",
+        ),
+    )
+
+    assert backend.backend_chain == ("gpt-6-luna", "claude-haiku-test", "openai/gpt-6-luna")
+
+
+def test_fast_total_timeout_is_split_across_available_stages(monkeypatch):
+    _install_fake_backends(monkeypatch)
+
+    backend = cloud_chain(
+        "fast",
+        total_timeout=6,
+        cfg=_cfg(
+            FAST_CHAIN_ORDER=["anthropic", "openrouter"],
+            CHAT_CLOUD_FALLBACK_MODEL="",
+        ),
+    )
+
+    assert backend.stage_timeouts == (3, 3)
 
 
 def test_chat_chain_keeps_openrouter_fallback_and_has_no_local_stage(monkeypatch):

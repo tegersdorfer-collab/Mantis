@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import base64
 
+from core.vision import MAX_IMAGE_RAW_BYTES, validate_image_payload
+
 
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 MAX_IMAGES = 4
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
+# 7.5 MB rohe Bytes ergeben höchstens 10 MB nach Base64-Kodierung.
+MAX_IMAGE_BYTES = MAX_IMAGE_RAW_BYTES
 VISION_TIMEOUT_S = 8.0
 
 
@@ -42,6 +45,12 @@ async def describe_images(
         data = image.get("data")
         content_type = str(image.get("content_type") or "").split(";", 1)[0].casefold()
         if not isinstance(data, (bytes, bytearray)) or not data or len(data) > MAX_IMAGE_BYTES:
+            continue
+        if content_type not in SUPPORTED_IMAGE_TYPES:
+            continue
+        try:
+            content_type = validate_image_payload(bytes(data))
+        except ValueError:
             continue
         if content_type not in SUPPORTED_IMAGE_TYPES:
             continue

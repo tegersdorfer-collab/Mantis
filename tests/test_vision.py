@@ -3,9 +3,23 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import struct
+
+import pytest
 
 from core import vision
 from core.backends.base import AgentBackend
+
+
+def _png(width=1, height=1):
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + struct.pack(">I", 13)
+        + b"IHDR"
+        + struct.pack(">II", width, height)
+        + b"\x08\x02\x00\x00\x00"
+        + b"\x00\x00\x00\x00"
+    )
 
 
 class FakeVisionBackend(AgentBackend):
@@ -42,7 +56,8 @@ def test_ask_image_routes_cloud_vision_and_encodes_image(monkeypatch):
     monkeypatch.setattr(vision, "_chain", None)
     monkeypatch.setattr(vision, "cloud_chain", cloud_chain)
 
-    result = asyncio.run(vision.ask_image(b"image-bytes", "Beschreibe es.", max_tokens=77))
+    png_bytes = _png()
+    result = asyncio.run(vision.ask_image(png_bytes, "Beschreibe es.", max_tokens=77))
 
     assert result == "Ein Bild"
     assert purposes == [("vision", {"reasoning": "low"})]
@@ -51,8 +66,8 @@ def test_ask_image_routes_cloud_vision_and_encodes_image(monkeypatch):
     assert content[0] == {"type": "text", "text": "Beschreibe es."}
     assert content[1] == {
         "type": "image", "source": {
-            "type": "base64", "media_type": "image/jpeg",
-            "data": base64.b64encode(b"image-bytes").decode(),
+            "type": "base64", "media_type": "image/png",
+            "data": base64.b64encode(png_bytes).decode(),
         },
     }
 
@@ -62,10 +77,43 @@ def test_ask_image_requests_json_when_format_is_json(monkeypatch):
     monkeypatch.setattr(vision, "_chain", None)
     monkeypatch.setattr(vision, "cloud_chain", lambda *_args, **_kwargs: backend)
 
-    result = asyncio.run(vision.ask_image(b"image", "Schätze Makros.", format="json"))
+    result = asyncio.run(vision.ask_image(_png(), "Schätze Makros.", format="json"))
 
     assert result == '{"items":[]}'
     assert "validem JSON" in backend.calls[0]["messages"][0]["content"]
+
+
+def test_ask_image_rejects_base64_payload_over_anthropic_limit_before_chain(monkeypatch):
+    called = []
+    monkeypatch.setattr(vision, "_chain", None)
+    monkeypatch.setattr(vision, "cloud_chain", lambda *_args, **_kwargs: called.append(True))
+
+    with pytest.raises(ValueError, match="10 MB"):
+        asyncio.run(vision.ask_image(b"x" * 7_500_001, "Beschreibe es."))
+
+    assert called == []
+
+
+def test_ask_image_rejects_dimensions_over_provider_limit_before_chain(monkeypatch):
+    called = []
+    monkeypatch.setattr(vision, "_chain", None)
+    monkeypatch.setattr(vision, "cloud_chain", lambda *_args, **_kwargs: called.append(True))
+
+    with pytest.raises(ValueError, match="8000x8000"):
+        asyncio.run(vision.ask_image(_png(8001, 1), "Beschreibe es."))
+
+    assert called == []
+
+
+def test_ask_image_rejects_unrecognized_image_bytes_before_chain(monkeypatch):
+    called = []
+    monkeypatch.setattr(vision, "_chain", None)
+    monkeypatch.setattr(vision, "cloud_chain", lambda *_args, **_kwargs: called.append(True))
+
+    with pytest.raises(ValueError, match="Bildformat"):
+        asyncio.run(vision.ask_image(b"image-bytes", "Beschreibe es."))
+
+    assert called == []
 
 
 def test_describe_image_returns_fallback_when_cloud_fails(monkeypatch):

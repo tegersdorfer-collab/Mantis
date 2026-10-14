@@ -201,6 +201,38 @@ def test_all_backend_failures_raise_a_clear_exhaustion_error():
         _call(backend)
 
 
+def test_empty_visible_answer_uses_next_provider():
+    empty = FakeBackend("openrouter", result=("", []))
+    fallback = FakeBackend("anthropic", result=("sichtbare Antwort", []))
+    backend = FallbackBackend(
+        backends=[empty, fallback], stage_timeouts=[0.5, 0.5], cooldown_s=60,
+    )
+
+    assert _call(backend) == ("sichtbare Antwort", [])
+    assert empty.calls == 1
+    assert fallback.calls == 1
+
+
+def test_anthropic_unsupported_parameter_400_falls_through_without_permanent_disable():
+    import httpx
+
+    error = httpx.HTTPStatusError(
+        "temperature is deprecated for this model",
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        response=httpx.Response(400),
+    )
+    anthropic = FakeBackend("claude-haiku-5-5", error=error)
+    fallback = FakeBackend("chatgpt-plan", result=("fallback", []))
+    backend = FallbackBackend(
+        backends=[anthropic, fallback], stage_timeouts=[0.5, 0.5], cooldown_s=180,
+    )
+
+    assert _call(backend) == ("fallback", [])
+    assert anthropic.calls == 1
+    assert fallback.calls == 1
+    assert backend._down_until[0] != float("inf")
+
+
 def test_chain_uses_next_available_cloud_stage_during_primary_cooldown():
     primary = FakeBackend("openrouter-primary", error=ConnectionError("offline"))
     secondary = FakeBackend("openrouter-fallback", result=("cloud fallback", []))
