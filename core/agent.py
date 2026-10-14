@@ -9,6 +9,7 @@ Backends (core/backends/) übernehmen den LLM-spezifischen Teil:
 
 Dieser Loop kennt nur backend.call() — egal welcher Anbieter dahintersteckt.
 """
+import asyncio
 import json
 import logging
 import re
@@ -49,6 +50,7 @@ class Agent:
         max_tokens: int,
         think: bool = False,
         force_tool_call: bool = False,
+        tool_selection_task: asyncio.Future | None = None,
     ) -> tuple[str, list[dict], str | None]:
         timer = voice_timing.LlmCall()
         tool_calls = []
@@ -57,7 +59,7 @@ class Agent:
             content, tool_calls, attempt_id = await self._call_backend_inner(
                 messages, tools=tools, stream_cb=stream_cb, temperature=temperature,
                 max_tokens=max_tokens, think=think, force_tool_call=force_tool_call,
-                timer=timer,
+                timer=timer, tool_selection_task=tool_selection_task,
             )
         except BaseException as exc:
             error = type(exc).__name__
@@ -77,13 +79,20 @@ class Agent:
         think: bool = False,
         force_tool_call: bool = False,
         timer: "voice_timing.LlmCall",
+        tool_selection_task: asyncio.Future | None = None,
     ) -> tuple[str, list[dict], str | None]:
         if stream_cb is None:
-            content, tool_calls = await self._backend.call(
-                messages, tools=tools, stream_cb=None,
+            kwargs = dict(
+                tools=tools, stream_cb=None,
                 temperature=temperature, max_tokens=max_tokens,
                 think=think, force_tool_call=force_tool_call,
             )
+            if isinstance(self._backend, FallbackBackend) and tool_selection_task is not None:
+                content, tool_calls = await self._backend.call(
+                    messages, **kwargs, tool_selection_task=tool_selection_task,
+                )
+            else:
+                content, tool_calls = await self._backend.call(messages, **kwargs)
             return content, tool_calls, None
 
         if isinstance(self._backend, FallbackBackend):
@@ -103,6 +112,7 @@ class Agent:
                 temperature=temperature, max_tokens=max_tokens,
                 think=think, force_tool_call=force_tool_call,
                 attempt_cb=report_event,
+                tool_selection_task=tool_selection_task,
             )
             return content, tool_calls, active_attempt_id[0]
 
@@ -147,6 +157,7 @@ class Agent:
         force_tools: bool = False,
         think: bool = False,
         dry_run_tools: bool = False,
+        tool_selection_task: asyncio.Future | None = None,
     ) -> tuple[str, list[dict]]:
         """
         Führt den ReAct-Loop aus.
@@ -165,18 +176,43 @@ class Agent:
 
         msgs: list[dict] = [{"role": "system", "content": system}] + norm
 
-        if not use_tools or allowed_tools == []:
+        # Globale Tool-Sperre: eine nachgereichte Auswahl darf Tools nie wieder aktivieren.
+        if not use_tools:
+            tool_selection_task = None
+
+        if not use_tools or (allowed_tools == [] and tool_selection_task is None):
             schemas = None
+        elif tool_selection_task is not None:
+            # Anthropic sends this full catalog anyway; permissions are resolved only
+            # if a tool call actually needs dispatch.
+            schemas = toolreg.ollama_schemas()
         elif allowed_tools:
             schemas = toolreg.ollama_schemas(only=allowed_tools)
         else:
             schemas = toolreg.ollama_schemas()
 
         # Schemas guide the model; enforce the same permissions at dispatch too.
-        permitted_tools = {s["function"]["name"] for s in (schemas or [])}
+        permitted_tools = (
+            set(allowed_tools or []) if tool_selection_task is not None
+            else {s["function"]["name"] for s in (schemas or [])}
+        )
         trace: list[dict] = []
 
+        async def resolve_tool_selection(*, wait: bool) -> bool:
+            nonlocal tool_selection_task, schemas, permitted_tools, force_tools
+            if tool_selection_task is None:
+                return False
+            if not wait and not tool_selection_task.done():
+                return False
+            selected, selected_force = await tool_selection_task
+            schemas = toolreg.ollama_schemas(only=selected)
+            permitted_tools = {schema["function"]["name"] for schema in schemas}
+            force_tools = force_tools or selected_force
+            tool_selection_task = None
+            return True
+
         for step in range(self._max_steps):
+            await resolve_tool_selection(wait=False)
             is_first = step == 0
             force = force_tools and is_first and bool(schemas)
             BUS.emit("thinking", "Denke nach…", detail=self._backend.model_name)
@@ -188,9 +224,11 @@ class Agent:
                 max_tokens=max_tokens,
                 think=think and is_first,
                 force_tool_call=force,
+                tool_selection_task=tool_selection_task,
             )
 
             if not tool_calls:
+                await resolve_tool_selection(wait=False)
                 # Math-Guard: Antwort enthält Rechnung ohne calculate aufgerufen?
                 if "calculate" in permitted_tools and _needs_calculate(content) and not any(
                     t["tool"] == "calculate" for t in trace
@@ -207,6 +245,7 @@ class Agent:
                     content, tool_calls, attempt_id = await self._call_backend(
                         msgs, tools=schemas, stream_cb=stream_cb,
                         temperature=0.2, max_tokens=300,
+                        tool_selection_task=tool_selection_task,
                     )
                     msgs = msgs[:-2]
                     if not tool_calls:
@@ -229,6 +268,7 @@ class Agent:
                     content, tool_calls, attempt_id = await self._call_backend(
                         msgs, tools=schemas, stream_cb=stream_cb,
                         temperature=0.3, max_tokens=200,
+                        tool_selection_task=tool_selection_task,
                     )
                     if not tool_calls:
                         await self._end_attempt(stream_cb, attempt_id, final=True)
@@ -240,6 +280,9 @@ class Agent:
                     return content.strip(), trace
             else:
                 await self._end_attempt(stream_cb, attempt_id, final=False)
+
+            if tool_calls:
+                await resolve_tool_selection(wait=True)
 
             # Tool-Calls ausführen
             msgs.append({

@@ -190,6 +190,36 @@ class TestStreamingSplit:
             "etwa achtzehn Grad warm werden, mit Regen am Nachmittag und Wind aus Nordwest.")
         assert len(bloecke[0]) >= tts._STREAM_MIN_CHARS
 
+    def test_erster_block_darf_an_frueher_kommagrenze_endigen(self):
+        text = "Das ist eine ausreichend lange Einleitung, danach kommt der Rest."
+        bloecke = tts._split_for_streaming(text)
+        assert bloecke[0] == "Das ist eine ausreichend lange Einleitung,"
+        assert " ".join(bloecke).split() == text.split()
+
+    def test_dezimalkomma_ist_keine_fruehe_schnittgrenze(self):
+        text = "Der Messwert beträgt ungefähr 10,4 Stunden, und danach ging es weiter."
+        bloecke = tts._split_for_streaming(text)
+        assert bloecke[0] == "Der Messwert beträgt ungefähr 10,4 Stunden,"
+        assert "10,4" in bloecke[0]
+
+    @pytest.mark.parametrize(("text", "zahl"), [
+        ("Dein Termin ist heute um 18:30 Uhr, danach fahren wir nach Hause.", "18:30"),
+        ("Deine Arbeitszeit läuft von 10–12 Uhr, danach ist Pause.", "10–12"),
+    ])
+    def test_fruehe_schnittgrenze_zerlegt_keine_uhrzeiten_oder_zahlenbereiche(self, text, zahl):
+        bloecke = tts._split_for_streaming(text)
+        assert any(zahl in block for block in bloecke)
+
+    def test_fruehe_schnittgrenze_braucht_mindestens_25_zeichen(self):
+        text = "Das ist kurz, dann geht es weiter."
+        assert tts._split_for_streaming(text) == [text]
+
+    def test_erster_block_darf_an_gedankenstrich_oder_doppelpunkt_endigen(self):
+        gedankenstrich = "Der erste Gedanke ist lang genug – danach folgt der Rest."
+        doppelpunkt = "Hier steht eine lange Einleitung: danach folgt der Rest."
+        assert tts._split_for_streaming(gedankenstrich)[0].endswith("–")
+        assert tts._split_for_streaming(doppelpunkt)[0].endswith(":")
+
     def test_bloecke_wachsen_nur_begrenzt(self):
         """Kein Block darf viel länger sein als sein Vorgänger — sonst überholt die
         Wiedergabe die Synthese."""

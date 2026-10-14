@@ -175,6 +175,65 @@ class TestTranscribeParakeet:
         assert loader_threads and loader_threads[0] != caller_thread
         assert voice._parakeet_unavailable is False
 
+    def test_vorladen_warmt_mit_stille_im_selben_executor_auf(self, monkeypatch):
+        import threading
+        import wave
+        from concurrent.futures import ThreadPoolExecutor
+
+        monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
+        monkeypatch.setattr(voice.config, "STT_PRELOAD", True, raising=False)
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-parakeet")
+        monkeypatch.setattr(voice, "_parakeet_executor", executor)
+        worker_threads = []
+        wav_details = []
+
+        class FakeModel:
+            def transcribe(self, path):
+                worker_threads.append(threading.get_ident())
+                with wave.open(path, "rb") as wav:
+                    wav_details.append((
+                        wav.getnchannels(), wav.getframerate(), wav.getnframes(), wav.getsampwidth(),
+                    ))
+                return MagicMock(text="")
+
+        model = FakeModel()
+        monkeypatch.setattr(voice, "_load_parakeet_model", lambda _model_id: (
+            worker_threads.append(threading.get_ident()) or model
+        ))
+
+        async def run_preload():
+            await voice.preload_parakeet()
+
+        try:
+            asyncio.run(run_preload())
+        finally:
+            executor.shutdown(wait=True)
+
+        assert model is voice._parakeet_model
+        assert len(worker_threads) == 2
+        assert worker_threads[0] == worker_threads[1]
+        assert wav_details == [(1, 16000, 16000, 2)]
+
+    def test_warmup_fehler_laesst_vorgeladenes_modell_verfuegbar(self, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
+        monkeypatch.setattr(voice.config, "STT_PRELOAD", True, raising=False)
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-parakeet")
+        monkeypatch.setattr(voice, "_parakeet_executor", executor)
+        model = MagicMock()
+        model.transcribe.side_effect = RuntimeError("MLX warmup fehlgeschlagen")
+        monkeypatch.setattr(voice, "_load_parakeet_model", lambda _model_id: model)
+
+        try:
+            asyncio.run(voice.preload_parakeet())
+        finally:
+            executor.shutdown(wait=True)
+
+        assert voice._parakeet_model is model
+        assert voice._parakeet_unavailable is False
+        model.transcribe.assert_called_once()
+
     def test_vorladen_ist_per_setting_abschaltbar(self, monkeypatch):
         monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
         monkeypatch.setattr(voice.config, "STT_PRELOAD", False, raising=False)

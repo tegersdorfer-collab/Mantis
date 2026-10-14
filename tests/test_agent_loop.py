@@ -286,6 +286,91 @@ def test_backend_cannot_execute_unpermitted_tools(echo_tool, monkeypatch, permis
     assert be.calls[1]["messages"][-1]["content"] == trace[0]["result"]
 
 
+def test_deferred_tool_selection_blocks_unpermitted_tool_after_selection_finishes(echo_tool):
+    executed = []
+
+    async def write(text=""):
+        executed.append(text)
+        return "written"
+
+    toolreg.REGISTRY["echo"].handler = write
+    be = FakeBackend([("", [_tc("echo", {"text": "unauthorized"})]), ("Done", [])])
+
+    async def run():
+        release_selection = asyncio.Event()
+
+        async def selection():
+            await release_selection.wait()
+            return ["calculate"], False
+
+        selection_task = asyncio.create_task(selection())
+        agent_task = asyncio.create_task(Agent(be).run(
+            [], system="s", tool_selection_task=selection_task,
+        ))
+        await asyncio.sleep(0)
+        assert len(be.calls) == 1
+        assert not agent_task.done()
+        release_selection.set()
+        return await agent_task
+
+    _text, trace = asyncio.run(run())
+    assert executed == []
+    assert "nicht erlaubt" in trace[0]["result"]
+
+
+def test_deferred_tool_selection_does_not_delay_answer_without_tool(echo_tool):
+    be = FakeBackend([("Direkte Antwort.", [])])
+
+    async def run():
+        pending_selection = asyncio.get_running_loop().create_future()
+        result = await Agent(be).run(
+            [], system="s", tool_selection_task=pending_selection,
+        )
+        assert not pending_selection.done()
+        return result
+
+    assert asyncio.run(run()) == ("Direkte Antwort.", [])
+
+
+@pytest.mark.parametrize("selection_ready", [True, False], ids=["fertig", "verzoegert"])
+def test_use_tools_false_stays_a_global_lock_after_deferred_selection(echo_tool, monkeypatch, selection_ready):
+    executed = []
+
+    async def write(text=""):
+        executed.append(text)
+        return "written"
+
+    monkeypatch.setattr(toolreg.REGISTRY["echo"], "handler", write)
+    be = FakeBackend([("", [_tc("echo", {"text": "unauthorized"})]), ("Done", [])])
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        if selection_ready:
+            selection_task = loop.create_future()
+            selection_task.set_result((["echo"], True))
+        else:
+            async def select_later():
+                await asyncio.sleep(0)
+                return ["echo"], True
+
+            selection_task = asyncio.create_task(select_later())
+        try:
+            result = await Agent(be).run(
+                [], system="s", use_tools=False, tool_selection_task=selection_task,
+            )
+            if not selection_ready:
+                await selection_task
+            return result
+        finally:
+            if not selection_ready and not selection_task.done():
+                selection_task.cancel()
+                await asyncio.gather(selection_task, return_exceptions=True)
+
+    _, trace = asyncio.run(run())
+    assert executed == []
+    assert "nicht erlaubt" in trace[0]["result"]
+
+
 def test_math_guard_does_not_request_disallowed_calculate(echo_tool):
     be = FakeBackend([("Durchschnitt ~ 73", [])])
     text, trace = asyncio.run(Agent(be).run([], system="s", allowed_tools=["echo"]))
