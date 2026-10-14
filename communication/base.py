@@ -9,12 +9,24 @@ from typing import Callable, Awaitable
 
 
 @dataclass
+class IncomingAttachment:
+    filename: str
+    content_type: str
+    size: int
+    data: bytes
+
+
+@dataclass
 class IncomingMessage:
     text: str
     sender_id: str
     timestamp: datetime
     raw: object | None = None   # Original Message-Objekt falls gebraucht
     channel: str = "telegram"
+    source_message_id: str | None = None
+    reply_to_message_id: str | None = None
+    attachments: tuple[IncomingAttachment, ...] = ()
+    attachment_notice: str = ""
 
 
 MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
@@ -23,7 +35,7 @@ MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
 class CommunicationChannel(ABC):
 
     @abstractmethod
-    async def send(self, text: str) -> None:
+    async def send(self, text: str) -> object | None:
         """Nachricht an Timo senden."""
         ...
 

@@ -294,6 +294,28 @@ class AgentRemoteService:
             return False
         return True
 
+    def begin_user_turn(self, msg: IncomingMessage | None = None) -> None:
+        """Verwirft offene Vorschläge beim nächsten Turn außer dessen DM-Bestätigung."""
+        keep_requester = None
+        if msg is not None and self._is_trusted_dm(msg):
+            requester_id = str(msg.sender_id)
+            proposal = self.pending.get(requester_id)
+            raw_channel = getattr(msg.raw, "channel", None)
+            same_dm = proposal is not None and proposal.dm_id == str(
+                getattr(raw_channel, "id", "")
+            )
+            text = str(msg.text or "").strip()
+            confirmation_attempt = (
+                _CONFIRMATION_RE.fullmatch(text) is not None
+                or text.casefold() in _REJECTIONS
+            )
+            if same_dm and confirmation_attempt:
+                keep_requester = requester_id
+
+        for requester_id in tuple(self.pending):
+            if requester_id != keep_requester:
+                self.pending.pop(requester_id, None)
+
     @staticmethod
     def _start_body(text: str) -> str | None:
         for pattern in _START_PATTERNS:

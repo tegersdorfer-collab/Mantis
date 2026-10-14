@@ -93,9 +93,15 @@ async def execute(name: str, args: dict) -> str:
         _tool_failure_counts[name] = 0
         return str(result)
     except TypeError as e:
-        _note_failure(name, e)
+        _note_failure(name, RuntimeError(type(e).__name__) if name.startswith("inbox_") else e)
+        if name.startswith("inbox_"):
+            return "FEHLER: ungültige Inbox-Argumente."
         return f"FEHLER: ungültige Argumente für {name}: {e}"
     except Exception as e:
+        if name.startswith("inbox_"):
+            log.warning("Tool %s fehlgeschlagen (%s)", name, type(e).__name__)
+            _note_failure(name, RuntimeError(type(e).__name__))
+            return "FEHLER: Inbox-Vorgang fehlgeschlagen."
         log.warning(f"Tool {name} fehlgeschlagen: {e}")
         _note_failure(name, e)
         return f"FEHLER beim Ausführen von {name}: {e}"
@@ -151,6 +157,11 @@ _CATEGORY_KEYWORDS = {
                      "wer ist", "was ist", "preis", "kostet", "wie viel",
                      "brain", "second brain", "notiz", "notiere", "speichere", "inbox",
                      "wissen", "ressource", "daily note", "tageslog"],
+    "inbox":        ["merkliste", "merker", "gemerkt", "was wollte ich mir noch",
+                     "was wollte ich noch anschauen", "was war die idee mit",
+                     "links von letzter woche", "hab ich gesehen", "inbox",
+                     "korrigiere den merker", "korrigier den merker", "lösch den merker",
+                     "loesch den merker"],
     "memory":       ["merk dir", "merke", "behalte", "vergiss nicht", "erinnere dich"],
     "health":       ["schlaf", "schritte", "hrv", "puls", "gewicht", "gesundheit"],
     "system":       ["api-kosten", "api kosten", "api-ausgaben", "token", "llm-kosten",
@@ -213,6 +224,11 @@ def select_tools(text: str) -> list[str]:
         if any(k in t for k in kws):
             cats.add(cat)
 
+    # Ein klarer Inbox-Bezug darf keine Second-Brain- oder generischen Aktionen
+    # anbieten; der Datenbereich ist absichtlich eigenständig.
+    if "inbox" in cats:
+        cats = {"inbox"}
+
     has_action = any(w in t for w in _ACTION_WORDS)
     is_question = "?" in text
 
@@ -223,6 +239,11 @@ def select_tools(text: str) -> list[str]:
         return [n for n in _FALLBACK_TOOLS if n in REGISTRY]
 
     names = [name for name, tool in REGISTRY.items() if tool.category in cats]
+
+    # Inbox-Vorgänge bleiben in ihrem eigenen Datenbereich. Weder semantisches
+    # Ranking noch die generischen Skill-Werkzeuge dürfen fremde Tools hinzufügen.
+    if cats == {"inbox"}:
+        return names
 
     # Aktionswort ohne klare Kategorie → Produktivitäts-Tools als Default
     if has_action and not names:
@@ -262,7 +283,11 @@ async def select_tools_async(text: str) -> tuple[list[str], bool]:
     Aktionswort im Text muss weiter ziehen (Recall vor Precision bei kleinen Modellen).
     """
     names = select_tools(text)
-    force = bool(names) and is_action(text)
+    force = bool(names) and (
+        is_action(text) or any(REGISTRY[name].category == "inbox" for name in names if name in REGISTRY)
+    )
+    if names and all(REGISTRY[name].category == "inbox" for name in names if name in REGISTRY):
+        return names, True
     jev = await decisions.tool_categories(text)
     if jev is None:
         return names, force

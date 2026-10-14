@@ -167,6 +167,7 @@ class Orchestrator:
             if discord_channel is not None
             else None
         )
+        self.msg_handler.agent_remote = self.agent_remote
 
         self.idle_loop = IdleLoop(
             autopilot=self.autopilot, reflection=self.reflection,
@@ -194,10 +195,6 @@ class Orchestrator:
     # ── Öffentliche API (delegiert an Teilmodule) ─────────────────────────────
 
     async def handle_message(self, msg: IncomingMessage) -> None:
-        remote = getattr(self, "agent_remote", None)
-        if remote is not None and getattr(msg, "channel", None) == "discord":
-            if await remote.handle(msg, self.msg_handler._channel_for(msg)):
-                return
         await self.msg_handler.handle(msg, resume_idle_cb=self.idle_loop.resume)
 
     async def dashboard_respond(

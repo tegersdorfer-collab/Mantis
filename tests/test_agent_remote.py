@@ -335,6 +335,24 @@ def test_confirmation_reply_can_target_any_chunk_of_a_long_preview(git_repo, tmp
     _run(run())
 
 
+def test_user_turn_lifecycle_preserves_an_allowed_remote_confirmation(git_repo, tmp_path):
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = Route()
+        await service.handle(_message("codex: mantis analysiere README"), route)
+        confirmation = _proposal_confirmation(service)
+
+        service.begin_user_turn(confirmation)
+        assert service.pending.get("123") is not None
+
+        await service.handle(confirmation, route)
+
+        assert len(harness.calls) == 1
+        await service.stop()
+
+    _run(run())
+
+
 @pytest.mark.parametrize("command", ["ja", "start"])
 def test_wrong_short_confirmation_id_keeps_proposal_unstarted(git_repo, tmp_path, command):
     async def run():
@@ -1615,24 +1633,22 @@ def test_test_command_and_registry_fields_are_absent_from_v1(git_repo, tmp_path)
     assert "test_status" not in {field.name for field in fields(RunRecord)}
 
 
-def test_fast_path_consumes_remote_message_before_normal_handler():
+def test_orchestrator_routes_remote_messages_through_the_shared_handler():
     async def run():
         from orchestrator import Orchestrator
         from unittest.mock import AsyncMock
 
         remote = SimpleNamespace(handle=AsyncMock(return_value=True))
-        handler = SimpleNamespace(
-            _channel_for=lambda _msg: "reply-route",
-            handle=AsyncMock(),
-        )
+        handler = SimpleNamespace(handle=AsyncMock())
         orchestrator = object.__new__(Orchestrator)
         orchestrator.agent_remote = remote
         orchestrator.msg_handler = handler
+        orchestrator.idle_loop = SimpleNamespace(resume=lambda: None)
 
         await orchestrator.handle_message(_message("was läuft?"))
 
-        remote.handle.assert_awaited_once()
-        handler.handle.assert_not_awaited()
+        remote.handle.assert_not_awaited()
+        handler.handle.assert_awaited_once()
 
     _run(run())
 
@@ -1834,12 +1850,13 @@ def test_discord_route_disables_mentions_for_untrusted_result_text():
         )
         destination = Destination()
         sent_ids = await channel.for_message(SimpleNamespace(channel=destination)).send(
-            "untrusted result: @everyone <@123>"
+            "@everyone " + "x" * 2000
         )
 
-        assert sent_ids == ("discord-1",)
+        assert sent_ids == ("discord-1", "discord-2")
         assert destination.sent == [
-            ("untrusted result: @everyone <@123>", {"allowed_mentions": "mentions-disabled"}),
+            ("@everyone", {"allowed_mentions": "mentions-disabled"}),
+            ("x" * 2000, {"allowed_mentions": "mentions-disabled"}),
         ]
 
     _run(run())

@@ -525,6 +525,48 @@ MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS brain_notes_category_idx ON brain_notes (category);",
     "CREATE INDEX IF NOT EXISTS brain_notes_embedding_idx ON brain_notes USING hnsw (embedding vector_cosine_ops) WHERE embedding IS NOT NULL;",
+    """CREATE TABLE IF NOT EXISTS merk_inbox_items (
+        id                  BIGSERIAL PRIMARY KEY,
+        title               TEXT NOT NULL,
+        user_note           TEXT NOT NULL DEFAULT '',
+        source_kind         TEXT NOT NULL DEFAULT 'text'
+                            CHECK (source_kind IN ('link', 'image', 'text', 'mixed')),
+        source_urls         TEXT[] NOT NULL DEFAULT '{}',
+        normalized_urls     TEXT[] NOT NULL DEFAULT '{}',
+        dedupe_key          TEXT,
+        platform            TEXT NOT NULL DEFAULT 'unknown',
+        source_metadata     JSONB NOT NULL DEFAULT '{}'::jsonb,
+        image_description   TEXT NOT NULL DEFAULT '',
+        category            TEXT NOT NULL DEFAULT 'sonstiges'
+                            CHECK (category IN ('anschauen', 'lesen', 'film-serie', 'kaufen',
+                                                'idee', 'ort', 'zitat', 'sonstiges')),
+        category_source     TEXT NOT NULL DEFAULT 'auto'
+                            CHECK (category_source IN ('auto', 'user')),
+        tags                TEXT[] NOT NULL DEFAULT '{}',
+        tags_source         TEXT NOT NULL DEFAULT 'auto'
+                            CHECK (tags_source IN ('auto', 'user')),
+        status              TEXT NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open', 'done')),
+        embedding           vector(1024),
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at        TIMESTAMPTZ,
+        source_message_id   TEXT UNIQUE,
+        source_message_ids  TEXT[] NOT NULL DEFAULT '{}',
+        confirmation_message_ids TEXT[] NOT NULL DEFAULT '{}'
+    );""",
+    "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS source_message_ids TEXT[] NOT NULL DEFAULT '{}';",
+    "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS category_source TEXT NOT NULL DEFAULT 'auto' CHECK (category_source IN ('auto', 'user'));",
+    "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS tags_source TEXT NOT NULL DEFAULT 'auto' CHECK (tags_source IN ('auto', 'user'));",
+    "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS confirmation_message_ids TEXT[] NOT NULL DEFAULT '{}';",
+    "UPDATE merk_inbox_items SET source_message_ids=ARRAY[source_message_id] WHERE source_message_id IS NOT NULL AND cardinality(source_message_ids)=0;",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_source_message_ids_idx ON merk_inbox_items USING gin (source_message_ids);",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_confirmation_message_ids_idx ON merk_inbox_items USING gin (confirmation_message_ids);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS merk_inbox_open_dedupe_idx ON merk_inbox_items (dedupe_key) WHERE status='open' AND dedupe_key IS NOT NULL;",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_status_created_idx ON merk_inbox_items (status, created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_category_idx ON merk_inbox_items (category, status, created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_urls_gin_idx ON merk_inbox_items USING gin (normalized_urls);",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_embedding_idx ON merk_inbox_items USING hnsw (embedding vector_cosine_ops) WHERE embedding IS NOT NULL;",
     "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS today_focus BOOLEAN DEFAULT FALSE;",
     """CREATE TABLE IF NOT EXISTS body_measurements (
         id          SERIAL PRIMARY KEY,
@@ -552,6 +594,56 @@ MIGRATIONS = [
     "ALTER TABLE workout_sets ADD COLUMN IF NOT EXISTS rpe INT;",
     "ALTER TABLE workout_sets ADD COLUMN IF NOT EXISTS is_warmup BOOLEAN DEFAULT FALSE;",
     "ALTER TABLE workout_sets ADD COLUMN IF NOT EXISTS is_failure BOOLEAN DEFAULT FALSE;",
+    # Gym-Coach: optionale Übungsmetadaten lassen bestehende Übungen unangetastet.
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS exercise_type TEXT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS equipment TEXT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS rep_min INT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS rep_max INT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS rep_start INT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS load_mode TEXT;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS weight_increment_kg DOUBLE PRECISION;",
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS dumbbell_pair BOOLEAN;",
+    "ALTER TABLE workouts ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ;",
+    "ALTER TABLE workouts ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;",
+    "UPDATE workouts SET last_activity_at=created_at WHERE last_activity_at IS NULL;",
+    "UPDATE workouts SET ended_at=created_at WHERE ended_at IS NULL AND type IS DISTINCT FROM 'gym';",
+    """CREATE TABLE IF NOT EXISTS exercise_aliases (
+        id              SERIAL PRIMARY KEY,
+        alias           TEXT NOT NULL,
+        normalized_alias TEXT NOT NULL UNIQUE,
+        exercise_id     INT REFERENCES exercises(id) ON DELETE CASCADE,
+        equipment_prefix TEXT,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS gym_single_open_idx ON workouts(type)
+       WHERE type='gym' AND ended_at IS NULL;""",
+    """INSERT INTO exercise_aliases (alias, normalized_alias, exercise_id)
+       SELECT MIN(name), LOWER(REGEXP_REPLACE(name, '[-[:space:]]+', ' ', 'g')), MIN(id)
+       FROM exercises
+       GROUP BY LOWER(REGEXP_REPLACE(name, '[-[:space:]]+', ' ', 'g'))
+       HAVING COUNT(*)=1
+       ON CONFLICT (normalized_alias) DO NOTHING;""",
+    """WITH groups(canonical, aliases) AS (
+           VALUES
+             ('Bankdrücken', ARRAY['Bankdrücken','Bank','BD','Bench','Bench Press']::TEXT[]),
+             ('Kniebeuge', ARRAY['Kniebeuge','Kniebeugen','Squat','Squats']::TEXT[]),
+             ('Beinpresse', ARRAY['Beinpresse','Leg Press']::TEXT[]),
+             ('Schulterdrücken', ARRAY['Schulterdrücken','Shoulder Press','Overhead Press','OHP']::TEXT[]),
+             ('Klimmzüge', ARRAY['Klimmzüge','Klimmzug','Pull-up','Pullups']::TEXT[]),
+             ('Bizepscurls', ARRAY['Bizepscurls','Bizepscurl','Biceps Curl','Bicep Curl']::TEXT[])
+       ), resolved AS (
+           SELECT g.canonical, MIN(e.id) AS exercise_id, g.aliases
+           FROM groups g
+           JOIN exercises e ON LOWER(e.name)=ANY(
+               SELECT LOWER(candidate) FROM UNNEST(g.aliases) AS candidates(candidate)
+           )
+           GROUP BY g.canonical, g.aliases
+           HAVING COUNT(DISTINCT e.id)=1
+       )
+       INSERT INTO exercise_aliases (alias, normalized_alias, exercise_id)
+       SELECT alias, LOWER(REGEXP_REPLACE(alias, '[-[:space:]]+', ' ', 'g')), exercise_id
+       FROM resolved CROSS JOIN LATERAL UNNEST(aliases) AS aliases_out(alias)
+       ON CONFLICT (normalized_alias) DO NOTHING;""",
     "ALTER TABLE meals ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'done';",
 
     # LLM-Usage-Tracking (Token-Verbrauch + API-Kosten pro Call)
@@ -713,6 +805,25 @@ MIGRATIONS = [
 ]
 
 
+def _backfill_legacy_exercise_metadata(cur) -> None:
+    """Füllt Gym-Metadaten der Import-Bestandsübungen, nur wo sie noch NULL sind.
+
+    Idempotent; vorhandene Werte, Namen und Sätze bleiben unangetastet.
+    """
+    from domains.gym.legacy import LEGACY_EXERCISES
+
+    for item in LEGACY_EXERCISES:
+        cur.execute(
+            """UPDATE exercises SET
+                 equipment=COALESCE(equipment,%s),
+                 exercise_type=COALESCE(exercise_type,%s),
+                 load_mode=COALESCE(load_mode,%s)
+               WHERE LOWER(name)=LOWER(%s)
+                 AND (equipment IS NULL OR exercise_type IS NULL OR load_mode IS NULL)""",
+            (item.equipment, item.exercise_type, item.load_mode, item.name),
+        )
+
+
 def run_migrations() -> None:
     """Führt alle Migrationen idempotent aus."""
     init_pool()
@@ -720,6 +831,7 @@ def run_migrations() -> None:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
         for stmt in MIGRATIONS:
             cur.execute(stmt)
+        _backfill_legacy_exercise_metadata(cur)
     log.info(f"Migrationen ausgeführt ({len(MIGRATIONS)} Statements)")
 
 
