@@ -6,16 +6,21 @@ import re
 import unicodedata
 from datetime import datetime
 
-from communication.base import CommunicationChannel, IncomingMessage, MessageHandler as MH
+from communication.base import (
+    CommunicationChannel, IncomingAttachment, IncomingMessage, MessageHandler as MH,
+)
 import config
 
 log = logging.getLogger(__name__)
 
 _MESSAGE_LIMIT = 2000
 _UNSUPPORTED_ATTACHMENT = (
-    "Anhänge und Sprachnachrichten kann ich noch nicht verarbeiten — "
-    "schreib mir den Inhalt bitte als Text."
+    "Ich kann in der Merk-Inbox nur Bilder verarbeiten. Für andere Anhänge oder "
+    "Sprachnachrichten schreib mir den Inhalt bitte als Text."
 )
+_SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_IMAGES = 4
 _CODE_BLOCK = re.compile(r"(```[^\n]*\n.*?```)", re.DOTALL)
 
 
@@ -242,8 +247,8 @@ class DiscordChannel(CommunicationChannel):
     async def _default_route(self):
         return self.for_first_allowed_user()
 
-    async def send(self, text: str) -> None:
-        await (await self._default_route()).send(text)
+    async def send(self, text: str) -> str | None:
+        return await (await self._default_route()).send(text)
 
     async def send_plain(self, text: str) -> None:
         """Sendet einen unformatierten Text ohne Umwandlung oder Aufteilung."""
@@ -326,18 +331,77 @@ class DiscordChannel(CommunicationChannel):
         if not self._authorized(message):
             return
         route = self.for_message(message)
-        if getattr(message, "attachments", None):
-            await route.send(_UNSUPPORTED_ATTACHMENT)
+        raw_attachments = tuple(getattr(message, "attachments", ()) or ())
+        incoming_attachments = []
+        rejected = 0
+        oversized = False
+        for attachment in raw_attachments:
+            content_type = str(getattr(attachment, "content_type", "") or "").split(";", 1)[0].casefold()
+            if content_type not in _SUPPORTED_IMAGE_TYPES:
+                rejected += 1
+                continue
+            if len(incoming_attachments) >= _MAX_IMAGES:
+                rejected += 1
+                continue
+            try:
+                size = int(getattr(attachment, "size", -1))
+            except (TypeError, ValueError):
+                size = -1
+            if size < 0 or size > _MAX_IMAGE_BYTES:
+                oversized = oversized or size > _MAX_IMAGE_BYTES
+                rejected += 1
+                continue
+            reader = getattr(attachment, "read", None)
+            if not callable(reader):
+                rejected += 1
+                continue
+            try:
+                data = await reader()
+            except Exception:
+                rejected += 1
+                continue
+            if not isinstance(data, (bytes, bytearray)) or not data or len(data) > _MAX_IMAGE_BYTES:
+                oversized = oversized or isinstance(data, (bytes, bytearray)) and len(data) > _MAX_IMAGE_BYTES
+                rejected += 1
+                continue
+            incoming_attachments.append(IncomingAttachment(
+                filename=str(getattr(attachment, "filename", "Bild"))[:255],
+                content_type=content_type,
+                size=len(data),
+                data=bytes(data),
+            ))
+
+        if raw_attachments and not incoming_attachments:
+            notice = (
+                "Bilder dürfen höchstens 10 MiB groß sein."
+                if oversized else _UNSUPPORTED_ATTACHMENT
+            )
+            await route.send(notice)
             return
-        text = getattr(message, "content", "")
-        if not text:
+
+        text = str(getattr(message, "content", "") or "")
+        if not text and not incoming_attachments:
             return
+        reference = getattr(message, "reference", None)
+        reference_id = getattr(reference, "message_id", None)
+        notice = ""
+        if rejected:
+            parts = []
+            if oversized:
+                parts.append("Bilder über 10 MiB wurden ignoriert")
+            if rejected and not oversized:
+                parts.append("Nicht-Bild-Anhänge oder zusätzliche Bilder wurden ignoriert")
+            notice = "; ".join(parts) + "."
         incoming = IncomingMessage(
             text=text,
             sender_id=str(message.author.id),
             timestamp=datetime.now(),
             raw=message,
             channel="discord",
+            source_message_id=str(message.id) if getattr(message, "id", None) is not None else None,
+            reply_to_message_id=str(reference_id) if reference_id is not None else None,
+            attachments=tuple(incoming_attachments),
+            attachment_notice=notice,
         )
         if self._handler:
             await self._handler(incoming)
@@ -376,14 +440,19 @@ class _DiscordRoute:
             return await user.create_dm()
         return user
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str) -> str | None:
         await self._stop_typing()
         destination = await self._resolve_destination()
         if destination is None:
             log.warning("Discord-Nachricht nicht gesendet: kein erlaubter Empfänger oder keine Verbindung")
             raise ConnectionError("Discord nicht verbunden oder kein erlaubter Empfänger")
+        sent_message = None
         for chunk in split_discord_message(text):
-            await destination.send(chunk)
+            sent_message = await destination.send(chunk)
+        if isinstance(sent_message, (str, int)):
+            return str(sent_message)
+        message_id = getattr(sent_message, "id", None)
+        return str(message_id) if message_id is not None else None
 
     async def send_plain(self, text: str) -> None:
         """Sendet einen einzelnen Text unverändert, ohne Markdown-Verarbeitung."""

@@ -10,6 +10,11 @@ StreamCb = Callable[[str], Awaitable[None]]
 
 
 class AgentBackend(ABC):
+    @property
+    def supports_vision(self) -> bool:
+        """Ob dieses Backend Modell Bilder in seinem nativen Chat-Aufruf annimmt."""
+        return False
+
     @abstractmethod
     async def call(
         self,
