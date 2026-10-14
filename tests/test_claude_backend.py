@@ -490,3 +490,56 @@ def test_anthropic_cached_prefix_is_byte_identical_when_selected_tools_change(mo
     assert task_payload["messages"][0]["content"][0]["text"] == "Welche Aufgaben sind offen?"
     assert weather_payload["system"][1]["text"] == "\n\nWeather turn context"
     assert task_payload["system"][1]["text"] == "\n\nTask turn context"
+
+
+def _captured_create_kwargs(purpose, model="claude-haiku-5-5"):
+    captured = {}
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                content=[
+                    SimpleNamespace(type="thinking", thinking="hmm"),
+                    SimpleNamespace(type="text", text="ok"),
+                ],
+                stop_reason="end_turn",
+                usage=None,
+            )
+
+    backend = object.__new__(ClaudeBackend)
+    backend._model = model
+    backend._purpose = purpose
+    backend._client = SimpleNamespace(messages=FakeMessages())
+    result = asyncio.run(backend.call(
+        [{"role": "user", "content": "hi"}], None, None, 0.2, 100,
+    ))
+    return captured, result
+
+
+@pytest.mark.parametrize("purpose", ["voice", "fast"])
+def test_fast_purposes_disable_thinking_and_set_low_effort(purpose):
+    kwargs, result = _captured_create_kwargs(purpose)
+
+    assert kwargs["thinking"] == {"type": "disabled"}
+    assert kwargs["output_config"] == {"effort": "low"}
+    assert result == ("ok", [])  # Thinking-Blöcke werden ignoriert
+
+
+@pytest.mark.parametrize("purpose", ["chat-agent", "background", "vision"])
+def test_other_purposes_keep_default_thinking(purpose):
+    kwargs, _ = _captured_create_kwargs(purpose)
+
+    assert "thinking" not in kwargs
+    assert "output_config" not in kwargs
+
+
+def test_fast_thinking_setting_can_be_turned_off(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "ANTHROPIC_FAST_THINKING_DISABLED", False, raising=False)
+    monkeypatch.setattr(config, "ANTHROPIC_FAST_EFFORT", "medium", raising=False)
+    kwargs, _ = _captured_create_kwargs("voice")
+
+    assert "thinking" not in kwargs
+    assert kwargs["output_config"] == {"effort": "medium"}

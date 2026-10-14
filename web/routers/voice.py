@@ -18,7 +18,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 
-from core import db
+from core import db, voice_timing
 from core.voice import transcribe_audio, is_addressed_to_mantis, mark_conversation_active, _conversation_active
 from core.voice_stream import VoiceStreamSession
 from core.stream_events import StreamEvent
@@ -55,6 +55,7 @@ def _record_voice_latency(
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
         "model": model,
         "stage": stage,
+        **voice_timing.snapshot(),
     }
     log.info("voice_latency %s", detail)
     db.log_event("voice_latency", "Voice-Turn", detail)
@@ -250,6 +251,7 @@ async def sende_streaming_antwort(
                             log.debug("TTS-Stream konnte nicht geschlossen werden: %s", exc)
                 queue.task_done()
 
+    timing_token = voice_timing.start()
     responder = asyncio.create_task(produce_response())
     sender = asyncio.create_task(synthesize_sentences())
     response_error = None
@@ -282,12 +284,15 @@ async def sende_streaming_antwort(
             if not client_disconnected:
                 await websocket.send_json({"type": "audio_end", "count": sequence})
         finally:
-            _record_voice_latency(
-                orch, started_at, stt_ms=stt_ms,
-                address_check_ms=address_check_ms,
-                first_token_ms=first_token_ms,
-                first_tts_block_ms=first_tts_block_ms,
-            )
+            try:
+                _record_voice_latency(
+                    orch, started_at, stt_ms=stt_ms,
+                    address_check_ms=address_check_ms,
+                    first_token_ms=first_token_ms,
+                    first_tts_block_ms=first_tts_block_ms,
+                )
+            finally:
+                voice_timing.reset(timing_token)
     if response_error is not None:
         raise response_error
     return reply
@@ -304,6 +309,7 @@ def build_router(orch=None) -> APIRouter:
         first_tts_block_ms = None
         reply = None
         audio_b64 = None
+        timing_token = None
         try:
             suffix = Path(audio.filename or "segment.wav").suffix or ".wav"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
@@ -321,6 +327,7 @@ def build_router(orch=None) -> APIRouter:
                 addressed = False
 
             if addressed and orch is not None:
+                timing_token = voice_timing.start()
                 reply, _trace = await orch.voice_respond(text)
                 mark_conversation_active()
                 try:
@@ -332,11 +339,15 @@ def build_router(orch=None) -> APIRouter:
                     audio_b64 = base64.b64encode(ogg).decode("ascii")
                     first_tts_block_ms = round((time.perf_counter() - started_at) * 1000, 1)
         finally:
-            _record_voice_latency(
-                orch, started_at, stt_ms=stt_ms,
-                address_check_ms=address_check_ms,
-                first_tts_block_ms=first_tts_block_ms,
-            )
+            try:
+                _record_voice_latency(
+                    orch, started_at, stt_ms=stt_ms,
+                    address_check_ms=address_check_ms,
+                    first_tts_block_ms=first_tts_block_ms,
+                )
+            finally:
+                if timing_token is not None:
+                    voice_timing.reset(timing_token)
 
         return {"text": text, "addressed": addressed, "reply": reply, "audio_b64": audio_b64}
 
@@ -409,11 +420,12 @@ def build_router(orch=None) -> APIRouter:
                 started_at = result.get("turn_started_at", time.perf_counter())
                 first_tts_block_ms = None
                 reply = None
-                if orch is not None:
-                    reply, _trace = await orch.voice_respond(text)
-                    mark_conversation_active()
-
+                timing_token = None
                 try:
+                    if orch is not None:
+                        timing_token = voice_timing.start()
+                        reply, _trace = await orch.voice_respond(text)
+                        mark_conversation_active()
                     await sende_antwort(websocket, text, reply, audio_streaming)
                     first_tts_block_ms = (
                         round((time.perf_counter() - started_at) * 1000, 1)
@@ -426,10 +438,14 @@ def build_router(orch=None) -> APIRouter:
                     log.info(f"Voice-WebSocket beim Antwortversand getrennt: {e}")
                     break
                 finally:
-                    _record_voice_latency(
-                        orch, started_at, stt_ms=result.get("stt_ms"),
-                        first_tts_block_ms=first_tts_block_ms,
-                    )
+                    try:
+                        _record_voice_latency(
+                            orch, started_at, stt_ms=result.get("stt_ms"),
+                            first_tts_block_ms=first_tts_block_ms,
+                        )
+                    finally:
+                        if timing_token is not None:
+                            voice_timing.reset(timing_token)
         except WebSocketDisconnect:
             log.info("Voice-WebSocket-Verbindung geschlossen")
         except Exception as e:

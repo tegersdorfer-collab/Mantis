@@ -67,6 +67,8 @@ class MantisSettings(BaseSettings):
     ANTHROPIC_ALLOWED_MODELS: list[str] = Field(
         default_factory=lambda: ["claude-haiku-5-5"],
     )
+    ANTHROPIC_FAST_THINKING_DISABLED: bool = True
+    ANTHROPIC_FAST_EFFORT: str = "low"
     CLAUDE_CHAT_MODEL: str = "claude-haiku-5-5"
     CHAT_ANTHROPIC_MODEL: str = "claude-haiku-5-5"
     CHAT_CLOUD_MODEL: str = "openai/gpt-6-luna"
