@@ -42,6 +42,9 @@ class ReminderStore:
                 );
             """)
             cur.execute(
+                "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS kind TEXT"
+            )
+            cur.execute(
                 "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS "
                 "delivery_attempts INTEGER NOT NULL DEFAULT 0"
             )
@@ -52,11 +55,11 @@ class ReminderStore:
                 "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ"
             )
 
-    def add(self, text: str, remind_at: datetime) -> int:
+    def add(self, text: str, remind_at: datetime, kind: str | None = None) -> int:
         with _db.cursor() as cur:
             cur.execute(
-                "INSERT INTO reminders (text, remind_at) VALUES (%s, %s) RETURNING id",
-                (text, remind_at),
+                "INSERT INTO reminders (text, remind_at, kind) VALUES (%s, %s, %s) RETURNING id",
+                (text, remind_at, kind),
             )
             rid = cur.fetchone()["id"]
         log.info(f"⏰ Reminder gesetzt: '{text}' um {remind_at.strftime('%d.%m. %H:%M')}")
@@ -137,11 +140,11 @@ class ReminderStore:
         """Beendet den nächsten offenen Voice-Timer, ohne normale Reminder anzutasten."""
         changed = _db.execute(
             "WITH timer AS ("
-            "SELECT id FROM reminders WHERE sent = FALSE AND text LIKE %s "
+            "SELECT id FROM reminders WHERE sent = FALSE AND kind = %s "
             "ORDER BY remind_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
             ") UPDATE reminders SET sent = TRUE, claimed_at = NULL, retry_after = NULL "
             "FROM timer WHERE reminders.id = timer.id",
-            ("Timer:%",),
+            ("timer",),
         )
         return changed > 0
 

@@ -77,13 +77,13 @@ async def _list_tasks():
     {"text": {"type": "string"},
      "at": {"type": "string", "description": "Zeitpunkt, z.B. '15:30', 'morgen 8:00', 'in 2 stunden'"}},
     ["text", "at"], "productivity")
-async def _set_reminder(text: str, at: str):
+async def _set_reminder(text: str, at: str, kind: str | None = None):
     if not CTX.reminders:
         return "Reminder nicht verfügbar."
     dt = parse_datetime(at)
     if not dt:
         return f"Konnte Zeit '{at}' nicht verstehen."
-    CTX.reminders.add(text, dt)
+    CTX.reminders.add(text, dt, kind="timer" if kind == "timer" else None)
     return f"Erinnerung gesetzt: '{text}' am {dt.strftime('%d.%m. %H:%M')}"
 
 

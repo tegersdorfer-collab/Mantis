@@ -312,11 +312,13 @@ def test_voice_timer_and_volume_commands_are_narrow_and_deterministic():
     assert timer.args == {
         "text": "Timer: 5 Minuten",
         "at": "2026-10-14T10:05:00",
+        "kind": "timer",
     }
     assert parse_datetime(timer.args["at"]) is not None
     assert natural_timer is not None and natural_timer.args == {
         "text": "Timer: 2 Minuten",
         "at": "2026-10-14T10:02:00",
+        "kind": "timer",
     }
     assert stop is not None and stop.tool == "stop_timer"
     assert louder is not None and louder.args == {"action": "volume_up"}

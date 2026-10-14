@@ -281,7 +281,8 @@ def match_voice(text: str, *, now: datetime | None = None) -> FastCommand | None
                 amount, unit = seconds, "Sekunde" if seconds == 1 else "Sekunden"
             return FastCommand(
                 "set_reminder",
-                {"text": f"Timer: {amount} {unit}", "at": due.strftime("%Y-%m-%dT%H:%M:%S")},
+                {"text": f"Timer: {amount} {unit}", "at": due.strftime("%Y-%m-%dT%H:%M:%S"),
+                 "kind": "timer"},
                 "timer-start",
             )
     if _TIMER_STOP_RE.fullmatch(phrase):
