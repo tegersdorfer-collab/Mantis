@@ -10,6 +10,7 @@ from domains.inbox.store import (
     create_item,
     delete_item,
     mark_done,
+    resolve_item,
     search_items,
 )
 
@@ -86,6 +87,28 @@ def test_same_normalized_open_link_updates_existing_note_and_urls(inbox_test_db)
     ]
 
 
+def test_duplicate_message_id_remains_idempotent_after_item_is_done(inbox_test_db):
+    first = create_item(**_new(source_message_id=_TEST_PREFIX + "first"))
+    duplicate = create_item(**_new(
+        source_message_id=_TEST_PREFIX + "second",
+        user_note="Mit Denis Villeneuve",
+    ))
+
+    assert duplicate["duplicate_link"] is True
+    assert _TEST_PREFIX + "second" in duplicate["item"]["source_message_ids"]
+
+    mark_done(item_id=first["item"]["id"])
+    retry = create_item(**_new(
+        source_message_id=_TEST_PREFIX + "second",
+        user_note="Dieser Retry darf nicht erneut anhängen",
+    ))
+
+    assert retry["created"] is False
+    assert retry["duplicate_link"] is False
+    assert retry["item"]["id"] == first["item"]["id"]
+    assert retry["item"]["user_note"] == "Später ansehen\nMit Denis Villeneuve"
+
+
 def test_done_entry_does_not_block_a_new_item_with_the_same_link(inbox_test_db):
     first = create_item(**_new())
     mark_done(item_id=first["item"]["id"])
@@ -159,3 +182,21 @@ def test_delete_requires_unique_match_and_removes_the_row(inbox_test_db):
     deleted = delete_item(item_id=first["id"])
     assert deleted["status"] == "deleted"
     assert db.query_one("SELECT id FROM merk_inbox_items WHERE id=%s", (first["id"],)) is None
+
+
+def test_search_resolution_and_delete_treat_like_wildcards_as_literal(inbox_test_db):
+    item = create_item(**_new(
+        title="1000 Tipps",
+        source_kind="text",
+        source_urls=[],
+        source_message_id=_TEST_PREFIX + "literal-percent",
+    ))["item"]
+
+    matches = search_items(SearchQuery(query="10%", status="all"))
+    resolved = resolve_item(query="10%")
+    deleted = delete_item(query="10%")
+
+    assert item["id"] not in [row["id"] for row in matches]
+    assert resolved["status"] == "not_found"
+    assert deleted["status"] == "not_found"
+    assert db.query_one("SELECT id FROM merk_inbox_items WHERE id=%s", (item["id"],))

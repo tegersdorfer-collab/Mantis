@@ -515,6 +515,25 @@ def test_discord_typing_indicator_runs_until_the_reply_is_sent():
     asyncio.run(run())
 
 
+def test_discord_route_returns_the_sent_message_id_for_inbox_replies():
+    async def run():
+        channel, _client = await _start_channel()
+        destination = _Destination("dm")
+
+        async def send(_text):
+            return SimpleNamespace(id=987654321)
+
+        destination.send = send
+        route = channel.for_message(_Message(_User(123), destination))
+
+        reference_id = await route.send("📥 gemerkt: Balkon-Idee · ID 41")
+
+        assert reference_id == "987654321"
+        await channel.stop()
+
+    asyncio.run(run())
+
+
 def test_discord_ready_log_includes_bot_name_not_token(caplog):
     async def run():
         channel, client = await _start_channel()

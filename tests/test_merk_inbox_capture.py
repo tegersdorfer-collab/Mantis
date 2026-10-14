@@ -14,6 +14,10 @@ from domains.inbox.capture import (
 @pytest.mark.parametrize("text", [
     "https://youtu.be/abc123",
     "Schau ich mir später an https://example.org/post",
+    "https://youtube.com/watch?v=abc123",
+    "https://youtu.be/abc123?si=share-token",
+    "Merk dir https://example.org/post?id=42",
+    "Für später https://example.org/post?ref=share",
     "https://www.tiktok.com/@name/video/42",
     "https://www.instagram.com/reel/abc/",
     "https://example.org/post.utm_source=share",
@@ -65,11 +69,75 @@ def test_regular_chat_or_ambiguous_request_is_not_silently_captured(text):
     assert classify_capture(text).capture is False
 
 
-def test_image_without_caption_is_a_capture_but_text_without_link_is_not():
+@pytest.mark.parametrize("text", [
+    "Mein Speicher ist voll",
+    "Ich habe das schon notiert",
+    "Merk dir das nicht",
+    "Zeig mir meine gespeicherten Links",
+    "Ist das seriös https://example.org/article",
+    "Vergleiche https://example.org/a mit https://example.org/b",
+    "Erklär mir https://example.org/article",
+    "Fass zusammen https://example.org/article",
+    "Was ist das https://example.org/article",
+    "Wie funktioniert das https://example.org/article",
+    "Warum ist das interessant https://example.org/article",
+    "Bitte prüfe https://example.org/article",
+    "Unmerk dir https://example.org/article",
+    "Ich habe das schon notiert https://example.org/article",
+    "https://example.org/article?what=is-this ist das seriös?",
+    "Kannst du https://example.org/article erklären",
+    "Zeige mir https://example.org/article",
+    "Merk dir das und fasse den Artikel zusammen https://example.org/article",
+    "Merk dir das nicht: https://example.org/article",
+    "Lösch meinen Merker https://example.org/article",
+    "Was wollte ich mir noch anschauen? https://example.org/article",
+    "Das ist mein Speicher https://example.org/article",
+    "Kannst du diesen Link vergleichen https://example.org/a https://example.org/b",
+    "Schau dir diesen Link an https://example.org/article",
+    "Lies den Artikel https://example.org/article",
+    "Check bitte, ob das stimmt https://example.org/article",
+])
+def test_reviewed_questions_commands_and_non_save_phrases_go_to_agent(text):
+    assert classify_capture(text).capture is False
+
+
+@pytest.mark.parametrize("text", [
+    "Merk dir https://example.org/a",
+    "MERKE dir https://example.org/a",
+    "Für später: https://example.org/a",
+    "Später anschauen https://example.org/a",
+    "Später lesen https://example.org/a",
+    "inbox: https://example.org/a",
+    "📥 https://example.org/a",
+    "Speichere diese Idee https://example.org/a",
+    "Notier: https://example.org/a",
+    "Behalte das für mich im Kopf https://example.org/a",
+    "Halte das fest https://example.org/a",
+    "Pack das auf meine Merkliste https://example.org/a",
+    "Für später https://example.org/a?utm_source=discord",
+    "Schau ich mir später an https://example.org/a?view=1",
+    "Artikel über Sci-Fi https://example.org/a",
+    "Balkon mit Kräutern https://example.org/a",
+    "Das will ich später kaufen https://shop.example/a?item=1",
+    "https://example.org/a?question=why&next=what",
+    "Merk dir: Arrival · #scifi https://example.org/a?share=1",
+    "📥 Später lesen https://example.org/a?id=1",
+])
+def test_conservative_short_share_notes_and_start_triggers_are_captured(text):
+    assert classify_capture(text).capture is True
+
+
+def test_image_without_caption_or_with_explicit_trigger_is_captured():
     assert classify_capture("", has_image=True).capture is True
-    assert classify_capture("Balkon-Idee", has_image=True).capture is True
+    assert classify_capture("Merk dir: Balkon-Idee", has_image=True).capture is True
+    assert classify_capture("Balkon-Idee", has_image=True).capture is False
     assert classify_capture("Was ist das?", has_image=True).capture is False
     assert classify_capture("Eine Idee für nächstes Jahr").capture is False
+
+
+def test_standalone_explicit_markers_are_recognized():
+    assert classify_capture("📥").capture is True
+    assert classify_capture("inbox:").capture is True
 
 
 def test_url_extraction_strips_sentence_punctuation_and_rejects_other_schemes():

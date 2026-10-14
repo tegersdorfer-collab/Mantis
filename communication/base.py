@@ -35,7 +35,7 @@ MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
 class CommunicationChannel(ABC):
 
     @abstractmethod
-    async def send(self, text: str) -> None:
+    async def send(self, text: str) -> object | None:
         """Nachricht an Timo senden."""
         ...
 

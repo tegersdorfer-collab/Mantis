@@ -91,9 +91,10 @@ lokal bei Mantis und außerhalb des Claude-/Codex-Agentenindex. Es gibt keinen V
 
 Mindestfelder: id, title, user_note, source_kind (link, image, text oder mixed),
 source_urls, platform, source_metadata (JSONB), image_description, category, tags,
-status (open oder done), embedding, created_at, updated_at, completed_at und Discord
-source_message_id. source_message_id soll eindeutig sein, damit ein erneut zugestelltes
-Gateway-Event kein Duplikat erzeugt. Pro Discord-Nachricht entsteht höchstens ein Eintrag;
+status (open oder done), embedding, created_at, updated_at, completed_at,
+source_message_id und source_message_ids. source_message_id bleibt der eindeutige
+Erstbezug für Gateway-Retrys; source_message_ids enthält alle Share- und
+Bestätigungsnachrichten-IDs, auf die eine Discord-Antwort zeigen kann. Pro Discord-Nachricht entsteht höchstens ein Eintrag;
 mehrere Links bleiben gemeinsam in source_urls, Metadaten werden für den ersten Link geholt.
 Das Bild selbst wird in v1 nicht gespeichert; gespeichert werden nur die vom Vision-Modell
 erkannten Informationen. Löschen entfernt den Datensatz samt Embedding endgültig.
@@ -310,4 +311,13 @@ Discord-Chats ohne Inbox-Intent erhalten kein use_case=inbox.
 3. Klassifikation aus Nachricht + Metadaten, keine Filmroulette-Anbindung in v1.
 4. Kein Export in v1.
 5. Ja, ein Eintrag pro Nachricht.
+6. **Konservative Erfassung:** Eine Nachricht wird nur erfasst, wenn sie mit einem
+   ausdrücklichen Merk-Auslöser beginnt (z. B. „merk dir“, „merke“, „für später“,
+   „später anschauen/lesen“, „inbox:“ oder „📥“; jeweils mit Wortgrenzen und ohne
+   Verneinung wie „merk dir das nicht“), oder wenn bei einem Link der Text außerhalb
+   der URLs leer ist bzw. nur eine kurze Notiz mit höchstens ungefähr zwölf Wörtern ohne
+   Fragezeichen, Fragewort oder Arbeitsauftrag enthält, oder wenn ein Bild ohne Caption
+   geteilt wird. Bei Bildern mit Text gilt ebenfalls nur ein ausdrücklicher Merk-Auslöser.
+   Fragen und Aufträge bleiben Agent-Turns, auch wenn sie einen Link enthalten. Abfragen
+   wie „Zeig mir meine gespeicherten Links“ sind keine Erfassung.
 Zusätzlich: Embeddings mit dem bereits im Repo genutzten lokalen Embedding-Weg (kein neues großes Modell; RAM-Regel: nie zwei lokale Modelle > 4 GB gleichzeitig). yt-dlp 2026.06.09 ist installiert; Metadaten-Abruf mit hartem Timeout (≤ 8 s), die Bestätigung an Timo darf nicht auf langsame Metadaten warten (sofort „📥 gemerkt“, Titel/Kategorie werden nachgetragen und bei Abfragen verwendet; optional die Bestätigung per Edit aktualisieren).

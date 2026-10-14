@@ -42,10 +42,7 @@ def create_item(
     message_id = str(source_message_id) if source_message_id is not None else None
 
     if message_id:
-        existing = db.query_one(
-            "SELECT * FROM merk_inbox_items WHERE source_message_id=%s",
-            (message_id,),
-        )
+        existing = _find_message_item(message_id)
         if existing:
             return {"item": existing, "created": False, "duplicate_link": False}
 
@@ -56,7 +53,10 @@ def create_item(
             (normalized_urls,),
         )
         if existing:
-            updated = _append_duplicate(existing, urls, normalized_urls, user_note, source_kind)
+            updated = _append_duplicate(
+                existing, urls, normalized_urls, user_note, source_kind,
+                source_message_id=message_id,
+            )
             return {"item": updated, "created": False, "duplicate_link": True}
 
     vector = _vector_literal(embedding)
@@ -65,14 +65,14 @@ def create_item(
         """INSERT INTO merk_inbox_items
             (title, user_note, source_kind, source_urls, normalized_urls, dedupe_key,
              platform, source_metadata, image_description, category, tags, source_message_id,
-             embedding)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s::vector)
+             source_message_ids, embedding)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s::vector)
            ON CONFLICT DO NOTHING RETURNING *""",
         (
             title, (user_note or "").strip(), source_kind, urls, normalized_urls, dedupe_key,
             platform or "unknown", json.dumps(source_metadata or {}, ensure_ascii=False),
             (image_description or "")[:12000], category, _unique_tags(tags or []), message_id,
-            vector,
+            [message_id] if message_id else [], vector,
         ),
     )
     if row:
@@ -81,9 +81,7 @@ def create_item(
     # Ein gleichzeitiger Discord-Retry oder URL-Share kann zwischen Vorabfrage und
     # INSERT gewonnen haben. Die Unique-Indizes bleiben die letzte Idempotenzgrenze.
     if message_id:
-        existing = db.query_one(
-            "SELECT * FROM merk_inbox_items WHERE source_message_id=%s", (message_id,)
-        )
+        existing = _find_message_item(message_id)
         if existing:
             return {"item": existing, "created": False, "duplicate_link": False}
     if dedupe_key:
@@ -92,7 +90,10 @@ def create_item(
             (dedupe_key,),
         )
         if existing:
-            updated = _append_duplicate(existing, urls, normalized_urls, user_note, source_kind)
+            updated = _append_duplicate(
+                existing, urls, normalized_urls, user_note, source_kind,
+                source_message_id=message_id,
+            )
             return {"item": updated, "created": False, "duplicate_link": True}
     raise RuntimeError("Inbox-Merker konnte nicht angelegt werden")
 
@@ -103,6 +104,8 @@ def _append_duplicate(
     normalized_urls: list[str],
     user_note: str,
     source_kind: str,
+    *,
+    source_message_id: str | None = None,
 ) -> dict:
     merged_urls = _unique([*(existing.get("source_urls") or []), *urls])
     merged_normalized = _unique([*(existing.get("normalized_urls") or []), *normalized_urls])
@@ -116,17 +119,49 @@ def _append_duplicate(
     row = db.query_one(
         """UPDATE merk_inbox_items
            SET source_urls=%s, normalized_urls=%s, user_note=%s, source_kind=%s,
+               source_message_ids=CASE
+                 WHEN %s IS NULL OR %s=ANY(source_message_ids) THEN source_message_ids
+                 ELSE array_append(source_message_ids, %s)
+               END,
                updated_at=NOW()
            WHERE id=%s RETURNING *""",
-        (merged_urls, merged_normalized, old_note, merged_kind, existing["id"]),
+        (
+            merged_urls, merged_normalized, old_note, merged_kind,
+            source_message_id, source_message_id, source_message_id, existing["id"],
+        ),
     )
     return row or existing
+
+
+def _find_message_item(message_id: str) -> dict | None:
+    return db.query_one(
+        "SELECT * FROM merk_inbox_items WHERE source_message_id=%s "
+        "OR %s=ANY(source_message_ids) LIMIT 1",
+        (message_id, message_id),
+    )
+
+
+def add_source_message_reference(item_id: int, message_id: str) -> dict | None:
+    """Registriert die Discord-Bestätigung als Reply-Referenz auf den Merker."""
+    value = str(message_id or "").strip()
+    if not value:
+        return None
+    return db.query_one(
+        """UPDATE merk_inbox_items
+           SET source_message_ids=CASE
+             WHEN %s=ANY(source_message_ids) THEN source_message_ids
+             ELSE array_append(source_message_ids, %s)
+           END
+           WHERE id=%s RETURNING *""",
+        (value, value, item_id),
+    )
 
 
 def update_enrichment(
     item_id: int,
     *,
     title: str | None = None,
+    title_if_current: str | None = None,
     platform: str | None = None,
     source_metadata: dict | None = None,
     image_description: str | None = None,
@@ -138,8 +173,13 @@ def update_enrichment(
     assignments = []
     params = []
     if title and title.strip():
-        assignments.append("title=%s")
-        params.append(title.strip()[:500])
+        clean_title = title.strip()[:500]
+        if title_if_current is None:
+            assignments.append("title=%s")
+            params.append(clean_title)
+        else:
+            assignments.append("title=CASE WHEN title=%s THEN %s ELSE title END")
+            params.extend([title_if_current, clean_title])
     if platform:
         assignments.append("platform=%s")
         params.append(platform[:80])
@@ -202,25 +242,26 @@ def search_items(
         "image_description, category, tags, status, created_at, updated_at, completed_at, "
         "source_message_id"
     )
-    keyword_expr = "(title ILIKE %s OR user_note ILIKE %s OR image_description ILIKE %s " \
-                   "OR array_to_string(tags, ' ') ILIKE %s)"
+    keyword_expr = "(title ILIKE %s ESCAPE '!' OR user_note ILIKE %s ESCAPE '!' " \
+                   "OR image_description ILIKE %s ESCAPE '!' " \
+                   "OR array_to_string(tags, ' ') ILIKE %s ESCAPE '!')"
     select_params = []
     where_query = ""
     order = "created_at DESC"
     if term:
-        pattern = f"%{term}%"
+        pattern = f"%{_escape_like(term)}%"
         select_params.extend([pattern] * 4)
         columns += f", CASE WHEN {keyword_expr} THEN 1 ELSE 0 END AS keyword_score"
         if vector:
             columns += ", embedding <=> %s::vector AS vector_distance"
             select_params.append(vector)
-            where_query = f" AND ({keyword_expr} OR (embedding IS NOT NULL AND embedding <=> %s::vector < 0.6))"
+            where_query = f"({keyword_expr} OR (embedding IS NOT NULL AND embedding <=> %s::vector < 0.6))"
             order = "keyword_score DESC, embedding <=> %s::vector ASC NULLS LAST, created_at DESC"
             where_params.extend([pattern] * 4)
             where_params.append(vector)
             order_params = [vector]
         else:
-            where_query = f" AND {keyword_expr}"
+            where_query = keyword_expr
             order = "keyword_score DESC, created_at DESC"
             where_params.extend([pattern] * 4)
             order_params = []
@@ -231,7 +272,7 @@ def search_items(
     if where:
         sql += " WHERE " + " AND ".join(where)
     if where_query:
-        sql += where_query
+        sql += (" AND " if where else " WHERE ") + where_query
     sql += f" ORDER BY {order} LIMIT %s"
     params = [*select_params, *where_params, *order_params, max(1, min(int(limit), 20))]
     return db.query(sql, tuple(params))
@@ -339,21 +380,24 @@ def _resolve_target(
         row = db.query_one("SELECT * FROM merk_inbox_items WHERE id=%s", (item_id,))
         return (row, "not_found") if row else (None, "not_found")
     if reference is not None:
-        ref = str(reference).strip().lstrip("#")
-        if ref.isdecimal():
-            row = db.query_one("SELECT * FROM merk_inbox_items WHERE id=%s", (int(ref),))
-            if row:
-                return row, "found"
-        row = db.query_one("SELECT * FROM merk_inbox_items WHERE source_message_id=%s", (ref,))
-        return (row, "found") if row else (None, "not_found")
+        ref = str(reference).strip()
+        rows = db.query(
+            "SELECT * FROM merk_inbox_items WHERE source_message_id=%s "
+            "OR %s=ANY(source_message_ids) ORDER BY updated_at DESC LIMIT 2",
+            (ref, ref),
+        )
+        if len(rows) == 1:
+            return rows[0], "found"
+        return (None, "ambiguous") if rows else (None, "not_found")
     if query and query.strip():
-        pattern = f"%{query.strip()}%"
+        pattern = f"%{_escape_like(query.strip())}%"
         status_filter = " AND status=%s" if status else ""
         params = [pattern, pattern]
         if status:
             params.append(status)
         rows = db.query(
-            "SELECT * FROM merk_inbox_items WHERE (title ILIKE %s OR user_note ILIKE %s)"
+            "SELECT * FROM merk_inbox_items WHERE (title ILIKE %s ESCAPE '!' "
+            "OR user_note ILIKE %s ESCAPE '!')"
             f"{status_filter} ORDER BY updated_at DESC LIMIT 3",
             tuple(params),
         )
@@ -396,6 +440,11 @@ def _unique(values) -> list:
             result.append(value)
             seen.add(value)
     return result
+
+
+def _escape_like(value: str) -> str:
+    """Escaped LIKE-Musterzeichen; `!` ist explizit als Escape-Zeichen gesetzt."""
+    return str(value).replace("!", "!!").replace("%", "!%").replace("_", "!_")
 
 
 def _unique_tags(tags) -> list[str]:

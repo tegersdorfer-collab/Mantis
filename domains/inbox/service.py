@@ -16,16 +16,12 @@ from domains.inbox.capture import (
     classify_capture,
     extract_source_urls,
     platform_for_url,
+    remove_save_prefix,
 )
 
 log = logging.getLogger(__name__)
 _BERLIN = ZoneInfo("Europe/Berlin")
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
-_SAVE_PREFIX = re.compile(
-    r"^\s*(?:merk(?:e)? dir|speicher(?:e)?|notier(?:e)?)\s+"
-    r"(?:das|dir|diese idee|diesen link)?\s*[:,-]?\s*",
-    re.IGNORECASE,
-)
 _PASSIVE_NOTE = re.compile(
     r"^(?:schau|sehe|lese|will|möchte|moechte|für später|fuer spaeter|später ansehen|spaeter ansehen)\b",
     re.IGNORECASE,
@@ -103,9 +99,16 @@ async def capture_discord_message(
         response += f" · {attachment_notice}"
     _metric("capture", status, duration_ms=_elapsed_ms(started))
     try:
-        await channel.send(response)
+        sent_message = await channel.send(response)
     except Exception as exc:
         log.warning("Merk-Inbox-Bestätigung fehlgeschlagen (%s)", type(exc).__name__)
+    else:
+        confirmation_id = _message_reference_id(sent_message)
+        if confirmation_id:
+            try:
+                store.add_source_message_reference(item["id"], confirmation_id)
+            except Exception as exc:
+                log.warning("Merk-Inbox-Reply-Referenz fehlgeschlagen (%s)", type(exc).__name__)
 
     should_enrich = created or duplicate_link
     needs_metadata = created and bool(urls)
@@ -174,22 +177,42 @@ async def _enrich_item(
     if images and not description:
         description = fallback_image_description
 
-    title = (source_data.get("title") or item.get("title") or "Merker").strip()
-    metadata_values = {
+    existing_metadata = item.get("source_metadata")
+    metadata_values = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+    metadata_values.update({
         key: source_data.get(key)
         for key in ("type", "title", "description", "author", "platform", "thumbnail", "published_at")
         if source_data.get(key) not in (None, "")
-    }
+    })
+    effective_note = str(item.get("user_note") or note or "").strip()
+    effective_description = description or str(item.get("image_description") or "")
     category, tags = classify_item(
-        note,
-        {**metadata_values, "image_description": description},
+        effective_note,
+        {**metadata_values, "image_description": effective_description},
+    )
+    existing_category = item.get("category")
+    if existing_category in {"anschauen", "lesen", "film-serie", "kaufen", "idee", "ort", "zitat"}:
+        category = existing_category
+    elif category == "sonstiges" and existing_category:
+        category = existing_category
+    tags = list(dict.fromkeys([*(item.get("tags") or []), *tags]))
+    item_platform = str(item.get("platform") or (platform_for_url(urls[0]) if urls else "unknown"))
+    fallback_title = _initial_title("", urls, images, item_platform)
+    current_title = str(item.get("title") or "").strip()
+    has_user_title = bool(effective_note) and current_title.casefold() != fallback_title.casefold()
+    can_set_external_title = not has_user_title and current_title.casefold() == fallback_title.casefold()
+    enriched_title = source_data.get("title") if can_set_external_title else None
+    title_for_embedding = str(
+        enriched_title or item.get("title") or metadata_values.get("title") or "Merker"
     )
 
     embedding = None
     if needs_embedding and embedding_provider is not None:
         try:
             vector = await asyncio.wait_for(
-                embedding_provider.embed(f"{title}\n{note}\n{description}".strip()), timeout=3.0
+            embedding_provider.embed(
+                f"{title_for_embedding}\n{effective_note}\n{effective_description}".strip()
+            ), timeout=3.0
             )
             if vector:
                 embedding = list(vector)
@@ -199,7 +222,8 @@ async def _enrich_item(
     try:
         store.update_enrichment(
             item["id"],
-            title=source_data.get("title"),
+            title=enriched_title,
+            title_if_current=fallback_title if enriched_title else None,
             platform=source_data.get("platform"),
             source_metadata=metadata_values if source_data else None,
             image_description=description if images else None,
@@ -252,8 +276,15 @@ def _user_note(text: str, urls) -> str:
     for url in urls:
         value = value.replace(url, " ")
     value = re.sub(r'https?://[^\s<>"\']+', " ", value)
-    value = _SAVE_PREFIX.sub("", value)
+    value = remove_save_prefix(value)
     return " ".join(value.split()).strip(" .,;:-")[:12000]
+
+
+def _message_reference_id(sent_message) -> str | None:
+    if isinstance(sent_message, (str, int)):
+        return str(sent_message)
+    value = getattr(sent_message, "id", None)
+    return str(value) if value is not None else None
 
 
 def _initial_title(note: str, urls, images, platform: str) -> str:

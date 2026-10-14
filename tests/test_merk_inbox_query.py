@@ -106,6 +106,15 @@ def test_reply_reference_routes_short_management_command_to_inbox():
     assert is_inbox_request("Lösch das bitte", has_reference=True) is True
 
 
+@pytest.mark.parametrize("text", [
+    "Lösch Merker ID 42",
+    "Lösch #42",
+    "Korrigiere Eintrag 43",
+])
+def test_mutation_with_current_message_item_id_routes_to_inbox(text):
+    assert is_inbox_request(text) is True
+
+
 def test_inbox_agent_tools_are_available_without_exposing_second_brain_tools():
     from core import skills  # noqa: F401
     from core.tools import select_tools

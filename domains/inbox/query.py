@@ -85,7 +85,14 @@ def is_inbox_request(text: str, *, has_reference: bool = False) -> bool:
     if re.search(r"\b(?:hab|habe) ich (?:es )?(?:gesehen|erledigt|abgehakt)\b", lower):
         return True
     if any(pattern.search(lower) for pattern in _MUTATION_PATTERNS):
-        return bool(re.search(r"\b(?:merker|merkliste|inbox)\b", lower))
+        has_inbox_name = bool(re.search(r"\b(?:merker|merkliste|inbox)\b", lower))
+        text_without_urls = re.sub(r"https?://[^\s<>\"']+", " ", lower)
+        has_item_id = bool(re.search(
+            r"(?<!\w)(?:id|eintrag|merker)\s*(?:nr\.?\s*)?#?\s*\d{1,19}\b|"
+            r"(?<!\w)#\d{1,19}\b",
+            text_without_urls,
+        ))
+        return has_inbox_name or has_item_id
     if re.search(r"\b(?:my )?(?:saved|remembered) (?:links?|items?)\b", lower):
         return True
     return False

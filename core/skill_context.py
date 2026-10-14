@@ -10,6 +10,7 @@ die CTX importiert haben, die gebundenen Werte — eine Rebind-Zuweisung
 (`CTX = ctx`) würde importierte Referenzen dagegen stale lassen.
 """
 import logging
+from contextvars import ContextVar
 from dataclasses import dataclass, fields
 
 log = logging.getLogger("core.skills")
@@ -26,6 +27,17 @@ class SkillContext:
 
 
 CTX = SkillContext()
+
+
+@dataclass(frozen=True)
+class InboxTurnContext:
+    item_id: int | None = None
+    reply_reference: str | None = None
+
+
+INBOX_TURN_CONTEXT: ContextVar[InboxTurnContext | None] = ContextVar(
+    "inbox_turn_context", default=None,
+)
 
 
 def bind(ctx: SkillContext) -> None:

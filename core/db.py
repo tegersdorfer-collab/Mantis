@@ -547,8 +547,12 @@ MIGRATIONS = [
         created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         completed_at        TIMESTAMPTZ,
-        source_message_id   TEXT UNIQUE
+        source_message_id   TEXT UNIQUE,
+        source_message_ids  TEXT[] NOT NULL DEFAULT '{}'
     );""",
+    "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS source_message_ids TEXT[] NOT NULL DEFAULT '{}';",
+    "UPDATE merk_inbox_items SET source_message_ids=ARRAY[source_message_id] WHERE source_message_id IS NOT NULL AND cardinality(source_message_ids)=0;",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_source_message_ids_idx ON merk_inbox_items USING gin (source_message_ids);",
     "CREATE UNIQUE INDEX IF NOT EXISTS merk_inbox_open_dedupe_idx ON merk_inbox_items (dedupe_key) WHERE status='open' AND dedupe_key IS NOT NULL;",
     "CREATE INDEX IF NOT EXISTS merk_inbox_status_created_idx ON merk_inbox_items (status, created_at DESC);",
     "CREATE INDEX IF NOT EXISTS merk_inbox_category_idx ON merk_inbox_items (category, status, created_at DESC);",

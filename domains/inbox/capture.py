@@ -10,20 +10,37 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from tools.url_handler import extract_urls as _extract_urls
 
 
-_SAVE_PHRASES = (
-    "merk dir", "merke dir", "für später", "fuer später", "für spaeter",
-    "speicher", "speichere", "notier", "notiere", "behalte das",
-    "halte das fest", "auf meine merkliste", "später kaufen", "spaeter kaufen",
-    "save this", "remember this", "for later", "save for later",
+_SAVE_START = re.compile(
+    r"^\s*(?:"
+    r"merk\s+dir|merke(?:\s+dir)?|für\s+später|fuer\s+später|"
+    r"für\s+spaeter|fuer\s+spaeter|später\s+(?:anschauen|ansehen|lesen)|"
+    r"spaeter\s+(?:anschauen|ansehen|lesen)|inbox\s*:|📥|"
+    r"speicher(?:e)?|notier(?:e)?|behalte\s+das|halte\s+das\s+fest|"
+    r"(?:pack\s+das\s+)?auf\s+meine\s+merkliste|"
+    r"später\s+kaufen|spaeter\s+kaufen|save\s+this|remember\s+this|"
+    r"for\s+later|save\s+for\s+later"
+    r")(?=\b|$|\s|:)",
+    re.IGNORECASE,
 )
-_WORK_PHRASES = (
-    "fass zusammen", "fasse zusammen", "zusammenfassen", "fass das", "fasse den artikel zusammen",
-    "erklär", "erklaer",
-    "erkläre", "erklaere", "prüf", "pruef", "prüfe", "pruefe", "übersetz",
-    "uebersetz", "übersetze", "uebersetze", "such mir", "such nach",
-    "finde heraus", "öffne", "oeffne", "analysier", "analysiere", "was ist",
-    "worum geht", "wie funktioniert", "kannst du", "prüfen", "bewerte",
+_WORK_REQUEST = re.compile(
+    r"\b(?:vergleiche?|erklär(?:e)?|erklaer(?:e)?|unmerk(?:e)?|fass(?:e)?\s+(?:das\s+)?zusammen|"
+    r"zusammenfassen|prüf(?:e)?|pruef(?:e)?|übersetz(?:e)?|uebersetz(?:e)?|"
+    r"such(?:e)?\s+(?:mir|nach)|finde\s+(?:heraus|mir)|öffne|oeffne|"
+    r"analysier(?:e)?|bewerte|prüfen|pruefen|fix(?:e|en)?|"
+    r"lösch(?:e)?|loesch(?:e)?|entfern(?:e)?|korrigier(?:e)?|aender(?:e)?|änder(?:e)?|"
+    r"schau\s+(?:dir|mal|das|den|die|diesen|diese)|sieh\s+dir|lies\b|lese\s+(?:dir|den|die|das)|"
+    r"check(?:e)?\b|read\b|look\s+at|review\b|recommend\b|"
+    r"zeig(?:e)?|zeige|kannst\s+du|sag\s+mir|was|wie|warum|wieso|wer|wo|"
+    r"welche|welcher|welches|ist\s+das|is\s+this|what|how|why|compare|explain|"
+    r"summari[sz]e)\b",
+    re.IGNORECASE,
 )
+_CHATTER_OR_ASSERTION = re.compile(
+    r"\b(?:ich\s+(?:habe|hab|bin|war|glaube|denke|finde)|"
+    r"mein(?:e|er|en)?\s+\w+\s+(?:ist|sind|war|wird)|das\s+ist\s+mein)\b",
+    re.IGNORECASE,
+)
+_NEGATION = re.compile(r"\b(?:nicht|nie|niemals)\b", re.IGNORECASE)
 _TRACKING_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid", "si"}
 _TAG_PATTERNS = (
     ("scifi", re.compile(r"\b(?:sci[ -]?fi|science fiction)\b", re.I)),
@@ -62,23 +79,56 @@ def extract_source_urls(text: str) -> list[str]:
 def classify_capture(text: str, *, has_image: bool = False) -> CaptureDecision:
     """Entscheidet konservativ, ob eine Discord-Nachricht sofort gemerkt wird."""
     clean_text = (text or "").strip()
-    lower = clean_text.casefold()
     urls = extract_source_urls(clean_text)
-    asks_to_summarize = re.search(r"\bfass(?:e)?\b.{0,40}\bzusammen\b", lower)
-    if "?" in clean_text or asks_to_summarize or any(phrase in lower for phrase in _WORK_PHRASES):
+    outside_urls = _outside_url_text(clean_text, urls).strip()
+    explicit_match = _SAVE_START.match(outside_urls)
+    if explicit_match and _NEGATION.search(outside_urls[explicit_match.end():]):
+        return CaptureDecision(False, "negated_save", tuple(urls))
+    asks_to_summarize = re.search(r"\bfass(?:e)?\b.{0,40}\bzusammen\b", outside_urls, re.I)
+    if "?" in outside_urls or _WORK_REQUEST.search(outside_urls) or asks_to_summarize:
         return CaptureDecision(False, "agent_request", tuple(urls))
 
-    if has_image and not clean_text and not urls:
-        return CaptureDecision(True, "image_share")
-
-    explicit = any(phrase in lower for phrase in _SAVE_PHRASES)
-    if explicit:
+    if explicit_match:
         return CaptureDecision(True, "explicit_save", tuple(urls))
+
     if has_image:
-        return CaptureDecision(True, "image_share", tuple(urls))
+        if not outside_urls:
+            return CaptureDecision(True, "image_share", tuple(urls))
+        return CaptureDecision(False, "image_with_caption", tuple(urls))
+
     if urls:
-        return CaptureDecision(True, "bare_link", tuple(urls))
-    return CaptureDecision(False, "normal_chat")
+        if not outside_urls:
+            return CaptureDecision(True, "bare_link", tuple(urls))
+        word_count = len(re.findall(r"\b[\wÀ-ž]+\b", outside_urls, flags=re.UNICODE))
+        if word_count <= 12 and not _CHATTER_OR_ASSERTION.search(outside_urls):
+            return CaptureDecision(True, "short_share_note", tuple(urls))
+    return CaptureDecision(False, "normal_chat", tuple(urls))
+
+
+def _outside_url_text(text: str, urls: list[str]) -> str:
+    """Entfernt Links vor Frage- und Auftragsprüfungen, auch bei URL-Querystrings."""
+    outside = text
+    for url in urls:
+        outside = outside.replace(url, " ")
+    return re.sub(r"https?://[^\s<>\"']+", " ", outside, flags=re.IGNORECASE)
+
+
+def remove_save_prefix(text: str) -> str:
+    """Entfernt einen führenden Merk-Auslöser aus dem gespeicherten Nutztext."""
+    value = str(text or "")
+    match = _SAVE_START.match(value)
+    if not match:
+        return value
+    value = value[match.end():]
+    if match.group().strip() == "📥":
+        second_match = _SAVE_START.match(value)
+        if second_match:
+            value = value[second_match.end():]
+    value = re.sub(
+        r"^\s*(?:(?:das|diese idee|diesen link|bitte)\b\s*)?[:,-]?\s*",
+        "", value, flags=re.IGNORECASE,
+    )
+    return value
 
 
 def normalize_url(url: str) -> str:
