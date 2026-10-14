@@ -38,17 +38,22 @@ _QUESTION_WORDS = frozenset({
     "wie", "was", "wer", "wen", "wem", "wessen", "wo", "wohin", "woher",
     "wann", "warum", "wieso", "weshalb", "welche", "welcher", "welches",
 })
+_QUESTION_PRONOUNS = frozenset({
+    "ich", "du", "er", "sie", "es", "wir", "ihr", "mich", "mir", "dich",
+    "dir", "ihn", "ihm", "uns", "euch", "das",
+})
 _QUESTION_VERBS = frozenset({
     "bin", "bist", "ist", "sind", "seid", "war", "waren", "wird", "werden",
     "habe", "hast", "hat", "haben", "hatte", "steht", "stehen", "gibt",
     "geht", "gehts", "kommt", "kostet", "macht", "kann", "kannst", "können",
-    "soll", "sollst", "liege", "liegt", "schläft", "schlaf",
+    "soll", "sollst", "liege", "liegt", "schläft", "schlaf", "meinst",
 })
 _SEPARABLE_COMMANDS = frozenset({
     "mach", "mache", "schalt", "schalte", "dreh", "drehe", "stell", "stelle",
     "lies", "lese", "zeig", "zeige", "hol", "hole", "ruf", "rufe", "hör", "höre",
 })
 _SEPARABLE_PARTICLES = frozenset({"an", "aus", "ein", "mit", "vor", "zu", "zurück"})
+_COMMAND_FILLERS = frozenset({"mal", "kurz", "bitte", "eben", "schnell"})
 _MODAL_OR_WISH_VERBS = frozenset({
     "will", "willst", "wollen", "wollt", "wollte", "wollten", "würde",
     "würdest", "würden", "möchte", "möchtest", "möchten", "muss", "musst",
@@ -69,12 +74,12 @@ _COMMAND_VERBS = _SEPARABLE_COMMANDS | frozenset({
     "spiel", "spiele", "sag", "sage", "erzähl", "erzähle", "öffne", "öffn",
     "schließe", "schließ", "schick", "schicke",
 })
-_COMMAND_COMPLEMENTS = frozenset({"hoch", "runter", "ab"})
+_COMMAND_COMPLEMENTS = frozenset({"hoch", "runter", "ab", "lauter", "leiser"})
 _FULL_VERBS = frozenset({
     "abhaken", "abholen", "anfangen", "ankommen", "anrufen", "aufmachen",
     "aufräumen", "ausschalten", "einkaufen", "einschalten", "eintragen",
-    "erklären", "erinnern", "erzählen", "finden", "gehen", "hören", "kochen",
-    "lesen", "machen", "mitbringen", "öffnen", "planen", "reden", "schicken",
+    "erklären", "erinnern", "erzählen", "finden", "gehen", "helfen", "hören",
+    "kochen", "lesen", "machen", "mitbringen", "öffnen", "planen", "reden", "schicken",
     "schlafen", "schreiben", "sehen", "senden", "spielen", "stoppen", "suchen",
     "trinken", "vorlesen", "warten", "zeigen", "zuhören", "mergen", "merge",
     "reviewen", "testen", "fixen", "pushen", "deployen", "builden",
@@ -176,7 +181,10 @@ def classify_utterance(text: str) -> UtteranceStatus:
         return UtteranceStatus.INCOMPLETE
 
     if first in _COMMAND_VERBS and last in _SEPARABLE_PARTICLES | _COMMAND_COMPLEMENTS:
-        if any(word not in _CONTENT_FUNCTION_WORDS for word in words[1:-1]):
+        if any(
+            word not in _CONTENT_FUNCTION_WORDS | _COMMAND_FILLERS
+            for word in words[1:-1]
+        ):
             return UtteranceStatus.COMPLETE
         return UtteranceStatus.INCOMPLETE
     if first in _QUESTION_WORDS and last in _SEPARABLE_PARTICLES:
@@ -193,12 +201,19 @@ def classify_utterance(text: str) -> UtteranceStatus:
             after_verb = words[index + 1:]
             if any(item not in _QUESTION_FUNCTION_WORDS for item in after_verb):
                 return UtteranceStatus.COMPLETE
+            if (
+                after_verb
+                and after_verb[-1] in _QUESTION_PRONOUNS
+                and all(item in _QUESTION_FUNCTION_WORDS for item in after_verb)
+            ):
+                return UtteranceStatus.COMPLETE
             if words == ["wie", "spät", "ist", "es"]:
                 return UtteranceStatus.COMPLETE
 
     if first in _COMMAND_VERBS:
         command_content = [
-            word for word in words[1:] if word not in _CONTENT_FUNCTION_WORDS
+            word for word in words[1:]
+            if word not in _CONTENT_FUNCTION_WORDS | _COMMAND_FILLERS
         ]
         if not command_content:
             return UtteranceStatus.INCOMPLETE
@@ -210,6 +225,17 @@ def classify_utterance(text: str) -> UtteranceStatus:
             if "auf" in words[1:-1] and len(command_content) >= 3:
                 return UtteranceStatus.COMPLETE
             return UtteranceStatus.INCOMPLETE
+        if first in _SEPARABLE_COMMANDS:
+            first_argument = next(
+                (
+                    word for word in words[1:]
+                    if word not in _COMMAND_FILLERS
+                ),
+                None,
+            )
+            if first_argument in _DETERMINERS:
+                return UtteranceStatus.INCOMPLETE
+            return UtteranceStatus.UNKNOWN
         return UtteranceStatus.COMPLETE
 
     if last in _FULL_VERBS:
@@ -234,6 +260,9 @@ def classify_utterance(text: str) -> UtteranceStatus:
 
     if _ends_in_determiner_adjective(words):
         return UtteranceStatus.INCOMPLETE
+
+    if last in _QUESTION_PRONOUNS:
+        return UtteranceStatus.UNKNOWN
 
     if last in _INCOMPLETE_ENDINGS:
         return UtteranceStatus.INCOMPLETE

@@ -254,7 +254,6 @@ class VoiceStreamSession:
     async def _run_partial(
         self, audio: bytes, generation: int, audio_end_sample_index: int,
     ) -> str | None:
-        started_at = self._clock()
         try:
             text = await self._partial_transcriber(audio)
         except asyncio.CancelledError:
@@ -262,11 +261,6 @@ class VoiceStreamSession:
         except Exception as exc:
             log.debug("Teil-STT fehlgeschlagen (%s)", type(exc).__name__)
             return None
-        finally:
-            audio_seconds = len(audio) / (2 * SAMPLE_RATE)
-            elapsed_ms = max(0.0, (self._clock() - started_at) * 1000)
-            if audio_seconds > 0:
-                stt_runtime.record_stt_runtime(audio_seconds, elapsed_ms)
 
         if text is None:
             return None

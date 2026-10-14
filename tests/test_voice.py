@@ -422,6 +422,20 @@ def test_stt_runtime_estimate_learns_from_warmup_and_final_runs(monkeypatch, tmp
     assert stt_runtime.estimate_stt_runtime_ms(1.0) < 550
 
 
+def test_failed_parakeet_inference_does_not_record_stt_runtime(monkeypatch):
+    recorded = []
+    model = MagicMock()
+    model.transcribe.side_effect = RuntimeError("Inference fehlgeschlagen")
+    monkeypatch.setattr(voice, "_parakeet_model", model)
+    monkeypatch.setattr(
+        voice, "_record_stt_runtime",
+        lambda audio_path, started_at: recorded.append((audio_path, started_at)),
+    )
+
+    assert asyncio.run(voice._transcribe_parakeet("/tmp/fake.wav")) == ""
+    assert recorded == []
+
+
 def test_whisper_voice_transcript_also_normalizes_the_initial_wake_word(monkeypatch):
     monkeypatch.setattr(voice.config, "STT_ENGINE", "whisper")
     monkeypatch.setattr(

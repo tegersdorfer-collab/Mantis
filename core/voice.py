@@ -294,12 +294,10 @@ async def _transcribe_parakeet(audio_path: str) -> str:
     try:
         loop = asyncio.get_running_loop()
         started_at = time.perf_counter()
-        try:
-            result = await _await_worker_completion(
-                loop.run_in_executor(_parakeet_executor, _parakeet_model.transcribe, audio_path)
-            )
-        finally:
-            _record_stt_runtime(audio_path, started_at)
+        result = await _await_worker_completion(
+            loop.run_in_executor(_parakeet_executor, _parakeet_model.transcribe, audio_path)
+        )
+        _record_stt_runtime(audio_path, started_at)
         return (result.text or "").strip()
     except Exception as e:
         # Laufzeitfehler (kaputte Datei o.ä.) — kein Grund, die Engine zu wechseln.
