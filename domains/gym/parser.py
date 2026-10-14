@@ -14,6 +14,7 @@ _EQUIPMENT = (
     (re.compile(r"^(?:kh|kurzhantel(?:n)?)\b[\s-]*", re.I), "dumbbell"),
     (re.compile(r"^(?:lh|langhantel(?:n)?)\b[\s-]*", re.I), "barbell"),
     (re.compile(r"^(?:sz(?:-?stange)?)\b[\s-]*", re.I), "ez_bar"),
+    (re.compile(r"^kabel\b[\s-]*", re.I), "machine"),
 )
 _REJECTION_TERMS = (
     "pound", " lb", "umrechnen", "wie viel", "wieviel", "wie schwer",
@@ -33,6 +34,7 @@ _NON_EXERCISE_START = re.compile(
 class ParsedSet:
     weight_kg: float | None
     reps: int
+    is_warmup: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,51 +110,92 @@ def _prefix_and_remainder(text: str, aliases: dict[str, list[str]]):
     return raw_name, tail, equipment, exercise, ambiguous, fuzzy, bool(exercise)
 
 
+def _rep_values(text: str) -> list[int] | None:
+    """Liest ausschließlich ganzzahlige Wiederholungen mit klaren Trennern."""
+    value = _REP_WORDS.sub(" ", text)
+    value = re.sub(r"(?<=\d)\s*:\s*(?=\d)", " ", value)
+    value = value.strip().rstrip("!;.")
+    if not value:
+        return None
+    # Ein einzelnes Kommapaar kann eine Dezimalzahl sein (12,5), keine sichere Wdh-Liste.
+    if re.fullmatch(r"\d{1,2},\d{1,2}", value):
+        return None
+    if not re.fullmatch(r"[\s,/;x:-]*\d{1,2}(?:[\s,/;x:-]+\d{1,2})*", value, re.I):
+        return None
+    numbers = [int(item) for item in re.findall(r"\d+", value)]
+    if not numbers or any(not 1 <= item <= 30 for item in numbers):
+        return None
+    return numbers
+
+
 def _parse_chunk(chunk: str, allow_bodyweight: bool) -> list[ParsedSet] | None:
-    chunk = chunk.strip().replace("×", "x")
+    chunk = chunk.strip().replace("×", "x").rstrip("!;.")
     if not chunk:
         return None
-    chunk = re.sub(r"(?<=\d)\s*(?:kg|kilo)\b", " ", chunk, flags=re.I)
     if re.search(r"\d+\s*mal\b", chunk, re.I) and not re.search(
         r"\b(?:wdh|wiederholungen?|reps?|saetze?|sätze?)\b", chunk, re.I
     ):
         return None
 
-    # Setzahl x Wiederholungen; ein führendes Lastgewicht bleibt stehen.
-    set_rep = re.search(r"(?<![\w.])(\d{1,2})\s*x\s*(\d{1,2})(?![\w.])", chunk, re.I)
-    if set_rep:
+    cleaned = re.sub(r"(?<=\d)\s*(?:kg|kilo)\b", " ", chunk, flags=re.I)
+    cleaned = re.sub(r"(?<!\w)\+\s+(?=\d)", "+", cleaned)
+    cleaned = _REP_WORDS.sub(" ", cleaned)
+    cleaned = re.sub(r"\b(?:mal|à)\b", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"(?<=\d)\s*:\s*(?=\d)", " ", cleaned)
+    cleaned = cleaned.strip()
+
+    # Gewicht gefolgt von Satzanzahl × Wiederholungen.
+    weighted_set_rep = re.fullmatch(
+        r"([+]?\d+(?:[.,]\d+)?)\s+(\d{1,2})\s*x\s*(\d{1,2})",
+        cleaned,
+        re.I,
+    )
+    if weighted_set_rep:
+        weight = _numeric_value(weighted_set_rep.group(1))
+        count, reps = int(weighted_set_rep.group(2)), int(weighted_set_rep.group(3))
+        if weight is None or not 0 < weight <= 10000 or not 1 <= count <= 10 or not 1 <= reps <= 30:
+            return None
+        return [ParsedSet(weight, reps) for _ in range(count)]
+
+    # Kompakte Konvention: Gewicht × Sätze × Wiederholungen.
+    compact_weighted_set_rep = re.fullmatch(
+        r"([+]?\d+(?:[.,]\d+)?)\s*x\s*(\d{1,2})\s*x\s*(\d{1,2})",
+        cleaned,
+        re.I,
+    )
+    if compact_weighted_set_rep:
+        weight = _numeric_value(compact_weighted_set_rep.group(1))
+        count, reps = int(compact_weighted_set_rep.group(2)), int(compact_weighted_set_rep.group(3))
+        if weight is None or not 0 < weight <= 10000 or not 1 <= count <= 10 or not 1 <= reps <= 30:
+            return None
+        return [ParsedSet(weight, reps) for _ in range(count)]
+
+    # Ebenfalls eindeutig: Sätze × Wiederholungen, danach das Gewicht.
+    set_rep_weight = re.fullmatch(
+        r"(\d{1,2})\s*x\s*(\d{1,2})\s+([+]?\d+(?:[.,]\d+)?)",
+        cleaned,
+        re.I,
+    )
+    if set_rep_weight:
+        count, reps = int(set_rep_weight.group(1)), int(set_rep_weight.group(2))
+        weight = _numeric_value(set_rep_weight.group(3))
+        if weight is None or not 0 < weight <= 10000 or not 1 <= count <= 10 or not 1 <= reps <= 30:
+            return None
+        return [ParsedSet(weight, reps) for _ in range(count)]
+
+    # Setanzahl × Wiederholungen ohne zusätzliche Last.
+    set_rep = re.fullmatch(r"(\d{1,2})\s*x\s*(\d{1,2})", cleaned, re.I)
+    if set_rep and int(set_rep.group(1)) <= 10:
         count, reps = int(set_rep.group(1)), int(set_rep.group(2))
-        if 1 <= count <= 10 and 1 <= reps <= 30:
-            before, after = chunk[:set_rep.start()], chunk[set_rep.end():]
-            remaining = _REP_WORDS.sub(" ", before + " " + after)
-            remaining = re.sub(r"\b(?:x|mal|à)\b", " ", remaining, flags=re.I)
-            values = [_numeric_value(m.group()) for m in _NUMBER.finditer(remaining)]
-            if any(value is None for value in values) or len(values) > 1:
-                return None
-            weight = values[0] if values else None
-            if weight is not None and weight <= 0:
-                return None
-            return [ParsedSet(weight, reps) for _ in range(count)]
-        if reps < 1 or reps > 30:
+        if not 1 <= count <= 10 or not 1 <= reps <= 30:
             return None
+        return [ParsedSet(None, reps) for _ in range(count)]
 
-    # Einzelner Satz mit x als Wiederholungsmarker (z.B. 80 kg x 8).
-    single_rep = re.search(r"\bx\s*(\d{1,2})\b", chunk, re.I)
-    if single_rep:
-        reps = int(single_rep.group(1))
-        if not 1 <= reps <= 30:
-            return None
-        remaining = chunk[:single_rep.start()] + " " + chunk[single_rep.end():]
-        remaining = _REP_WORDS.sub(" ", remaining)
-        values = [_numeric_value(m.group()) for m in _NUMBER.finditer(remaining)]
-        if len(values) > 1 or any(v is None or v <= 0 for v in values):
-            return None
-        return [ParsedSet(values[0] if values else None, reps)]
-
-    # Explizite Schreibweise wie "3 Sätze à 8 Wiederholungen".
+    # Explizite Schreibweise wie "80 kg 3 Sätze à 8 Wiederholungen".
     set_words = re.search(
         r"(?<!\w)(\d{1,2})\s*(?:saetze?|sätze?)\s*(?:à|x)?\s*(\d{1,2})\b",
-        chunk, re.I,
+        chunk,
+        re.I,
     )
     if set_words:
         count, reps = int(set_words.group(1)), int(set_words.group(2))
@@ -160,35 +203,41 @@ def _parse_chunk(chunk: str, allow_bodyweight: bool) -> list[ParsedSet] | None:
             return None
         remaining = chunk[:set_words.start()] + " " + chunk[set_words.end():]
         remaining = _REP_WORDS.sub(" ", remaining)
-        values = [_numeric_value(m.group()) for m in _NUMBER.finditer(remaining)]
-        if len(values) > 1 or any(v is None or v <= 0 for v in values):
+        remaining = re.sub(r"\b(?:x|mal|à)\b", " ", remaining, flags=re.I)
+        values = [_numeric_value(match.group()) for match in _NUMBER.finditer(remaining)]
+        if len(values) > 1 or any(value is None or value <= 0 for value in values):
             return None
-        return [ParsedSet(values[0] if values else None, reps) for _ in range(count)]
+        weight = values[0] if values else None
+        return [ParsedSet(weight, reps) for _ in range(count)]
 
-    cleaned = _REP_WORDS.sub(" ", chunk)
-    cleaned = re.sub(r"\b(?:x|mal|à)\b", " ", cleaned, flags=re.I)
-    values = [_numeric_value(m.group()) for m in _NUMBER.finditer(cleaned)]
-    if not values or any(value is None for value in values):
-        return None
-    if not cleaned.strip() or not re.fullmatch(r"[\s+\d.,-]+", cleaned):
-        return None
+    # Ein kompaktes Komma-Triplett ohne vorheriges Gewicht bleibt bei bekannten
+    # Nicht-Klimmzug-Übungen mehrdeutig und wird nicht als kg interpretiert.
+    if re.fullmatch(r"\s*\d{1,2}(?:,\d{1,2}){2,}\s*", cleaned):
+        if not allow_bodyweight:
+            return None
+        body_reps = _rep_values(cleaned)
+        return [ParsedSet(None, reps) for reps in body_reps] if body_reps else None
 
-    if (
-        allow_bodyweight and not chunk.lstrip().startswith("+")
-        and len(values) <= 10 and all(1 <= value <= 30 for value in values)
+    if allow_bodyweight and not cleaned.lstrip().startswith("+"):
+        body_reps = _rep_values(cleaned)
+        if body_reps:
+            return [ParsedSet(None, reps) for reps in body_reps]
+
+    match = _NUMBER.search(cleaned)
+    if not match:
+        return None
+    weight = _numeric_value(match.group())
+    if weight is None or not 0 < weight <= 10000:
+        return None
+    remainder = cleaned[:match.start()] + " " + cleaned[match.end():]
+    if re.match(r"^\s*\d{1,2}\s*x.*x", remainder, re.I) or re.match(
+        r"^\s*x\s+\d{1,2}\s*x", remainder, re.I
     ):
-        return [ParsedSet(None, int(value)) for value in values]
-    if len(values) == 1 and chunk.lstrip().startswith("+"):
         return None
-    if len(values) == 1:
+    reps = _rep_values(remainder)
+    if not reps:
         return None
-    weight = values[0]
-    reps = values[1:]
-    if chunk.lstrip().startswith("+"):
-        weight = values[0]
-    if weight <= 0 or weight > 10000 or any(not 1 <= value <= 30 for value in reps):
-        return None
-    return [ParsedSet(weight, int(value)) for value in reps]
+    return [ParsedSet(weight, count) for count in reps]
 
 
 def parse_set_message(
@@ -216,6 +265,25 @@ def parse_set_message(
     )
     if not tail:
         return None
+    warmup = bool(re.search(r"\b(?:warm\s*up|warmup|aufwärm\w*)\b", tail, re.I))
+    tail = re.sub(r"\b(?:warm\s*up|warmup|aufwärm\w*)\b", " ", tail, flags=re.I)
+    suffix_equipment = re.match(
+        r"^(kh|kurzhantel(?:n)?|lh|langhantel(?:n)?|sz(?:-?stange)?|kabel|cable)\b[\s-]*",
+        tail,
+        re.I,
+    )
+    if suffix_equipment:
+        suffix = normalize_alias(suffix_equipment.group(1))
+        suffix_kind = (
+            "dumbbell" if suffix.startswith(("kh", "kurzhantel")) else
+            "barbell" if suffix.startswith(("lh", "langhantel")) else
+            "machine" if suffix.startswith(("kabel", "cable")) else "ez_bar"
+        )
+        if equipment and equipment != suffix_kind:
+            return None
+        equipment = suffix_kind
+        tail = tail[suffix_equipment.end():]
+    tail = re.sub(r"(?<=\d)\s*:\s*(?=\d)", " ", tail)
     # A comma followed by whitespace separates set pairs. A decimal comma does not.
     chunks = re.split(r",\s+", tail)
     parsed_sets = []
@@ -224,16 +292,16 @@ def parse_set_message(
         parsed = _parse_chunk(chunk, allow_bodyweight=bodyweight)
         if not parsed and parsed_sets:
             # Nach einer Last kann ein einzelner Wert ein weiterer Satz mit derselben Last sein.
-            cleaned = _REP_WORDS.sub(" ", chunk)
-            cleaned = re.sub(r"\b(?:x|mal|à)\b", " ", cleaned, flags=re.I)
-            values = [_numeric_value(m.group()) for m in _NUMBER.finditer(cleaned)]
-            if len(values) == 1 and values[0] is not None and 1 <= values[0] <= 30:
+            reps = _rep_values(chunk)
+            if reps and len(reps) == 1:
                 previous_weight = parsed_sets[-1].weight_kg
                 if bodyweight or previous_weight is not None:
-                    parsed = [ParsedSet(previous_weight, int(values[0]))]
+                    parsed = [ParsedSet(previous_weight, reps[0])]
         if not parsed:
             return None
-        parsed_sets.extend(parsed)
+        parsed_sets.extend(
+            ParsedSet(item.weight_kg, item.reps, warmup) for item in parsed
+        )
     if not 1 <= len(parsed_sets) <= 20:
         return None
     if known and not is_pullup_name(exercise) and any(

@@ -39,19 +39,26 @@ def _weight_step(metadata: dict | None) -> float | None:
     }.get(str(metadata.get("equipment") or "").lower())
 
 
-def progression_set_count(current_count: int, planned_count: int | None) -> int:
-    """Nimmt die aktuelle Satzanzahl vor Planwert und Dreier-Standard."""
+def progression_set_count(
+    current_count: int,
+    planned_count: int | None,
+    previous_count: int = 0,
+) -> int:
+    """Hält mindestens aktuelle, letzte und geplante Satzanzahl bereit."""
     try:
         current_count = int(current_count)
     except (TypeError, ValueError):
         current_count = 0
-    if current_count > 0:
-        return current_count
+    try:
+        previous_count = int(previous_count)
+    except (TypeError, ValueError):
+        previous_count = 0
     try:
         planned_count = int(planned_count) if planned_count is not None else 0
     except (TypeError, ValueError):
         planned_count = 0
-    return planned_count if 1 <= planned_count <= 20 else 3
+    planned_count = planned_count if 1 <= planned_count <= 20 else 3
+    return max(current_count, previous_count, planned_count)
 
 
 def recommend_next(

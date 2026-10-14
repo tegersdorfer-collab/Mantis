@@ -27,9 +27,25 @@ def test_set_count_can_come_from_default_plan_fallback():
 
 
 def test_set_count_prefers_current_input_then_plan_then_default():
-    assert progression_set_count(current_count=1, planned_count=4) == 1
+    assert progression_set_count(current_count=1, planned_count=4) == 4
     assert progression_set_count(current_count=0, planned_count=4) == 4
     assert progression_set_count(current_count=0, planned_count=None) == 3
+    assert progression_set_count(current_count=1, previous_count=3, planned_count=None) == 3
+
+
+def test_single_set_input_keeps_the_previous_session_target_count():
+    current = _sets(80, [8])
+    previous = _sets(80, [8, 8, 7])
+    count = progression_set_count(
+        current_count=len(current), previous_count=len(previous), planned_count=None
+    )
+
+    suggestion = recommend_next(
+        current, previous, {"exercise_type": "compound"}, set_count=count
+    )
+
+    assert suggestion["target_reps"] == [8, 8, 7]
+    assert len(suggestion["target_reps"]) == 3
 
 
 def test_first_isolation_session_starts_at_ten_reps():

@@ -5,6 +5,8 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+
 from communication.base import IncomingMessage
 from core import db
 from core.message_handler import MessageHandler
@@ -99,6 +101,68 @@ def test_smalltalk_numbers_are_not_misrouted_to_gym(monkeypatch):
 
     assert agent.run.await_count == 1
     assert all('"use_case"' not in params[3] for _sql, params in persisted)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Termin am 14 10",
+        "Treffen 18 30",
+        "Zahnarzt 14 30",
+        "Bus 52 5",
+        "Raum 204 3",
+        "Miete 650 5",
+        "Seite 120 5",
+        "Film 120 8",
+        "Jahr 2026 10 14",
+        "Wecker 6 30 7",
+        "Training 18 30",
+        "Kaffee 3 2 1",
+    ],
+)
+def test_reviewed_ambiguous_messages_reach_the_normal_agent(monkeypatch, text):
+    handler, persisted, kzg, _lzg, agent, _channel = _handler(monkeypatch)
+
+    asyncio.run(handler.handle(IncomingMessage(text, "timo", datetime(2026, 10, 14)), None))
+
+    assert agent.run.await_count == 1
+    assert kzg.added[0] == ("user", text)
+    assert all('"use_case"' not in params[3] for _sql, params in persisted)
+
+
+@pytest.mark.parametrize("text", ["Training fertig", "Bank 80 8"])
+def test_open_task_clarification_takes_priority_over_gym_routing(monkeypatch, text):
+    handler, persisted, _kzg, _lzg, agent, _channel = _handler(monkeypatch)
+    monkeypatch.setattr(db, "query", lambda sql, *_args, **_kwargs: (
+        [{"id": 12}] if "FROM tasks" in sql else []
+    ))
+    monkeypatch.setattr(
+        gym_session, "add_sets", Mock(side_effect=AssertionError("must answer clarification"))
+    )
+
+    asyncio.run(handler.handle(IncomingMessage(text, "timo", datetime(2026, 10, 14)), None))
+
+    assert agent.run.await_count == 0
+    assert persisted[1][1][1].startswith("Danke!")
+    assert all('"use_case": "gym"' not in params[3] for _sql, params in persisted)
+
+
+def test_open_accountability_prompt_takes_priority_over_gym_routing(monkeypatch):
+    handler, persisted, _kzg, _lzg, agent, channel = _handler(monkeypatch)
+    monkeypatch.setattr(
+        "domains.accountability.intercept", lambda _text: "Notiert."
+    )
+    monkeypatch.setattr(
+        gym_session, "add_sets", Mock(side_effect=AssertionError("must answer prompt"))
+    )
+
+    asyncio.run(handler.handle(
+        IncomingMessage("Bank 80 8", "timo", datetime(2026, 10, 14)), None
+    ))
+
+    assert agent.run.await_count == 0
+    assert channel.send.await_args.args[0] == "Notiert."
+    assert all('"use_case": "gym"' not in params[3] for _sql, params in persisted)
 
 
 def test_parser_fallback_sends_only_current_text_and_aliases_to_chat_chain(monkeypatch):

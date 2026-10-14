@@ -120,16 +120,47 @@ def _exercise_defaults(name: str, equipment: str | None, load_mode: str) -> dict
     }
 
 
+def _equipment_variant_name(cur, name: str, equipment: str | None, load_mode: str) -> str:
+    """Gibt gerätegleiche Bestandsübungen zurück, sonst einen getrennten Namen."""
+    if not equipment:
+        return name
+    label = {
+        "dumbbell": "Kurzhantel",
+        "barbell": "Langhantel",
+        "ez_bar": "SZ-Stange",
+        "machine": "Maschine",
+    }.get(equipment)
+    if not label:
+        return name
+    variant = f"{name} ({label})"
+    rows = _fetchall(
+        cur,
+        """SELECT id,name,equipment,load_mode FROM exercises
+           WHERE LOWER(name)=LOWER(%s) OR LOWER(name)=LOWER(%s)""",
+        (name, variant),
+    )
+    for row in rows:
+        effective_equipment = row.get("equipment") or _exercise_defaults(
+            row["name"], None, row.get("load_mode") or load_mode
+        )["equipment"]
+        if effective_equipment == equipment:
+            return row["name"]
+    if any(normalize_alias(row["name"]) == normalize_alias(name) for row in rows):
+        return variant
+    return name
+
+
 def _ensure_exercise(cur, name: str, alias: str | None, equipment: str | None,
                      load_mode: str, *, allow_create: bool) -> dict | None:
+    storage_name = _equipment_variant_name(cur, name, equipment, load_mode)
     row = _fetchone(
         cur,
         """SELECT id, name, exercise_type, equipment, rep_min, rep_max, rep_start,
                   load_mode, weight_increment_kg, dumbbell_pair
            FROM exercises WHERE LOWER(name)=LOWER(%s) LIMIT 1""",
-        (name,),
+        (storage_name,),
     )
-    if not row and alias:
+    if not row and alias and not equipment:
         row = _fetchone(
             cur,
             """SELECT e.id, e.name, e.exercise_type, e.equipment, e.rep_min, e.rep_max,
@@ -151,7 +182,7 @@ def _ensure_exercise(cur, name: str, alias: str | None, equipment: str | None,
                ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name
                RETURNING id, name, exercise_type, equipment, rep_min, rep_max, rep_start,
                          load_mode, weight_increment_kg, dumbbell_pair""",
-            (name, defaults["category"], defaults["muscle"], defaults["unit"],
+            (storage_name, defaults["category"], defaults["muscle"], defaults["unit"],
              defaults["exercise_type"], defaults["equipment"], defaults["rep_min"],
              defaults["rep_max"], defaults["rep_start"], defaults["load_mode"],
              defaults["weight_increment_kg"], defaults["dumbbell_pair"]),
@@ -269,6 +300,7 @@ def _exercise_state(cur, workout_id: int, exercise_id: int) -> dict:
     prior_rows = [row for group in groups if group and group[0]["workout_id"] != workout_id for row in group]
     count = progression_set_count(
         len(current), _planned_set_count(cur, exercise.get("name", "")),
+        previous_count=len(previous),
     )
     return {
         "current_sets": current,
@@ -316,12 +348,15 @@ def add_sets(parsed, *, allow_create: bool = False, now: datetime | None = None)
             cur.execute(
                 """INSERT INTO workout_sets
                      (workout_id, exercise_id, set_index, reps, weight_kg, is_warmup)
-                   VALUES (%s,%s,%s,%s,%s,FALSE)""",
-                (workout["id"], exercise["id"], next_index, item.reps, item.weight_kg),
+                   VALUES (%s,%s,%s,%s,%s,%s)""",
+                (
+                    workout["id"], exercise["id"], next_index, item.reps,
+                    item.weight_kg, item.is_warmup,
+                ),
             )
             inserted_sets.append({
                 "set_index": next_index, "reps": item.reps,
-                "weight_kg": item.weight_kg, "is_warmup": False,
+                "weight_kg": item.weight_kg, "is_warmup": item.is_warmup,
             })
         cur.execute("UPDATE workouts SET last_activity_at=%s WHERE id=%s", (moment, workout["id"]))
 
@@ -352,6 +387,7 @@ def add_sets(parsed, *, allow_create: bool = False, now: datetime | None = None)
         ]
         set_count = progression_set_count(
             len(current), _planned_set_count(cur, exercise["name"]),
+            previous_count=len(previous),
         )
         return {
             "workout_id": workout["id"], "date": workout["date"],
@@ -419,7 +455,12 @@ def finish(now: datetime | None = None) -> dict | None:
         return {"workout_id": workout["id"], "timed_out": timed_out, "prs": prs, **summary}
 
 
-def correct_last_reps(reps: int, now: datetime | None = None) -> dict | None:
+def correct_last_reps(
+    reps: int,
+    now: datetime | None = None,
+    *,
+    expected_reps: int | None = None,
+) -> dict | None:
     moment = local_now(now)
     with db.cursor() as cur:
         _lock_session(cur)
@@ -430,12 +471,14 @@ def correct_last_reps(reps: int, now: datetime | None = None) -> dict | None:
             return None
         row = _fetchone(
             cur,
-            """SELECT id, exercise_id, set_index FROM workout_sets
+            """SELECT id, exercise_id, set_index, reps FROM workout_sets
                WHERE workout_id=%s ORDER BY id DESC LIMIT 1""",
             (workout["id"],),
         )
         if not row:
             return None
+        if expected_reps is not None and row.get("reps") != expected_reps:
+            return {"conflict": True, "reps": row.get("reps"), "expected_reps": expected_reps}
         cur.execute("UPDATE workout_sets SET reps=%s WHERE id=%s", (reps, row["id"]))
         cur.execute("UPDATE workouts SET last_activity_at=%s WHERE id=%s", (moment, workout["id"]))
         state = _exercise_state(cur, workout["id"], row["exercise_id"])

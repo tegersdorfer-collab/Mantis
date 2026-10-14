@@ -168,3 +168,111 @@ def test_set_write_rolls_back_workout_and_exercise_after_database_error(gym_data
         "SELECT id FROM workouts WHERE type='gym' AND ended_at IS NULL"
     ) is None
 
+
+def test_same_exercise_name_with_dumbbell_and_barbell_keeps_separate_history(gym_database):
+    name = f"Synthetic KH-LH {uuid4()}"
+    moment = datetime.now(ZoneInfo("Europe/Berlin"))
+    db.execute(
+        """INSERT INTO exercises
+             (name, category, muscle, unit, exercise_type, equipment, rep_min, rep_max,
+              rep_start, load_mode, weight_increment_kg, dumbbell_pair)
+           VALUES (%s,'strength','chest','reps','compound','barbell',6,10,8,
+                   'external',2.5,FALSE)""",
+        (name,),
+    )
+    original = db.query_one(
+        """SELECT id,name,equipment,exercise_type,rep_min,rep_max,rep_start,load_mode,
+                  weight_increment_kg,dumbbell_pair FROM exercises WHERE name=%s""",
+        (name,),
+    )
+    workout_id = None
+
+    def log(equipment, minute):
+        return session.add_sets(
+            ParsedLog(
+                exercise=name, sets=(ParsedSet(30.0, 10),), equipment=equipment,
+                known=True, alias=name,
+            ),
+            allow_create=True,
+            now=moment + timedelta(minutes=minute),
+        )
+
+    try:
+        dumbbell = log("dumbbell", 0)
+        workout_id = dumbbell["workout_id"]
+        barbell = log("barbell", 2)
+        log("dumbbell", 4)
+        rows = db.query(
+            """SELECT e.id,e.name,e.equipment,COUNT(*) AS sets
+               FROM workout_sets ws JOIN exercises e ON e.id=ws.exercise_id
+               WHERE ws.workout_id=%s GROUP BY e.id,e.name,e.equipment ORDER BY e.id""",
+            (dumbbell["workout_id"],),
+        )
+        after = db.query_one(
+            """SELECT id,name,equipment,exercise_type,rep_min,rep_max,rep_start,load_mode,
+                      weight_increment_kg,dumbbell_pair FROM exercises WHERE id=%s""",
+            (original["id"],),
+        )
+
+        assert dumbbell["exercise"] == f"{name} (Kurzhantel)"
+        assert barbell["exercise"] == name
+        assert len(rows) == 2
+        assert sorted(row["sets"] for row in rows) == [1, 2]
+        assert original == after
+    finally:
+        if workout_id:
+            db.execute("DELETE FROM workouts WHERE id=%s", (workout_id,))
+        db.execute(
+            "DELETE FROM exercises WHERE name=%s OR name=%s",
+            (name, f"{name} (Kurzhantel)"),
+        )
+
+
+def test_rep_correction_with_wrong_old_value_does_not_update_database(gym_database):
+    name = f"Synthetic correction {uuid4()}"
+    moment = datetime.now(ZoneInfo("Europe/Berlin"))
+    created = session.add_sets(_parsed(name, known=True), allow_create=True, now=moment)
+    try:
+        result = session.correct_last_reps(
+            7, moment + timedelta(minutes=2), expected_reps=6
+        )
+        stored = db.query_one(
+            "SELECT reps FROM workout_sets WHERE workout_id=%s ORDER BY id DESC LIMIT 1",
+            (created["workout_id"],),
+        )
+
+        assert result == {"conflict": True, "reps": 7, "expected_reps": 6}
+        assert stored["reps"] == 7
+    finally:
+        db.execute("DELETE FROM workouts WHERE id=%s", (created["workout_id"],))
+        db.execute("DELETE FROM exercises WHERE name=%s", (name,))
+
+
+def test_warmup_marker_is_persisted_and_excluded_from_progression(gym_database):
+    name = f"Synthetic warmup {uuid4()}"
+    moment = datetime.now(ZoneInfo("Europe/Berlin"))
+    result = session.add_sets(
+        ParsedLog(
+            exercise=name,
+            sets=(ParsedSet(40.0, 10, True), ParsedSet(80.0, 8)),
+            known=True,
+            alias=name,
+        ),
+        allow_create=True,
+        now=moment,
+    )
+    try:
+        rows = db.query(
+            "SELECT is_warmup,reps FROM workout_sets WHERE workout_id=%s ORDER BY set_index",
+            (result["workout_id"],),
+        )
+
+        assert [(row["is_warmup"], row["reps"]) for row in rows] == [(True, 10), (False, 8)]
+        assert [
+            (row["reps"], row["weight_kg"], row["is_warmup"])
+            for row in result["current_sets"]
+        ] == [(8, 80.0, False)]
+    finally:
+        db.execute("DELETE FROM workouts WHERE id=%s", (result["workout_id"],))
+        db.execute("DELETE FROM exercises WHERE name=%s", (name,))
+

@@ -25,6 +25,21 @@ def test_clear_set_line_is_a_deterministic_log_intent(monkeypatch):
     assert intent.parsed.exercise == "Bankdrücken"
 
 
+def test_generic_curls_ask_for_equipment_instead_of_being_ignored(monkeypatch):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    coach = GymCoach()
+
+    intent = coach.classify("Curls 15 4x10")
+    assert intent is not None
+    assert intent.action == "clarify_equipment"
+
+    result = asyncio.run(coach.process(intent))
+
+    assert "Kurzhantel" in result.text
+    assert "SZ" in result.text
+    assert "Kabel" in result.text
+
+
 def test_bare_today_question_stays_with_the_normal_agent(monkeypatch):
     monkeypatch.setattr(coach_module, "load_aliases", _aliases)
     monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: None)
@@ -71,6 +86,14 @@ def test_parser_fallback_is_limited_to_plausible_strength_messages(monkeypatch):
     assert intent is not None
     assert intent.action == "parser_fallback"
     assert coach.classify("80 kg wie viel sind das in pounds?") is None
+
+
+@pytest.mark.parametrize("text", ["Bank 8,8,7", "Bank 80 12,5"])
+def test_ambiguous_or_decimal_reps_do_not_become_gym_actions(monkeypatch, text):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: None)
+
+    assert GymCoach().classify(text) is None
 
 
 @pytest.mark.parametrize(
@@ -174,6 +197,49 @@ def test_resolved_pending_payload_is_not_reused(monkeypatch):
     ])
 
     assert GymCoach()._latest_pending() is None
+
+
+def test_old_pending_is_ignored_when_a_later_assistant_message_is_normal(monkeypatch):
+    def query(sql):
+        if "meta ? 'gym_pending'" in sql:
+            return [{"meta": {"gym_pending": {"kind": "new_exercise"}}}]
+        return [{"meta": {"use_case": "chat"}}]
+
+    monkeypatch.setattr(coach_module.db, "query", query)
+
+    coach = GymCoach()
+    assert coach._latest_pending() is None
+    assert coach.classify("ja") is None
+
+
+def test_last_set_repair_keeps_the_claimed_old_value(monkeypatch):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+
+    intent = GymCoach().classify("letzter Satz 7 nicht 8")
+
+    assert intent is not None
+    assert intent.action == "correct_reps"
+    assert intent.payload == {"reps": 7, "expected_reps": 8}
+
+
+def test_last_set_repair_reports_a_mismatch_without_claiming_success(monkeypatch):
+    calls = []
+
+    def correct(reps, now=None, *, expected_reps=None):
+        calls.append((reps, expected_reps))
+        return {"conflict": True, "reps": 9}
+
+    monkeypatch.setattr(coach_module.session, "correct_last_reps", correct)
+    intent = coach_module.GymIntent(
+        "correct_reps", payload={"reps": 7, "expected_reps": 8}
+    )
+
+    result = asyncio.run(GymCoach().process(intent))
+
+    assert calls == [(7, 8)]
+    assert "9 Wdh." in result.text
+    assert "nicht 8" in result.text
+    assert "Korrigiert" not in result.text
 
 
 def test_split_pending_does_not_capture_unrelated_chat(monkeypatch):

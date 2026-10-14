@@ -17,7 +17,10 @@ BUILTIN_ALIAS_GROUPS = {
         "Schulterdrücken", "Shoulder Press", "Overhead Press", "OHP",
     ),
     "Klimmzüge": ("Klimmzüge", "Klimmzug", "Pull-up", "Pull-ups", "Pullups"),
-    "Bizepscurls": ("Bizepscurls", "Bizepscurl", "Biceps Curl", "Bicep Curl"),
+    "Bizepscurls": (
+        "Bizepscurls", "Bizepscurl", "Biceps Curl", "Bicep Curl", "Curls",
+    ),
+    "Hammercurls": ("Hammercurls", "Hammercurl", "Hammer Curls", "Hammer Curl"),
 }
 
 

@@ -87,6 +87,17 @@ class MessageHandler:
             if self._active_turns == 0:
                 self._resume_idle_loop(callback)
 
+    def _record_user_message(self, text: str, channel_name: str) -> None:
+        self.kzg.add("user", text)
+        self._persist_msg("user", text, channel=channel_name)
+        self._check_verification_bump(text)
+        try:
+            last_turns = self.kzg.get_recent_turns(n=2)
+            if last_turns and last_turns[-1].role == "assistant":
+                self.proactive_tracker.record_user_response()
+        except Exception:
+            pass
+
     # ── Verification Bump ─────────────────────────────────────────────────────
 
     def _check_verification_bump(self, text: str) -> None:
@@ -141,6 +152,40 @@ class MessageHandler:
         BUS.emit("thinking", "Nachricht empfangen…", detail=msg.text[:60])
         log.info(f"Eingehend: {msg.text[:60]}")
 
+        # Task-Klärungsantwort
+        waiting = db.query(
+            "SELECT id FROM tasks WHERE execution_phase='waiting_clarification' "
+            "AND clarification_answer IS NULL ORDER BY created_at DESC LIMIT 1"
+        )
+        if waiting:
+            self._record_user_message(msg.text, channel_name)
+            db.execute(
+                "UPDATE tasks SET clarification_answer=%s, execution_phase='executing', "
+                "hold_until=NULL WHERE id=%s",
+                (msg.text, waiting[0]["id"])
+            )
+            response = "Danke! Ich mache mit deiner Antwort weiter an der Aufgabe. 👍"
+            self.kzg.add("assistant", response)
+            self._persist_msg("assistant", response, channel=channel_name)
+            BUS.emit("response", response)
+            if channel_name == "discord":
+                await response_channel.send(response)
+            return
+
+        # Accountability & Momentum: eingehende Antwort auf einen offenen
+        # Anchor/Block-Prompt verbuchen (deterministisch, kein LLM). Bewusst VOR
+        # dem Agenten — sonst würde das Chat-Modell die sekundenkurze Interaktion
+        # in ein Gespräch verwandeln (genau das will die Spec nicht).
+        from domains import accountability
+        acc_reply = accountability.intercept(msg.text)
+        if acc_reply is not None:
+            self._record_user_message(msg.text, channel_name)
+            self.kzg.add("assistant", acc_reply)
+            self._persist_msg("assistant", acc_reply, channel=channel_name)
+            BUS.emit("response", acc_reply)
+            await response_channel.send(acc_reply)
+            return
+
         # Gym-Nachrichten bleiben außerhalb von KZG/LZG und des Agenten-Kontexts.
         try:
             gym_intent = self.gym_coach.classify(msg.text, now=msg.timestamp)
@@ -177,49 +222,7 @@ class MessageHandler:
             await response_channel.send(gym_result.text)
             return
 
-        self.kzg.add("user", msg.text)
-        self._persist_msg("user", msg.text, channel=channel_name)
-        self._check_verification_bump(msg.text)
-
-        # Engagement Decay
-        try:
-            last_turns = self.kzg.get_recent_turns(n=2)
-            if last_turns and last_turns[-1].role == "assistant":
-                self.proactive_tracker.record_user_response()
-        except Exception:
-            pass
-
-        # Task-Klärungsantwort
-        waiting = db.query(
-            "SELECT id FROM tasks WHERE execution_phase='waiting_clarification' "
-            "AND clarification_answer IS NULL ORDER BY created_at DESC LIMIT 1"
-        )
-        if waiting:
-            db.execute(
-                "UPDATE tasks SET clarification_answer=%s, execution_phase='executing', "
-                "hold_until=NULL WHERE id=%s",
-                (msg.text, waiting[0]["id"])
-            )
-            response = "Danke! Ich mache mit deiner Antwort weiter an der Aufgabe. 👍"
-            self.kzg.add("assistant", response)
-            self._persist_msg("assistant", response, channel=channel_name)
-            BUS.emit("response", response)
-            if channel_name == "discord":
-                await response_channel.send(response)
-            return
-
-        # Accountability & Momentum: eingehende Antwort auf einen offenen
-        # Anchor/Block-Prompt verbuchen (deterministisch, kein LLM). Bewusst VOR
-        # dem Agenten — sonst würde das Chat-Modell die sekundenkurze Interaktion
-        # in ein Gespräch verwandeln (genau das will die Spec nicht).
-        from domains import accountability
-        acc_reply = accountability.intercept(msg.text)
-        if acc_reply is not None:
-            self.kzg.add("assistant", acc_reply)
-            self._persist_msg("assistant", acc_reply, channel=channel_name)
-            BUS.emit("response", acc_reply)
-            await response_channel.send(acc_reply)
-            return
+        self._record_user_message(msg.text, channel_name)
 
         # Alpha Progression
         alpha_response = await self._handle_alpha_progression(msg.text, channel_name)

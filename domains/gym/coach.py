@@ -36,7 +36,11 @@ class GymResult:
 def _parsed_payload(parsed: ParsedLog) -> dict:
     return {
         "exercise": parsed.exercise,
-        "sets": [{"weight_kg": item.weight_kg, "reps": item.reps} for item in parsed.sets],
+        "sets": [{
+            "weight_kg": item.weight_kg,
+            "reps": item.reps,
+            "is_warmup": item.is_warmup,
+        } for item in parsed.sets],
         "equipment": parsed.equipment,
         "load_mode": parsed.load_mode,
         "known": parsed.known,
@@ -53,6 +57,7 @@ def _payload_parsed(payload: dict) -> ParsedLog | None:
             ParsedSet(
                 float(item["weight_kg"]) if item.get("weight_kg") is not None else None,
                 int(item["reps"]),
+                bool(item.get("is_warmup")),
             )
             for item in payload["sets"]
         )
@@ -111,8 +116,7 @@ class GymCoach:
         try:
             rows = db.query(
                 """SELECT meta FROM chat_messages
-                   WHERE role='assistant' AND meta ? 'gym_pending'
-                   ORDER BY id DESC LIMIT 1"""
+                   WHERE role='assistant' ORDER BY id DESC LIMIT 1"""
             )
         except Exception:
             return None
@@ -175,9 +179,15 @@ class GymCoach:
     @staticmethod
     def _correction_intent(text: str, aliases: dict[str, list[str]]) -> GymIntent | None:
         normalized = normalize_alias(text)
-        match = re.search(r"\bfalsch\b.*\bletzter satz\s+(\d{1,2})\s+nicht\s+\d{1,2}", normalized)
-        if match and 1 <= int(match.group(1)) <= 30:
-            return GymIntent("correct_reps", payload={"reps": int(match.group(1))})
+        match = re.search(
+            r"(?:\bfalsch\b.*)?\bletzter satz\s+(\d{1,2})\s+nicht\s+(\d{1,2})\b",
+            normalized,
+        )
+        if match and all(1 <= int(value) <= 30 for value in match.groups()):
+            return GymIntent(
+                "correct_reps",
+                payload={"reps": int(match.group(1)), "expected_reps": int(match.group(2))},
+            )
         if re.search(r"\b(?:loesch|loesche|entferne)\s+(?:bitte\s+)?(?:den\s+)?letzten satz\b", normalized):
             return GymIntent("delete_last_set")
         match = re.match(r"(.+?)\s+war\s+([+]?\d+(?:[.,]\d+)?)\s*(?:kg)?$", text.strip(), re.I)
@@ -193,9 +203,20 @@ class GymCoach:
         return None
 
     @staticmethod
+    def _needs_curl_equipment_clarification(parsed: ParsedLog) -> bool:
+        if parsed.equipment:
+            return False
+        return any(
+            "curl" in normalize_alias(value or "")
+            for value in (parsed.alias, parsed.exercise)
+        )
+
+    @staticmethod
     def _strong_training_intent(text: str, aliases: dict[str, list[str]]) -> bool:
         normalized = normalize_alias(text)
         if has_non_exercise_start(text):
+            return False
+        if GymCoach._looks_like_time_or_date(text):
             return False
         if any(term in normalized for term in (
             "pound", " lb", "umrechnen", "wie viel", "wieviel", "gelaufen",
@@ -223,6 +244,33 @@ class GymCoach:
             has_exercise_name and len(values) >= 3 and values[0] > 30
             and all(1 <= value <= 30 for value in values[1:])
         )
+
+    @staticmethod
+    def _looks_like_time_or_date(text: str) -> bool:
+        raw_values = re.findall(r"(?<![\w.])[+]?[0-9]+(?:[.,][0-9]+)?(?![\d.])", text)
+        try:
+            values = [float(value.lstrip("+").replace(",", ".")) for value in raw_values]
+        except ValueError:
+            return False
+        if len(values) >= 3 and values[0] >= 1900:
+            if 1 <= values[1] <= 12 and 1 <= values[2] <= 31:
+                return True
+        if len(values) < 2:
+            return False
+        pairs = list(zip(values, values[1:]))
+        if len(values) == 2:
+            return any(
+                0 <= first <= 24 and 0 <= second <= 59
+                or 1 <= first <= 31 and 1 <= second <= 12
+                for first, second in pairs
+            )
+        if all(0 <= value <= 31 for value in values):
+            return any(
+                0 <= first <= 24 and 0 <= second <= 59
+                or 1 <= first <= 31 and 1 <= second <= 12
+                for first, second in pairs
+            )
+        return False
 
     def classify(self, text: str, now: datetime | None = None) -> GymIntent | None:
         now = session.local_now(now)
@@ -283,8 +331,24 @@ class GymCoach:
             if parsed.ambiguous:
                 return GymIntent("ambiguous_exercise", parsed=parsed)
             if parsed.known:
+                if self._needs_curl_equipment_clarification(parsed):
+                    return GymIntent("clarify_equipment", parsed=parsed)
                 return GymIntent("set_logged", parsed=parsed)
-            return GymIntent("confirm_new_exercise", parsed=parsed)
+            explicit_gym = bool(
+                parsed.equipment
+                or re.search(r"\b(?:kg|kilo|wdh|wiederholungen?|reps?|sätze?|saetze?)\b", text, re.I)
+            )
+            if not explicit_gym and self._looks_like_time_or_date(text):
+                return None
+            if explicit_gym:
+                return GymIntent("confirm_new_exercise", parsed=parsed)
+            try:
+                active_session = session.open_session(now)
+            except Exception:
+                active_session = None
+            if active_session or self._strong_training_intent(text, aliases):
+                return GymIntent("confirm_new_exercise", parsed=parsed)
+            return None
 
         if self._strong_training_intent(text, aliases):
             return GymIntent("parser_fallback", payload={"text": text})
@@ -321,6 +385,12 @@ class GymCoach:
             pending = self._pending("ambiguous", candidate, now)
             choices = " oder ".join(parsed.ambiguous)
             return GymResult(f"Meinst du {choices}? Schreib den passenden Übungsnamen.", action, pending)
+        if action == "clarify_equipment":
+            return GymResult(
+                "❓ Meinst du Kurzhantel (KH), SZ-Stange oder Kabel? "
+                "Sende den Satz bitte noch einmal mit der Variante, z. B. „KH Curls 15 4x10“.",
+                action,
+            )
         if action == "parser_fallback":
             if llm_fallback is None:
                 return GymResult("❓ Schreib den Satz bitte eindeutiger, z. B. Bank 80 8 8.", action)
@@ -542,7 +612,15 @@ class GymCoach:
         payload = intent.payload or {}
         try:
             if intent.action == "correct_reps":
-                result = session.correct_last_reps(payload["reps"], now)
+                result = session.correct_last_reps(
+                    payload["reps"], now, expected_reps=payload.get("expected_reps")
+                )
+                if result and result.get("conflict"):
+                    return GymResult(
+                        f"❓ Der letzte Satz hat {result['reps']} Wdh., nicht "
+                        f"{payload['expected_reps']}. Welche Zahl stimmt?",
+                        intent.action,
+                    )
                 label = f"jetzt {payload['reps']} Wdh."
             elif intent.action == "delete_last_set":
                 result = session.delete_last_set(now)

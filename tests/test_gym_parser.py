@@ -36,6 +36,11 @@ from domains.gym.parser import parse_set_message
         ("Bank 80kg x 8", "Bankdrücken", [80], [8], None),
         ("Bank 80 kg 3 Sätze à 8 Wdh", "Bankdrücken", [80] * 3, [8] * 3, None),
         ("SZ-Stange Bizepscurls 25 12 10", "Bizepscurls", [25, 25], [12, 10], "ez_bar"),
+        ("KH Curls 15 4x10", "Bizepscurls", [15] * 4, [10] * 4, "dumbbell"),
+        ("SZ Curls 15 4x10", "Bizepscurls", [15] * 4, [10] * 4, "ez_bar"),
+        ("Kabel Curls 15 4x10", "Bizepscurls", [15] * 4, [10] * 4, "machine"),
+        ("Bank 100x5x5", "Bankdrücken", [100] * 5, [5] * 5, None),
+        ("Bank 3x8 80", "Bankdrücken", [80] * 3, [8] * 3, None),
         ("LH Bankdrücken 60 10 9", "Bankdrücken", [60, 60], [10, 9], "barbell"),
         ("KH Bankdrücken 24 10 9", "Bankdrücken", [24, 24], [10, 9], "dumbbell"),
         ("Langhantel Kniebeugen 90.5 5 5", "Kniebeuge", [90.5] * 2, [5, 5], "barbell"),
@@ -53,6 +58,55 @@ def test_parses_realistic_training_lines(text, exercise, weights, reps, equipmen
     assert [item.weight_kg for item in parsed.sets] == weights
     assert [item.reps for item in parsed.sets] == reps
     assert parsed.equipment == equipment
+
+
+@pytest.mark.parametrize(
+    ("text", "exercise"),
+    [
+        ("Curls 15 4x10", "Bizepscurls"),
+        ("Bizepscurls 15 4x10", "Bizepscurls"),
+        ("Hammercurls 15 4x10", "Hammercurls"),
+    ],
+)
+def test_curl_names_resolve_as_known_aliases(text, exercise):
+    parsed = parse_set_message(text)
+
+    assert parsed is not None
+    assert parsed.exercise == exercise
+    assert parsed.known is True
+    assert [item.weight_kg for item in parsed.sets] == [15] * 4
+    assert [item.reps for item in parsed.sets] == [10] * 4
+
+
+@pytest.mark.parametrize(
+    ("text", "weights", "reps", "equipment", "warmup"),
+    [
+        ("Bank 80 8,8,7", [80, 80, 80], [8, 8, 7], None, False),
+        ("Kniebeuge 100 5,5,5", [100, 100, 100], [5, 5, 5], None, False),
+        ("Klimmzüge 8,8,7", [None, None, None], [8, 8, 7], None, False),
+        ("Bank 8,8,7", None, None, None, False),
+        ("Bank 80 12,5", None, None, None, False),
+        ("Bank 80 8 8 7!", [80, 80, 80], [8, 8, 7], None, False),
+        ("Bank 80: 8 8 7", [80, 80, 80], [8, 8, 7], None, False),
+        ("Bank 80x8 8 7", [80, 80, 80], [8, 8, 7], None, False),
+        ("Bank 80 8/8/7", [80, 80, 80], [8, 8, 7], None, False),
+        ("Schulterdrücken KH 22,5 10", [22.5], [10], "dumbbell", False),
+        ("Bank Warmup 40 10", [40], [10], None, True),
+    ],
+)
+def test_regression_compact_numbers_and_tolerant_formats(
+    text, weights, reps, equipment, warmup,
+):
+    parsed = parse_set_message(text)
+
+    if weights is None:
+        assert parsed is None
+        return
+    assert parsed is not None
+    assert [item.weight_kg for item in parsed.sets] == weights
+    assert [item.reps for item in parsed.sets] == reps
+    assert parsed.equipment == equipment
+    assert all(item.is_warmup is warmup for item in parsed.sets)
 
 
 @pytest.mark.parametrize(
