@@ -417,6 +417,21 @@ def test_history_reply_shows_last_sessions_and_epley_trend(monkeypatch):
     assert "Bestwert" in result.text
 
 
+def test_history_displays_zero_added_load_as_bodyweight(monkeypatch):
+    monkeypatch.setattr(coach_module.session, "exercise_history", lambda *_args, **_kwargs: [
+        {"workout_id": 2, "date": "2026-10-14", "created_at": "2026-10-14T10:00:00+02:00",
+         "sets": [{"weight_kg": 0, "reps": 10, "load_mode": "added"}]},
+        {"workout_id": 1, "date": "2026-10-01", "created_at": "2026-10-01T10:00:00+02:00",
+         "sets": [{"weight_kg": None, "reps": 9, "load_mode": "bodyweight"}]},
+    ])
+
+    result = GymCoach()._history("Klimmzüge")
+
+    assert "Körpergewicht×10" in result.text
+    assert "Körpergewicht×9" in result.text
+    assert "0 kg×10" not in result.text
+
+
 def test_finish_reply_summarizes_workout_and_prs(monkeypatch):
     monkeypatch.setattr(coach_module.session, "finish", lambda *_args: {
         "workout_id": 5, "timed_out": False, "duration_min": 47,
@@ -495,6 +510,51 @@ def test_history_trend_uses_creation_time_for_workouts_on_the_same_date(monkeypa
     result = GymCoach()._history("Bank")
 
     assert "e1RM +6.3 kg" in result.text
+
+
+def test_history_trend_uses_workout_date_before_import_time(monkeypatch):
+    monkeypatch.setattr(coach_module.session, "exercise_history", lambda *_args, **_kwargs: [
+        {"workout_id": 2, "date": "2026-09-08", "created_at": "2026-09-08T10:00:00+02:00",
+         "sets": [{"weight_kg": 80, "reps": 8, "load_mode": "external"}]},
+        {"workout_id": 1, "date": "2026-09-01", "created_at": "2026-09-09T10:00:00+02:00",
+         "sets": [{"weight_kg": 70, "reps": 8, "load_mode": "external"}]},
+    ])
+
+    result = GymCoach()._history("Bank")
+
+    assert "08.09.: 80 kg×8 | 01.09.: 70 kg×8" in result.text
+    assert "e1RM +12.7 kg" in result.text
+
+
+def test_upper_lower_rotation_uses_workout_date_before_import_time(monkeypatch):
+    monkeypatch.setattr(coach_module.db, "get_setting", lambda _key: "Upper/Lower")
+    monkeypatch.setattr(coach_module.fitness, "active_plan", lambda: None)
+    monkeypatch.setattr(coach_module.session, "workout_exercise_history", lambda **_kwargs: [
+        {"workout_id": 2, "date": "2026-09-08", "created_at": "2026-09-08T10:00:00+02:00",
+         "exercise": "Beincurls", "muscle": "legs", "reps": 10, "weight_kg": 40},
+        {"workout_id": 1, "date": "2026-09-01", "created_at": "2026-09-09T10:00:00+02:00",
+         "exercise": "Bankdrücken", "muscle": "chest", "reps": 8, "weight_kg": 80},
+    ])
+
+    result = GymCoach()._next_workout(datetime(2026, 9, 10, 10, tzinfo=timezone.utc))
+
+    assert "Nächste Einheit: Upper" in result.text
+
+
+def test_saved_split_uses_workout_date_before_import_time_for_last_unit(monkeypatch):
+    monkeypatch.setattr(coach_module.db, "set_setting", lambda *_args: None)
+    monkeypatch.setattr(coach_module.session, "workout_exercise_history", lambda **_kwargs: [
+        {"workout_id": 2, "date": "2026-09-08", "created_at": "2026-09-08T10:00:00+02:00",
+         "exercise": "Beincurls", "muscle": "legs", "reps": 10, "weight_kg": 40},
+        {"workout_id": 1, "date": "2026-09-01", "created_at": "2026-09-09T10:00:00+02:00",
+         "exercise": "Bankdrücken", "muscle": "chest", "reps": 8, "weight_kg": 80},
+    ])
+
+    result = GymCoach()._save_split_answer(
+        {"answer": "Upper/Lower"}, datetime(2026, 9, 10, 10, tzinfo=timezone.utc)
+    )
+
+    assert "Nächste Einheit: Upper" in result.text
 
 
 @pytest.mark.parametrize("text", [

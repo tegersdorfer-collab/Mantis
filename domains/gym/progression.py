@@ -39,6 +39,19 @@ def _weight_step(metadata: dict | None) -> float | None:
     }.get(str(metadata.get("equipment") or "").lower())
 
 
+def _is_bodyweight_mode(load_mode: str | None) -> bool:
+    return str(load_mode or "").lower() in {"added", "bodyweight"}
+
+
+def _is_unweighted(value) -> bool:
+    if value is None:
+        return True
+    try:
+        return math.isclose(float(value), 0.0, abs_tol=0.001)
+    except (TypeError, ValueError):
+        return False
+
+
 def progression_set_count(
     current_count: int,
     planned_count: int | None,
@@ -90,10 +103,16 @@ def recommend_next(
 
     history = _working_sets([*(historical_sets or []), *previous])
     if history:
+        bodyweight_mode = _is_bodyweight_mode((metadata or {}).get("load_mode"))
+
         def same_load(row):
             row_weight = row.get("weight_kg")
             if weight is None or row_weight is None:
-                return weight is None and row_weight is None
+                if weight is None and row_weight is None:
+                    return True
+                return bodyweight_mode and _is_unweighted(
+                    row_weight if weight is None else weight
+                )
             try:
                 return math.isclose(float(row_weight), float(weight), abs_tol=0.001)
             except (TypeError, ValueError):
@@ -208,7 +227,7 @@ def personal_records(
         elif load_mode in {"bodyweight", "added"}:
             comparable = [
                 int(old["reps"]) for old in history
-                if old.get("reps") is not None and old.get("weight_kg") is None
+                if old.get("reps") is not None and _is_unweighted(old.get("weight_kg"))
             ]
             if comparable and reps_value > max(comparable):
                 reps_pr = True

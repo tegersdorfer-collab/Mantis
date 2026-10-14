@@ -1,5 +1,7 @@
 """Double-Progression und PRs ohne Datenbank."""
 
+import pytest
+
 from domains.gym.progression import (
     estimate_1rm, personal_records, recommend_next, progression_set_count,
 )
@@ -179,6 +181,30 @@ def test_bodyweight_sets_do_not_make_weight_or_e1rm_prs():
     records = personal_records(_sets(None, [10]), _sets(None, [9]), load_mode="bodyweight")
 
     assert records == {"weight": False, "reps": True, "e1rm": False}
+
+
+@pytest.mark.parametrize("load_mode", ["added", "bodyweight"])
+def test_unweighted_progression_matches_zero_kg_imports_for_bodyweight(load_mode):
+    imported = _sets(0, [10, 10, 10])
+    current = _sets(None, [8, 8, 7])
+
+    suggestion = recommend_next(
+        current, imported,
+        {"exercise_type": "compound", "load_mode": load_mode}, set_count=3,
+    )
+
+    assert suggestion == {"weight_kg": None, "target_reps": [10, 10, 10], "incremented": False}
+    assert [row["weight_kg"] for row in imported] == [0, 0, 0]
+
+
+@pytest.mark.parametrize("load_mode", ["added", "bodyweight"])
+def test_bodyweight_repetition_pr_matches_zero_kg_imports(load_mode):
+    imported = _sets(0, [10])
+
+    records = personal_records(_sets(None, [11]), imported, load_mode=load_mode)
+
+    assert records == {"weight": False, "reps": True, "e1rm": False}
+    assert imported[0]["weight_kg"] == 0
 
 
 

@@ -6,7 +6,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from core import db
@@ -84,6 +84,37 @@ def _timestamp(value: str | datetime | None) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _workout_sort_key(workout: dict) -> tuple:
+    """Sortiert nach Trainingsdatum; Importzeit und ID lösen Gleichstände auf."""
+    raw_date = workout.get("date")
+    if isinstance(raw_date, datetime):
+        workout_date = raw_date.date()
+    elif isinstance(raw_date, date):
+        workout_date = raw_date
+    else:
+        try:
+            workout_date = date.fromisoformat(str(raw_date)[:10]) if raw_date else None
+        except ValueError:
+            workout_date = None
+
+    created_at = _timestamp(workout.get("created_at"))
+    if created_at is None:
+        created_key = float("-inf")
+    else:
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        created_key = created_at.astimezone(timezone.utc).timestamp()
+        if workout_date is None:
+            workout_date = created_at.date()
+
+    workout_id = workout.get("workout_id", workout.get("id"))
+    try:
+        id_key = (0, int(workout_id))
+    except (TypeError, ValueError):
+        id_key = (1, str(workout_id or ""))
+    return workout_date or date.min, created_key, id_key
 
 
 def _confirmation(text: str) -> str | None:
@@ -602,6 +633,7 @@ class GymCoach:
         sessions = session.exercise_history(exercise_name, limit=5)
         if not sessions:
             return GymResult(f"ℹ️ Für {exercise_name} habe ich noch keinen Verlauf.", "history")
+        sessions = sorted(sessions, key=_workout_sort_key, reverse=True)
         rows = []
         e1rms = []
         for workout in sessions:
@@ -617,7 +649,14 @@ class GymCoach:
             rendered = []
             session_e1rms = []
             for item in sets:
-                weight = _format_weight(item.get("weight_kg"))
+                weight_value = item.get("weight_kg")
+                if item.get("load_mode") in {"added", "bodyweight"} and weight_value is not None:
+                    try:
+                        if float(weight_value) == 0:
+                            weight_value = None
+                    except (TypeError, ValueError):
+                        pass
+                weight = _format_weight(weight_value)
                 rendered.append(f"{weight}×{item.get('reps')}")
                 estimate = None if item.get("load_mode") in {"added", "bodyweight"} else estimate_1rm(
                     item.get("weight_kg"), item.get("reps")
@@ -625,13 +664,11 @@ class GymCoach:
                 if estimate is not None:
                     session_e1rms.append(estimate)
             if session_e1rms:
-                e1rms.append((workout.get("created_at") or date_value, max(session_e1rms)))
+                e1rms.append((workout, max(session_e1rms)))
             rows.append(f"{date_text}: {'/'.join(rendered)}")
         trend = ""
         if e1rms:
-            ordered = sorted(e1rms, key=lambda item: (
-                _timestamp(item[0]).timestamp() if _timestamp(item[0]) else float("-inf")
-            ))
+            ordered = sorted(e1rms, key=lambda item: _workout_sort_key(item[0]))
             delta = ordered[-1][1] - ordered[0][1]
             best = max(value for _date, value in e1rms)
             trend = f" · e1RM {'+' if delta >= 0 else ''}{delta:.1f} kg · Bestwert {best:.1f} kg"
@@ -677,19 +714,24 @@ class GymCoach:
 
     def _next_workout(self, now: datetime) -> GymResult:
         split = db.get_setting("gym_split")
-        history = session.workout_exercise_history(limit=200)
+        history = sorted(
+            session.workout_exercise_history(limit=200),
+            key=_workout_sort_key,
+            reverse=True,
+        )
         sequence = self._split_sequence(split) if split else []
         workouts: dict[int, dict] = {}
         for row in history:
             if row.get("is_warmup"):
                 continue
             entry = workouts.setdefault(row["workout_id"], {
-                "date": row.get("date"), "created_at": row.get("created_at"), "rows": [],
+                "workout_id": row["workout_id"], "date": row.get("date"),
+                "created_at": row.get("created_at"), "rows": [],
             })
             entry["rows"].append(row)
         ordered = sorted(
             workouts.values(),
-            key=lambda item: str(item.get("created_at") or item.get("date") or date.min),
+            key=_workout_sort_key,
         )
         categories = [self._workout_category(item["rows"], sequence) for item in ordered]
         categories = [item for item in categories if item]
@@ -755,6 +797,7 @@ class GymCoach:
 
     @staticmethod
     def _active_plan_reply(history: list[dict]) -> GymResult | None:
+        history = sorted(history, key=_workout_sort_key, reverse=True)
         try:
             active = fitness.active_plan()
         except Exception:
@@ -834,6 +877,7 @@ class GymCoach:
 
     @staticmethod
     def _next_workout_reply(category: str, history: list[dict], now: datetime) -> GymResult:
+        history = sorted(history, key=_workout_sort_key, reverse=True)
         suggestions = []
         seen = set()
         split = ["Upper", "Lower"] if category in {"Upper", "Lower"} else None
@@ -860,14 +904,18 @@ class GymCoach:
         label = "/".join(sequence)
         db.set_setting("gym_split", label)
         next_category = sequence[0]
-        history = session.workout_exercise_history(limit=200)
+        history = sorted(
+            session.workout_exercise_history(limit=200),
+            key=_workout_sort_key,
+            reverse=True,
+        )
         categories_by_workout: dict[int, list[dict]] = {}
         for row in history:
             if not row.get("is_warmup"):
                 categories_by_workout.setdefault(row["workout_id"], []).append(row)
         ordered = sorted(
             categories_by_workout.values(),
-            key=lambda rows: str(rows[0].get("created_at") or rows[0].get("date") or ""),
+            key=lambda rows: _workout_sort_key(rows[0]),
         )
         categories = [self._workout_category(rows, sequence) for rows in ordered]
         categories = [item for item in categories if item]

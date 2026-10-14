@@ -136,6 +136,21 @@ def test_bare_bank_asks_when_a_second_variant_exists(monkeypatch):
     assert set(parsed.ambiguous) == {"Bankdrücken", "KH Bankdrücken"}
 
 
+def test_legacy_alias_keeps_bench_variants_ambiguous_until_equipment_is_given(monkeypatch):
+    _legacy_db(monkeypatch, ["Bench Press", "Bench Press (Kurzhantel)"])
+    aliases = load_aliases()
+    monkeypatch.setattr(coach_module, "load_aliases", lambda: aliases)
+
+    bare = GymCoach().classify("Bank 30 10")
+    prefixed = GymCoach().classify("KH Bank 30 10")
+
+    assert bare is not None and bare.action == "ambiguous_exercise"
+    assert set(bare.parsed.ambiguous) == {"Bench Press", "Bench Press (Kurzhantel)"}
+    assert prefixed is not None and prefixed.action == "set_logged"
+    assert prefixed.parsed.exercise == "Bench Press"
+    assert prefixed.parsed.equipment == "dumbbell"
+
+
 def test_single_stored_exercise_with_equipment_keeps_its_real_name(monkeypatch):
     _legacy_db(monkeypatch, ["Bankdrücken"], {"Bankdrücken": "barbell"})
 

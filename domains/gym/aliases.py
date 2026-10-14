@@ -204,7 +204,12 @@ def load_aliases() -> dict[str, list[str]]:
         for alias in (entry.name, *entry.aliases):
             key = normalize_alias(alias)
             if key:
-                result[key] = [stored]
+                existing = result.get(key, [])
+                if len(existing) > 1:
+                    if stored not in existing:
+                        existing.append(stored)
+                else:
+                    result[key] = [stored]
     return result
 
 
