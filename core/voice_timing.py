@@ -20,6 +20,7 @@ class TurnTiming:
         self.tool_exec_ms = 0.0
         self.llm_calls: list[dict] = []
         self.pending_tokens: int | None = None
+        self.reflex = False
 
     def snapshot(self) -> dict:
         return {
@@ -27,6 +28,7 @@ class TurnTiming:
             "context_ms": round(self.context_ms, 1),
             "llm_calls": [dict(c) for c in self.llm_calls],
             "tool_exec_ms": round(self.tool_exec_ms, 1),
+            "reflex": self.reflex,
         }
 
 
@@ -42,6 +44,13 @@ def reset(token: contextvars.Token) -> None:
 
 def current() -> TurnTiming | None:
     return _current.get()
+
+
+def mark_reflex() -> None:
+    """Markiert eine lokal beantwortete Voice-Anfrage im aktuellen Turn."""
+    timing = _current.get()
+    if timing is not None:
+        timing.reflex = True
 
 
 def snapshot() -> dict:

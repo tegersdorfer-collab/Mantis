@@ -714,14 +714,24 @@ class MessageHandler:
         # Deterministischer Fast-Path für kritische Fixbefehle (Licht, Not-Stopp):
         # ruft das Tool DIREKT, ohne LLM — 100% zuverlässig, sofort, modellunabhängig.
         # (Kleine Modelle täuschen sonst unter dem großen Prompt Erfolg vor.)
-        fast = fast_commands.match(text)
+        fast = fast_commands.match_voice(text) if voice_turn else fast_commands.match(text)
         if fast is not None:
+            if voice_turn:
+                voice_timing.mark_reflex()
+            if fast.tool == "voice_reflex":
+                result = fast.args["response"]
+                return result, [{
+                    "tool": fast.tool, "args": {}, "result": result[:500], "reflex": True,
+                }]
             try:
                 result = await skills.T.execute(fast.tool, fast.args)
             except Exception as e:
                 result = f"❌ {fast.tool} fehlgeschlagen: {e}"
             log.info("⚡ Fast-Path %s → %s(%s)", fast.label, fast.tool, fast.args)
-            return result, [{"tool": fast.tool, "args": fast.args, "result": result[:500]}]
+            trace = {"tool": fast.tool, "args": fast.args, "result": result[:500]}
+            if voice_turn:
+                trace["reflex"] = True
+            return result, [trace]
 
         # Skill-Factory: eigener Fast-Path, weil hier Quellcode erzeugt werden muss
         # und der Agent das Pflichtargument skill_name reproduzierbar verschluckt
@@ -778,8 +788,11 @@ class MessageHandler:
         message_meta = {"tools": tools_used, "model": agent.model_name}
         if meta:
             message_meta.update(meta)
+        reflex = any(item.get("reflex") is True for item in trace)
+        if reflex:
+            message_meta["reflex"] = True
         self._persist_msg("assistant", response, channel=channel_name, meta=message_meta)
-        if message_meta.get("use_case") != "inbox":
+        if message_meta.get("use_case") != "inbox" and not reflex:
             _safe_task(self._post_turn(user_text, response, tools_used), "post_turn")
 
     # ── Post-Turn Learning ────────────────────────────────────────────────────

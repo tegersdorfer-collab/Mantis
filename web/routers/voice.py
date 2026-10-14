@@ -68,6 +68,11 @@ def _record_voice_latency(
     return detail
 
 
+def _mark_reflex(trace) -> None:
+    if any(isinstance(item, dict) and item.get("reflex") is True for item in (trace or [])):
+        voice_timing.mark_reflex()
+
+
 async def sende_antwort(websocket, text: str, reply: str | None, audio_streaming: bool) -> None:
     """Schickt die Antwort — als Tonblöcke (audio_streaming) oder als ein audio_b64.
 
@@ -244,7 +249,8 @@ async def sende_streaming_antwort(
 
     async def produce_response() -> None:
         try:
-            reply, _trace = await orch.voice_respond(text, stream_cb=on_update)
+            reply, trace = await orch.voice_respond(text, stream_cb=on_update)
+            _mark_reflex(trace)
             reply = reply or ""
             response.append((reply or None, None))
             await queue.join()
@@ -448,7 +454,8 @@ def build_router(orch=None) -> APIRouter:
 
             if addressed and orch is not None:
                 timing_token = voice_timing.start()
-                reply, _trace = await orch.voice_respond(text)
+                reply, trace = await orch.voice_respond(text)
+                _mark_reflex(trace)
                 mark_conversation_active()
                 try:
                     ogg = await synthesize(reply)
@@ -544,7 +551,8 @@ def build_router(orch=None) -> APIRouter:
                 try:
                     if orch is not None:
                         timing_token = voice_timing.start()
-                        reply, _trace = await orch.voice_respond(text)
+                        reply, trace = await orch.voice_respond(text)
+                        _mark_reflex(trace)
                         mark_conversation_active()
                     await sende_antwort(websocket, text, reply, audio_streaming)
                     first_tts_block_ms = (

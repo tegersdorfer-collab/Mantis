@@ -188,6 +188,8 @@ class MantisSettings(BaseSettings):
     CHAT_TTL_DAYS: int = 365
 
     # ── Hintergrundjobs ──────────────────────────────────────────────────────
+    SITUATION_ENABLED: bool = True
+    SITUATION_REFRESH_S: int = 300
     INSIGHTS_ENABLED: bool = False
     PATTERN_DETECTION_ENABLED: bool = False
     TRAINING_PLAN_AUTOGEN_ENABLED: bool = False

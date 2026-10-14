@@ -14,6 +14,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import config
 
 
 @dataclass
@@ -178,4 +182,123 @@ def match(text: str) -> FastCommand | None:
                 args["typ"] = "playlist"
             return FastCommand("spotify", args, "musik-spiel")
 
+    return None
+
+
+_WEEKDAYS_DE = (
+    "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag",
+)
+_MONTHS_DE = (
+    "Januar", "Februar", "März", "April", "Mai", "Juni",
+    "Juli", "August", "September", "Oktober", "November", "Dezember",
+)
+_DURATION_NUMBERS = {
+    "ein": 1, "eine": 1, "eins": 1, "einen": 1,
+    "zwei": 2, "drei": 3, "vier": 4, "fünf": 5, "fuenf": 5,
+    "sechs": 6, "sieben": 7, "acht": 8, "neun": 9, "zehn": 10,
+    "elf": 11, "zwölf": 12, "zwoelf": 12, "dreizehn": 13,
+    "vierzehn": 14, "fünfzehn": 15, "fuenfzehn": 15,
+    "sechzehn": 16, "siebzehn": 17, "achtzehn": 18,
+    "neunzehn": 19, "zwanzig": 20,
+}
+_DURATION_PREFIX_RE = re.compile(
+    r"^(?:(?:stell(?:e)?|setz(?:e)?|setze)\s+(?:mir\s+)?(?:einen|den)?\s*timer\s+"
+    r"(?:auf|in|für)\s+|timer\s+(?:auf|in|für)\s+)"
+    r"(?P<count>\d{1,3}|[a-zäöü]+)\s*"
+    r"(?P<unit>sekunden?|sek|minuten?|min|stunden?|std|h)$",
+    re.IGNORECASE,
+)
+_DURATION_SUFFIX_RE = re.compile(
+    r"^(?P<count>\d{1,3}|[a-zäöü]+)\s*(?P<unit>sekunden?|sek|minuten?|min|stunden?|std|h)\s+timer$",
+    re.IGNORECASE,
+)
+_TIMER_STOP_RE = re.compile(
+    r"^(?:timer\s+(?:stopp(?:en)?|stop(?:pen)?|abbrechen|beenden)|"
+    r"(?:stopp(?:e|en)?|stop(?:pe|pen)?|beende|abbrechen)\s+(?:den\s+)?timer)$",
+    re.IGNORECASE,
+)
+
+
+def _voice_text(text: str) -> str:
+    value = text.strip().lower()
+    value = re.sub(r"^(?:hey\s+)?mantis[\s,.:!-]+", "", value)
+    return re.sub(r"[\s?!.;,]+$", "", value).strip()
+
+
+def _as_voice_reflex(response: str, label: str) -> FastCommand:
+    return FastCommand("voice_reflex", {"response": response}, label)
+
+
+def _duration_seconds(count: str, unit: str) -> int | None:
+    if count.isdigit():
+        value = int(count)
+    else:
+        value = _DURATION_NUMBERS.get(count.lower())
+    if not value:
+        return None
+    unit = unit.lower()
+    multiplier = 1 if unit.startswith("sek") else 60 if unit.startswith("min") else 3600
+    seconds = value * multiplier
+    return seconds if seconds <= 86_400 else None
+
+
+def match_voice(text: str, *, now: datetime | None = None) -> FastCommand | None:
+    """Erkennt eng begrenzte Voice-Reflexe und sonstige bestehende Fast-Commands.
+
+    Fragen mit zusätzlichen Orts- oder Sachangaben bleiben beim LLM. `now` ist
+    für Tests injizierbar; im Betrieb gilt die konfigurierte lokale Zeitzone.
+    """
+    if not text or not text.strip():
+        return None
+    phrase = _voice_text(text)
+    if not phrase:
+        return None
+    if now is None:
+        now = datetime.now(ZoneInfo(config.OWNER_TIMEZONE))
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo(config.OWNER_TIMEZONE))
+
+    if phrase in {"wie spät ist es", "wie spät ist's", "wie viel uhr ist es", "uhrzeit"}:
+        return _as_voice_reflex(f"Es ist {now:%H:%M} Uhr.", "uhrzeit")
+    if phrase in {"welches datum ist heute", "was ist heute für ein datum", "was ist das datum",
+                  "heutiges datum", "datum"}:
+        return _as_voice_reflex(
+            f"Heute ist der {now.day}. {_MONTHS_DE[now.month - 1]} {now.year}.", "datum",
+        )
+    if phrase in {"welcher wochentag ist heute", "welcher tag ist heute", "wochentag"}:
+        return _as_voice_reflex(f"Heute ist {_WEEKDAYS_DE[now.weekday()]}.", "wochentag")
+
+    timer_match = _DURATION_PREFIX_RE.fullmatch(phrase) or _DURATION_SUFFIX_RE.fullmatch(phrase)
+    if timer_match:
+        seconds = _duration_seconds(timer_match.group("count"), timer_match.group("unit"))
+        if seconds is not None:
+            due = (now + timedelta(seconds=seconds)).replace(microsecond=0)
+            if seconds % 3600 == 0:
+                amount, unit = seconds // 3600, "Stunde" if seconds == 3600 else "Stunden"
+            elif seconds % 60 == 0:
+                amount, unit = seconds // 60, "Minute" if seconds == 60 else "Minuten"
+            else:
+                amount, unit = seconds, "Sekunde" if seconds == 1 else "Sekunden"
+            return FastCommand(
+                "set_reminder",
+                {"text": f"Timer: {amount} {unit}", "at": due.strftime("%Y-%m-%dT%H:%M:%S")},
+                "timer-start",
+            )
+    if _TIMER_STOP_RE.fullmatch(phrase):
+        return FastCommand("stop_timer", {}, "timer-stop")
+
+    volume_match = re.fullmatch(
+        r"(?:(?:(?:mach(?:e)?|stell(?:e)?)\s+)?(?:die\s+)?musik\s+)?"
+        r"(?P<direction>lauter|leiser)",
+        phrase,
+    )
+    if volume_match:
+        direction = "up" if volume_match.group("direction") == "lauter" else "down"
+        return FastCommand("spotify", {"action": f"volume_{direction}"}, f"lautstaerke-{direction}")
+
+    command = match(text)
+    if command is not None:
+        return command
+    if phrase in {"stopp", "stop", "abbrechen", "halt"}:
+        return _as_voice_reflex("Okay.", "stopp")
     return None

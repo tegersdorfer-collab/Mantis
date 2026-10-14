@@ -42,7 +42,7 @@ from . import (
 # Auto-generiert; neue Tools, die hier fehlen, bleiben am Ende erhalten.
 _ORDER = [
     'web_search', 'get_weather', 'remember', 'recall', 'create_task', 'add_subtask',
-    'complete_task', 'set_task_progress', 'list_tasks', 'set_reminder', 'create_calendar_event', 'get_calendar',
+    'complete_task', 'set_task_progress', 'list_tasks', 'set_reminder', 'stop_timer', 'create_calendar_event', 'get_calendar',
     'update_calendar_event', 'delete_calendar_event', 'reschedule_after_overrun', 'get_health', 'log_habit', 'create_habit',
     'list_habits', 'log_workout', 'log_workout_detailed', 'recent_workouts', 'log_meal', 'nutrition_today',
     'add_journal', 'create_goal', 'update_goal', 'list_goals', 'calculate', 'read_own_code',

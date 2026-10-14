@@ -86,6 +86,15 @@ async def _set_reminder(text: str, at: str):
     CTX.reminders.add(text, dt)
     return f"Erinnerung gesetzt: '{text}' am {dt.strftime('%d.%m. %H:%M')}"
 
+
+@T.register("stop_timer", "Stoppt den nächsten offenen Voice-Timer.", {}, [], "productivity")
+async def _stop_timer():
+    if not CTX.reminders:
+        return "Timer nicht verfügbar."
+    if CTX.reminders.stop_next_timer():
+        return "Timer gestoppt."
+    return "Kein aktiver Timer."
+
 @T.register("create_calendar_event",
     "Erstellt einen Kalendereintrag.",
     {"title": {"type": "string"},

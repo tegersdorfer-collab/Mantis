@@ -25,6 +25,7 @@ def test_prompt_builder_marks_static_prefix_and_keeps_live_context_in_dynamic_su
     )
     builder._task_ctx = lambda: "TASK_CONTEXT"
     monkeypatch.setattr("core.prompt_builder.skill_md.build_skill_context", lambda _text: "SKILL_CONTEXT")
+    monkeypatch.setattr("core.situation.prompt_context", lambda: "SITUATION_CONTEXT")
 
     prompt = asyncio.run(builder.build("frage"))
 
@@ -34,7 +35,30 @@ def test_prompt_builder_marks_static_prefix_and_keeps_live_context_in_dynamic_su
     assert all(value in dynamic for value in (
         "WARM_PROFILE_CONTEXT", "DIRECTIVES_CONTEXT", "SKILL_CONTEXT", "BEHAVIOR_CONTEXT",
         "MEMORY_CONTEXT", "KG_CONTEXT", "TASK_CONTEXT", "DASHBOARD_CONTEXT", "## Aktuell:",
+        "SITUATION_CONTEXT",
     ))
+    assert "SITUATION_CONTEXT" not in prompt.cache_prefix
+    assert prompt.cache_prefix == (
+        "IDENTITY\n\n## Werkzeuge\n"
+        "Du hast Zugriff auf viele Tools (Tasks, Reminder, Kalender, Habits, Fitness, "
+        "Ernährung, Journal, Ziele, Health-Daten, Wetter, Web-Suche, Gedächtnis). "
+        "Nutze sie EIGENSTÄNDIG wenn Timo etwas erledigt oder wissen will – frag nicht um Erlaubnis, "
+        "handle. Antworte danach kurz und natürlich auf Deutsch.\n"
+        "KRITISCH: Wenn Timo eine AKTION verlangt (löschen, erstellen, eintragen, verschieben, "
+        "erinnern, abhaken etc.) MUSST du das passende Tool aufrufen. NIEMALS sagen 'ich habe "
+        "keine Funktion dafür' oder 'ich kann das nicht' wenn ein passendes Tool existiert. "
+        "Bestätige eine Aktion NIE, ohne das Tool wirklich aufgerufen zu haben.\n"
+        "BEISPIELE: 'leg eine Aufgabe an: Steuer' → create_task aufrufen. "
+        "'wie war mein Schlaf' → get_health aufrufen. 'erinnere mich um 9 an X' → set_reminder. "
+        "Erst das Tool, dann eine kurze Bestätigung.\n"
+        "AUFGABEN-ZUWEISUNG: Wenn du create_task aufrufst, entscheidet das System automatisch "
+        "ob du (Mantis) oder Timo die Aufgabe bekommt – ruf einfach create_task auf.\n"
+        "FÄHIGKEITSLÜCKEN: Wenn KEIN passendes Tool existiert, kann create_skill einen "
+        "inaktiven Python-Entwurf speichern. Manuelle Prüfung und Integration sind nötig; "
+        "der Entwurf erweitert deine verfügbaren Tools nicht automatisch.\n"
+        "ZEIT/DATUM: Nutze den Wert aus '## Aktuell'. Für Termine: 'morgen 14:00', 'heute 18:30' "
+        "oder 'TT.MM.JJJJ HH:MM' – immer LOKALE Zeit, niemals UTC.\n"
+    )
     extended = prompt + "\n\nVoice instructions"
     assert extended.cache_prefix == prompt.cache_prefix
     assert extended.endswith("Voice instructions")

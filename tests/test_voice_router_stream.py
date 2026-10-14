@@ -642,3 +642,30 @@ def test_streaming_voice_turn_resets_timing_context(monkeypatch):
     asyncio.run(run())
 
     assert logged[0][2]["context_ms"] == 17.0
+
+
+def test_streaming_reflex_trace_sets_voice_latency_flag(monkeypatch):
+    from core import voice_timing
+
+    logged = []
+
+    class ReflexOrchestrator:
+        voice_agent = type("Agent", (), {"backend": type("Backend", (), {
+            "model_name": "voice-reflex", "last_used_backend": None,
+        })()})()
+
+        async def voice_respond(self, _text, stream_cb=None):
+            return "Es ist 09:07 Uhr.", [{"tool": "voice_reflex", "reflex": True}]
+
+    async def fake_tts(_text, **_kwargs):
+        yield b"REFLEX_AUDIO"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+
+    asyncio.run(sende_streaming_antwort(
+        FakeWebSocket(), "Wie spät ist es?", ReflexOrchestrator(),
+    ))
+
+    assert logged[0][2]["reflex"] is True
+    assert voice_timing.current() is None

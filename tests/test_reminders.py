@@ -268,6 +268,32 @@ def test_next_due_seconds_includes_a_retry_backoff_deadline(monkeypatch):
     assert ReminderStore().next_due_seconds() == 60.0
 
 
+def test_next_due_returns_text_and_timestamp_for_situation_snapshot(monkeypatch):
+    remind_at = datetime(2026, 10, 14, 14, 30)
+    monkeypatch.setattr(
+        "tools.reminders._db.query_one",
+        lambda _sql, params=(): {"id": 25, "text": "Zahnarzt anrufen", "remind_at": remind_at},
+    )
+
+    reminder = ReminderStore().next_due()
+
+    assert reminder == {"id": 25, "text": "Zahnarzt anrufen", "remind_at": remind_at}
+
+
+def test_stop_next_timer_marks_only_an_unsent_timer_as_sent(monkeypatch):
+    calls = []
+
+    def execute(sql, params=()):
+        calls.append((sql, params))
+        return 1
+
+    monkeypatch.setattr("tools.reminders._db.execute", execute)
+
+    assert ReminderStore().stop_next_timer() is True
+    assert calls[0][1] == ("Timer:%",)
+    assert "sent = FALSE" in calls[0][0]
+
+
 def test_autopilot_retries_delivery_confirmation_without_resending_after_lease(monkeypatch):
     database = ReminderMemoryDB()
     _install_fake_db(monkeypatch, database)

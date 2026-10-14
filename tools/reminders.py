@@ -126,5 +126,24 @@ class ReminderStore:
         )
         return float(row["secs"]) if row and row.get("secs") is not None else None
 
+    def next_due(self) -> dict | None:
+        """Liefert Text und Zeitpunkt des nächsten ungesendeten Reminders."""
+        return _db.query_one(
+            "SELECT id, text, remind_at FROM reminders WHERE sent = FALSE "
+            "ORDER BY COALESCE(retry_after, remind_at) ASC LIMIT 1"
+        )
+
+    def stop_next_timer(self) -> bool:
+        """Beendet den nächsten offenen Voice-Timer, ohne normale Reminder anzutasten."""
+        changed = _db.execute(
+            "WITH timer AS ("
+            "SELECT id FROM reminders WHERE sent = FALSE AND text LIKE %s "
+            "ORDER BY remind_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+            ") UPDATE reminders SET sent = TRUE, claimed_at = NULL, retry_after = NULL "
+            "FROM timer WHERE reminders.id = timer.id",
+            ("Timer:%",),
+        )
+        return changed > 0
+
     def close(self) -> None:
         pass  # Pool-Verwaltung übernimmt core.db

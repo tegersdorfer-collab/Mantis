@@ -195,6 +195,36 @@ def test_skill_pause_and_volume():
     assert asyncio.run(_spotify("volume")) == "❌ Bitte volume 0-100 angeben."
 
 
+def test_skill_voice_volume_reflex_adjusts_existing_spotify_volume(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from tools.spotify import applescript as sp
+    from core.skills.spotify import _spotify
+
+    current = AsyncMock(side_effect=[67, 4])
+    set_volume = AsyncMock()
+    monkeypatch.setattr(sp, "get_volume", current)
+    monkeypatch.setattr(sp, "set_volume", set_volume)
+
+    assert asyncio.run(_spotify("volume_up")) == "🔊 Lautstärke 77 %"
+    assert asyncio.run(_spotify("volume_down")) == "🔊 Lautstärke 0 %"
+    assert set_volume.await_args_list[0].args == (77,)
+    assert set_volume.await_args_list[1].args == (0,)
+
+
+def test_stop_timer_skill_uses_reminder_store(monkeypatch):
+    from types import SimpleNamespace
+
+    from core.skill_context import CTX
+    from core import tools as T
+    from core.skills.productivity import _stop_timer
+
+    monkeypatch.setattr(CTX, "reminders", SimpleNamespace(stop_next_timer=lambda: True))
+
+    assert asyncio.run(_stop_timer()) == "Timer gestoppt."
+    assert "stop_timer" in T.REGISTRY
+
+
 def test_skill_spiel_without_credentials_gives_setup_hint():
     from core.skills import spotify as skill
     old = (cfg.SPOTIFY_CLIENT_ID, cfg.SPOTIFY_CLIENT_SECRET)

@@ -1,6 +1,7 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -68,6 +69,46 @@ def test_idle_loop_calls_autopilot_tick_even_when_autonomous_messages_are_off(mo
     asyncio.run(loop._tick_autopilot())
 
     assert calls == [True]
+
+
+def test_situation_snapshot_refreshes_on_configured_background_interval(monkeypatch):
+    import core.idle_loop as idle_loop_module
+    from core import situation
+
+    class Clock(datetime):
+        current = datetime(2026, 10, 14, 9, 0)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    loop = _loop()
+    refresh = AsyncMock()
+    monkeypatch.setattr(idle_loop_module, "datetime", Clock)
+    monkeypatch.setattr(situation, "refresh_snapshot", refresh)
+    monkeypatch.setattr(config, "SITUATION_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "SITUATION_REFRESH_S", 300, raising=False)
+
+    asyncio.run(loop._tick_situation())
+    Clock.current += timedelta(seconds=299)
+    asyncio.run(loop._tick_situation())
+    Clock.current += timedelta(seconds=1)
+    asyncio.run(loop._tick_situation())
+
+    assert refresh.await_count == 2
+
+
+def test_situation_snapshot_refresh_can_be_disabled(monkeypatch):
+    from core import situation
+
+    refresh = AsyncMock()
+    loop = _loop()
+    monkeypatch.setattr(situation, "refresh_snapshot", refresh)
+    monkeypatch.setattr(config, "SITUATION_ENABLED", False, raising=False)
+
+    asyncio.run(loop._tick_situation())
+
+    refresh.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
