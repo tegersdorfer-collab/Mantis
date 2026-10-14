@@ -744,26 +744,72 @@ class MessageHandler:
             with voice_timing.phase("context_ms"):
                 return await self.prompt_builder.build(text)
 
+        def _keyword_selection():
+            try:
+                names = skills.T.select_tools(text)
+                force = bool(names) and (
+                    skills.T.is_action(text)
+                    or any(
+                        skills.T.REGISTRY[name].category == "inbox"
+                        for name in names if name in skills.T.REGISTRY
+                    )
+                )
+                return names, force
+            except Exception as exc:
+                log.warning(
+                    "Keyword-Tool-Auswahl fehlgeschlagen (%s)", type(exc).__name__,
+                )
+                return [], False
+
         async def _timed_select():
             with voice_timing.phase("tool_select_ms"):
-                return await skills.T.select_tools_async(text)
+                try:
+                    return await skills.T.select_tools_async(text)
+                except Exception as exc:
+                    log.warning(
+                        "Tool-Auswahl fehlgeschlagen (%s) — nutze Keyword-Auswahl",
+                        type(exc).__name__,
+                    )
+                    return _keyword_selection()
 
-        system, (allowed, force_tools) = await asyncio.gather(
-            _timed_build(), _timed_select(),
+        tool_selection_task = None
+        supports_full_catalog = (
+            getattr(getattr(agent, "backend", None), "sends_full_tool_catalog", False) is True
         )
+        if supports_full_catalog:
+            allowed, force_tools = _keyword_selection()
+            tool_selection_task = asyncio.create_task(
+                _timed_select(), name=f"tool-selection-{channel_name}",
+            )
+            try:
+                system = await _timed_build()
+            except BaseException:
+                tool_selection_task.cancel()
+                raise
+        else:
+            system, (allowed, force_tools) = await asyncio.gather(
+                _timed_build(), _timed_select(),
+            )
         if voice_turn:
             system += "\n\n" + VOICE_RESPONSE_INSTRUCTIONS
         messages = self.kzg.recent_messages(max_tokens=3000)
         if voice_turn:
             messages = _messages_with_voice_reminder(messages, text)
         try:
-            return await agent.run(
+            run_kwargs = dict(
                 messages=messages,
                 system=system, stream_cb=stream_cb,
                 allowed_tools=allowed, force_tools=force_tools,
                 temperature=0.75, max_tokens=max_tokens,
             )
-        except Exception as e:
+            if tool_selection_task is not None:
+                run_kwargs["tool_selection_task"] = tool_selection_task
+            return await agent.run(**run_kwargs)
+        except BaseException as e:
+            if tool_selection_task is not None and not tool_selection_task.done():
+                tool_selection_task.cancel()
+            if not isinstance(e, Exception):
+                raise
             log.error("Agent-Fehler (%s): %s", channel_name, redact_error_text(e))
             db.log_error(f"agent_turn/{channel_name}", e)
             return "⚠️ Technisches Problem, versuch es nochmal.", []

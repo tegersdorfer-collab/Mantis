@@ -726,23 +726,38 @@ _STREAM_FIRST_MAX_CHARS = 90   # erster Block klein halten: er bestimmt die Wart
 _STREAM_REST_MAX_CHARS = 250
 _STREAM_MIN_CHARS = 35      # Untergrenze: zu kurze Blöcke puffern zu wenig Wiedergabezeit
 _STREAM_WACHSTUM = 3        # ein Block höchstens 3× so lang wie sein Vorgänger
+_STREAM_FIRST_EARLY_MIN_CHARS = 25
+_STREAM_EARLY_BOUNDARY_RE = re.compile(r"(?<!\d),(?!\d)|[–—:]")
+
+
+def _first_early_stream_boundary(text: str) -> int | None:
+    """Liefert eine frühe Satzteilgrenze ab 25 Zeichen; Dezimalkommas bleiben außen vor."""
+    for match in _STREAM_EARLY_BOUNDARY_RE.finditer(text):
+        if match.end() >= _STREAM_FIRST_EARLY_MIN_CHARS:
+            return match.end()
+    return None
 
 
 def _split_for_streaming(text: str) -> list[str]:
     """Zerlegt Text in Stücke, die einzeln synthetisiert werden.
 
-    Geschnitten wird NUR an Satzgrenzen. Das ist der Grund, warum die Stücke
-    lückenlos aneinandergehängt klingen: an einem Satzende steht ohnehin eine
-    Sprechpause, der Übergang fällt dort nicht auf. Innerhalb eines Satzes zu
-    schneiden würde man hören.
+    Der erste Block darf nach mindestens 25 Zeichen an Komma, Gedankenstrich oder
+    Doppelpunkt enden. Danach wird wie bisher satzweise geschnitten. An solchen
+    Satzteilgrenzen klingt der Übergang natürlich; Dezimalkommas bleiben ungeteilt.
 
-    Ein einzelner überlanger Satz wird nicht zerlegt — lieber ein spätes Stück
-    als ein hörbarer Schnitt mitten im Satz.
+    Ohne passende frühe Satzteilgrenze wird ein einzelner überlanger Satz nicht
+    willkürlich zerlegt — lieber ein spätes Stück als ein hörbarer Schnitt.
     """
     saetze = [t for t in re.split(r"(?<=[.!?…])\s+", text.strip()) if t.strip()]
     if not saetze:
         return []
-    stuecke: list[str] = []
+    erster_frueher_teil = None
+    grenze = _first_early_stream_boundary(saetze[0])
+    if grenze is not None and saetze[0][grenze:].strip():
+        erster_frueher_teil = saetze[0][:grenze].strip()
+        saetze[0] = saetze[0][grenze:].strip()
+
+    stuecke: list[str] = [erster_frueher_teil] if erster_frueher_teil else []
     aktuell = ""
     for satz in saetze:
         if not stuecke:
@@ -776,8 +791,8 @@ async def synthesize_stream(
     """Wie synthesize(), liefert die Antwort aber stückweise als einzelne
     OGG/Opus-Blöcke — jeder für sich abspielbar.
 
-    Damit startet die Wiedergabe nach dem ersten Satz statt nach der ganzen
-    Antwort: bei vier Sätzen rund 0,6 s statt 4,5 s bis zum ersten Ton.
+    Damit startet die Wiedergabe nach dem ersten Satzteil oder Satz statt nach der
+    ganzen Antwort: bei vier Sätzen rund 0,6 s statt 4,5 s bis zum ersten Ton.
 
     Der Lock wird über den GESAMTEN Stream gehalten. Zwei gleichzeitige Antworten
     würden sonst ihre Stücke ineinander schieben — und es läuft ohnehin nur ein

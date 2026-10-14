@@ -22,7 +22,7 @@ from core import db, voice_timing
 from core.voice import transcribe_audio, is_addressed_to_mantis, mark_conversation_active, _conversation_active
 from core.voice_stream import VoiceStreamSession
 from core.stream_events import StreamEvent
-from core.tts import synthesize, synthesize_stream
+from core.tts import _first_early_stream_boundary, synthesize, synthesize_stream
 
 log = logging.getLogger("mantis.api")
 
@@ -170,6 +170,14 @@ async def sende_streaming_antwort(
             if state is None:
                 return
             pending = str(state["pending"]) + event.text_delta
+            if not state["deferred"] and not has_queued_sentence:
+                first_sentence = re.split(r"(?<=[.!?…])\s+", pending, maxsplit=1)[0]
+                boundary = _first_early_stream_boundary(first_sentence)
+                if boundary is not None:
+                    early_part = pending[:boundary].strip()
+                    if early_part:
+                        pending = pending[boundary:].lstrip()
+                        await queue_sentence(early_part)
             sentences = re.split(r"(?<=[.!?…])\s+", pending)
             if len(sentences) > 1:
                 if not state["deferred"]:

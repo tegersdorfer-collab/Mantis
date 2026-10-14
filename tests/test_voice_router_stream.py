@@ -184,6 +184,41 @@ def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkey
     assert logged[0][2]["stage"] == "Backend"
 
 
+def test_voice_stream_synthesizes_first_long_clause_at_comma_without_splitting_decimal(monkeypatch):
+    spoken = []
+    audio_ready = asyncio.Event()
+
+    class StreamingWebSocket(FakeWebSocket):
+        async def send_json(self, data):
+            await super().send_json(data)
+            if data.get("type") == "audio_chunk":
+                audio_ready.set()
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            await stream_cb(attempt_start("voice-comma"))
+            await stream_cb(delta(
+                "voice-comma",
+                "Der Messwert beträgt ungefähr 10,4 Stunden, und danach ging es weiter. ",
+            ))
+            await audio_ready.wait()
+            await stream_cb(attempt_end("voice-comma", final=True))
+            return "Der Messwert beträgt ungefähr 10,4 Stunden, und danach ging es weiter.", []
+
+    async def fake_tts(text, **_kwargs):
+        spoken.append(text)
+        yield f"audio-{text}".encode()
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+    asyncio.run(sende_streaming_antwort(
+        StreamingWebSocket(), "Mantis, lies den Messwert", FakeOrchestrator(),
+    ))
+
+    assert spoken[0] == "Der Messwert beträgt ungefähr 10,4 Stunden,"
+    assert spoken[1] == "und danach ging es weiter."
+
+
 def test_voice_stream_appends_real_deltas_without_splitting_words(monkeypatch):
     spoken = []
 

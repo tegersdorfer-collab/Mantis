@@ -4,6 +4,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from core.message_handler import MessageHandler
@@ -67,3 +68,47 @@ class TestDashboardRespondUiWiring:
         asyncio.run(handler._agent_turn("Hallo", channel_name="web"))
 
         assert handler.agent.run.await_args.kwargs["max_tokens"] == 4000
+
+    def test_toolauswahl_fehler_nutzt_konservative_keyword_auswahl(self, monkeypatch):
+        handler = _make_handler()
+        handler.agent.backend = SimpleNamespace(sends_full_tool_catalog=True)
+
+        async def selection_fails(_text):
+            raise RuntimeError("Klassifikation ausgefallen")
+
+        monkeypatch.setattr("core.message_handler.fast_commands.match", lambda _: None)
+        monkeypatch.setattr("core.message_handler.skill_request.match", lambda _: None)
+        monkeypatch.setattr("core.message_handler.skills.T.select_tools_async", selection_fails)
+        monkeypatch.setattr(
+            "core.message_handler.skills.T.select_tools", lambda _text: ["calculate"],
+        )
+        monkeypatch.setattr("core.message_handler.skills.T.is_action", lambda _text: False)
+
+        async def run():
+            await handler._agent_turn("Hallo", channel_name="voice", agent=handler.agent)
+            selection_task = handler.agent.run.await_args.kwargs["tool_selection_task"]
+            assert await selection_task == (["calculate"], False)
+
+        asyncio.run(run())
+
+    def test_backend_mit_gefilterten_schemas_wartet_vor_agent_start(self, monkeypatch):
+        handler = _make_handler()
+        handler.agent.backend = SimpleNamespace(sends_full_tool_catalog=False)
+        order = []
+
+        async def select(_text):
+            order.append("selection")
+            return ["calculate"], False
+
+        async def run(**_kwargs):
+            order.append("agent")
+            return "Antwort", []
+
+        handler.agent.run = run
+        monkeypatch.setattr("core.message_handler.fast_commands.match", lambda _: None)
+        monkeypatch.setattr("core.message_handler.skill_request.match", lambda _: None)
+        monkeypatch.setattr("core.message_handler.skills.T.select_tools_async", select)
+
+        asyncio.run(handler._agent_turn("Hallo", channel_name="voice", agent=handler.agent))
+
+        assert order == ["selection", "agent"]
