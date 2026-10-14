@@ -21,6 +21,8 @@ wenn parakeet-mlx nicht installiert ist).
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import logging
+from pathlib import Path
+import re
 import time
 
 import config
@@ -39,6 +41,10 @@ _whisper_lock = asyncio.Lock()
 # Paket oder fehlgeschlagener Modell-Download). Dann geht es dauerhaft über whisper,
 # statt bei jeder Äußerung erneut in denselben Fehler zu laufen.
 _parakeet_unavailable = False
+_MANTIS_MISHEARINGS = frozenset({
+    "mantasy", "bantas", "mantes", "mantiss", "mentis", "mandis",
+})
+_INITIAL_WORD_RE = re.compile(r"^(?P<prefix>\s*(?:hey\b[\s,!?-]*)?)(?P<word>[^\W_]+)", re.IGNORECASE)
 
 # Nach jeder Mantis-Antwort bleibt für dieses Fenster jede Folge-Äußerung automatisch
 # "adressiert" — ohne das würde is_addressed_to_mantis() kurze Antworten wie "ja",
@@ -72,10 +78,99 @@ async def transcribe_audio(audio_path: str) -> str:
             if not _parakeet_unavailable:  # kann sich gesetzt haben, während wir warteten
                 text = await _transcribe_parakeet(audio_path)
                 if not _parakeet_unavailable:
-                    return text
+                    return _normalize_voice_transcript(text)
         log.warning("Parakeet nicht verfügbar – ab jetzt whisper.cpp")
 
-    return await _transcribe_whisper(audio_path)
+    return _normalize_voice_transcript(await _transcribe_whisper(audio_path))
+
+
+def _edit_distance_at_most_two(left: str, right: str) -> int:
+    if abs(len(left) - len(right)) > 2:
+        return 3
+    previous = list(range(len(right) + 1))
+    for row, left_char in enumerate(left, start=1):
+        current = [row]
+        for column, right_char in enumerate(right, start=1):
+            current.append(min(
+                current[-1] + 1,
+                previous[column] + 1,
+                previous[column - 1] + (left_char != right_char),
+            ))
+        if min(current) > 2:
+            return 3
+        previous = current
+    return previous[-1]
+
+
+def _normalize_voice_transcript(text: str) -> str:
+    """Korrigiert einen Mantis-ähnlichen Anredenamen am Anfang eines Voice-Transkripts."""
+    match = _INITIAL_WORD_RE.match(text)
+    if match is None:
+        return text
+    word = match.group("word")
+    normalized = word.lower()
+    if not 5 <= len(normalized) <= 8:
+        return text
+    if normalized not in _MANTIS_MISHEARINGS:
+        if _edit_distance_at_most_two(normalized, "mantis") > 2:
+            return text
+        # Mantis endet hörbar auf „is“. Die Endungsprüfung hält Wörter wie
+        # „Mantel“ trotz des Edit-Abstands von zwei unverändert.
+        if _edit_distance_at_most_two(normalized[-2:], "is") > 1:
+            return text
+    return f"{match.group('prefix')}Mantis{text[match.end('word'):]}"
+
+
+def _load_parakeet_model(model_id: str):
+    """Lädt Parakeet aus dem lokalen HF-Cache, sonst mit dem Paket-Downloadpfad."""
+    from parakeet_mlx import from_pretrained
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        config_path = hf_hub_download(model_id, "config.json", local_files_only=True)
+        weights_path = hf_hub_download(model_id, "model.safetensors", local_files_only=True)
+        if Path(config_path).parent == Path(weights_path).parent:
+            # Eine lokale Snapshot-Directory verhindert, dass from_pretrained den Hub anfragt.
+            return from_pretrained(str(Path(config_path).parent))
+    except Exception:
+        # Bei unvollständigem/fehlendem Cache übernimmt from_pretrained den Download.
+        pass
+    return from_pretrained(model_id)
+
+
+async def preload_parakeet() -> None:
+    """Lädt Parakeet im STT-Executor vor; Fehler bleiben ohne Einfluss auf den Start."""
+    global _parakeet_model, _parakeet_unavailable
+    if (
+        not getattr(config, "STT_PRELOAD", True)
+        or getattr(config, "STT_ENGINE", "parakeet") != "parakeet"
+        or _parakeet_model is not None
+        or _parakeet_unavailable
+    ):
+        return
+    async with _whisper_lock:
+        if _parakeet_model is not None or _parakeet_unavailable:
+            return
+        model_id = getattr(config, "STT_PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
+        try:
+            loop = asyncio.get_running_loop()
+            _parakeet_model = await loop.run_in_executor(
+                _parakeet_executor, _load_parakeet_model, model_id,
+            )
+            log.info("Parakeet-Modell im Hintergrund vorgeladen")
+        except Exception as exc:
+            log.warning("Parakeet-Vorladen fehlgeschlagen (%s)", type(exc).__name__)
+
+
+def schedule_parakeet_preload() -> asyncio.Task | None:
+    """Plant das Modell-Laden als Hintergrund-Task ein, sofern es aktiviert ist."""
+    if (
+        not getattr(config, "STT_PRELOAD", True)
+        or getattr(config, "STT_ENGINE", "parakeet") != "parakeet"
+    ):
+        return None
+    return asyncio.create_task(preload_parakeet(), name="parakeet-stt-preload")
 
 
 async def _transcribe_parakeet(audio_path: str) -> str:
@@ -83,17 +178,17 @@ async def _transcribe_parakeet(audio_path: str) -> str:
     damit der Aufrufer einmalig auf whisper umschaltet. Nur unter _whisper_lock aufrufen."""
     global _parakeet_model, _parakeet_unavailable
     if _parakeet_model is None:
-        try:
-            from parakeet_mlx import from_pretrained
-        except ImportError:
-            log.warning("parakeet-mlx nicht installiert")
-            _parakeet_unavailable = True
-            return ""
         model_id = getattr(config, "STT_PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
         log.info(f"🔊 Lade Parakeet-Modell '{model_id}' …")
         try:
             loop = asyncio.get_running_loop()
-            _parakeet_model = await loop.run_in_executor(_parakeet_executor, from_pretrained, model_id)
+            _parakeet_model = await loop.run_in_executor(
+                _parakeet_executor, _load_parakeet_model, model_id,
+            )
+        except ImportError:
+            log.warning("parakeet-mlx nicht installiert")
+            _parakeet_unavailable = True
+            return ""
         except Exception as e:
             # Typisch: kein Netz beim allerersten Start (Modell noch nicht im HF-Cache).
             log.error(f"Parakeet-Modell konnte nicht geladen werden: {e}")

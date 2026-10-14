@@ -89,6 +89,27 @@ def _persisted_role_channels(inserted):
     return [(params[0], params[2]) for _sql, params in inserted]
 
 
+@pytest.mark.parametrize(
+    ("facade", "expected_max_tokens", "voice_instructions"),
+    [("dashboard", 4000, False), ("voice", 241, True)],
+)
+def test_voice_turn_uses_spoken_prompt_and_configured_token_budget(
+    monkeypatch, facade, expected_max_tokens, voice_instructions,
+):
+    orchestrator, _inserted, _idle_loop = _make_orchestrator(monkeypatch)
+    monkeypatch.setattr("core.message_handler.config.VOICE_MAX_TOKENS", 241, raising=False)
+
+    if facade == "voice":
+        asyncio.run(orchestrator.voice_respond("Wie war mein Schlaf?"))
+    else:
+        asyncio.run(orchestrator.dashboard_respond("Wie war mein Schlaf?"))
+
+    call = orchestrator.voice_agent.run.await_args
+    assert call.kwargs["max_tokens"] == expected_max_tokens
+    has_voice_instructions = "Deine Antworten werden vorgelesen" in call.kwargs["system"]
+    assert has_voice_instructions is voice_instructions
+
+
 def test_prompt_history_filters_empty_and_whitespace_turns():
     from memory.chat_messages import filter_prompt_messages
 

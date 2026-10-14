@@ -31,30 +31,61 @@ PRICES: list[tuple[str, float, float]] = [
 ]
 
 
-def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
+def cost_usd(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+) -> float | None:
     """Schätzt bekannte Modellkosten; unbekannte Modelle bleiben unbekannt."""
     m = (model or "").lower()
     for pattern, in_price, out_price in PRICES:
         if pattern in m:
-            return (input_tokens * in_price + output_tokens * out_price) / 1_000_000
+            return (
+                input_tokens * in_price
+                + output_tokens * out_price
+                + cache_creation_input_tokens * in_price * 1.25
+                + cache_read_input_tokens * in_price * 0.1
+            ) / 1_000_000
     return None
 
 
-def _fallback_cost(provider: str, model: str, input_tokens: int, output_tokens: int) -> float | None:
+def _fallback_cost(
+    provider: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+) -> float | None:
     if (provider or "").lower() in {"ollama", "chatgpt-plan"}:
         return 0.0
-    return cost_usd(model, input_tokens, output_tokens)
+    return cost_usd(
+        model, input_tokens, output_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+    )
 
 
 def record(provider: str, model: str, input_tokens: int, output_tokens: int,
            purpose: str = "chat", actual_cost: float | None = None,
            generation_id: str | None = None, api_key: str | None = None,
-           generation_client: httpx.AsyncClient | None = None) -> None:
+           generation_client: httpx.AsyncClient | None = None,
+           cache_creation_input_tokens: int = 0,
+           cache_read_input_tokens: int = 0) -> None:
     """Schreibt einen Usage-Eintrag. Läuft im Event-Loop asynchron (nicht blockierend),
     außerhalb davon synchron. Fehler werden nur geloggt."""
     input_count = input_tokens or 0
     output_count = output_tokens or 0
-    if not input_count and not output_count and actual_cost is None and not generation_id:
+    cache_creation_count = cache_creation_input_tokens or 0
+    cache_read_count = cache_read_input_tokens or 0
+    if (
+        not input_count and not output_count and not cache_creation_count
+        and not cache_read_count and actual_cost is None and not generation_id
+    ):
         return
     try:
         from core import db
@@ -65,11 +96,21 @@ def record(provider: str, model: str, input_tokens: int, output_tokens: int,
         )
         cost = None if needs_generation_lookup else (
             actual_cost if actual_cost is not None
-            else _fallback_cost(provider, model, input_count, output_count)
+            else _fallback_cost(
+                provider, model, input_count, output_count,
+                cache_creation_input_tokens=cache_creation_count,
+                cache_read_input_tokens=cache_read_count,
+            )
         )
-        sql = ("INSERT INTO llm_usage (provider, model, purpose, input_tokens, "
-               "output_tokens, cost_usd) VALUES (%s,%s,%s,%s,%s,%s)")
-        params = (provider, model, purpose, input_count, output_count, cost)
+        sql = (
+            "INSERT INTO llm_usage (provider, model, purpose, input_tokens, output_tokens, "
+            "cache_creation_input_tokens, cache_read_input_tokens, cost_usd) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)"
+        )
+        params = (
+            provider, model, purpose, input_count, output_count,
+            cache_creation_count, cache_read_count, cost,
+        )
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -89,7 +130,12 @@ def record(provider: str, model: str, input_tokens: int, output_tokens: int,
             if needs_generation_lookup:
                 params = (
                     provider, model, purpose, input_count, output_count,
-                    _fallback_cost(provider, model, input_count, output_count),
+                    cache_creation_count, cache_read_count,
+                    _fallback_cost(
+                        provider, model, input_count, output_count,
+                        cache_creation_input_tokens=cache_creation_count,
+                        cache_read_input_tokens=cache_read_count,
+                    ),
                 )
             db.execute(sql, params)
     except Exception as e:
@@ -205,6 +251,8 @@ def summary(days: int = 30) -> dict:
         SELECT created_at::date AS date,
                SUM(input_tokens)  AS input_tokens,
                SUM(output_tokens) AS output_tokens,
+               SUM(cache_creation_input_tokens) AS cache_creation_input_tokens,
+               SUM(cache_read_input_tokens) AS cache_read_input_tokens,
                SUM(cost_usd)      AS cost_usd
         FROM llm_usage
         WHERE created_at >= CURRENT_DATE - %s::int
@@ -218,6 +266,8 @@ def summary(days: int = 30) -> dict:
                COUNT(*)           AS calls,
                SUM(input_tokens)  AS input_tokens,
                SUM(output_tokens) AS output_tokens,
+               SUM(cache_creation_input_tokens) AS cache_creation_input_tokens,
+               SUM(cache_read_input_tokens) AS cache_read_input_tokens,
                SUM(cost_usd)      AS cost_usd
         FROM llm_usage
         WHERE created_at >= CURRENT_DATE - %s::int

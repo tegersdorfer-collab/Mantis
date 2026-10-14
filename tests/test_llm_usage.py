@@ -38,6 +38,13 @@ class TestCostUsd:
     def test_haiku_55_price_is_explicitly_estimated(self):
         assert cost_usd("claude-haiku-5-5", 1_000_000, 1_000_000) == 6.0
 
+    def test_anthropic_cache_tokens_use_write_and_read_multipliers(self):
+        assert cost_usd(
+            "claude-haiku-5-5", 1_000_000, 0,
+            cache_creation_input_tokens=1_000_000,
+            cache_read_input_tokens=1_000_000,
+        ) == 2.35
+
     def test_unknown_model_cost_is_unknown(self):
         assert cost_usd("mystery-model", 1000, 1000) is None
 
@@ -58,8 +65,50 @@ class TestCostUsd:
         assert _fallback_cost("local", "unknown:variant", 500_000, 500_000) is None
 
 
+def test_run_migrations_apply_prompt_cache_usage_columns(monkeypatch):
+    from contextlib import contextmanager
+    from core import db
+
+    statements = []
+
+    class Cursor:
+        def execute(self, statement):
+            statements.append(statement)
+
+    @contextmanager
+    def fake_cursor(**_kwargs):
+        yield Cursor()
+
+    monkeypatch.setattr(db, "init_pool", lambda: None)
+    monkeypatch.setattr(db, "cursor", fake_cursor)
+    monkeypatch.setattr(db, "_backfill_legacy_exercise_metadata", lambda _cursor: None)
+
+    db.run_migrations()
+
+    assert "ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS cache_creation_input_tokens INT DEFAULT 0;" in statements
+    assert "ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS cache_read_input_tokens INT DEFAULT 0;" in statements
+
+
 @pytest.mark.db
 class TestRecord:
+    def test_test_database_migration_adds_anthropic_cache_columns(self):
+        from core import db
+        import psycopg2
+
+        try:
+            db.run_migrations()
+            columns = db.query(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'llm_usage' "
+                "AND column_name IN ('cache_creation_input_tokens', 'cache_read_input_tokens')"
+            )
+        except psycopg2.OperationalError as exc:
+            pytest.skip(f"mantis_test ist in dieser Umgebung nicht erreichbar: {exc}")
+
+        assert {row["column_name"] for row in columns} == {
+            "cache_creation_input_tokens", "cache_read_input_tokens",
+        }
+
     def test_zero_tokens_is_noop(self):
         # Darf keinen DB-Zugriff versuchen (early return)
         with patch("core.db.execute") as mock_exec:
@@ -77,7 +126,23 @@ class TestRecord:
             assert params[2] == "chat-agent"
             assert params[3] == 2000
             assert params[4] == 500
-            assert abs(params[5] - 0.0045) < 1e-9
+            assert params[5:7] == (0, 0)
+            assert abs(params[7] - 0.0045) < 1e-9
+
+    def test_record_persists_cache_token_counts_and_priced_cost(self):
+        with patch("core.db.execute") as mock_exec:
+            record(
+                "claude", "claude-haiku-5-5", 100, 20,
+                purpose="chat-agent",
+                cache_creation_input_tokens=400,
+                cache_read_input_tokens=500,
+            )
+
+        mock_exec.assert_called_once()
+        sql, params = mock_exec.call_args.args
+        assert "cache_creation_input_tokens" in sql
+        assert "cache_read_input_tokens" in sql
+        assert params == ("claude", "claude-haiku-5-5", "chat-agent", 100, 20, 400, 500, 0.00075)
 
     def test_record_uses_actual_provider_cost_when_available(self):
         with patch("core.db.execute") as mock_exec:
@@ -89,7 +154,8 @@ class TestRecord:
             mock_exec.assert_called_once()
             _, params = mock_exec.call_args[0]
             assert params[:5] == ("openrouter", "openai/gpt-6-luna", "chat-agent", 2000, 500)
-            assert params[5] == 0.001237
+            assert params[5:7] == (0, 0)
+            assert params[7] == 0.001237
 
     def test_actual_zero_cost_is_saved_even_without_tokens(self):
         with patch("core.db.execute") as mock_exec:
@@ -100,14 +166,14 @@ class TestRecord:
 
         mock_exec.assert_called_once()
         assert mock_exec.call_args.args[1] == (
-            "openrouter", "openai/gpt-6-luna", "chat-agent", 0, 0, 0.0,
+            "openrouter", "openai/gpt-6-luna", "chat-agent", 0, 0, 0, 0, 0.0,
         )
 
     def test_unknown_openrouter_cost_is_stored_as_null(self):
         with patch("core.db.execute") as mock_exec:
             record("openrouter", "vendor/unknown", 12, 5)
 
-        assert mock_exec.call_args.args[1][5] is None
+        assert mock_exec.call_args.args[1][7] is None
 
     def test_generation_cost_is_fetched_async_then_backfilled(self, monkeypatch):
         from core import db
@@ -287,6 +353,37 @@ class TestRecord:
 
         assert result["daily"][0]["cost_usd"] is None
         assert result["by_model"][0]["cost_usd"] is None
+
+    def test_summary_exposes_cache_token_totals(self, monkeypatch):
+        from core import db
+        from core.llm_usage import summary
+
+        daily = {
+            "date": date(2026, 10, 13), "input_tokens": 10,
+            "output_tokens": 5, "cost_usd": 0.01,
+        }
+        by_model = {
+            "provider": "claude", "model": "claude-haiku-5-5", "calls": 1,
+            "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.01,
+        }
+
+        def query(sql, *_):
+            if "SUM(cache_creation_input_tokens)" not in sql:
+                return [daily] if "created_at::date" in sql else [by_model]
+            cached = {"cache_creation_input_tokens": 400, "cache_read_input_tokens": 900}
+            return [
+                {**daily, **cached} if "created_at::date" in sql else {**by_model, **cached}
+            ]
+
+        monkeypatch.setattr(db, "query", query)
+        monkeypatch.setattr(db, "query_one", lambda *_: {"today": 0, "week": 0, "month": 0})
+
+        result = summary()
+
+        assert result["daily"][0]["cache_creation_input_tokens"] == 400
+        assert result["daily"][0]["cache_read_input_tokens"] == 900
+        assert result["by_model"][0]["cache_creation_input_tokens"] == 400
+        assert result["by_model"][0]["cache_read_input_tokens"] == 900
 
     def test_api_costs_labels_unknown_cost_as_unknown(self, monkeypatch):
         from core import llm_usage
