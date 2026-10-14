@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import json
 import struct
 from unittest.mock import AsyncMock
 
@@ -128,6 +129,30 @@ def test_describe_images_rejects_oversized_dimensions_before_provider_call():
 
     assert result is None
     backend.call.assert_not_awaited()
+
+
+def test_describe_images_keeps_total_json_payload_under_provider_limit():
+    backend = AsyncMock()
+    backend.supports_vision = True
+    backend.model_name = "claude-haiku-5-5"
+    backend.call.return_value = ("Vier Bilder geprüft", [])
+    image = _png_bytes() + b"x" * (6_570_000 - len(_png_bytes()))
+
+    result = asyncio.run(describe_images(
+        [{"data": image, "content_type": "image/png"} for _ in range(4)],
+        caption="", backend=backend,
+    ))
+
+    assert result == "Vier Bilder geprüft"
+    messages = backend.call.await_args.kwargs["messages"]
+    request_body = json.dumps({
+        "messages": messages,
+        "tools": None,
+        "temperature": 0.1,
+        "max_tokens": 500,
+    }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(request_body) < 32_000_000
+    assert sum(block["type"] == "image" for block in messages[0]["content"]) == 3
 
 
 def test_no_cloud_vision_stage_returns_none_without_trying_local_backend():

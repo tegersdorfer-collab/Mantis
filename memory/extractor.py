@@ -18,6 +18,7 @@ import re
 
 from core.jsonutil import extract_json
 from core.llm_gate import GATE
+from core import decisions
 from core.backends.factory import cloud_chain
 from core.backends.llm_adapter import BackendLLMAdapter
 from memory.lzg import LZG
@@ -39,7 +40,13 @@ def verify_prompt(user_text: str, claim: str) -> str:
 
 
 async def verify_claim(provider, user_text: str, claim: str) -> bool:
-    """Prüft die Behauptung mit der Fast-Cloud-Kette; Fehler lehnen sie ab."""
+    """Fragt Jev zuerst und nutzt bei Unsicherheit den vorhandenen Fast-Cloud-Provider."""
+    try:
+        jev_answer = await decisions.fact_supported(user_text, claim)
+        if jev_answer is not None:
+            return jev_answer
+    except Exception as e:
+        log.debug("Jev-Fakten-Verifier fehlgeschlagen: %s", e)
     try:
         answer = await provider.complete(
             verify_prompt(user_text, claim), temperature=0.0, max_tokens=8,

@@ -108,21 +108,17 @@ async def sende_antwort(websocket, text: str, reply: str | None, audio_streaming
     await websocket.send_json({"type": "audio_end", "count": seq})
 
 
-def _merge_stream_update(current: str, update: str) -> tuple[str, str]:
-    """Führt kumulative Provider-Texte aus aufeinanderfolgenden Runden zusammen."""
+def _update_delta(current: str, update: str) -> tuple[str, str]:
+    """Leitet neue Zeichen aus kumulativen Updates derselben Modellrunde ab."""
     if update.startswith(current):
         return update, update[len(current):]
     if current.startswith(update):
         return current, ""
-    overlap = min(len(current), len(update))
-    while overlap and current[-overlap:] != update[:overlap]:
-        overlap -= 1
-    if overlap < 3:
-        overlap = 0
-    delta = update[overlap:]
-    if current and delta and not current[-1].isspace() and not delta[0].isspace():
-        delta = " " + delta
-    return current + delta, delta
+    return update, update
+
+
+def _sentence_complete(text: str) -> bool:
+    return bool(re.search(r"[.!?…][\"'»”’)}\]]*$", text.strip()))
 
 
 async def sende_streaming_antwort(
@@ -141,18 +137,33 @@ async def sende_streaming_antwort(
     first_tts_block_ms = None
     sequence = 0
     queue: asyncio.Queue[str | None] = asyncio.Queue()
-    stream_state = {"full": "", "pending": ""}
+    stream_state = {"round_id": None, "full": "", "pending": ""}
     response: list[tuple[str | None, Exception | None]] = []
+
+    async def flush_round(*, final: bool = False) -> None:
+        pending = stream_state["pending"].strip()
+        if pending and (final or _sentence_complete(pending)):
+            await queue.put(pending)
+        stream_state["full"] = ""
+        stream_state["pending"] = ""
 
     async def on_update(update: str) -> None:
         nonlocal first_token_ms
         if not update or update.startswith("🔧"):
             return
+        round_id = getattr(update, "round_id", None)
+        if round_id is not None:
+            previous_round = stream_state["round_id"]
+            if previous_round is not None and round_id != previous_round:
+                await flush_round()
+            stream_state["round_id"] = round_id
         if first_token_ms is None:
             first_token_ms = round((time.perf_counter() - started_at) * 1000, 1)
-        stream_state["full"], delta = _merge_stream_update(stream_state["full"], update)
+        stream_state["full"], delta = _update_delta(stream_state["full"], str(update))
         if not delta:
             return
+        if stream_state["pending"] and delta and not stream_state["pending"][-1].isspace() and not delta[0].isspace():
+            delta = " " + delta
         stream_state["pending"] += delta
         sentences = re.split(r"(?<=[.!?…])\s+", stream_state["pending"])
         if len(sentences) > 1:
@@ -165,16 +176,16 @@ async def sende_streaming_antwort(
         try:
             reply, _trace = await orch.voice_respond(text, stream_cb=on_update)
             reply = reply or ""
-            stream_state["full"], delta = _merge_stream_update(stream_state["full"], reply)
-            stream_state["pending"] += delta
+            if not stream_state["full"] or reply.startswith(stream_state["full"]):
+                await on_update(reply)
+            await flush_round(final=True)
             response.append((reply or None, None))
         except Exception as exc:
             response.append((None, exc))
             log.error("Voice-Cloud-Antwort fehlgeschlagen: %s", exc)
         finally:
             if stream_state["pending"].strip():
-                await queue.put(stream_state["pending"].strip())
-                stream_state["pending"] = ""
+                await flush_round(final=True)
             await queue.put(None)
 
     async def synthesize_sentences() -> None:

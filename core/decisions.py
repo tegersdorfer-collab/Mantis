@@ -1,7 +1,7 @@
-"""Zentrale Cloud-Klassifikationen und konservative Entscheidungsschwellen.
+"""Zentrale Jev-Entscheidungen, Cloud-Fallbacks und konservative Schwellen.
 
 Fragen, Kriterien und Bänder stehen gemeinsam, damit sie überprüfbar bleiben.
-Unsichere oder fehlende Antworten gehen an den jeweiligen sicheren Fallback.
+Jev wird zuerst gefragt; bei Ausfall oder Unsicherheit entscheidet die Fast-Cloud-Kette.
 Die JSONL-Entscheidungslogs behalten das bisherige JevKit-Format für Kalibrierung.
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from jevkit import Band, Bands, band
 
 import config
 from core import decide
-from core.decide import Noul
+from core.decide import JevUnavailable, Noul
 from core import local_decide
 
 log = logging.getLogger(__name__)
@@ -28,8 +28,8 @@ SURE = 0.5             # Ja/Nein gilt als sicher ab |p-0.5|*2 >= 0.5, d.h. p <= 
 TOOL_CATEGORY_P = 0.6  # P(ja) ab der eine Tool-Kategorie als betroffen gilt
 TOOL_ACTION_P = 0.7    # P(ja) ab der Tool-Calls erzwungen werden
 
-# Drei Bänder statt einer Schwelle (jevkit.gate). ACT übernimmt die Cloud-Antwort;
-# CONFIRM/ESCALATE verwenden den sicheren Fallback.
+# Drei Bänder statt einer Schwelle (jevkit.gate). ACT übernimmt Jevs Antwort;
+# CONFIRM/ESCALATE fragen die Fast-Cloud-Kette.
 _DEFAULT = Bands(act=SURE, escalate=0.25)
 BANDS: dict[str, Bands] = {
     # Gemessen 21.09.2026 (bench/jev, 14 Fälle + live_path): alle Antworten mit conf >= 0.38 richtig,
@@ -37,6 +37,8 @@ BANDS: dict[str, Bands] = {
     "addressed": Bands(act=0.4, escalate=0.2),
     "supported": _DEFAULT,
     "supersedes": _DEFAULT,
+    "voice_address": _DEFAULT,
+    "fact_supported": _DEFAULT,
     # UI-Aktionen gelten nur ab der konservativen, explizit konfigurierten Confidence.
     "ui_action": Bands(act=config.cfg.JEV_UI_ACT_CONFIDENCE, escalate=0.0),
 }
@@ -89,18 +91,54 @@ def _jev_answer(ans: decide.Answer):
 
 
 async def _cloud_answers(state, questions: dict[str, object]) -> dict[str, decide.Answer] | None:
-    """Ruft alle Mantis-Klassifikationen über die zentrale Cloud-Kette ab."""
+    """Ruft die Fast-Cloud-Kette als Ersatz für ausgefallenes oder unsicheres Jev auf."""
     try:
         return await local_decide.score(state, questions)
     except local_decide.LocalDecisionUnavailable as e:
         log.debug("Cloud-Entscheidung nicht verfügbar: %r", e)
         return None
 
+
+async def _jev_answers(state, questions: dict[str, object]) -> dict[str, decide.Answer] | None:
+    """Fragt zuerst die konfigurierte Jev-Provider-Kette ab."""
+    try:
+        return await decide.decide(state, questions)
+    except JevUnavailable as e:
+        log.debug("Jev-Entscheidung nicht verfügbar: %r", e)
+        return None
+
+
+def _answer_is_act(name: str, answer, question) -> bool:
+    expected_kind = (
+        "noul" if isinstance(question, jevkit.Noul)
+        else "choice" if isinstance(question, jevkit.Choice)
+        else "score"
+    )
+    if not isinstance(answer, decide.Answer) or answer.kind != expected_kind:
+        return False
+    try:
+        return band(_jev_answer(answer), BANDS.get(name, _DEFAULT)) is Band.ACT
+    except (TypeError, ValueError):
+        return False
+
+
+async def _jev_then_cloud_answers(
+    state,
+    questions: dict[str, jevkit.Noul | jevkit.Choice | jevkit.Score],
+) -> dict[str, decide.Answer] | None:
+    """Jev entscheidet nur bei vollständiger ACT-Antwort; sonst folgt die Fast-Cloud-Kette."""
+    answers = await _jev_answers(state, questions)
+    if answers is not None and set(answers) == set(questions) and all(
+        _answer_is_act(name, answers[name], question)
+        for name, question in questions.items()
+    ):
+        return answers
+    return await _cloud_answers(state, questions)
+
 # ── Fragen ────────────────────────────────────────────────────────────────────
 
 Q_ADDRESSED = Noul(
-    # State-Feld heißt `untrusted_text` (jevkit.untrusted) — das Transkript ist Fremdtext
-    # (Voice-Eingabe) und läuft deshalb zusammen mit dem Guard (siehe `addressed()`).
+    # Das Transkript ist Fremdtext (Voice-Eingabe) und läuft zusammen mit dem Guard.
     "Das Transkript ist eine Anfrage oder ein Befehl an den persönlichen Sprachassistenten im Raum "
     "(auch ohne Namensnennung), nicht Selbstgespräch oder Gespräch mit einer anderen Person.",
     criteria={"true": "Der Sprecher will, dass der Assistent reagiert",
@@ -162,10 +200,22 @@ TOOL_CATEGORIES_OHNE_ROUTING: set[str] = {"general", "uiauto_internal"}
 
 async def _noul_or_fallback(name: str, state, question: Noul, fallback: Fallback, *,
                             guard: bool = False) -> bool:
-    """`guard=True` bewertet Fremdtext und Guard gemeinsam; unsicher heißt Fallback."""
+    """Fragt Jev zuerst; Unsicherheit geht in die Fast-Cloud-Kette, Guard-Treffer zum Fallback."""
     questions = {name: question}
     if guard:
         questions = jevkit.with_guard(questions)
+    jev_answers = await _jev_answers(state, questions)
+    if jev_answers is not None and set(jev_answers) == set(questions):
+        if guard and jev_answers[jevkit.GUARD_ID].p >= 0.5:
+            log.info("Jev-Guard %s: Treffer (p=%.2f) → Fallback",
+                     name, jev_answers[jevkit.GUARD_ID].p)
+            return await fallback()
+        ans = jev_answers[name]
+        if _answer_is_act(name, ans, question):
+            b = band(_jev_answer(ans), BANDS.get(name, _DEFAULT))
+            await asyncio.to_thread(_log, name, ans, b, state)
+            return bool(ans.value)
+
     answers = await _cloud_answers(state, questions)
     if answers is None or set(answers) != set(questions):
         return await fallback()
@@ -174,9 +224,9 @@ async def _noul_or_fallback(name: str, state, question: Noul, fallback: Fallback
                  name, answers[jevkit.GUARD_ID].p)
         return await fallback()
     ans = answers[name]
-    if not isinstance(ans, decide.Answer) or ans.kind != "noul":
+    if not _answer_is_act(name, ans, question):
         return await fallback()
-    b = band(jevkit.NoulAnswer(ans.p), BANDS.get(name, _DEFAULT))
+    b = band(_jev_answer(ans), BANDS.get(name, _DEFAULT))
     await asyncio.to_thread(_log, name, ans, b, state)
     if b is not Band.ACT:
         log.debug("Cloud-Entscheidung %s: %s (p=%.2f) → Fallback", name, b.value, ans.p)
@@ -190,6 +240,38 @@ async def addressed(text: str, fallback: Fallback) -> bool:
     Band-Logik überhaupt läuft."""
     return await _noul_or_fallback("addressed", jevkit.untrusted(text), Q_ADDRESSED, fallback,
                                    guard=True)
+
+
+async def voice_address(text: str) -> bool | None:
+    """Benchmark-Frage für den Voice-Adresscheck; None fordert den Cloud-Fast-Fallback an."""
+    return await _jev_noul("voice_address", {"transkript": text}, Q_ADDRESSED, guard=True)
+
+
+async def fact_supported(user_text: str, claim: str) -> bool | None:
+    """Benchmark-Frage für den Fakten-Verifier; None fordert dessen Cloud-Fallback an."""
+    state = {
+        "sprecher": "Timo (der Nutzer, spricht in der ersten Person)",
+        "text": user_text,
+        "behauptung": claim,
+    }
+    return await _jev_noul("fact_supported", state, Q_CLAIM_SUPPORTED)
+
+
+async def _jev_noul(name: str, state, question: Noul, *, guard: bool = False) -> bool | None:
+    questions = {name: question}
+    if guard:
+        questions = jevkit.with_guard(questions)
+    answers = await _jev_answers(state, questions)
+    if answers is None or set(answers) != set(questions):
+        return None
+    if guard and answers[jevkit.GUARD_ID].p >= 0.5:
+        return None
+    answer = answers[name]
+    if not _answer_is_act(name, answer, question):
+        return None
+    b = band(_jev_answer(answer), BANDS.get(name, _DEFAULT))
+    await asyncio.to_thread(_log, name, answer, b, state)
+    return bool(answer.value)
 
 
 async def claim_supported(user_text: str, claim: str, fallback: Fallback) -> bool:
@@ -216,7 +298,7 @@ async def tool_categories(text: str) -> tuple[set[str], bool | None] | None:
         for cat, desc in TOOL_CATEGORY_DESCRIPTIONS.items()
     }
     questions["aktion"] = Q_ACTION
-    answers = await _cloud_answers(text, questions)
+    answers = await _jev_then_cloud_answers(text, questions)
     if answers is None or set(answers) != set(questions):
         return None
     for name, ans in answers.items():
@@ -250,7 +332,7 @@ async def ui_action(state: dict | list | str, criteria: dict[str, object]) -> de
         "Choose exactly one safe next action from the available criteria. Do not perform an action.",
         criteria,
     )
-    answers = await _cloud_answers(safe_state, {"ui_action": question})
+    answers = await _jev_then_cloud_answers(safe_state, {"ui_action": question})
     if not answers:
         return None
 

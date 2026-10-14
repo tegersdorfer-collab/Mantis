@@ -23,7 +23,7 @@ import logging
 import time
 
 import config
-from core import fast
+from core import decisions, fast
 
 log = logging.getLogger(__name__)
 
@@ -143,9 +143,8 @@ async def is_addressed_to_mantis(text: str) -> bool:
     Drei Layer: (1) Keyword-Vorfilter — wird "Mantis" explizit genannt, sofort JA
     ohne LLM-Call (Latenz ~0). (2) Konversations-Fortsetzung — läuft gerade ein
     Gespräch (siehe mark_conversation_active()), gilt jede Folge-Äußerung als
-    adressiert, auch ohne Namen oder klaren Befehl. (3) Sonst entscheidet die
-    kurze Fast-Variante der Cloud-Kette; Fehler oder Timeout entscheiden
-    konservativ mit NEIN."""
+    adressiert. (3) Sonst fragt der Check zuerst Jev und bei Unsicherheit die
+    kurze Fast-Variante der Cloud-Kette; Fehler entscheiden konservativ mit NEIN."""
     stripped = text.strip()
     if not stripped:
         return False
@@ -153,6 +152,13 @@ async def is_addressed_to_mantis(text: str) -> bool:
         return True
     if time.monotonic() < _conversation_active_until:
         return True
+
+    try:
+        jev_answer = await decisions.voice_address(stripped)
+        if jev_answer is not None:
+            return jev_answer
+    except Exception as e:
+        log.debug("Jev-Voice-Adresscheck fehlgeschlagen: %s", e)
 
     prompt = (
         f"Ist dieser Satz eine Anfrage oder ein Befehl an einen persönlichen KI-Assistenten "

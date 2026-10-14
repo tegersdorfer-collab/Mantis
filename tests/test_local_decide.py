@@ -60,7 +60,7 @@ def test_score_uses_one_fast_cloud_call_for_all_typed_questions(monkeypatch):
 
     answers = asyncio.run(local_decide.score({"untrusted_text": "Licht an"}, questions))
 
-    assert purposes == [("fast", {"reasoning": "minimal", "total_timeout": 3.0})]
+    assert purposes == [("fast", {"reasoning": "minimal"})]
     assert len(backend.calls) == 1
     assert backend.calls[0]["tools"] is None
     assert "Antworte ausschließlich mit validem JSON" in backend.calls[0]["messages"][0]["content"]
@@ -119,6 +119,35 @@ def test_score_reuses_provider_chain_and_its_cooldowns(monkeypatch):
     assert len(backend.calls) == 2
 
 
+def test_cached_chain_applies_each_call_timeout_without_freezing_first_budget(monkeypatch):
+    from core.backends.fallback import FallbackBackend
+
+    backend = FakeCloudBackend('{"q":{"A":0.8,"B":0.2}}', delay=0.025)
+    configured = []
+
+    def cloud_chain(purpose, **kwargs):
+        configured.append((purpose, kwargs))
+        return FallbackBackend(
+            backends=[backend],
+            stage_timeouts=[None],
+            total_timeout_s=kwargs.get("total_timeout"),
+            cooldown_s=0,
+        )
+
+    monkeypatch.setattr(local_decide, "cloud_chain", cloud_chain)
+    monkeypatch.setattr(local_decide, "_provider", None, raising=False)
+    question = {"q": Noul("Ist es wahr?")}
+
+    with pytest.raises(local_decide.LocalDecisionUnavailable, match="timeout"):
+        asyncio.run(local_decide.score("Text", question, timeout_s=0.01))
+
+    answers = asyncio.run(local_decide.score("Text", question, timeout_s=0.1))
+
+    assert answers["q"].value is True
+    assert len(configured) == 1
+    assert configured[0][1].get("total_timeout") is None
+
+
 def test_score_stage_timeout_leaves_time_for_fallback_within_total_timeout(monkeypatch):
     from core.backends.fallback import FallbackBackend
 
@@ -128,11 +157,9 @@ def test_score_stage_timeout_leaves_time_for_fallback_within_total_timeout(monke
 
     def cloud_chain(purpose, **kwargs):
         configured.append((purpose, kwargs))
-        stage_timeout = kwargs.get("timeout", kwargs["total_timeout"] / 2)
         return FallbackBackend(
             backends=[first, fallback],
-            stage_timeouts=[stage_timeout, stage_timeout],
-            total_timeout_s=kwargs["total_timeout"],
+            stage_timeouts=[30.0, 30.0],
         )
 
     monkeypatch.setattr(local_decide, "cloud_chain", cloud_chain)
@@ -145,4 +172,4 @@ def test_score_stage_timeout_leaves_time_for_fallback_within_total_timeout(monke
     assert answers["q"].value is True
     assert first.calls == [] or len(first.calls) == 1
     assert len(fallback.calls) == 1
-    assert configured == [("fast", {"reasoning": "minimal", "total_timeout": 0.06})]
+    assert configured == [("fast", {"reasoning": "minimal"})]

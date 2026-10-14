@@ -44,14 +44,20 @@ class BackendLLMAdapter(LLMProvider):
         temperature: float = 0.7,
         max_tokens: int = 1024,
         format: str | dict | None = None,
+        timeout_s: float | None = None,
     ) -> str:
-        text, _ = await self.backend.call(
+        call_kwargs = dict(
             messages=self._messages(messages, system, format),
             tools=None,
             stream_cb=None,
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        call_with_timeout = getattr(self.backend, "call_with_timeout", None)
+        if timeout_s is not None and callable(call_with_timeout):
+            text, _ = await call_with_timeout(**call_kwargs, timeout_s=timeout_s)
+        else:
+            text, _ = await self.backend.call(**call_kwargs)
         return text
 
     async def stream(

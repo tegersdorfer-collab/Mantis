@@ -115,6 +115,80 @@ def test_addressed_sicher_ja_ohne_fallback():
     assert set(qs) == {"addressed", jevkit.GUARD_ID}
 
 
+def test_addressed_uses_jev_before_cloud_and_skips_cloud_for_act(monkeypatch):
+    order = []
+
+    async def jev(state, questions):
+        order.append("jev")
+        assert "addressed" in questions and jevkit.GUARD_ID in questions
+        return {"addressed": _noul(0.97), jevkit.GUARD_ID: _noul(0.05)}
+
+    async def cloud(*_args, **_kwargs):
+        order.append("cloud")
+        return {"addressed": _noul(0.02), jevkit.GUARD_ID: _noul(0.05)}
+
+    monkeypatch.setattr(decisions.decide, "decide", jev)
+    monkeypatch.setattr(local_decide, "score", cloud)
+
+    assert asyncio.run(decisions.addressed("mach das Licht an", _fallback_false)) is True
+    assert order == ["jev"]
+
+
+def test_addressed_falls_back_to_cloud_when_jev_band_is_not_act(monkeypatch):
+    order = []
+
+    async def jev(_state, _questions):
+        order.append("jev")
+        return {"addressed": _noul(0.6), jevkit.GUARD_ID: _noul(0.05)}
+
+    async def cloud(_state, questions):
+        order.append("cloud")
+        assert "addressed" in questions and jevkit.GUARD_ID in questions
+        return {"addressed": _noul(0.97), jevkit.GUARD_ID: _noul(0.05)}
+
+    monkeypatch.setattr(decisions.decide, "decide", jev)
+    monkeypatch.setattr(local_decide, "score", cloud)
+
+    assert asyncio.run(decisions.addressed("mach das Licht an", _fallback_false)) is True
+    assert order == ["jev", "cloud"]
+
+
+def test_voice_and_fact_jev_wrappers_use_bench_questions_and_default_band(monkeypatch):
+    calls = []
+
+    async def jev(state, questions):
+        calls.append((state, questions))
+        answers = {next(iter(questions)): _noul(0.7)}
+        if jevkit.GUARD_ID in questions:
+            answers[jevkit.GUARD_ID] = _noul(0.05)
+        return answers
+
+    monkeypatch.setattr(decisions.decide, "decide", jev)
+
+    async def check():
+        assert await decisions.voice_address("Mantis, Licht an") is None
+        assert await decisions.fact_supported("Ich wohne in Nürnberg", "Timo wohnt in Nürnberg") is None
+
+    asyncio.run(check())
+
+    address_state, address_questions = calls[0]
+    assert address_state == {"transkript": "Mantis, Licht an"}
+    assert address_questions["voice_address"].instructions == (
+        "Das Transkript ist eine Anfrage oder ein Befehl an den persönlichen Sprachassistenten im Raum "
+        "(auch ohne Namensnennung), nicht Selbstgespräch oder Gespräch mit einer anderen Person."
+    )
+    verify_state, verify_questions = calls[1]
+    assert verify_state == {
+        "sprecher": "Timo (der Nutzer, spricht in der ersten Person)",
+        "text": "Ich wohne in Nürnberg",
+        "behauptung": "Timo wohnt in Nürnberg",
+    }
+    assert verify_questions["fact_supported"].instructions == (
+        "Die Behauptung wird im Text wörtlich oder eindeutig direkt gestützt — keine Vermutung, "
+        "keine Verallgemeinerung, keine Verwechslung der Person."
+    )
+
+
 def test_addressed_unsicher_nimmt_fallback():
     fake = _jev_returning({"addressed": _noul(0.6), jevkit.GUARD_ID: _noul(0.05)})   # confidence 0.2 < SURE
     with patch.object(decisions.local_decide, "score", fake):

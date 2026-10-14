@@ -29,31 +29,68 @@ def _ollama_generation_violations(tree: ast.Module, relative: str) -> list[str]:
                 for alias in node.names if alias.name == "OLLAMA_BASE_URL"
             )
 
+    assignments: dict[str, list[ast.expr]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, (ast.Name, ast.Attribute)):
+                assignments.setdefault(ast.unparse(target), []).append(value)
+
     def references_ollama_base(expression):
         return any(
             (isinstance(part, ast.Attribute) and part.attr == "OLLAMA_BASE_URL")
             or (isinstance(part, ast.Name) and part.id in ollama_base_names)
+            or ast.unparse(part) in ollama_base_names
             or (isinstance(part, ast.Constant) and "11434" in str(part.value))
             for part in ast.walk(expression)
         )
 
-    for _ in range(2):
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and references_ollama_base(node.value):
-                ollama_base_names.update(
-                    target.id for target in node.targets if isinstance(target, ast.Name)
-                )
+    changed = True
+    while changed:
+        changed = False
+        for target, values in assignments.items():
+            if target not in ollama_base_names and any(
+                references_ollama_base(value) for value in values
+            ):
+                ollama_base_names.add(target)
+                changed = True
+
+    def expression_has_path(expression, suffix, seen=None):
+        seen = set() if seen is None else seen
+        if suffix in ast.unparse(expression):
+            return True
+        for part in ast.walk(expression):
+            name = ast.unparse(part) if isinstance(part, (ast.Name, ast.Attribute)) else None
+            if name and name in assignments and name not in seen:
+                if any(expression_has_path(value, suffix, seen | {name})
+                       for value in assignments[name]):
+                    return True
+        return False
 
     ollama_client_names = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
-            continue
-        factory_name = getattr(node.value.func, "attr", "")
-        base_url = next((keyword.value for keyword in node.value.keywords if keyword.arg == "base_url"), None)
-        if factory_name.endswith("Client") and base_url is not None and references_ollama_base(base_url):
-            ollama_client_names.update(
-                target.id for target in node.targets if isinstance(target, ast.Name)
-            )
+    for target, values in assignments.items():
+        for value in values:
+            if not isinstance(value, ast.Call):
+                continue
+            factory_name = getattr(value.func, "attr", "")
+            base_url = next((keyword.value for keyword in value.keywords if keyword.arg == "base_url"), None)
+            if factory_name.endswith("Client") and base_url is not None and references_ollama_base(base_url):
+                ollama_client_names.add(target)
+    changed = True
+    while changed:
+        changed = False
+        for target, values in assignments.items():
+            if target in ollama_client_names:
+                continue
+            if any(any(ast.unparse(part) in ollama_client_names for part in ast.walk(value))
+                   for value in values):
+                ollama_client_names.add(target)
+                changed = True
 
     violations = []
     for node in ast.walk(tree):
@@ -63,12 +100,15 @@ def _ollama_generation_violations(tree: ast.Module, relative: str) -> list[str]:
             continue
         url_parts = [keyword.value for keyword in node.keywords if keyword.arg in {"url", "uri"}]
         url_parts.extend(node.args[:2])
-        url_text = " ".join(ast.unparse(part) for part in url_parts)
-        path = next((suffix for suffix in ("/api/chat", "/api/generate") if suffix in url_text), None)
+        path = next(
+            (suffix for suffix in ("/api/chat", "/api/generate")
+             if any(expression_has_path(part, suffix) for part in url_parts)),
+            None,
+        )
         if path is None:
             continue
         receiver = node.func.value
-        receiver_name = receiver.id if isinstance(receiver, ast.Name) else None
+        receiver_name = ast.unparse(receiver)
         has_ollama_base = (
             any(references_ollama_base(part) for part in url_parts)
             or receiver_name in ollama_client_names
@@ -147,6 +187,14 @@ async def generate(client, payload):
     await client.request(\"POST\", config.OLLAMA_BASE_URL + \"/api/generate\", json=payload)
 async def alias_chat(payload):
     await httpx.post(f\"{ollama_base}/api/chat\", json=payload)
+async def aliased_url(client, payload):
+    endpoint_base = config.OLLAMA_BASE_URL
+    endpoint = endpoint_base + \"/api/chat\"
+    await client.post(endpoint, json=payload)
+async def stored_client(self, payload):
+    self.client = httpx.AsyncClient(base_url=config.OLLAMA_BASE_URL)
+    relative_endpoint = \"/api/generate\"
+    await self.client.post(relative_endpoint, json=payload)
 async def session_generate(payload):
     client = httpx.AsyncClient(base_url=ollama_base)
     await client.post(\"/api/generate\", json=payload)
@@ -155,9 +203,9 @@ async def session_generate(payload):
 
     violations = _ollama_generation_violations(mutant, "mutation.py")
 
-    assert len(violations) == 4
-    assert sum("/api/chat" in violation for violation in violations) == 2
-    assert sum("/api/generate" in violation for violation in violations) == 2
+    assert len(violations) == 6
+    assert sum("/api/chat" in violation for violation in violations) == 3
+    assert sum("/api/generate" in violation for violation in violations) == 3
 
 
 def test_legacy_local_generation_settings_are_removed():

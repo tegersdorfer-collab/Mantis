@@ -26,14 +26,13 @@ class LocalDecisionUnavailable(RuntimeError):
 _provider: BackendLLMAdapter | None = None
 
 
-def _get_provider(total_timeout_s: float) -> BackendLLMAdapter:
-    """Erstellt die Fast-Kette einmal, damit Stage-Cooldowns erhalten bleiben."""
+def _get_provider() -> BackendLLMAdapter:
+    """Erstellt die Fast-Kette einmal; je Aufruf gilt außen ein eigenes Zeitbudget."""
     global _provider
     if _provider is None:
         _provider = BackendLLMAdapter(cloud_chain(
             "fast",
             reasoning="minimal",
-            total_timeout=total_timeout_s,
         ))
     return _provider
 
@@ -188,7 +187,7 @@ async def score(
         + "\n\n".join(sections)
     )
     try:
-        provider = _get_provider(timeout_s)
+        provider = _get_provider()
         async with asyncio.timeout(timeout_s):
             async with GATE:
                 response = await provider.complete(
@@ -196,6 +195,7 @@ async def score(
                     temperature=0.0,
                     max_tokens=max(80, 12 * sum(len(item[2]) for item in prepared.values())),
                     format="json",
+                        timeout_s=timeout_s,
                 )
     except TimeoutError as exc:
         raise LocalDecisionUnavailable(f"Cloud-Entscheidung timeout nach {timeout_s:g}s") from exc

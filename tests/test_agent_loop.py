@@ -87,6 +87,33 @@ def test_tool_call_then_answer(echo_tool):
     assert "tool" in roles
 
 
+def test_stream_updates_carry_the_agent_model_round(echo_tool):
+    class StreamingBackend(FakeBackend):
+        def __init__(self):
+            super().__init__([("", [_tc("echo", {"text": "hi"})]), ("Fertig.", [])])
+            self.updates = [["Zwischenstand"], ["Fertig."]]
+
+        async def call(self, messages, tools=None, stream_cb=None,
+                       temperature=0.7, max_tokens=1500, think=False,
+                       force_tool_call=False):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            for update in self.updates[len(self.calls) - 1]:
+                await stream_cb(update)
+            return self.responses.pop(0)
+
+    backend = StreamingBackend()
+    received = []
+
+    async def collect(update):
+        received.append((str(update), getattr(update, "round_id", None)))
+
+    asyncio.run(Agent(backend).run(
+        [{"role": "user", "content": "hi"}], system="s", stream_cb=collect,
+    ))
+
+    assert received == [("Zwischenstand", 0), ("🔧 …", 0), ("Fertig.", 1)]
+
+
 def test_math_guard_executes_retry_tool_calls(echo_tool):
     """Math-Guard-Retry liefert calculate → muss ausgeführt werden, ohne Extra-LLM-Call."""
     be = FakeBackend([

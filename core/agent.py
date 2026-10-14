@@ -24,6 +24,25 @@ log = logging.getLogger(__name__)
 StreamCb = Callable[[str], Awaitable[None]]
 
 
+class StreamUpdate(str):
+    """Text-kompatibles Stream-Update mit der Modellrunde, aus der es stammt."""
+
+    def __new__(cls, text: str, round_id: int):
+        update = super().__new__(cls, text)
+        update.round_id = round_id
+        return update
+
+
+def _round_stream_cb(stream_cb: StreamCb | None, round_id: int) -> StreamCb | None:
+    if stream_cb is None:
+        return None
+
+    async def report(update: str) -> None:
+        await stream_cb(StreamUpdate(update, round_id))
+
+    return report
+
+
 class Agent:
     def __init__(self, backend: AgentBackend, max_steps: int = 8):
         self._backend = backend
@@ -82,11 +101,12 @@ class Agent:
             is_first = step == 0
             force = force_tools and is_first and bool(schemas)
             BUS.emit("thinking", "Denke nach…", detail=self._backend.model_name)
+            round_stream_cb = _round_stream_cb(stream_cb, step)
 
             content, tool_calls = await self._backend.call(
                 msgs,
                 tools=schemas,
-                stream_cb=stream_cb,
+                stream_cb=round_stream_cb,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 think=think and is_first,
@@ -138,7 +158,7 @@ class Agent:
             # Tool-Calls ausführen
             if stream_cb:
                 try:
-                    await stream_cb("🔧 …")
+                    await stream_cb(StreamUpdate("🔧 …", step))
                 except Exception:
                     pass
 
@@ -180,7 +200,7 @@ class Agent:
 
         # Max-Steps erreicht
         content, _ = await self._backend.call(
-            msgs, tools=None, stream_cb=stream_cb,
+            msgs, tools=None, stream_cb=_round_stream_cb(stream_cb, self._max_steps),
             temperature=temperature, max_tokens=max_tokens,
         )
         return content.strip(), trace

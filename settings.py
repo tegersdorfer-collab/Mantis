@@ -54,7 +54,10 @@ class MantisSettings(BaseSettings):
     STT_ENGINE: str = "parakeet"
     STT_PARAKEET_MODEL: str = "mlx-community/parakeet-tdt-0.6b-v3"
     ANTHROPIC_API_KEY: str = ""
-    CLAUDE_CHAT_MODEL: str = "claude-haiku-4-5-20251001"
+    ANTHROPIC_ALLOWED_MODELS: list[str] = Field(
+        default_factory=lambda: ["claude-haiku-5-5"],
+    )
+    CLAUDE_CHAT_MODEL: str = "claude-haiku-5-5"
     CHAT_ANTHROPIC_MODEL: str = "claude-haiku-5-5"
     CHAT_CLOUD_MODEL: str = "openai/gpt-6-luna"
     CHAT_CLOUD_FALLBACK_MODEL: str = ""

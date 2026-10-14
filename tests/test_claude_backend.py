@@ -7,6 +7,57 @@ import httpx
 import pytest
 
 from core.backends.claude import ClaudeBackend, _extract_tool_calls
+from llm.claude import ClaudeProvider
+
+
+def test_anthropic_model_allowlist_defaults_to_haiku_55(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_ALLOWED_MODELS", raising=False)
+    monkeypatch.delenv("CLAUDE_CHAT_MODEL", raising=False)
+
+    from settings import MantisSettings
+
+    settings = MantisSettings(_env_file=None)
+
+    assert settings.ANTHROPIC_ALLOWED_MODELS == ["claude-haiku-5-5"]
+    assert settings.CLAUDE_CHAT_MODEL == "claude-haiku-5-5"
+
+
+@pytest.mark.parametrize("provider", [ClaudeBackend, ClaudeProvider])
+def test_anthropic_constructors_reject_models_outside_allowlist(monkeypatch, provider):
+    import config
+
+    monkeypatch.setattr(config, "ANTHROPIC_ALLOWED_MODELS", ["claude-haiku-5-5"], raising=False)
+
+    with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
+        provider(model="claude-opus-4-6")
+
+
+def test_backend_rechecks_allowlist_before_each_api_call(monkeypatch):
+    import config
+
+    backend = object.__new__(ClaudeBackend)
+    backend._model = "claude-haiku-5-5"
+    monkeypatch.setattr(config, "ANTHROPIC_ALLOWED_MODELS", ["claude-opus-4-6"], raising=False)
+
+    with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
+        asyncio.run(backend.call([], None, None, 0.2, 100))
+
+
+def test_llm_provider_rechecks_allowlist_before_chat_and_stream(monkeypatch):
+    import config
+
+    provider = object.__new__(ClaudeProvider)
+    provider._model = "claude-haiku-5-5"
+    monkeypatch.setattr(config, "ANTHROPIC_ALLOWED_MODELS", ["claude-opus-4-6"], raising=False)
+
+    with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
+        asyncio.run(provider.chat([]))
+
+    async def consume_stream():
+        return [chunk async for chunk in provider.stream([])]
+
+    with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
+        asyncio.run(consume_stream())
 
 
 def test_claude_tool_use_requires_object_arguments():
@@ -171,7 +222,6 @@ def test_haiku_55_omits_unsupported_temperature_parameter():
     assert "thinking" not in payload
 
 
-def test_supported_haiku_45_chat_keeps_temperature_parameter():
-    payload = _claude_request_payload("claude-haiku-4-5-20251001")
-
-    assert payload["temperature"] == 0.2
+def test_unallowed_haiku_45_is_rejected_before_request():
+    with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
+        _claude_request_payload("claude-haiku-4-5-20251001")

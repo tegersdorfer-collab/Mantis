@@ -8,6 +8,7 @@ import logging
 import anthropic
 
 from core.backends.base import AgentBackend, StreamCb
+from core.anthropic_models import ensure_anthropic_model_allowed
 import config
 
 log = logging.getLogger(__name__)
@@ -161,6 +162,7 @@ class ClaudeBackend(AgentBackend):
 
     def __init__(self, model: str | None = None, purpose: str = "chat-agent"):
         self._model = model or config.CLAUDE_CHAT_MODEL
+        ensure_anthropic_model_allowed(self._model)
         self._purpose = purpose
         self._client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
@@ -182,6 +184,7 @@ class ClaudeBackend(AgentBackend):
         think: bool = False,
         force_tool_call: bool = False,
     ) -> tuple[str, list[dict]]:
+        ensure_anthropic_model_allowed(self._model)
         system, anthropic_msgs = _ollama_msgs_to_anthropic(messages)
 
         kwargs: dict = dict(

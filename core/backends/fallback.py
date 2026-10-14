@@ -109,6 +109,7 @@ class FallbackBackend(AgentBackend):
         max_tokens: int,
         think: bool = False,
         force_tool_call: bool = False,
+        timeout_s: float | None = None,
     ) -> tuple[str, list[dict]]:
         kwargs = dict(
             messages=messages, tools=tools, stream_cb=stream_cb,
@@ -118,10 +119,10 @@ class FallbackBackend(AgentBackend):
 
         self._last_used_backend = None
         failures: list[str] = []
-        deadline = (
-            time.monotonic() + self._total_timeout_s
-            if self._total_timeout_s is not None else None
-        )
+        call_timeout = self._total_timeout_s if timeout_s is None else timeout_s
+        if call_timeout is not None and call_timeout <= 0:
+            raise ValueError("timeout_s muss positiv sein")
+        deadline = time.monotonic() + call_timeout if call_timeout is not None else None
         for index, backend in enumerate(self._backends):
             if time.time() < self._down_until[index]:
                 continue
@@ -132,7 +133,8 @@ class FallbackBackend(AgentBackend):
                 result = backend.call(**kwargs)
                 timeout = self._stage_timeouts[index]
                 if remaining is not None:
-                    timeout = remaining if timeout is None else min(timeout, remaining)
+                    stage_budget = remaining / (len(self._backends) - index)
+                    timeout = stage_budget if timeout is None else min(timeout, stage_budget)
                 if timeout is None:
                     outcome = await result
                 else:
@@ -166,6 +168,10 @@ class FallbackBackend(AgentBackend):
                     raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen") from e
 
         raise AllBackendsFailedError(failures)
+
+    async def call_with_timeout(self, *, timeout_s: float, **kwargs) -> tuple[str, list[dict]]:
+        """Wendet ein einzelnes Aufrufbudget an und behält dabei den Provider-Cooldown."""
+        return await self.call(**kwargs, timeout_s=timeout_s)
 
     def _next_available_backend(self, start: int) -> AgentBackend:
         now = time.time()

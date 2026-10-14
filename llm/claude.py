@@ -6,12 +6,14 @@ from typing import AsyncIterator
 import anthropic
 
 from .base import LLMProvider, Message
+from core.anthropic_models import ensure_anthropic_model_allowed
 import config
 
 
 class ClaudeProvider(LLMProvider):
     def __init__(self, model: str | None = None):
         self._model = model or config.CLAUDE_CHAT_MODEL
+        ensure_anthropic_model_allowed(self._model)
         self._client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
     @property
@@ -37,6 +39,7 @@ class ClaudeProvider(LLMProvider):
         max_tokens: int = 1024,
         format: str | dict | None = None,
     ) -> str:
+        ensure_anthropic_model_allowed(self._model)
         kwargs: dict = dict(
             model=self._model,
             max_tokens=max_tokens,
@@ -70,6 +73,7 @@ class ClaudeProvider(LLMProvider):
         temperature: float = 0.7,
         max_tokens: int = 1024,
     ) -> AsyncIterator[str]:
+        ensure_anthropic_model_allowed(self._model)
         kwargs: dict = dict(
             model=self._model,
             max_tokens=max_tokens,

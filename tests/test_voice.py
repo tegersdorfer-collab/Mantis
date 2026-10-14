@@ -225,9 +225,11 @@ class TestTranscribeAudio:
 
 class TestIsAddressedToMantis:
     def test_namensnennung_liefert_true_ohne_llm_call(self):
-        with patch("core.fast.yes_no", new=AsyncMock()) as mock_yes_no:
+        with patch("core.decisions.voice_address", new=AsyncMock()) as mock_jev, \
+             patch("core.fast.yes_no", new=AsyncMock()) as mock_yes_no:
             result = asyncio.run(voice.is_addressed_to_mantis("Mantis, wie wird das Wetter morgen?"))
         assert result is True
+        mock_jev.assert_not_awaited()
         mock_yes_no.assert_not_called()
 
     def test_namensnennung_gross_klein_unabhaengig(self):
@@ -242,6 +244,25 @@ class TestIsAddressedToMantis:
         assert result is True
         mock_yes_no.assert_called_once()
         assert mock_yes_no.call_args.kwargs == {}
+
+    def test_jev_entscheidet_vor_dem_cloud_fallback(self):
+        jev = AsyncMock(return_value=True)
+        with patch("core.decisions.voice_address", new=jev), \
+             patch("core.fast.yes_no", new=AsyncMock()) as fast:
+            result = asyncio.run(voice.is_addressed_to_mantis("Ruf mir die Nacht-Zusammenfassung auf"))
+        assert result is True
+        jev.assert_awaited_once_with("Ruf mir die Nacht-Zusammenfassung auf")
+        fast.assert_not_awaited()
+
+    def test_jev_unsicherheit_faellt_auf_die_bestehende_cloud_kette_zurueck(self):
+        jev = AsyncMock(return_value=None)
+        fast = AsyncMock(return_value=False)
+        with patch("core.decisions.voice_address", new=jev), \
+             patch("core.fast.yes_no", new=fast):
+            result = asyncio.run(voice.is_addressed_to_mantis("Ich rede mit jemand anderem"))
+        assert result is False
+        jev.assert_awaited_once()
+        fast.assert_awaited_once()
 
     def test_ohne_namen_faellt_auf_kleines_modell_zurueck_nein(self):
         with patch("core.fast.yes_no", new=AsyncMock(return_value=False)):

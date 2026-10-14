@@ -29,6 +29,34 @@ def test_verify_claim_uses_cloud_provider_and_names_speaker():
     assert kwargs == {"temperature": 0.0, "max_tokens": 8}
 
 
+def test_verify_claim_uses_jev_before_cloud(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    provider = FakeProvider("NEIN")
+    jev = AsyncMock(return_value=True)
+    monkeypatch.setattr("core.decisions.fact_supported", jev)
+
+    result = asyncio.run(ex.verify_claim(provider, "Ich wohne hier", "Timo wohnt hier"))
+
+    assert result is True
+    jev.assert_awaited_once_with("Ich wohne hier", "Timo wohnt hier")
+    assert provider.calls == []
+
+
+def test_verify_claim_uses_cloud_when_jev_is_uncertain(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    provider = FakeProvider("NEIN")
+    jev = AsyncMock(return_value=None)
+    monkeypatch.setattr("core.decisions.fact_supported", jev)
+
+    result = asyncio.run(ex.verify_claim(provider, "Ich wohne hier", "Timo wohnt hier"))
+
+    assert result is False
+    jev.assert_awaited_once()
+    assert len(provider.calls) == 1
+
+
 def test_verifier_prompt_uses_explicit_speaker_context():
     prompt = ex.verify_prompt("Ich war beim Zahnarzt", "Timo war beim Zahnarzt")
     assert "Timo" in prompt and "Ich-Form" in prompt
