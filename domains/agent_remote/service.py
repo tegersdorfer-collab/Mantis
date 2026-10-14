@@ -22,6 +22,7 @@ from typing import Any, Callable, Mapping, Sequence
 from communication.base import IncomingMessage
 from domains.agent_remote.process import (
     process_group_exists as _process_group_exists,
+    process_group_identities as _process_group_identities,
     process_identity as _process_identity,
     signal_verified_process_group as _verified_signal_group,
 )
@@ -54,7 +55,7 @@ _READ_WORDS = re.compile(
     r"erklaer\w*|erklär\w*|explain\w*|inspect\w*|frage\w*|read\w*)\b",
     re.IGNORECASE,
 )
-_CONFIRMATIONS = {"ja", "start"}
+_CONFIRMATION_RE = re.compile(r"^(ja|start)(?:\s+([a-f0-9]{4}))?$", re.IGNORECASE)
 _REJECTIONS = {"nein"}
 _REMOVED_DIFF_COMMAND = re.compile(r"^diff\s+\S+$", re.IGNORECASE)
 _REGISTRY_FIELDS = {"pid", "start", "dir", "session", "run", "title"}
@@ -64,6 +65,11 @@ _GIT_HARDENING = (
     ("core.sshCommand", ""),
     ("core.attributesFile", "/dev/null"),
     ("protocol.allow", "never"),
+)
+_GIT_AUDIT_REGEX = (
+    r"^(include|includeif|filter)\.|"
+    r"^(diff\..*\.(command|textconv)|diff\.external|merge\..*\.driver|"
+    r"core\.(fsmonitor|hookspath))$"
 )
 
 
@@ -122,6 +128,8 @@ class Proposal:
     branch: str | None = None
     worktree: str | None = None
     signature: str = ""
+    preview_message_id: str | None = None
+    preview_message_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -154,6 +162,7 @@ class RunRecord:
     pid: int | None = None
     pgid: int | None = None
     process_identity: str | None = None
+    verified_group_members: dict[str, str] = field(default_factory=dict)
     registry_id: str | None = None
     registry_run: str | None = None
     ended_at: float | None = None
@@ -224,7 +233,8 @@ class AgentRemoteService:
         sleep: Callable[[float], Any] | None = None,
         process_identity: Callable[[int], str | None] | None = None,
         process_group: Callable[[int], int] | None = None,
-        signal_process_group: Callable[[int, int, str, str], bool] | None = None,
+        process_group_identities: Callable[[int], Mapping[str, str] | None] | None = None,
+        signal_process_group: Callable[[int, int, str, str, Mapping[str, str]], bool] | None = None,
         process_group_exists: Callable[[int], bool] | None = None,
     ):
         self.config = config
@@ -236,6 +246,7 @@ class AgentRemoteService:
         self._sleep = sleep or asyncio.sleep
         self._process_identity = process_identity or _process_identity
         self._process_group = process_group or os.getpgid
+        self._process_group_identities = process_group_identities or _process_group_identities
         self._signal_process_group = signal_process_group or _verified_signal_group
         self._process_group_exists = process_group_exists or _process_group_exists
         home = Path(config.home_dir or Path.home()).expanduser().resolve()
@@ -472,8 +483,9 @@ class AgentRemoteService:
         target = proposal.worktree if proposal.mode == "write" else proposal.repo_path
         mode = "schreiben (workspace-write)" if proposal.mode == "write" else "lesen (read-only)"
         branch = f"Branch: {proposal.branch}\n" if proposal.branch else ""
+        short_id = proposal.proposal_id[:4].lower()
         return (
-            f"Vorschlag {proposal.proposal_id} · gültig 10 Minuten\n"
+            f"Vorschlag-ID: `{short_id}` · gültig 10 Minuten\n"
             f"Repo: {proposal.repo_alias}\n"
             f"Kanonischer Repo-Pfad: {proposal.repo_path}\n"
             f"Ziel: {target}\n"
@@ -484,7 +496,9 @@ class AgentRemoteService:
             f"{proposal.task}\n\n"
             "codex-task ergänzt beim Start seinen festen Worker-Präfix und gegebenenfalls "
             "Jev-Gedächtnisverweise. Schreiblauf: keine Commits, Merges oder Pushes.\n"
-            "Zum Start antworte separat mit `ja` oder `start`; `nein` verwirft den Vorschlag."
+            f"Zum Start antworte mit `ja {short_id}` oder `start {short_id}` "
+            "(alternativ als Discord-Antwort auf genau diese Vorschau); "
+            "`nein` verwirft den Vorschlag."
         )
 
     async def _handle_start_request(self, msg, route, body: str) -> None:
@@ -538,8 +552,31 @@ class AgentRemoteService:
                 "Es wurde kein Lauf gestartet.",
             )
             return
+        if route is None:
+            return
+        preview = self._proposal_text(proposal)
+        try:
+            sent_message = await route.send(preview)
+        except Exception:
+            self.pending.pop(proposal.requester_id, None)
+            log.warning("Agent-Remote-Vorschau konnte nicht gesendet werden", exc_info=True)
+            return
+        if isinstance(sent_message, (list, tuple)):
+            message_ids = tuple(
+                str(getattr(item, "id", item))
+                for item in sent_message
+                if isinstance(getattr(item, "id", item), (str, int))
+            )
+        else:
+            message_id = getattr(sent_message, "id", sent_message)
+            message_ids = (str(message_id),) if isinstance(message_id, (str, int)) else ()
+        proposal = replace(
+            proposal,
+            preview_message_id=message_ids[0] if message_ids else None,
+            preview_message_ids=message_ids,
+        )
         self.pending[proposal.requester_id] = proposal
-        await self._reply(route, self._proposal_text(proposal))
+        await self._persist("assistant", preview)
 
     async def _handle_clarification(self, msg, route, text: str) -> bool:
         user_id = str(msg.sender_id)
@@ -611,6 +648,34 @@ class AgentRemoteService:
             # Ein verspätet zugestelltes/dupliziertes altes "ja" darf keinen neueren
             # Vorschlag bestätigen und lässt dessen echtes Bestätigungsfenster offen.
             return True
+        folded = text.strip().casefold()
+        if folded in _REJECTIONS:
+            self.pending.pop(user_id, None)
+            self._consumed_confirmations[self._event_key(msg)] = self._clock() + CONFIRMATION_TTL_SECONDS
+            await self._reply(route, "Vorschlag verworfen.")
+            return True
+        match = _CONFIRMATION_RE.fullmatch(text.strip())
+        if match is None:
+            return False
+        supplied_id = match.group(2)
+        reply_id = self._reply_message_id(msg)
+        is_matching_reply = (
+            supplied_id is None
+            and reply_id is not None
+            and reply_id in (
+                proposal.preview_message_ids
+                or ((proposal.preview_message_id,) if proposal.preview_message_id else ())
+            )
+        )
+        if supplied_id is not None:
+            supplied_id = supplied_id.casefold()
+        if supplied_id != proposal.proposal_id[:4].casefold() and not is_matching_reply:
+            await self._reply(
+                route,
+                f"Bitte bestätige mit `ja {proposal.proposal_id[:4]}` oder "
+                f"`start {proposal.proposal_id[:4]}`; alternativ antworte direkt auf die Vorschau.",
+            )
+            return True
         self.pending.pop(user_id, None)  # atomar verbrauchen, auch bei doppeltem Discord-Event
         self._consumed_confirmations[self._event_key(msg)] = self._clock() + CONFIRMATION_TTL_SECONDS
         if proposal.signature != self._proposal_signature(proposal):
@@ -619,9 +684,6 @@ class AgentRemoteService:
         if self._clock() >= proposal.expires_at:
             await self._reply(route, "Der Vorschlag ist abgelaufen. Bitte sende den Auftrag erneut.")
             return True
-        if text.strip().casefold() in _REJECTIONS:
-            await self._reply(route, "Vorschlag verworfen.")
-            return True
         current = self._known_aliases().get(proposal.repo_alias.casefold())
         current_root = self._repo_root(current[1]) if current else None
         if current_root is None or str(current_root) != proposal.repo_path:
@@ -629,6 +691,16 @@ class AgentRemoteService:
             return True
         await self._start_run(proposal, route)
         return True
+
+    @staticmethod
+    def _reply_message_id(msg) -> str | None:
+        raw = msg.raw
+        for name in ("reference", "message_reference"):
+            reference = getattr(raw, name, None)
+            message_id = getattr(reference, "message_id", None)
+            if message_id is not None:
+                return str(message_id)
+        return None
 
     async def handle(self, msg: IncomingMessage, route=None) -> bool:
         """Verarbeitet Agent-Remote-Befehle vor dem LLM-Turn; sonst False."""
@@ -645,9 +717,14 @@ class AgentRemoteService:
         self._consumed_confirmations = {
             key: expiry for key, expiry in self._consumed_confirmations.items() if expiry > now
         }
-        if folded in _CONFIRMATIONS | _REJECTIONS and self._event_key(msg) in self._consumed_confirmations:
+        is_confirmation_text = _CONFIRMATION_RE.fullmatch(text.strip()) is not None
+        is_rejection_text = folded in _REJECTIONS
+        if (
+            (is_confirmation_text or is_rejection_text)
+            and self._event_key(msg) in self._consumed_confirmations
+        ):
             return True
-        is_confirmation = folded in _CONFIRMATIONS | _REJECTIONS and pending
+        is_confirmation = (is_confirmation_text or is_rejection_text) and pending
         is_mode_reply = clarification and folded in {"lesen", "schreiben"}
         if (
             body is None
@@ -920,7 +997,7 @@ class AgentRemoteService:
                 result = self._command_runner(
                     [
                         git, "-C", str(repo), "config", "--includes", "--show-scope",
-                        "--get-regexp", r"^(include|includeif|filter)\.",
+                        "--get-regexp", _GIT_AUDIT_REGEX,
                     ],
                     check=False,
                     capture_output=True,
@@ -935,7 +1012,7 @@ class AgentRemoteService:
                 raise GitSafetyError("Git-Konfiguration konnte nicht sicher geprüft werden.")
             if not self._only_standard_lfs_config(result.stdout):
                 raise GitSafetyError(
-                    "Git-Konfiguration enthält include-, includeIf- oder filter-Einträge."
+                    "Git-Konfiguration enthält unsichere Include-, Filter- oder Ausführungseinträge."
                 )
 
     _STANDARD_LFS_FILTERS = {
@@ -952,9 +1029,16 @@ class AgentRemoteService:
             if not line.strip():
                 continue
             scope, tab, rest = line.partition("\t")
-            if not tab or scope not in {"global", "system"}:
+            if not tab:
                 return False
             key, _space, value = rest.partition(" ")
+            normalized_key = key.casefold()
+            if normalized_key in {"core.fsmonitor", "core.hookspath"}:
+                if value:
+                    return False
+                continue
+            if scope not in {"global", "system"}:
+                return False
             if cls._STANDARD_LFS_FILTERS.get(key) != value:
                 return False
         return True
@@ -1202,6 +1286,8 @@ class AgentRemoteService:
                 record.cwd = self._create_worktree(proposal)
                 record.worktree = record.cwd
                 self._save_run(record)
+            else:
+                self._audit_git_config(Path(record.repo_path).resolve(strict=True))
             tmp_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
             tmp_dir.chmod(0o700)
             if proposal.mode == "write" and not self._worktree_gitdir_matches(
@@ -1423,25 +1509,115 @@ class AgentRemoteService:
         record.ended_at = self._clock()
         self._save_run(record)
 
+    @staticmethod
+    def _normalize_group_identities(value) -> dict[str, str] | None:
+        if not isinstance(value, Mapping) or not value:
+            return None
+        normalized = {}
+        for pid, identity in value.items():
+            pid_text = str(pid)
+            if not pid_text.isdecimal() or int(pid_text) <= 0 or not isinstance(identity, str) or not identity:
+                return None
+            normalized[pid_text] = identity
+        return normalized
+
+    def _current_group_identities(self, pgid: int) -> dict[str, str] | None:
+        try:
+            return self._normalize_group_identities(self._process_group_identities(pgid))
+        except (OSError, ProcessLookupError, PermissionError, TypeError, ValueError):
+            return None
+
+    def _group_snapshot_matches(self, pgid: int, verified_members: Mapping[str, str]) -> bool:
+        current = self._current_group_identities(pgid)
+        if current is None:
+            return False
+        return all(verified_members.get(pid) == identity for pid, identity in current.items())
+
+    def _leader_is_dead(self, pid: int, pgid: int) -> bool:
+        try:
+            self._process_group(pid)
+        except ProcessLookupError:
+            return True
+        except (OSError, PermissionError, TypeError, ValueError):
+            return False
+        return False
+
     def _orphaned_group(self, record: RunRecord) -> bool:
-        """Leader tot, verifizierte Gruppe lebt: nur dann darf sie ohne Leader beendet werden."""
-        return (
-            isinstance(record.pid, int)
-            and isinstance(record.pgid, int)
-            and record.pgid == record.pid
-            and bool(record.process_identity)
-            and self._process_identity(record.pid) is None
-            and self._process_group_exists(record.pgid)
+        """Erlaubt eine verwaiste Gruppe nur mit gespeichertem, noch passendem Snapshot."""
+        if (
+            not isinstance(record.pid, int)
+            or not isinstance(record.pgid, int)
+            or record.pgid != record.pid
+            or not record.process_identity
+            or not self._process_group_exists(record.pgid)
+        ):
+            return False
+        try:
+            if self._process_identity(record.pid) is not None:
+                return False
+        except (OSError, ProcessLookupError, PermissionError, TypeError, ValueError):
+            return False
+        if not self._leader_is_dead(record.pid, record.pgid):
+            return False
+        verified = self._normalize_group_identities(record.verified_group_members)
+        return bool(
+            verified
+            and verified.get(str(record.pid)) == record.process_identity
+            and self._group_snapshot_matches(record.pgid, verified)
         )
 
     async def _terminate(self, record: RunRecord, process=None) -> bool:
-        if not self._identity_matches(record.pid, record.pgid, record.process_identity):
+        if (
+            not isinstance(record.pid, int)
+            or not isinstance(record.pgid, int)
+            or record.pgid != record.pid
+            or not record.process_identity
+        ):
+            self._mark_lost(record)
+            return False
+        try:
+            current_identity = self._process_identity(record.pid)
+        except (OSError, ProcessLookupError, PermissionError, TypeError, ValueError):
+            self._mark_lost(record)
+            return False
+        if current_identity is None:
             if not self._orphaned_group(record):
                 self._mark_lost(record)
                 return False
-        return await self._terminate_identity(
-            record.pid, record.pgid, record.process_identity, process,
+        elif current_identity != record.process_identity or not self._identity_matches(
+            record.pid, record.pgid, record.process_identity,
+        ):
+            self._mark_lost(record)
+            return False
+
+        verified = self._normalize_group_identities(record.verified_group_members)
+        if verified is None:
+            if current_identity is None:
+                self._mark_lost(record)
+                return False
+            verified = self._current_group_identities(record.pgid)
+            if (
+                verified is None
+                or verified.get(str(record.pid)) != record.process_identity
+                or not self._group_snapshot_matches(record.pgid, verified)
+            ):
+                self._mark_lost(record)
+                return False
+            record.verified_group_members = verified
+            self._save_run(record)
+        elif (
+            verified.get(str(record.pid)) != record.process_identity
+            or not self._group_snapshot_matches(record.pgid, verified)
+        ):
+            self._mark_lost(record)
+            return False
+
+        terminated = await self._terminate_identity(
+            record.pid, record.pgid, record.process_identity, process, verified,
         )
+        if not terminated:
+            self._mark_lost(record)
+        return terminated
 
     async def _complete_termination(self, record: RunRecord) -> None:
         record.status = record.termination_reason or "cancelled"
@@ -1468,21 +1644,41 @@ class AgentRemoteService:
         pgid,
         identity,
         process=None,
+        verified_members=None,
     ) -> bool:
         if not isinstance(pid, int) or not isinstance(pgid, int) or pgid != pid or not identity:
             return False
-        current_identity = self._process_identity(pid)
-        leader_matches = current_identity == identity and self._identity_matches(pid, pgid, identity)
         group_alive = self._process_group_exists(pgid)
-        if leader_matches:
-            signal_kind = "TERM"
-        elif current_identity is None and not group_alive:
+        if not group_alive:
             return True
-        elif current_identity is None:
-            signal_kind = "TERM_ORPHAN"
-        else:
+        verified = self._normalize_group_identities(verified_members)
+        if (
+            verified is None
+            or verified.get(str(pid)) != identity
+            or not self._group_snapshot_matches(pgid, verified)
+        ):
             return False
-        if not self._signal_process_group(pid, pgid, signal_kind, identity):
+
+        try:
+            current_identity = self._process_identity(pid)
+        except (OSError, ProcessLookupError, PermissionError, TypeError, ValueError):
+            return False
+        try:
+            current_pgid = self._process_group(pid)
+        except ProcessLookupError:
+            current_pgid = None
+        except (OSError, PermissionError):
+            return False
+        if current_pgid is None:
+            if current_identity is not None:
+                return False
+            signal_kind = "TERM_ORPHAN"
+        elif current_pgid != pgid or current_identity != identity:
+            return False
+        else:
+            signal_kind = "TERM"
+
+        if not self._signal_process_group(pid, pgid, signal_kind, identity, verified):
             return not self._process_group_exists(pgid)
         deadline = self._clock() + TERMINATION_GRACE_SECONDS
         while self._clock() < deadline:
@@ -1494,7 +1690,7 @@ class AgentRemoteService:
 
         if not self._process_group_exists(pgid):
             return True
-        if not self._signal_process_group(pid, pgid, "KILL", identity):
+        if not self._signal_process_group(pid, pgid, "KILL", identity, verified):
             return False
         deadline = self._clock() + TERMINATION_VERIFY_SECONDS
         while self._clock() < deadline:

@@ -64,6 +64,7 @@ class ProcessHarness:
         self.processes = []
         self.signals = []
         self.groups = set()
+        self.member_identities = {}
 
     def popen(self, args, **kwargs):
         process = FakeProcess()
@@ -90,14 +91,19 @@ class ProcessHarness:
     def process_group(pid):
         return pid
 
-    def signal_group(self, pid, pgid, sig, expected_identity):
-        self.signals.append((pid, pgid, sig, expected_identity))
+    def signal_group(self, pid, pgid, sig, expected_identity, verified_members=None):
+        self.signals.append((pid, pgid, sig, expected_identity, verified_members))
         if sig == "KILL":
             self.groups.discard(pgid)
         return True
 
     def group_exists(self, pgid):
         return pgid in self.groups
+
+    def group_identities(self, pgid):
+        if pgid not in self.groups:
+            return {}
+        return self.member_identities.get(pgid, {str(pgid): self.identity(pgid)})
 
 
 class Route:
@@ -106,13 +112,15 @@ class Route:
 
     async def send(self, text):
         self.messages.append(text)
+        return SimpleNamespace(id=f"preview-{len(self.messages)}")
 
 
-def _message(text, user="123", dm="dm-123", *, guild=None, bot=False):
+def _message(text, user="123", dm="dm-123", *, guild=None, bot=False, reply_to=None):
     raw = SimpleNamespace(
         author=SimpleNamespace(id=int(user), bot=bot),
         channel=SimpleNamespace(id=dm),
         guild=guild,
+        reference=SimpleNamespace(message_id=reply_to) if reply_to is not None else None,
     )
     return IncomingMessage(
         text=text, sender_id=user, timestamp=datetime(2026, 10, 14),
@@ -139,7 +147,8 @@ def _service(repo, tmp_path, harness=None, *, users=("123",), **overrides):
         name: overrides.pop(name)
         for name in (
             "clock", "sleep", "command_runner", "persist", "process_group_exists",
-            "process_identity", "process_group", "signal_process_group", "popen",
+            "process_identity", "process_group", "process_group_identities",
+            "signal_process_group", "popen",
         )
         if name in overrides
     }
@@ -149,6 +158,9 @@ def _service(repo, tmp_path, harness=None, *, users=("123",), **overrides):
         popen=injected.pop("popen", harness.popen),
         process_identity=injected.pop("process_identity", harness.identity),
         process_group=injected.pop("process_group", harness.process_group),
+        process_group_identities=injected.pop(
+            "process_group_identities", harness.group_identities,
+        ),
         signal_process_group=injected.pop("signal_process_group", harness.signal_group),
         process_group_exists=injected.pop("process_group_exists", harness.group_exists),
         **injected,
@@ -159,7 +171,25 @@ def _service(repo, tmp_path, harness=None, *, users=("123",), **overrides):
 async def _propose_and_confirm(service, route, prompt, *, user="123", dm=None):
     dm = dm or f"dm-{user}"
     await service.handle(_message(prompt, user=user, dm=dm), route)
-    await service.handle(_message("ja", user=user, dm=dm), route)
+    proposal = service.pending.get(user)
+    if proposal is not None:
+        await service.handle(
+            _message(f"ja {proposal.proposal_id[:4]}", user=user, dm=dm), route,
+        )
+
+
+def _proposal_confirmation(service, *, user="123", dm=None, command="ja", reply=False):
+    proposal = service.pending.get(user)
+    dm = dm or f"dm-{user}"
+    if proposal is None:
+        return _message(command, user=user, dm=dm)
+    if reply:
+        return _message(
+            command, user=user, dm=dm, reply_to=proposal.preview_message_id,
+        )
+    return _message(
+        f"{command} {proposal.proposal_id[:4]}", user=user, dm=dm,
+    )
 
 
 def test_foreign_discord_user_cannot_start_remote_job(git_repo, tmp_path):
@@ -204,6 +234,129 @@ def test_proposal_requires_a_separate_confirmation(git_repo, tmp_path):
     _run(run())
 
 
+def test_failed_preview_send_discards_proposal_before_confirmation(git_repo, tmp_path):
+    class FailedPreviewRoute(Route):
+        async def send(self, text):
+            if text.startswith("Vorschlag"):
+                raise ConnectionError("Discord nicht erreichbar")
+            return await super().send(text)
+
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = FailedPreviewRoute()
+
+        await service.handle(_message("codex: mantis analysiere Vorschau"), route)
+        await service.handle(_proposal_confirmation(service), route)
+
+        assert service.pending == {}
+        assert harness.calls == []
+        await service.stop()
+
+    _run(run())
+
+
+def test_late_preview_becomes_the_only_confirmable_proposal(git_repo, tmp_path):
+    async def run():
+        first_send_started = asyncio.Event()
+        release_first_send = asyncio.Event()
+
+        class ReorderedRoute(Route):
+            async def send(self, text):
+                if text.startswith("Vorschlag") and "erster-vorschlag" in text:
+                    first_send_started.set()
+                    await release_first_send.wait()
+                return await super().send(text)
+
+        service, harness = _service(git_repo, tmp_path)
+        route = ReorderedRoute()
+        first = asyncio.create_task(
+            service.handle(_message("codex: mantis analysiere erster-vorschlag"), route),
+        )
+        await first_send_started.wait()
+        await service.handle(_message("codex: mantis analysiere zweiter-vorschlag"), route)
+        release_first_send.set()
+        await first
+
+        proposal = service.pending["123"]
+        assert "erster-vorschlag" in route.messages[-1]
+        assert proposal.task.endswith("erster-vorschlag")
+        assert f"ja {proposal.proposal_id[:4]}" in route.messages[-1]
+
+        await service.handle(_proposal_confirmation(service), route)
+        assert len(harness.calls) == 1
+        assert "erster-vorschlag" in harness.calls[0][0][-1]
+        assert "zweiter-vorschlag" not in harness.calls[0][0][-1]
+        await service.stop()
+
+    _run(run())
+
+
+@pytest.mark.parametrize("command", ["ja", "start"])
+def test_confirmation_can_reply_to_the_exact_preview(git_repo, tmp_path, command):
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = Route()
+        await service.handle(_message("codex: mantis analysiere Reply"), route)
+        proposal = service.pending["123"]
+
+        assert getattr(proposal, "preview_message_id", None) == "preview-1"
+
+        await service.handle(
+            _proposal_confirmation(service, command=command, reply=True), route,
+        )
+        assert len(harness.calls) == 1
+        await service.stop()
+
+    _run(run())
+
+
+def test_confirmation_reply_can_target_any_chunk_of_a_long_preview(git_repo, tmp_path):
+    class MultiMessageRoute(Route):
+        async def send(self, text):
+            if text.startswith("Vorschlag"):
+                self.messages.append(text)
+                return ("preview-first", "preview-last")
+            return await super().send(text)
+
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = MultiMessageRoute()
+        await service.handle(_message("codex: mantis analysiere lange-Vorschau"), route)
+
+        proposal = service.pending["123"]
+        assert proposal.preview_message_ids == ("preview-first", "preview-last")
+        await service.handle(
+            _message("ja", reply_to="preview-last"), route,
+        )
+
+        assert len(harness.calls) == 1
+        await service.stop()
+
+    _run(run())
+
+
+@pytest.mark.parametrize("command", ["ja", "start"])
+def test_wrong_short_confirmation_id_keeps_proposal_unstarted(git_repo, tmp_path, command):
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = Route()
+        await service.handle(_message("codex: mantis analysiere IDs"), route)
+        proposal = service.pending["123"]
+        expected_id = proposal.proposal_id[:4]
+        wrong_id = ("0" if expected_id[0] != "0" else "1") + expected_id[1:]
+
+        await service.handle(_message(f"ja {wrong_id}"), route)
+
+        assert harness.calls == []
+        assert service.pending.get("123") is proposal
+
+        await service.handle(_proposal_confirmation(service, command=command), route)
+        assert len(harness.calls) == 1
+        await service.stop()
+
+    _run(run())
+
+
 def test_expired_proposal_cannot_be_confirmed(git_repo, tmp_path):
     async def run():
         now = [1000.0]
@@ -212,7 +365,7 @@ def test_expired_proposal_cannot_be_confirmed(git_repo, tmp_path):
         await service.handle(_message("codex: mantis analysiere README"), route)
         now[0] += 601
 
-        await service.handle(_message("ja"), route)
+        await service.handle(_proposal_confirmation(service), route)
 
         assert harness.calls == []
         assert any("abgelaufen" in item.lower() for item in route.messages)
@@ -225,9 +378,12 @@ def test_confirmation_from_another_user_or_dm_cannot_authorize_proposal(git_repo
         service, harness = _service(git_repo, tmp_path, users=("123", "456"))
         route = Route()
         await service.handle(_message("codex: mantis analysiere README"), route)
+        proposal_id = service.pending["123"].proposal_id[:4]
 
         await service.handle(_message("ja", user="456"), route)
-        await service.handle(_message("ja", user="123", dm="another-dm"), route)
+        await service.handle(
+            _message(f"ja {proposal_id}", user="123", dm="another-dm"), route,
+        )
 
         assert harness.calls == []
 
@@ -240,7 +396,7 @@ def test_unknown_repo_alias_and_chat_path_do_not_become_a_cwd(git_repo, tmp_path
         route = Route()
 
         await service.handle(_message("codex: other /tmp/hostile analysiere"), route)
-        await service.handle(_message("ja"), route)
+        await service.handle(_proposal_confirmation(service), route)
 
         assert harness.calls == []
         assert any("Alias" in item or "Repo" in item for item in route.messages)
@@ -354,8 +510,98 @@ def test_git_calls_use_hardened_config_and_minimal_environment(git_repo, tmp_pat
         assert task_env["LANG"]
         assert task_env["PATH"]
         assert task_env["GIT_ATTR_NOSYSTEM"] == "1"
+        assert task_env["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert "GIT_EXTERNAL_DIFF" not in task_env
         assert "DATABASE_URL" not in task_env
         assert "OPENROUTER_API_KEY" not in task_env
+        await service.stop()
+
+    _run(run())
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("diff.agent.command", "/usr/bin/touch diff-command-marker"),
+        ("diff.agent.textconv", "/usr/bin/touch diff-textconv-marker"),
+        ("diff.external", "/usr/bin/touch diff-external-marker"),
+        ("merge.agent.driver", "/usr/bin/touch merge-driver-marker"),
+        ("core.fsmonitor", "/usr/bin/touch fsmonitor-marker"),
+        ("core.hooksPath", "/tmp/agent-remote-hooks"),
+    ],
+)
+def test_repository_git_execution_config_is_rejected(git_repo, tmp_path, key, value):
+    _git("config", key, value, cwd=git_repo)
+
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = Route()
+
+        await _propose_and_confirm(service, route, "codex: mantis analysiere sichere-Konfiguration")
+
+        assert harness.calls == []
+        assert "Start verweigert" in route.messages[-1]
+        await service.stop()
+
+    _run(run())
+
+
+@pytest.mark.parametrize("scope", ["local", "worktree", "global", "system", "command"])
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("diff.agent.command", "/usr/bin/touch diff-command-marker"),
+        ("diff.agent.textconv", "/usr/bin/touch diff-textconv-marker"),
+        ("diff.external", "/usr/bin/touch diff-external-marker"),
+        ("merge.agent.driver", "/usr/bin/touch merge-driver-marker"),
+        ("core.fsmonitor", "/usr/bin/touch fsmonitor-marker"),
+        ("core.hooksPath", "/tmp/agent-remote-hooks"),
+    ],
+)
+def test_git_execution_config_is_rejected_in_every_config_scope(
+    git_repo, tmp_path, monkeypatch, key, value, scope,
+):
+    if scope == "local":
+        _git("config", key, value, cwd=git_repo)
+    elif scope == "worktree":
+        _git("config", "extensions.worktreeConfig", "true", cwd=git_repo)
+        _git("config", "--worktree", key, value, cwd=git_repo)
+    elif scope in {"global", "system"}:
+        config_file = tmp_path / f"{scope}.gitconfig"
+        _git("config", "--file", str(config_file), key, value, cwd=git_repo)
+        monkeypatch.setenv(
+            "GIT_CONFIG_GLOBAL" if scope == "global" else "GIT_CONFIG_SYSTEM",
+            str(config_file),
+        )
+    else:
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", key)
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", value)
+
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = Route()
+
+        await _propose_and_confirm(service, route, "codex: mantis analysiere jede-Konfiguration")
+
+        assert harness.calls == []
+        assert "Start verweigert" in route.messages[-1]
+        await service.stop()
+
+    _run(run())
+
+
+def test_empty_fsmonitor_and_hooks_path_config_are_not_rejected(git_repo, tmp_path):
+    _git("config", "core.fsmonitor", "", cwd=git_repo)
+    _git("config", "core.hooksPath", "", cwd=git_repo)
+
+    async def run():
+        service, harness = _service(git_repo, tmp_path)
+        route = Route()
+
+        await _propose_and_confirm(service, route, "codex: mantis analysiere leere-Konfiguration")
+
+        assert len(harness.calls) == 1
         await service.stop()
 
     _run(run())
@@ -583,9 +829,12 @@ def test_orphaned_verified_group_is_killed_after_leader_exits(git_repo, tmp_path
             await asyncio.sleep(0.2)
             identity = service._process_identity(leader.pid)
             assert identity
+            verified_members = service._current_group_identities(leader.pid)
+            assert verified_members
+            assert verified_members[str(leader.pid)] == identity
 
             terminated = await service._terminate_identity(
-                leader.pid, leader.pid, identity, leader,
+                leader.pid, leader.pid, identity, leader, verified_members,
             )
             leader.wait(timeout=2)
             assert terminated is True
@@ -639,7 +888,7 @@ def test_feature_disabled_fails_closed_without_launching(git_repo, tmp_path):
         route = Route()
 
         await service.handle(_message("codex: mantis analysiere"), route)
-        await service.handle(_message("ja"), route)
+        await service.handle(_proposal_confirmation(service), route)
 
         assert harness.calls == []
         assert any("deaktiviert" in item.lower() for item in route.messages)
@@ -674,7 +923,7 @@ def test_confirmation_is_bound_to_the_unchanged_proposal(git_repo, tmp_path):
         second_id = next(iter(service.pending.values())).proposal_id
         assert first_id != second_id
 
-        await service.handle(_message("ja"), route)
+        await service.handle(_proposal_confirmation(service), route)
 
         assert len(harness.calls) == 1
         assert "zweiter-vorschlag" in harness.calls[0][0][-1]
@@ -729,7 +978,7 @@ def test_confirmation_cannot_authorize_a_changed_proposal(git_repo, tmp_path):
         proposal = service.pending["123"]
         service.pending["123"] = replace(proposal, task="schreibe eine andere Datei")
 
-        await service.handle(_message("ja"), route)
+        await service.handle(_proposal_confirmation(service), route)
 
         assert harness.calls == []
         assert "verändert" in route.messages[-1]
@@ -742,7 +991,7 @@ def test_duplicate_confirmation_event_starts_exactly_one_process(git_repo, tmp_p
         service, harness = _service(git_repo, tmp_path)
         route = Route()
         await service.handle(_message("codex: mantis analysiere README"), route)
-        confirmation = _message("ja")
+        confirmation = _proposal_confirmation(service)
 
         await service.handle(confirmation, route)
         await service.handle(confirmation, route)
@@ -758,7 +1007,7 @@ def test_duplicate_confirmation_for_old_proposal_cannot_start_a_new_proposal(git
         service, harness = _service(git_repo, tmp_path)
         route = Route()
         await service.handle(_message("codex: mantis analysiere erster"), route)
-        old_confirmation = _message("ja")
+        old_confirmation = _proposal_confirmation(service)
         await service.handle(old_confirmation, route)
         await service.handle(_message("codex: mantis analysiere zweiter"), route)
 
@@ -768,7 +1017,7 @@ def test_duplicate_confirmation_for_old_proposal_cannot_start_a_new_proposal(git
         assert "zweiter" not in harness.calls[0][0][-1]
         assert "123" in service.pending
 
-        await service.handle(_message("ja"), route)
+        await service.handle(_proposal_confirmation(service), route)
 
         assert len(harness.calls) == 2
         assert "zweiter" in harness.calls[1][0][-1]
@@ -782,7 +1031,7 @@ def test_replayed_confirmation_after_restart_cannot_start_a_new_proposal(git_rep
         service, harness = _service(git_repo, tmp_path)
         route = Route()
         await service.handle(_message("codex: mantis analysiere erster"), route)
-        old_confirmation = _message("ja")
+        old_confirmation = _proposal_confirmation(service)
         await service.handle(old_confirmation, route)
         await service.stop()
 
@@ -798,7 +1047,7 @@ def test_replayed_confirmation_after_restart_cannot_start_a_new_proposal(git_rep
         assert len(harness.calls) == 1
         assert restarted.pending["123"].proposal_id == current.proposal_id
 
-        await restarted.handle(_message("ja"), route)
+        await restarted.handle(_proposal_confirmation(restarted), route)
         assert len(harness.calls) == 2
         assert "zweiter" in harness.calls[-1][0][-1]
         await restarted.stop()
@@ -848,32 +1097,87 @@ def test_orphan_and_kill_signals_require_the_saved_process_identity(monkeypatch)
     monkeypatch.setattr(agent_remote_process, "process_group_exists", lambda _pgid: True)
     monkeypatch.setattr(agent_remote_process.os, "getpgid", lambda _pid: 444)
     monkeypatch.setattr(agent_remote_process.os, "killpg", lambda *args: signals.append(args))
+    members = {"444": "darwin:1.000001"}
+    monkeypatch.setattr(
+        agent_remote_process, "process_group_identities", lambda _pgid: members,
+    )
 
-    # Leader tot, Gruppe lebt, Identität wurde beim Start gespeichert: signalisieren erlaubt.
-    monkeypatch.setattr(agent_remote_process, "process_identity", lambda _pid: None)
-    assert agent_remote_process.signal_verified_process_group(
-        444, 444, "TERM_ORPHAN", "darwin:1.000001",
+    # Ein lebender Leader darf nur mit exakt gleicher Identität signalisiert werden.
+    monkeypatch.setattr(
+        agent_remote_process, "process_identity", lambda _pid: "darwin:1.000001",
     )
     assert agent_remote_process.signal_verified_process_group(
-        444, 444, "KILL", "darwin:1.000001",
+        444, 444, "TERM", "darwin:1.000001", members,
+    )
+    assert agent_remote_process.signal_verified_process_group(
+        444, 444, "KILL", "darwin:1.000001", members,
     )
     assert [item[1] for item in signals] == [signal.SIGTERM, signal.SIGKILL]
 
-    # Ohne gespeicherte Identität nie.
+    # Eine nicht lesbare Leader-Identität erlaubt auch mit Snapshot kein Signal.
     signals.clear()
-    assert not agent_remote_process.signal_verified_process_group(444, 444, "KILL", "")
+    monkeypatch.setattr(agent_remote_process, "process_identity", lambda _pid: None)
+    assert not agent_remote_process.signal_verified_process_group(
+        444, 444, "TERM_ORPHAN", "darwin:1.000001", members,
+    )
+    assert not agent_remote_process.signal_verified_process_group(
+        444, 444, "KILL", "darwin:1.000001", members,
+    )
 
     # Hält eine andere Identität die PID, wird nie signalisiert.
+    monkeypatch.setattr(
+        agent_remote_process.os, "getpgid", lambda _pid: 444,
+    )
     monkeypatch.setattr(
         agent_remote_process, "process_identity", lambda _pid: "darwin:2.000002",
     )
     assert not agent_remote_process.signal_verified_process_group(
-        444, 444, "TERM_ORPHAN", "darwin:1.000001",
+        444, 444, "TERM", "darwin:1.000001", members,
     )
     assert not agent_remote_process.signal_verified_process_group(
-        444, 444, "KILL", "darwin:1.000001",
+        444, 444, "KILL", "darwin:1.000001", members,
     )
     assert signals == []
+
+
+def test_unreadable_real_leader_with_wrong_saved_identity_is_never_signaled(monkeypatch):
+    import domains.agent_remote.process as agent_remote_process
+
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": "/tmp",
+        "LANG": "C",
+    }
+    leader = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        identity = None
+        for _attempt in range(50):
+            identity = agent_remote_process.process_identity(leader.pid)
+            if identity:
+                break
+            threading.Event().wait(0.01)
+        assert identity
+        monkeypatch.setattr(agent_remote_process, "process_identity", lambda _pid: None)
+
+        signaled = agent_remote_process.signal_verified_process_group(
+            leader.pid, leader.pid, "TERM_ORPHAN", f"wrong-{identity}",
+        )
+
+        assert signaled is False
+        assert leader.poll() is None
+    finally:
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        leader.wait(timeout=2)
 
 
 def test_dead_leader_with_live_verified_group_is_killed_not_lost(git_repo, tmp_path):
@@ -882,7 +1186,16 @@ def test_dead_leader_with_live_verified_group_is_killed_not_lost(git_repo, tmp_p
         route = Route()
         await _propose_and_confirm(service, route, "codex: mantis analysiere Waise")
         record = next(iter(service.runs.values()))
+        child_pid = record.pid + 1_000_000
+        saved_members = {
+            str(record.pid): harness.identity(record.pid),
+            str(child_pid): f"child-{child_pid}",
+        }
+        record.verified_group_members = saved_members
+        service._save_run(record)
+        harness.member_identities[record.pgid] = {str(child_pid): f"child-{child_pid}"}
         service._process_identity = lambda _pid: None
+        service._process_group = lambda _pid: (_ for _ in ()).throw(ProcessLookupError())
 
         await service.handle(_message(f"abbrechen {record.remote_id}"), route)
 
@@ -994,6 +1307,9 @@ def test_launcher_atomically_persists_process_identity_before_exec(tmp_path):
     marker = tmp_path / "task-started"
     child_script.write_text(
         "import json, os, sys\n"
+        "assert os.environ.get('GIT_EXTERNAL_DIFF') is None\n"
+        "assert os.environ['GIT_CONFIG_NOSYSTEM'] == '1'\n"
+        "assert os.environ['GIT_ATTR_NOSYSTEM'] == '1'\n"
         "state = json.loads(open(sys.argv[1], encoding='utf-8').read())\n"
         "assert state['status'] == 'running'\n"
         "assert state['pid'] == os.getpid()\n"
@@ -1002,7 +1318,14 @@ def test_launcher_atomically_persists_process_identity_before_exec(tmp_path):
         "open(sys.argv[2], 'w').write('started')\n"
     )
     launcher = Path(__file__).resolve().parents[1] / "domains" / "agent_remote" / "launcher.py"
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path), "LANG": "C"}
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "LANG": "C",
+        "GIT_EXTERNAL_DIFF": "/usr/bin/touch should-not-run",
+        "GIT_CONFIG_NOSYSTEM": "0",
+        "GIT_ATTR_NOSYSTEM": "0",
+    }
 
     result = subprocess.run(
         [
@@ -1336,7 +1659,7 @@ def test_agent_flow_persists_messages_with_agent_use_case(git_repo, tmp_path):
         route = Route()
 
         await service.handle(_message("codex: mantis analysiere README"), route)
-        await service.handle(_message("ja"), route)
+        await service.handle(_proposal_confirmation(service), route)
 
         assert len(persisted) >= 4
         assert all(item[2]["channel"] == "discord" for item in persisted)
@@ -1473,7 +1796,7 @@ def test_unclear_mode_requires_read_or_write_before_confirmation(git_repo, tmp_p
         await service.handle(_message("schreiben"), route)
         assert harness.calls == []
         assert "schreiben" in route.messages[-1]
-        await service.handle(_message("ja"), route)
+        await service.handle(_proposal_confirmation(service), route)
 
         assert len(harness.calls) == 1
         assert harness.calls[0][1]["cwd"] != str(git_repo)
@@ -1502,6 +1825,7 @@ def test_discord_route_disables_mentions_for_untrusted_result_text():
 
         async def send(self, text, **kwargs):
             self.sent.append((text, kwargs))
+            return SimpleNamespace(id=f"discord-{len(self.sent)}")
 
     async def run():
         channel = DiscordChannel(
@@ -1509,10 +1833,11 @@ def test_discord_route_disables_mentions_for_untrusted_result_text():
             discord_module=SimpleNamespace(AllowedMentions=AllowedMentions),
         )
         destination = Destination()
-        await channel.for_message(SimpleNamespace(channel=destination)).send(
+        sent_ids = await channel.for_message(SimpleNamespace(channel=destination)).send(
             "untrusted result: @everyone <@123>"
         )
 
+        assert sent_ids == ("discord-1",)
         assert destination.sent == [
             ("untrusted result: @everyone <@123>", {"allowed_mentions": "mentions-disabled"}),
         ]

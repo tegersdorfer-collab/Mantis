@@ -65,6 +65,9 @@ def main(
                 return 2
             state["status"] = "running"
             write_locked_state(state_file, state)
+            os.environ.pop("GIT_EXTERNAL_DIFF", None)
+            os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+            os.environ["GIT_ATTR_NOSYSTEM"] = "1"
             try:
                 os.execve(binary, [binary, *task_args], os.environ)
             except OSError:

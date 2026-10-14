@@ -380,15 +380,20 @@ class _DiscordRoute:
             return await user.create_dm()
         return user
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str) -> tuple[str, ...]:
         await self._stop_typing()
         destination = await self._resolve_destination()
         if destination is None:
             log.warning("Discord-Nachricht nicht gesendet: kein erlaubter Empfänger oder keine Verbindung")
             raise ConnectionError("Discord nicht verbunden oder kein erlaubter Empfänger")
         kwargs = self._safe_mention_kwargs()
+        message_ids = []
         for chunk in split_discord_message(text):
-            await destination.send(chunk, **kwargs)
+            sent = await destination.send(chunk, **kwargs)
+            message_id = getattr(sent, "id", None)
+            if message_id is not None:
+                message_ids.append(str(message_id))
+        return tuple(message_ids)
 
     async def send_plain(self, text: str) -> None:
         """Sendet einen einzelnen Text unverändert, ohne Markdown-Verarbeitung."""
