@@ -9,7 +9,11 @@ from communication.base import IncomingMessage
 from communication.discord import DiscordChannel
 from core import db, log_observability
 from core.idle_loop import IdleLoop
-from core.message_handler import MessageHandler, VOICE_RESPONSE_INSTRUCTIONS
+from core.message_handler import (
+    MessageHandler,
+    VOICE_RESPONSE_INSTRUCTIONS,
+    _messages_with_voice_reminder,
+)
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from orchestrator import Orchestrator
@@ -595,3 +599,30 @@ def test_persistence_failures_are_logged_to_error_observability(monkeypatch, cap
 
     assert sum(record.levelno == logging.ERROR for record in caplog.records) == 2
     assert len(events) == 2
+
+
+def test_voice_reminder_does_not_mutate_nested_source_messages():
+    messages = [{
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": "Wie war mein Puls?",
+            "annotations": {"source": ["chat", {"turn": 4}]},
+        }],
+    }]
+    original = [{
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": "Wie war mein Puls?",
+            "annotations": {"source": ["chat", {"turn": 4}]},
+        }],
+    }]
+
+    copied = _messages_with_voice_reminder(messages, "Wie war mein Puls?")
+
+    assert copied[0] is not messages[0]
+    assert copied[0]["content"] is not messages[0]["content"]
+    assert copied[0]["content"][0] is not messages[0]["content"][0]
+    assert copied[0]["content"][0]["annotations"] is not messages[0]["content"][0]["annotations"]
+    assert messages == original

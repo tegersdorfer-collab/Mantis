@@ -251,20 +251,33 @@ def test_haiku_stream_reports_exact_text_deltas():
     assert collected == ["Es ist son", "nig."]
 
 
-def test_voice_stream_max_tokens_drops_incomplete_last_sentence():
+@pytest.mark.parametrize(
+    ("text_deltas", "expected"),
+    [
+        (("Der erste Satz ist fertig. ", "Die Nacht davor waren 8"), "Der erste Satz ist fertig."),
+        (("Dein Puls ist 53. ", "Die Nacht davor war"), "Dein Puls ist 53."),
+    ],
+)
+def test_voice_stream_max_tokens_drops_incomplete_last_sentence(text_deltas, expected):
     result, collected = _call_claude_with_sdk_events(
         include_message_stop=True,
-        text_deltas=("Der erste Satz ist fertig. ", "Die Nacht davor waren 8"),
+        text_deltas=text_deltas,
         stop_reason="max_tokens",
         purpose="voice",
     )
 
-    assert result == ("Der erste Satz ist fertig.", [])
-    assert collected == ["Der erste Satz ist fertig. ", "Die Nacht davor waren 8"]
+    assert result == (expected, [])
+    assert collected == list(text_deltas)
 
 
-def test_voice_nonstream_max_tokens_drops_incomplete_last_sentence():
-    partial = "Der erste Satz ist fertig. Die Nacht davor waren 8"
+@pytest.mark.parametrize(
+    ("partial", "expected"),
+    [
+        ("Der erste Satz ist fertig. Die Nacht davor waren 8", "Der erste Satz ist fertig."),
+        ("Dein Puls ist 53. Die Nacht davor war", "Dein Puls ist 53."),
+    ],
+)
+def test_voice_nonstream_max_tokens_drops_incomplete_last_sentence(partial, expected):
     response_body = {
         "id": "msg_voice_limit",
         "type": "message",
@@ -293,7 +306,7 @@ def test_voice_nonstream_max_tokens_drops_incomplete_last_sentence():
                 None, 0.2, 500,
             )
 
-    assert asyncio.run(call()) == ("Der erste Satz ist fertig.", [])
+    assert asyncio.run(call()) == (expected, [])
 
 
 def test_haiku_tool_use_rejects_missing_required_arguments():

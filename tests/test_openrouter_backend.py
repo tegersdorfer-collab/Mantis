@@ -503,8 +503,14 @@ def test_length_finish_reason_returns_available_response_in_both_paths(streaming
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_voice_length_finish_reason_drops_incomplete_last_sentence(streaming):
-    partial = "Der erste Satz ist fertig. Die Nacht davor waren 8"
+@pytest.mark.parametrize(
+    ("partial", "expected"),
+    [
+        ("Der erste Satz ist fertig. Die Nacht davor waren 8", "Der erste Satz ist fertig."),
+        ("Dein Puls ist 53. Die Nacht davor war", "Dein Puls ist 53."),
+    ],
+)
+def test_voice_length_finish_reason_drops_incomplete_last_sentence(streaming, partial, expected):
 
     def handler(request: httpx.Request) -> httpx.Response:
         if streaming:
@@ -529,7 +535,7 @@ def test_voice_length_finish_reason_drops_incomplete_last_sentence(streaming):
         stream_cb=stream_cb if streaming else None, temperature=0.2, max_tokens=500,
     ))
 
-    assert text == "Der erste Satz ist fertig."
+    assert text == expected
     assert calls == []
 
 

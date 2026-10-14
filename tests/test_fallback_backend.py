@@ -252,6 +252,24 @@ def test_empty_visible_answer_uses_next_provider():
     assert fallback.calls == 1
 
 
+def test_truncated_voice_answer_without_sentence_punctuation_keeps_primary():
+    from core.voice_text import last_complete_sentence
+
+    class TruncatedVoiceBackend(FakeBackend):
+        async def call(self, messages, tools, stream_cb, temperature, max_tokens,
+                       think=False, force_tool_call=False):
+            self.calls += 1
+            return last_complete_sentence("am 12. Oktober"), []
+
+    primary = TruncatedVoiceBackend("openrouter")
+    fallback = FakeBackend("anthropic", result=("Fallback-Antwort", []))
+    backend = FallbackBackend(primary, fallback, cooldown_s=60)
+
+    assert _call(backend) == ("am 12. Oktober", [])
+    assert primary.calls == 1
+    assert fallback.calls == 0
+
+
 def test_anthropic_unsupported_parameter_400_falls_through_without_permanent_disable():
     import httpx
 

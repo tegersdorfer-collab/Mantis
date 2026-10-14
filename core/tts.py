@@ -268,7 +268,11 @@ def _ordinal_to_german_words(number: int) -> str:
 def _date_ordinal(number: int, before: str) -> str:
     ordinal = _ordinal_to_german_words(number)
     context = before.casefold()
-    if re.search(r"(?:\bam\s+|\bvom\s+|\bzum\s+|\bbis\s+zum\s+|\bseit\s+dem\s+|\bauf\s+den\s+|\bfür\s+den\s+|\bden\s+)$", context):
+    if re.search(
+        r"(?:\bam\s+|\bvom\s+|\bzum\s+|\bbis\s+(?:zum\s+)?|"
+        r"\bseit\s+dem\s+|\bauf\s+den\s+|\bfür\s+den\s+|\bden\s+)$",
+        context,
+    ):
         return ordinal + "n"
     if re.search(r"\bder\s+$", context):
         return ordinal
@@ -281,9 +285,79 @@ def _decimal_to_german_words(value: str) -> str:
     return f"{_number_to_german_words(int(whole))} Komma {decimals}"
 
 
+def _digit_sequence_to_german_words(digits: str) -> str:
+    return " ".join(_number_to_german_words(int(digit)) for digit in digits)
+
+
 def _numbers_to_german_words(text: str) -> str:
     """Schreibt Datumszahlen, Uhrzeiten, Dezimalzahlen, Prozent und Kardinalzahlen aus."""
     spoken = str(text or "")
+
+    def version(match):
+        parts = match.group("number").split(".")
+        words = [
+            _digit_sequence_to_german_words(part)
+            if len(part) > 1 and part.startswith("0")
+            else _number_to_german_words(int(part))
+            for part in parts
+        ]
+        label = match.group("label") or ""
+        if label in ("v", "V"):
+            label = "Version "
+        return f"{label}{' Punkt '.join(words)}"
+
+    def version_unlabeled(match):
+        return version(match)
+
+    # Versionsnummern sind keine Datumsangaben oder Dezimalzahlen.
+    # Ohne Label nur eindeutige Formen: vier Teile oder drei Teile mit einstelligem Ende
+    # (12.10.26 bleibt ein Datum, 1.2.3 ist eine Version).
+    spoken = re.sub(
+        r"(?<![\w.])(?P<label>[vV](?=\d))?(?P<number>\d+\.\d+\.\d(?:\.\d+)*|\d+(?:\.\d+){3,})(?![\w.])",
+        lambda m: version(m) if m.group("label") is not None else version_unlabeled(m),
+        spoken,
+    )
+    spoken = re.sub(
+        r"(?P<label>\bVersion\s+)(?P<number>\d+(?:\.\d+)+)(?![\w.])",
+        version,
+        spoken,
+        flags=re.IGNORECASE,
+    )
+
+    def date_range(match):
+        first, last, month, year = match.groups()
+        first_number, last_number, month_number = int(first), int(last), int(month)
+        if (
+            not 1 <= first_number <= 31
+            or not 1 <= last_number <= 31
+            or month_number not in _MONTH_NAMES
+        ):
+            return match.group(0)
+        start = _date_ordinal(first_number, spoken[:match.start()])
+        end = _date_ordinal(last_number, "bis ")
+        result = f"{start} bis {end} {_MONTH_NAMES[month_number]}"
+        if year:
+            result += f" {_number_to_german_words(int(year))}"
+        return result
+
+    spoken = re.sub(
+        r"(?<!\d)(\d{1,2})\.\s*[–—-]\s*(\d{1,2})\.(\d{1,2})\.(?:(\d{4})(?!\d))?",
+        date_range,
+        spoken,
+    )
+
+    def date_transition(match):
+        first, connector, last, month = match.groups()
+        start = _date_ordinal(int(first), spoken[:match.start()])
+        end = _date_ordinal(int(last), f"{connector} ")
+        return f"{start} {connector} {end} {month}"
+
+    spoken = re.sub(
+        rf"(?<!\d)(\d{{1,2}})\.\s+(auf\s+den)\s+(\d{{1,2}})\.\s*({_MONTH_PATTERN})\b",
+        date_transition,
+        spoken,
+        flags=re.IGNORECASE,
+    )
 
     def numeric_date(match):
         day, month, year = match.groups()
@@ -293,11 +367,13 @@ def _numbers_to_german_words(text: str) -> str:
         month_name = _MONTH_NAMES[month_number]
         date = f"{_date_ordinal(day_number, spoken[:match.start()])} {month_name}"
         if year:
-            date += f" {_number_to_german_words(int(year))}"
+            # Zweistellige Jahre (12.10.26) als 20xx lesen.
+            year_number = int(year) + (2000 if len(year) == 2 else 0)
+            date += f" {_number_to_german_words(year_number)}"
         return date
 
     spoken = re.sub(
-        r"(?<!\d)(\d{1,2})\.(\d{1,2})\.(?:(\d{4})(?!\d))?",
+        r"(?<!\d)(\d{1,2})\.(\d{1,2})\.(?:(\d{4}|\d{2})(?!\d))?",
         numeric_date,
         spoken,
     )
@@ -313,10 +389,32 @@ def _numbers_to_german_words(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    def ordinal_date(match):
-        return _date_ordinal(int(match.group(1)), spoken[:match.start()])
+    def ordinal_before_noun(match):
+        before = spoken[:match.start()]
+        context = before.casefold()
+        ordinal = _ordinal_to_german_words(int(match.group("number")))
+        if re.search(r"(?:\b(?:im|am|beim|vom|zum|zur|ins)\s+|\b(?:den|dem|des)\s+)$", context):
+            return f"{ordinal}n {match.group('noun')}"
+        if re.search(r"\b(?:der|die|das)\s+$", context):
+            return f"{ordinal} {match.group('noun')}"
+        if re.search(r"(?:^|[.!?…])\s*$", before):
+            strong = ordinal[:-1] + "er" if ordinal.endswith("e") else ordinal + "er"
+            return f"{strong[0].upper() + strong[1:]} {match.group('noun')}"
+        return match.group(0)
 
-    spoken = re.sub(r"(?<![\w])([0-9]{1,2})\.(?!\d)", ordinal_date, spoken)
+    # Ein Punkt macht nur mit eindeutigem Nomenkontext eine Ordinalzahl.
+    spoken = re.sub(
+        r"(?<![\w])(?P<number>[0-9]{1,2})\.(?!\d)\s+(?P<noun>[A-ZÄÖÜ][\w-]*)\b",
+        ordinal_before_noun,
+        spoken,
+    )
+
+    spoken = re.sub(
+        r"(?<![\d:])24:00(?:\s*Uhr\b)?(?![\d:])",
+        "vierundzwanzig Uhr",
+        spoken,
+        flags=re.IGNORECASE,
+    )
 
     def clock_time(match):
         hour, minute = (int(match.group(1)), int(match.group(2)))
@@ -333,22 +431,85 @@ def _numbers_to_german_words(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
+    def grouped_thousands(match):
+        number = int(match.group("number").replace(".", ""))
+        words = _number_to_german_words(number)
+        if 1_000 <= number < 2_000 and words.startswith("eintausend"):
+            words = words[3:]
+        return f"minus {words}" if match.group("sign") == "-" else words
+
+    spoken = re.sub(
+        r"(?<![\w.])(?P<sign>-?)(?P<number>[1-9]\d{0,2}(?:\.\d{3})+)(?!\.\d|\d|\w)",
+        grouped_thousands,
+        spoken,
+    )
+
+    preserved_dotted_numbers = []
+
+    def preserve_ambiguous_dotted_number(match):
+        token = chr(0xE000 + len(preserved_dotted_numbers))
+        preserved_dotted_numbers.append((token, match.group(0)))
+        return token
+
+    # Nicht erkannte Punktzahlen können Versionen oder fremdformatierte Dezimalzahlen sein.
+    spoken = re.sub(
+        r"(?<!\d)\d+(?:\.\d+)+(?!\d)",
+        preserve_ambiguous_dotted_number,
+        spoken,
+    )
+
+    def phone_number(match):
+        groups = re.split(r"[ \t\u00a0]+", match.group(0).strip())
+        if not groups[0].startswith("0") and sum(map(len, groups)) < 7:
+            return match.group(0)
+        return ", ".join(_digit_sequence_to_german_words(group) for group in groups)
+
+    spoken = re.sub(
+        r"(?<![\w.])\d+(?:[ \t\u00a0]+\d+)*(?!\w)",
+        phone_number,
+        spoken,
+    )
+
+    def kilograms(match):
+        value = match.group("number")
+        words = (
+            _decimal_to_german_words(value)
+            if "," in value
+            else _number_to_german_words(int(value))
+        )
+        return f"{words} Kilo"
+
+    spoken = re.sub(
+        r"(?<!\w)(?P<number>-?\d+(?:,\d+)?)\s*kg\b",
+        kilograms,
+        spoken,
+        flags=re.IGNORECASE,
+    )
+
     def percent(match):
         number = match.group(1)
         words = _decimal_to_german_words(number) if "," in number else _number_to_german_words(int(number))
         return f"{words} Prozent"
 
-    spoken = re.sub(r"(?<!\w)(\d+(?:,\d+)?)\s*%(?!\w)", percent, spoken)
+    spoken = re.sub(r"(?<!\w)(-?\d+(?:,\d+)?)\s*%(?!\w)", percent, spoken)
     spoken = re.sub(
-        r"(?<!\w)(\d+),(\d+)(?!\w)",
+        r"(?<!\w)(-?\d+),(\d+)(?!\w)",
         lambda match: _decimal_to_german_words(match.group(0)),
         spoken,
     )
-    return re.sub(
+    spoken = re.sub(
+        r"(?<![\w.])-(\d+)(?!\w)",
+        lambda match: _number_to_german_words(-int(match.group(1))),
+        spoken,
+    )
+    spoken = re.sub(
         r"(?<!\w)\d+(?!\w)",
         lambda match: _number_to_german_words(int(match.group(0))),
         spoken,
     )
+    for token, original in preserved_dotted_numbers:
+        spoken = spoken.replace(token, original)
+    return spoken
 
 
 def _synth(text: str, speed: float) -> bytes:

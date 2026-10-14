@@ -658,5 +658,41 @@ def test_cartesia_numeric_date_uses_the_correct_ordinal_case():
     ) == "am zwölften Oktober und zwölfter Oktober; außerdem zwanzig Prozent."
 
 
-def test_cartesia_non_date_dot_numbers_do_not_break_number_speech():
-    assert tts._numbers_to_german_words("Version 1.13.5") == "Version eins.dreizehn.fünf"
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("1.234 Schritte", "tausendzweihundertvierunddreißig Schritte"),
+        ("2.000 kcal", "zweitausend kcal"),
+        ("Dein Ruhepuls ist 53.", "Dein Ruhepuls ist dreiundfünfzig."),
+        ("im 3. Satz", "im dritten Satz"),
+        ("der 3. Satz", "der dritte Satz"),
+        ("3. Satz", "Dritter Satz"),
+        ("Version 3.14", "Version drei Punkt vierzehn"),
+        ("Version 1.2.3", "Version eins Punkt zwei Punkt drei"),
+        ("Version 1.13.5", "Version eins Punkt dreizehn Punkt fünf"),
+        ("24:00 Uhr", "vierundzwanzig Uhr"),
+        ("vom 12. auf den 13. Oktober", "vom zwölften auf den dreizehnten Oktober"),
+        ("vom 12.–14.10.", "vom zwölften bis vierzehnten Oktober"),
+        ("2026", "zweitausendsechsundzwanzig"),
+        ("-3 Grad", "minus drei Grad"),
+        ("1234567", "eins zwei drei vier fünf sechs sieben"),
+        ("123 4567", "eins zwei drei, vier fünf sechs sieben"),
+        (
+            "0911 0123456",
+            "null neun eins eins, null eins zwei drei vier fünf sechs",
+        ),
+        ("2,5 kg", "zwei Komma fünf Kilo"),
+        ("2,5kg", "zwei Komma fünf Kilo"),
+        ("Wert 3.14", "Wert 3.14"),
+    ],
+)
+def test_cartesia_number_spelling_handles_review_regressions(text, expected):
+    assert tts._numbers_to_german_words(text) == expected
+
+
+def test_numbers_versions_and_two_digit_years():
+    from core import tts
+    assert tts._numbers_to_german_words("Version 3.14 und 1.2.3") == "Version drei Punkt vierzehn und eins Punkt zwei Punkt drei"
+    assert tts._numbers_to_german_words("Update auf v2.4.1 ist da") == "Update auf Version zwei Punkt vier Punkt eins ist da"
+    assert tts._numbers_to_german_words("am 12.10.26") == "am zwölften Oktober zweitausendsechsundzwanzig"
+    assert tts._numbers_to_german_words("am 12.10.2026") == "am zwölften Oktober zweitausendsechsundzwanzig"
