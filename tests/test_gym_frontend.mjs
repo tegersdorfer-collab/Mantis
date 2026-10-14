@@ -42,14 +42,44 @@ function createFrontend({
   const calls = [];
   const documentListeners = new Map();
   const windowListeners = new Map();
+  const draftInputs = [];
+  const screen = {
+    _innerHTML: "",
+    get innerHTML() { return this._innerHTML; },
+    set innerHTML(value) {
+      this._innerHTML = value;
+      draftInputs.length = 0;
+      for (const match of value.matchAll(/<input\b(?=[^>]*\bdata-draft-input\b)([^>]*)>/g)) {
+        const attributes = match[1];
+        const attribute = (name) => attributes.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1];
+        let currentValue = attribute("value") ?? "";
+        draftInputs.push({
+          dataset: {
+            clientId: attribute("data-client-id"),
+            index: attribute("data-index"),
+            field: attribute("data-field"),
+          },
+          matches: (selector) => selector === "[data-draft-input]",
+          writeCount: 0,
+          get value() { return currentValue; },
+          set value(value) { currentValue = String(value); this.writeCount += 1; },
+        });
+      }
+    },
+    querySelector: () => null,
+    querySelectorAll(selector) {
+      return selector === "[data-draft-input]" ? draftInputs : [];
+    },
+  };
   const elements = new Map([
-    ["#screen", { innerHTML: "", querySelector: () => null }],
+    ["#screen", screen],
     ["#timer-host", { innerHTML: "" }],
     ["#sync-host", { innerHTML: "" }],
     ["#notice-host", { innerHTML: "" }],
   ]);
   let reloads = 0;
   let intervalId = 0;
+  let clientIdSequence = 0;
   const context = vm.createContext({
     document: {
       body: { classList: { toggle() {}, remove() {}, add() {} } },
@@ -84,7 +114,7 @@ function createFrontend({
       get(key) { return key === "token" ? this.form.token : null; }
     },
     URLSearchParams,
-    crypto: { randomUUID: () => "vm-generated-client-id" },
+    crypto: { randomUUID: () => `vm-generated-client-id-${++clientIdSequence}` },
     setInterval: () => { intervalId += 1; return intervalId; },
     clearInterval() {},
   });
@@ -98,19 +128,31 @@ function createFrontend({
     windowListeners,
     get reloads() { return reloads; },
     click(action, data = {}) {
-      const button = { dataset: { action, ...data } };
+      const dataset = { action, ...data };
+      if (action === "log-draft" && data.index !== undefined) {
+        const input = draftInputs.find((entry) => entry.dataset.index === String(data.index)
+          && entry.dataset.field === "weight_kg");
+        dataset.clientId = input?.dataset.clientId;
+      }
+      const button = { dataset };
       return documentListeners.get("click")({
         target: { closest: (selector) => selector === "[data-action]" ? button : null },
       });
     },
     input(index, field, value) {
-      const input = {
-        dataset: { index: String(index), field },
-        value,
-        matches: (selector) => selector === "[data-draft-input]",
-      };
-      return documentListeners.get("input")({ target: input });
+      const input = draftInputs.find((entry) => entry.dataset.index === String(index)
+        && entry.dataset.field === field);
+      if (!input) throw new Error(`Missing visible draft input: ${index}/${field}`);
+      input.value = value;
+      input.writeCount = 0;
+      documentListeners.get("input")({ target: input });
+      return input;
     },
+    draftInput(index, field) {
+      return draftInputs.find((entry) => entry.dataset.index === String(index)
+        && entry.dataset.field === field);
+    },
+    draftInputs() { return [...draftInputs]; },
     submit(token) {
       return documentListeners.get("submit")({
         target: { id: "login-form", token },
@@ -327,6 +369,126 @@ test("Änderungen an vorbefüllten Werten übernehmen offene Folgezeilen ohne ei
 
   assert.equal(app.run('JSON.stringify(drafts.get("Squats").map((draft) => [draft.weight_kg, draft.reps]))'),
     JSON.stringify([["62,5", "7"], ["62,5", "8"], ["62,5", "8"]]));
+});
+
+test("Input aktualisiert sichtbare Folgefelder und ✓ sendet den angezeigten Wert", async () => {
+  const state = makeState({
+    prefill: [
+      { weight_kg: 60, reps: 10 },
+      { weight_kg: 60, reps: 10 },
+      { weight_kg: 60, reps: 10 },
+    ],
+  });
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sets") {
+        const item = JSON.parse(options.body);
+        const saved = { ...item, id: 31, set_index: 1 };
+        state.exercises[0].logged.push(saved);
+        return response(201, saved);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  const activeInput = app.input(0, "weight_kg", "62,5");
+  const nextInput = app.draftInput(1, "weight_kg");
+
+  assert.equal(activeInput.value, "62,5");
+  assert.equal(activeInput.writeCount, 0);
+  assert.equal(nextInput.value, "62,5");
+
+  await app.click("log-draft", { index: "1" });
+
+  const sent = app.calls.find((call) => call.url === "/api/sets");
+  assert.equal(JSON.parse(sent.body).weight_kg, 62.5);
+});
+
+test("parallele Direktversände entfernen gespeicherte Drafts anhand ihrer ID", async () => {
+  const state = makeState({
+    prefill: [
+      { weight_kg: 50, reps: 8 },
+      { weight_kg: 60, reps: 6 },
+      { weight_kg: 70, reps: 4 },
+    ],
+  });
+  const pendingResponses = [];
+  const app = createFrontend({
+    fetch: async (url, _options, call) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sets") {
+        const item = JSON.parse(call.body);
+        return new Promise((resolve) => pendingResponses.push({ item, resolve }));
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    failSetItem: (key) => key === "gym_queue",
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  const saveSecondRow = app.click("log-draft", { index: "1" });
+  assert.equal(await waitFor(() => pendingResponses.length === 1), true);
+  const saveFirstRow = app.click("log-draft", { index: "0" });
+  assert.equal(await waitFor(() => pendingResponses.length === 2), true);
+
+  const firstItem = pendingResponses[1].item;
+  pendingResponses[1].resolve(response(201, { ...firstItem, id: 41, set_index: 1 }));
+  await saveFirstRow;
+  const secondItem = pendingResponses[0].item;
+  pendingResponses[0].resolve(response(201, { ...secondItem, id: 42, set_index: 2 }));
+  await saveSecondRow;
+
+  const remainingWeights = app.draftInputs().filter((input) => input.dataset.field === "weight_kg");
+  const remainingReps = app.draftInputs().filter((input) => input.dataset.field === "reps");
+  assert.deepEqual(remainingWeights.map((input) => input.value), ["70"]);
+  assert.deepEqual(remainingReps.map((input) => input.value), ["4"]);
+  assert.match(app.elements.get("#screen").innerHTML, /data-set-id="41"/);
+  assert.match(app.elements.get("#screen").innerHTML, /data-set-id="42"/);
+  assert.equal(app.elements.get("#screen").innerHTML.includes('data-action="log-draft"'), true);
+});
+
+test("Training beenden wartet auf einen laufenden Direktversand und blockiert bei fehlender Bestätigung", async () => {
+  let resolveDirectSend;
+  let finishRequested = false;
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sets") {
+        return new Promise((resolve) => { resolveDirectSend = resolve; });
+      }
+      if (url === "/api/finish") {
+        finishRequested = true;
+        return response(200, { duration_min: 1, sets: 1, volume_kg: 600 });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+    failSetItem: (key) => key === "gym_queue",
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  app.input(0, "weight_kg", "60");
+  app.input(0, "reps", "10");
+  const sending = app.click("log-draft", { index: "0" });
+  assert.equal(await waitFor(() => typeof resolveDirectSend === "function"), true);
+
+  const finishing = app.click("finish");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(finishRequested, false);
+
+  resolveDirectSend(response(503, { detail: "offline" }));
+  await sending;
+  await finishing;
+
+  assert.equal(finishRequested, false);
+  assert.match(app.elements.get("#notice-host").innerHTML, /nicht gespeichert/i);
 });
 
 test("hinzugefügte Satzzeilen unterstützen ebenfalls Änderungen und automatische Übernahme", async () => {

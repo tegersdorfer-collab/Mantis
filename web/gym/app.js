@@ -23,6 +23,8 @@ queue = queue.filter((item) => item && typeof item.client_id === "string"
   && typeof item.exercise === "string" && Number.isFinite(Number(item.weight_kg))
   && Number.isInteger(Number(item.reps)));
 let flushPromise = null;
+const activeSetSends = new Set();
+const unconfirmedSetIds = new Set(queue.map((item) => item.client_id));
 let timerEnd = Number(readStored("gym_timer_end", 0)) || 0;
 let timerInterval = null;
 let clientCounter = 0;
@@ -42,6 +44,21 @@ function writeStored(key, value) {
     return true;
   } catch (_error) {
     return false;
+  }
+}
+
+function trackSetSend(promise) {
+  activeSetSends.add(promise);
+  promise.then(
+    () => activeSetSends.delete(promise),
+    () => activeSetSends.delete(promise),
+  );
+  return promise;
+}
+
+async function waitForSetSends() {
+  while (activeSetSends.size) {
+    await Promise.allSettled([...activeSetSends]);
   }
 }
 
@@ -101,6 +118,7 @@ function makeDraft(weight, reps, autoFilled) {
   const weightValue = inputWeight(weight);
   const repsValue = String(reps ?? "");
   return {
+    client_id: createClientId(),
     weight_kg: weightValue,
     reps: repsValue,
     autoFilled: autoFilled ? { weight_kg: weightValue, reps: repsValue } : null,
@@ -120,21 +138,30 @@ function draftsFor(exercise) {
   return drafts.get(exercise.name);
 }
 
-function updateDraftField(exercise, index, field, value) {
+function updateDraftField(exercise, clientId, field, value) {
   const list = draftsFor(exercise);
-  const draft = list[index];
+  const draftIndex = list.findIndex((entry) => entry.client_id === clientId);
+  const draft = list[draftIndex];
   if (!draft) return;
   const previous = draft[field];
   if (previous === value) return;
   draft[field] = value;
   draft.userChanged[field] = true;
 
-  for (let nextIndex = index + 1; nextIndex < list.length; nextIndex += 1) {
+  for (let nextIndex = draftIndex + 1; nextIndex < list.length; nextIndex += 1) {
     const next = list[nextIndex];
     if (next.userChanged[field] || next.autoFilled?.[field] !== previous || next[field] !== previous) continue;
     next[field] = value;
     next.autoFilled[field] = value;
+    for (const input of screen.querySelectorAll("[data-draft-input]")) {
+      if (input.dataset.clientId === next.client_id && input.dataset.field === field) input.value = value;
+    }
   }
+}
+
+function removeDraft(exercise, clientId) {
+  const list = draftsFor(exercise);
+  drafts.set(exercise.name, list.filter((draft) => draft.client_id !== clientId));
 }
 
 function renderBrand() {
@@ -173,7 +200,7 @@ function renderHome() {
     <section class="exercise-list" aria-label="Übungen">${list}</section>`;
 }
 
-function measureControl(field, value, mode, index, unit) {
+function measureControl(field, value, mode, index, unit, clientId = "") {
   const inputMode = field === "weight_kg" ? "decimal" : "numeric";
   const ariaLabel = field === "weight_kg" ? "Gewicht in Kilogramm" : "Wiederholungen";
   const action = mode === "edit" ? "adjust-edit" : "adjust-draft";
@@ -181,15 +208,16 @@ function measureControl(field, value, mode, index, unit) {
   const renderedValue = fieldName === "weight_kg" ? inputWeight(value) : String(value ?? "");
   const inputAttribute = mode === "edit"
     ? `data-edit-input data-field="${fieldName}"`
-    : `data-draft-input data-index="${index}" data-field="${fieldName}"`;
+    : `data-draft-input data-client-id="${escapeHtml(clientId)}" data-index="${index}" data-field="${fieldName}"`;
+  const clientAttribute = mode === "edit" ? "" : `data-client-id="${escapeHtml(clientId)}"`;
   return `<div class="measure-cell">
     <div class="measure-control">
       <button type="button" aria-label="${fieldName === "weight_kg" ? "Gewicht" : "Wiederholungen"} verringern"
-        data-action="${action}" data-field="${fieldName}" data-index="${index}" data-step="-1">−</button>
+        data-action="${action}" data-field="${fieldName}" data-index="${index}" ${clientAttribute} data-step="-1">−</button>
       <input ${inputAttribute} inputmode="${inputMode}" value="${escapeHtml(renderedValue)}"
         aria-label="${ariaLabel}" autocomplete="off">
       <button type="button" aria-label="${fieldName === "weight_kg" ? "Gewicht" : "Wiederholungen"} erhöhen"
-        data-action="${action}" data-field="${fieldName}" data-index="${index}" data-step="1">+</button>
+        data-action="${action}" data-field="${fieldName}" data-index="${index}" ${clientAttribute} data-step="1">+</button>
     </div>
     <span class="measure-unit">${unit}</span>
   </div>`;
@@ -212,9 +240,9 @@ function renderLoggedRow(set) {
 function renderDraftRow(draft, index, setNumber) {
   return `<div class="set-row">
     <span class="set-number">${setNumber}</span>
-    ${measureControl("weight_kg", draft.weight_kg, "draft", index, "kg")}
-    ${measureControl("reps", draft.reps, "draft", index, "Wdh.")}
-    <button class="check-button" type="button" data-action="log-draft" data-index="${index}"
+    ${measureControl("weight_kg", draft.weight_kg, "draft", index, "kg", draft.client_id)}
+    ${measureControl("reps", draft.reps, "draft", index, "Wdh.", draft.client_id)}
+    <button class="check-button" type="button" data-action="log-draft" data-client-id="${escapeHtml(draft.client_id)}" data-index="${index}"
       aria-label="Satz ${setNumber} speichern">✓</button>
   </div>`;
 }
@@ -440,6 +468,7 @@ function removePending(clientId) {
 }
 
 function keepSavedSet(item, saved) {
+  unconfirmedSetIds.delete(item.client_id);
   const exercise = appState?.exercises?.find((entry) => entry.name === item.exercise);
   if (!exercise || !saved?.id) return;
   removePending(item.client_id);
@@ -536,7 +565,7 @@ function flushQueue() {
   if (!queue.length) return Promise.resolve(true);
   if (screenMode !== "app") return Promise.resolve(false);
 
-  flushPromise = (async () => {
+  const sending = (async () => {
     let serverChanged = false;
     let validationRejected = false;
     while (queue.length) {
@@ -578,6 +607,7 @@ function flushQueue() {
         queue = queue.slice(1);
         writeStored("gym_queue", queue);
         removePending(item.client_id);
+        unconfirmedSetIds.delete(item.client_id);
         notice = failure.error || failure.detail || "Der Satz war ungültig und wurde verworfen.";
         validationRejected = true;
         continue;
@@ -594,10 +624,11 @@ function flushQueue() {
       if (screenMode === "app" && selectedExercise) await loadHistory(selectedExercise);
     }
     return queue.length === 0 && !validationRejected && screenMode === "app";
-  })().finally(() => {
+  })();
+  flushPromise = trackSetSend(sending.finally(() => {
     flushPromise = null;
     render();
-  });
+  }));
   return flushPromise;
 }
 
@@ -633,10 +664,10 @@ function addDraft() {
   render();
 }
 
-async function logDraft(index) {
+async function logDraft(clientId) {
   const exercise = currentExercise();
   const list = exercise ? draftsFor(exercise) : [];
-  const draft = list[index];
+  const draft = list.find((entry) => entry.client_id === clientId);
   if (!exercise || !draft) return;
   const weight = parseDecimal(draft.weight_kg);
   const reps = Number(String(draft.reps).trim());
@@ -646,52 +677,53 @@ async function logDraft(index) {
     return;
   }
 
-  const clientId = createClientId();
   const item = {
     client_id: clientId,
     exercise: exercise.name,
     weight_kg: weight,
     reps,
   };
+  unconfirmedSetIds.add(clientId);
 
   if (!writeStored("gym_queue", [...queue, item])) {
-    try {
-      const response = await fetch("/api/sets", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(item),
-      });
-      if (response.status === 401 || response.status === 403) {
-        screenMode = "login";
-        loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
-        notice = "Satz nicht gespeichert. Bitte nach der Anmeldung erneut abhaken.";
-        render();
-        return;
-      }
-      if (!response.ok) {
-        const failure = await response.json().catch(() => ({}));
-        const detail = failure.error || failure.detail;
-        notice = detail
-          ? `Satz nicht gespeichert. ${detail}`
-          : "Satz nicht gespeichert. Bitte Verbindung prüfen und erneut abhaken.";
-        render();
-        return;
-      }
+    const saved = await trackSetSend((async () => {
+      try {
+        const response = await fetch("/api/sets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(item),
+        });
+        if (response.status === 401 || response.status === 403) {
+          screenMode = "login";
+          loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
+          notice = "Satz nicht gespeichert. Bitte nach der Anmeldung erneut abhaken.";
+          return false;
+        }
+        if (!response.ok) {
+          const failure = await response.json().catch(() => ({}));
+          const detail = failure.error || failure.detail;
+          notice = detail
+            ? `Satz nicht gespeichert. ${detail}`
+            : "Satz nicht gespeichert. Bitte Verbindung prüfen und erneut abhaken.";
+          return false;
+        }
 
-      const saved = await response.json().catch(() => null);
-      if (!saved?.id) {
-        notice = "Satz nicht gespeichert. Die Serverbestätigung fehlt; bitte erneut abhaken.";
-        render();
-        return;
+        const confirmation = await response.json().catch(() => null);
+        if (!confirmation?.id) {
+          notice = "Satz nicht gespeichert. Die Serverbestätigung fehlt; bitte erneut abhaken.";
+          return false;
+        }
+        keepSavedSet(item, confirmation);
+        removeDraft(exercise, clientId);
+        notice = "Satz synchronisiert. Die lokale Offline-Speicherung ist nicht verfügbar.";
+        startTimer(exercise.rest_s);
+        return true;
+      } catch (_error) {
+        notice = "Satz nicht gespeichert. Bitte Verbindung prüfen und erneut abhaken.";
+        return false;
       }
-      keepSavedSet(item, saved);
-      list.splice(index, 1);
-      notice = "Satz synchronisiert. Die lokale Offline-Speicherung ist nicht verfügbar.";
-      startTimer(exercise.rest_s);
-      if (selectedExercise) await loadHistory(selectedExercise);
-    } catch (_error) {
-      notice = "Satz nicht gespeichert. Bitte Verbindung prüfen und erneut abhaken.";
-    }
+    })());
+    if (saved && selectedExercise) await loadHistory(selectedExercise);
     render();
     return;
   }
@@ -703,7 +735,7 @@ async function logDraft(index) {
     reps,
     set_index: exercise.logged.length + 1,
   });
-  list.splice(index, 1);
+  removeDraft(exercise, clientId);
   notice = "";
   startTimer(exercise.rest_s);
   render();
@@ -775,7 +807,8 @@ async function deleteEdit() {
 async function finishTraining() {
   if (!window.confirm("Training beenden und Session speichern?")) return;
   const synchronized = await flushQueue();
-  if (!synchronized || queue.length) {
+  await waitForSetSends();
+  if (!synchronized || queue.length || unconfirmedSetIds.size) {
     if (!notice) notice = "Erst synchronisieren, bevor du das Training beendest.";
     render();
     return;
@@ -798,7 +831,7 @@ document.addEventListener("input", (event) => {
   const input = event.target;
   if (input.matches("[data-draft-input]")) {
     const exercise = currentExercise();
-    if (exercise) updateDraftField(exercise, Number(input.dataset.index), input.dataset.field, input.value);
+    if (exercise) updateDraftField(exercise, input.dataset.clientId, input.dataset.field, input.value);
   } else if (input.matches("[data-edit-input]") && editingSet) {
     editingSet[input.dataset.field] = input.value;
   }
@@ -849,12 +882,12 @@ document.addEventListener("click", async (event) => {
   } else if (action === "add-draft") {
     addDraft();
   } else if (action === "log-draft") {
-    await logDraft(Number(button.dataset.index));
+    await logDraft(button.dataset.clientId);
   } else if (action === "adjust-draft") {
     const exercise = currentExercise();
-    const draft = exercise && draftsFor(exercise)[Number(button.dataset.index)];
+    const draft = exercise && draftsFor(exercise).find((entry) => entry.client_id === button.dataset.clientId);
     if (draft) {
-      updateDraftField(exercise, Number(button.dataset.index), button.dataset.field, changedValue(
+      updateDraftField(exercise, draft.client_id, button.dataset.field, changedValue(
         draft[button.dataset.field], button.dataset.field, Number(button.dataset.step),
       ));
       render();
