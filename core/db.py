@@ -658,10 +658,14 @@ MIGRATIONS = [
         purpose       TEXT DEFAULT 'chat',     -- chat-agent | background
         input_tokens  INT DEFAULT 0,
         output_tokens INT DEFAULT 0,
+        cache_creation_input_tokens INT DEFAULT 0,
+        cache_read_input_tokens INT DEFAULT 0,
         cost_usd      NUMERIC(10,6) DEFAULT 0,
         created_at    TIMESTAMPTZ DEFAULT NOW()
     );
     """,
+    "ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS cache_creation_input_tokens INT DEFAULT 0;",
+    "ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS cache_read_input_tokens INT DEFAULT 0;",
     "CREATE INDEX IF NOT EXISTS llm_usage_created_idx ON llm_usage (created_at DESC);",
 
     # Accountability & Momentum (v0: Daily Anchor + Der Block).

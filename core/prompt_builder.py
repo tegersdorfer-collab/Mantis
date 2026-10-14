@@ -12,6 +12,20 @@ import config
 log = logging.getLogger(__name__)
 
 
+class CacheableSystemPrompt(str):
+    """Systemtext mit Metadaten, wo der stabile, cachebare Präfix endet."""
+
+    def __new__(cls, value: str, cache_prefix: str):
+        prompt = super().__new__(cls, value)
+        prompt.cache_prefix = cache_prefix
+        return prompt
+
+    def __add__(self, suffix: str):
+        if not isinstance(suffix, str):
+            return NotImplemented
+        return type(self)(super().__add__(suffix), cache_prefix=self.cache_prefix)
+
+
 class PromptBuilder:
     def __init__(self, embed_llm, lzg, kzg, kg, reflection, dashboard, forgetting, identity: str):
         self.embed_llm  = embed_llm
@@ -146,6 +160,7 @@ class PromptBuilder:
             "ZEIT/DATUM: Nutze den Wert aus '## Aktuell'. Für Termine: 'morgen 14:00', 'heute 18:30' "
             "oder 'TT.MM.JJJJ HH:MM' – immer LOKALE Zeit, niemals UTC.\n"
         )
+        cache_prefix = prompt
         if warm_profile:
             prompt += f"\n{warm_profile}\n"
         if dir_ctx:
@@ -162,4 +177,4 @@ class PromptBuilder:
         if dash_ctx:
             prompt += f"\n## Live-Daten (Dashboard):\n{dash_ctx}\n"
         prompt += f"\n## Aktuell:\n{now_str}\n"
-        return prompt
+        return CacheableSystemPrompt(prompt, cache_prefix=cache_prefix)

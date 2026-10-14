@@ -179,6 +179,10 @@ async def main():
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
 
     await orchestrator.start()
+    from core.voice import schedule_parakeet_preload
+    preload_task = schedule_parakeet_preload()
+    if preload_task is not None:
+        orchestrator._bg_tasks.append(preload_task)
     asyncio.create_task(api_server.serve())
     log.info(f"🖥️  Dashboard läuft auf http://{dashboard_host}:{cfg.DASHBOARD_PORT} (bindet auf {dashboard_host})")
     if cfg.GYM_ENABLED:

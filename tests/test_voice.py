@@ -35,6 +35,16 @@ def whisper_engine(monkeypatch):
 class TestTranscribeParakeet:
     """Parakeet ist seit 22.09.2026 die Default-Engine (Benchmark: Weckname 72 % vs 28 %)."""
 
+    @pytest.fixture(autouse=True)
+    def _model_not_in_external_cache(self, monkeypatch):
+        import huggingface_hub
+
+        def cache_miss(_repo_id, _filename, *, local_files_only=False, **_kwargs):
+            assert local_files_only is True
+            raise FileNotFoundError("Testmodell nicht im lokalen HF-Cache")
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", cache_miss)
+
     def setup_method(self):
         voice._parakeet_model = None
         voice._parakeet_unavailable = False
@@ -57,6 +67,127 @@ class TestTranscribeParakeet:
             text = asyncio.run(voice.transcribe_audio("/tmp/fake.wav"))
         assert text == "Okay Mantis"
         mod.from_pretrained.assert_called_once_with(voice.config.STT_PARAKEET_MODEL)
+
+    @pytest.mark.parametrize(("raw", "expected"), [
+        ("Mantasy sehen …", "Mantis sehen …"),
+        ("Bantas, erzähl mir was.", "Mantis, erzähl mir was."),
+        ("mantes, erzähl mir was.", "Mantis, erzähl mir was."),
+        ("mantiss, erzähl mir was.", "Mantis, erzähl mir was."),
+        ("mentis, erzähl mir was.", "Mantis, erzähl mir was."),
+        ("mandis, erzähl mir was.", "Mantis, erzähl mir was."),
+        ("mäntis, erzähl mir was.", "Mantis, erzähl mir was."),
+        ("mantus, erzähl mir was.", "Mantis, erzähl mir was."),
+        ("mandes, erzähl mir was.", "Mantis, erzähl mir was."),
+        ("mantir, erzähl mir was.", "Mantis, erzähl mir was."),
+        ("Hey, mantes, mach weiter.", "Hey, Mantis, mach weiter."),
+        ("mantis, erzähl mir was.", "Mantis, erzähl mir was."),
+        ("Mangos kaufen", "Mangos kaufen"),
+        ("Mangas kaufen", "Mangas kaufen"),
+        ("Martin kaufen", "Martin kaufen"),
+        ("Nantes kaufen", "Nantes kaufen"),
+        ("Mantel anziehen", "Mantel anziehen"),
+        ("Mandeln kaufen", "Mandeln kaufen"),
+        ("Manchmal regnet es", "Manchmal regnet es"),
+        ("Mantra kaufen", "Mantra kaufen"),
+        ("Mandarin kaufen", "Mandarin kaufen"),
+        ("Bantu kaufen", "Bantu kaufen"),
+        ("Bandas, erzähl mir was.", "Bandas, erzähl mir was."),
+        ("Bitte Mantasy erklären", "Bitte Mantasy erklären"),
+    ])
+    def test_normalisiert_nur_mantis_aehnliches_erstes_wort(self, monkeypatch, raw, expected):
+        monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
+        model = MagicMock()
+        model.transcribe.return_value = MagicMock(text=raw)
+        voice._parakeet_model = model
+
+        text = asyncio.run(voice.transcribe_audio("/tmp/fake.wav"))
+
+        assert text == expected
+
+    def test_lader_nutzt_hf_cache_zuerst_ohne_netzwerk(self, monkeypatch, tmp_path):
+        import huggingface_hub
+
+        snapshot = tmp_path / "snapshot"
+        snapshot.mkdir()
+        (snapshot / "config.json").write_text("{}")
+        (snapshot / "model.safetensors").write_bytes(b"weights")
+        calls = []
+
+        def cached_download(repo_id, filename, *, local_files_only=False, **_kwargs):
+            calls.append((repo_id, filename, local_files_only))
+            assert local_files_only is True
+            return str(snapshot / filename)
+
+        expected_model = object()
+        package = MagicMock(from_pretrained=MagicMock(return_value=expected_model))
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", cached_download)
+        monkeypatch.setitem(sys.modules, "parakeet_mlx", package)
+
+        loaded = voice._load_parakeet_model("mlx-community/parakeet-tdt-0.6b-v3")
+
+        assert loaded is expected_model
+        assert calls == [
+            ("mlx-community/parakeet-tdt-0.6b-v3", "config.json", True),
+            ("mlx-community/parakeet-tdt-0.6b-v3", "model.safetensors", True),
+        ]
+        package.from_pretrained.assert_called_once_with(str(snapshot))
+
+    def test_lader_downloadet_nur_wenn_hf_cache_fehlgeschlagen_ist(self, monkeypatch):
+        import huggingface_hub
+
+        def cache_miss(_repo_id, _filename, *, local_files_only=False, **_kwargs):
+            assert local_files_only is True
+            raise FileNotFoundError("nicht im Cache")
+
+        package = MagicMock(from_pretrained=MagicMock(return_value="model"))
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", cache_miss)
+        monkeypatch.setitem(sys.modules, "parakeet_mlx", package)
+
+        assert voice._load_parakeet_model("mlx-community/parakeet-tdt-0.6b-v3") == "model"
+
+        package.from_pretrained.assert_called_once_with("mlx-community/parakeet-tdt-0.6b-v3")
+
+    def test_vorladen_startet_im_hintergrund_und_fehler_brechen_nicht_durch(self, monkeypatch):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
+        monkeypatch.setattr(voice.config, "STT_PRELOAD", True, raising=False)
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-parakeet")
+        monkeypatch.setattr(voice, "_parakeet_executor", executor)
+        caller_thread = threading.get_ident()
+        loader_threads = []
+
+        def fail_load(_model_id):
+            loader_threads.append(threading.get_ident())
+            raise RuntimeError("Modell fehlt")
+
+        monkeypatch.setattr(voice, "_load_parakeet_model", fail_load)
+
+        async def run_preload():
+            task = voice.schedule_parakeet_preload()
+            assert task is not None
+            await task
+
+        asyncio.run(run_preload())
+        executor.shutdown(wait=True)
+
+        assert loader_threads and loader_threads[0] != caller_thread
+        assert voice._parakeet_unavailable is False
+
+    def test_vorladen_ist_per_setting_abschaltbar(self, monkeypatch):
+        monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
+        monkeypatch.setattr(voice.config, "STT_PRELOAD", False, raising=False)
+        monkeypatch.setattr(voice, "_load_parakeet_model", lambda _model_id: pytest.fail("soll nicht laden"))
+
+        assert voice.schedule_parakeet_preload() is None
+
+    def test_vorladen_laedt_nicht_wenn_whisper_ausgewaehlt_ist(self, monkeypatch):
+        monkeypatch.setattr(voice.config, "STT_ENGINE", "whisper")
+        monkeypatch.setattr(voice.config, "STT_PRELOAD", True, raising=False)
+
+        assert voice.schedule_parakeet_preload() is None
+
 
     def test_laedt_modell_nur_einmal(self, monkeypatch):
         monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
@@ -180,6 +311,26 @@ class TestTranscribeParakeet:
                 )
             asyncio.run(run_both())
         assert max_concurrent == 1
+
+
+def test_voice_settings_default_to_short_answers_and_stt_preload(monkeypatch):
+    monkeypatch.delenv("VOICE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("STT_PRELOAD", raising=False)
+    from settings import MantisSettings
+
+    settings = MantisSettings(_env_file=None)
+
+    assert settings.VOICE_MAX_TOKENS == 350
+    assert settings.STT_PRELOAD is True
+
+
+def test_whisper_voice_transcript_also_normalizes_the_initial_wake_word(monkeypatch):
+    monkeypatch.setattr(voice.config, "STT_ENGINE", "whisper")
+    monkeypatch.setattr(
+        voice, "_transcribe_whisper", AsyncMock(return_value="Bantas, zeig mir das."),
+    )
+
+    assert asyncio.run(voice.transcribe_audio("/tmp/fake.wav")) == "Mantis, zeig mir das."
 
 
 class TestTranscribeAudio:

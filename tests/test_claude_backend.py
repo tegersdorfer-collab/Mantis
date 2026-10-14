@@ -111,7 +111,34 @@ def test_claude_usage_preserves_background_purpose(monkeypatch):
 
     backend._record_usage(SimpleNamespace(usage=SimpleNamespace(input_tokens=12, output_tokens=4)))
 
-    assert records == [(('claude', 'claude-haiku-5-5', 12, 4), {"purpose": "background"})]
+    assert records == [(('claude', 'claude-haiku-5-5', 12, 4), {
+        "purpose": "background",
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    })]
+
+
+def test_claude_usage_records_cache_token_counts(monkeypatch):
+    from core import llm_usage
+
+    records = []
+    monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: records.append((args, kwargs)))
+    backend = object.__new__(ClaudeBackend)
+    backend._model = "claude-haiku-5-5"
+    backend._purpose = "chat-agent"
+
+    backend._record_usage(SimpleNamespace(usage=SimpleNamespace(
+        input_tokens=12,
+        output_tokens=4,
+        cache_creation_input_tokens=800,
+        cache_read_input_tokens=1200,
+    )))
+
+    assert records == [(('claude', 'claude-haiku-5-5', 12, 4), {
+        "purpose": "chat-agent",
+        "cache_creation_input_tokens": 800,
+        "cache_read_input_tokens": 1200,
+    })]
 
 
 def test_haiku_55_cost_uses_explicit_estimated_price_table_entry():
@@ -230,7 +257,7 @@ def test_haiku_tool_use_rejects_missing_required_arguments():
         _extract_tool_calls(response, tools)
 
 
-def _claude_request_payload(model):
+def _claude_request_payload(model, *, system=None, tools=None):
     seen = {}
 
     def handler(request):
@@ -253,13 +280,46 @@ def _claude_request_payload(model):
             backend._purpose = "chat-agent"
             backend._client = anthropic.AsyncAnthropic(api_key="test", http_client=http_client)
             backend._record_usage = lambda _response: None
+            messages = [{"role": "user", "content": "hi"}]
+            if system is not None:
+                messages.insert(0, {"role": "system", "content": system})
             result = await backend.call(
-                [{"role": "user", "content": "hi"}], None, None, 0.2, 100,
+                messages, tools, None, 0.2, 100,
             )
         return result
 
     assert asyncio.run(call()) == ("ok", [])
     return seen["body"]
+
+
+def _claude_request_payloads(model, turns):
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "id": f"msg_test_{len(bodies)}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": model,
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+    async def call():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            backend = object.__new__(ClaudeBackend)
+            backend._model = model
+            backend._purpose = "chat-agent"
+            backend._client = anthropic.AsyncAnthropic(api_key="test", http_client=http_client)
+            backend._record_usage = lambda _response: None
+            for messages, tools in turns:
+                assert await backend.call(messages, tools, None, 0.2, 100) == ("ok", [])
+
+    asyncio.run(call())
+    return bodies
 
 
 def test_haiku_55_omits_unsupported_temperature_parameter():
@@ -272,3 +332,97 @@ def test_haiku_55_omits_unsupported_temperature_parameter():
 def test_unallowed_haiku_45_is_rejected_before_request():
     with pytest.raises(ValueError, match="ANTHROPIC_ALLOWED_MODELS"):
         _claude_request_payload("claude-haiku-4-5-20251001")
+
+
+def test_cached_system_prefix_and_tools_are_marked_in_anthropic_request(monkeypatch):
+    from core import tools as toolreg
+    from core.prompt_builder import CacheableSystemPrompt
+
+    first_tool = {"type": "function", "function": {
+        "name": "lookup", "description": "Lookup data",
+        "parameters": {"type": "object", "properties": {}},
+    }}
+    last_tool = {"type": "function", "function": {
+        "name": "create", "description": "Create data",
+        "parameters": {"type": "object", "properties": {}},
+    }}
+    monkeypatch.setattr(toolreg, "ollama_schemas", lambda: [first_tool, last_tool])
+    system = CacheableSystemPrompt(
+        "Stable instructions\n\nRemembered facts and current time",
+        cache_prefix="Stable instructions",
+    )
+
+    payload = _claude_request_payload(
+        "claude-haiku-5-5", system=system, tools=[first_tool, last_tool],
+    )
+
+    assert payload["system"] == [
+        {
+            "type": "text", "text": "Stable instructions",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "text", "text": "\n\nRemembered facts and current time"},
+    ]
+    assert "".join(block["text"] for block in payload["system"]) == str(system)
+    assert payload["tools"] == [
+        {
+            "name": "create", "description": "Create data",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "lookup", "description": "Lookup data",
+            "input_schema": {"type": "object", "properties": {}},
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+
+def test_anthropic_cached_prefix_is_byte_identical_when_selected_tools_change(monkeypatch):
+    from core import tools as toolreg
+    from core.prompt_builder import CacheableSystemPrompt
+
+    # Registry-Einfügereihenfolge absichtlich nicht alphabetisch.
+    monkeypatch.setattr(toolreg, "REGISTRY", {
+        "list_tasks": toolreg.Tool(
+            name="list_tasks", description="List open tasks", parameters={}, handler=lambda: "",
+        ),
+        "get_weather": toolreg.Tool(
+            name="get_weather", description="Get current weather",
+            parameters={"city": {"type": "string"}}, handler=lambda city=None: "",
+        ),
+    })
+    weather_tools = toolreg.ollama_schemas(only=["get_weather"])
+    task_tools = toolreg.ollama_schemas(only=["list_tasks"])
+    stable = "You are Mantis. Follow the user's request carefully."
+    turns = [
+        ([
+            {"role": "system", "content": CacheableSystemPrompt(
+                f"{stable}\n\nWeather turn context", cache_prefix=stable,
+            )},
+            {"role": "user", "content": "Wie ist das Wetter?"},
+        ], weather_tools),
+        ([
+            {"role": "system", "content": CacheableSystemPrompt(
+                f"{stable}\n\nTask turn context", cache_prefix=stable,
+            )},
+            {"role": "user", "content": "Welche Aufgaben sind offen?"},
+        ], task_tools),
+    ]
+
+    weather_payload, task_payload = _claude_request_payloads("claude-haiku-5-5", turns)
+
+    weather_cached_prefix = json.dumps(
+        [weather_payload["tools"], weather_payload["system"][0]],
+        ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    task_cached_prefix = json.dumps(
+        [task_payload["tools"], task_payload["system"][0]],
+        ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    assert weather_cached_prefix == task_cached_prefix
+    assert [tool["name"] for tool in weather_payload["tools"]] == ["get_weather", "list_tasks"]
+    assert weather_payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert weather_payload["messages"][0]["content"][0]["text"] == "Wie ist das Wetter?"
+    assert task_payload["messages"][0]["content"][0]["text"] == "Welche Aufgaben sind offen?"
+    assert weather_payload["system"][1]["text"] == "\n\nWeather turn context"
+    assert task_payload["system"][1]["text"] == "\n\nTask turn context"

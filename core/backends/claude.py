@@ -33,7 +33,44 @@ def _ollama_tools_to_anthropic(tools: list[dict]) -> list[dict]:
             "description": fn.get("description", ""),
             "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
         })
+    if result:
+        # Ein Breakpoint am Ende der Tool-Liste cached deren gemeinsamen Präfix.
+        result[-1]["cache_control"] = {"type": "ephemeral"}
     return result
+
+
+def _stable_anthropic_tool_schemas(tools: list[dict]) -> list[dict]:
+    """Nutzt für Anthropic den vollständigen, stabil sortierten Tool-Katalog."""
+    from core import tools as toolreg
+
+    schemas = toolreg.ollama_schemas()
+    if not schemas:
+        schemas = tools
+    return sorted(
+        schemas,
+        key=lambda tool: str((tool.get("function") or tool).get("name", "")),
+    )
+
+
+def _anthropic_system_content(system: str) -> str | list[dict]:
+    """Markiert nur den stabilen Prompt-Präfix für Anthropic Prompt Caching."""
+    cache_prefix = getattr(system, "cache_prefix", None)
+    if not isinstance(cache_prefix, str) or not cache_prefix or not system.startswith(cache_prefix):
+        return system
+
+    # Repo-Anforderung: anthropic>=0.40.0 (hier auf 0.105.2 aufgelöst). Haiku 5.5
+    # braucht laut Prompt-Caching-Doku
+    # mindestens 512 Prompt-Tokens (Haiku 4.5: 4096); kürzere Präfixe werden still ignoriert.
+    # https://platform.claude.com/docs/en/build-with-claude/prompt-caching#cache-limitations
+    blocks = [{
+        "type": "text",
+        "text": cache_prefix,
+        "cache_control": {"type": "ephemeral"},
+    }]
+    dynamic_suffix = system[len(cache_prefix):]
+    if dynamic_suffix:
+        blocks.append({"type": "text", "text": dynamic_suffix})
+    return blocks
 
 
 def _ollama_msgs_to_anthropic(messages: list[dict]) -> tuple[str | None, list[dict]]:
@@ -210,9 +247,11 @@ class ClaudeBackend(AgentBackend):
         if _supports_temperature(self._model):
             kwargs["temperature"] = temperature
         if system:
-            kwargs["system"] = system
+            kwargs["system"] = _anthropic_system_content(system)
         if tools:
-            kwargs["tools"] = _ollama_tools_to_anthropic(tools)
+            kwargs["tools"] = _ollama_tools_to_anthropic(
+                _stable_anthropic_tool_schemas(tools),
+            )
         if force_tool_call and tools:
             kwargs["tool_choice"] = {"type": "any"}
 
@@ -261,7 +300,13 @@ class ClaudeBackend(AgentBackend):
                 llm_usage.record("claude", self._model,
                                  getattr(u, "input_tokens", 0) or 0,
                                  getattr(u, "output_tokens", 0) or 0,
-                             purpose=self._purpose)
+                             purpose=self._purpose,
+                             cache_creation_input_tokens=(
+                                 getattr(u, "cache_creation_input_tokens", 0) or 0
+                             ),
+                             cache_read_input_tokens=(
+                                 getattr(u, "cache_read_input_tokens", 0) or 0
+                             ))
         except Exception:
             pass
 

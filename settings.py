@@ -36,6 +36,7 @@ class MantisSettings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_NUM_CTX: int = 8192
     OLLAMA_NUM_CTX_OVERRIDES: str = ""
+    VOICE_MAX_TOKENS: int = 350
     VOICE_SILENCE_MS: int = 800
     # ── STT (Sprache → Text) ─────────────────────────────────────────────────
     # "parakeet" (Default seit 22.09.2026) oder "whisper" (whisper.cpp medium, der
@@ -59,6 +60,7 @@ class MantisSettings(BaseSettings):
     TTS_CARTESIA_USD_PER_MILLION_CHARS: float = 65.0  # Pro-Überschuss, 1 Zeichen = 1 Credit
     STT_ENGINE: str = "parakeet"
     STT_PARAKEET_MODEL: str = "mlx-community/parakeet-tdt-0.6b-v3"
+    STT_PRELOAD: bool = True
     ANTHROPIC_API_KEY: str = ""
     ANTHROPIC_ALLOWED_MODELS: list[str] = Field(
         default_factory=lambda: ["claude-haiku-5-5"],
