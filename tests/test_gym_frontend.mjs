@@ -313,6 +313,152 @@ test("bei fehlgeschlagener Queue-Persistenz zeigt ein erfolgreicher Direktversan
   assert.equal(app.elements.get("#screen").innerHTML.includes("data-action=\"log-draft\""), false);
 });
 
+test("Retry nach verlorenem Direktversand korrigiert den idempotenten Satz vor dem Entfernen des Drafts", async () => {
+  const state = makeState({ prefill: [{ weight_kg: 60, reps: 10 }] });
+  const serverSets = new Map();
+  const postBodies = [];
+  const patchBodies = [];
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sets" && options.method === "POST") {
+        const item = JSON.parse(options.body);
+        postBodies.push(item);
+        const existing = serverSets.get(item.client_id);
+        if (existing) return response(200, existing);
+        serverSets.set(item.client_id, { ...item, id: 71, set_index: 1 });
+        throw new Error("response lost after server saved the set");
+      }
+      if (url === "/api/sets/71" && options.method === "PATCH") {
+        const patch = JSON.parse(options.body);
+        patchBodies.push(patch);
+        const [clientId, existing] = serverSets.entries().next().value;
+        const saved = { ...existing, ...patch };
+        serverSets.set(clientId, saved);
+        return response(200, saved);
+      }
+      throw new Error("Unexpected request: " + url);
+    },
+    failSetItem: (key) => key === "gym_queue",
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  await app.click("log-draft", { index: "0" });
+  assert.equal(app.elements.get("#screen").innerHTML.includes('data-action="log-draft"'), true);
+
+  app.input(0, "weight_kg", "70");
+  app.input(0, "reps", "8");
+  await app.click("log-draft", { index: "0" });
+
+  assert.equal(postBodies.length, 2);
+  assert.equal(postBodies[0].client_id, postBodies[1].client_id);
+  assert.deepEqual(patchBodies, [{ weight_kg: 70, reps: 8 }]);
+  assert.equal(serverSets.size, 1);
+  assert.deepEqual(
+    { weight_kg: [...serverSets.values()][0].weight_kg, reps: [...serverSets.values()][0].reps },
+    { weight_kg: 70, reps: 8 },
+  );
+  assert.match(app.elements.get("#screen").innerHTML, /data-set-id="71"/);
+  assert.equal(app.elements.get("#screen").innerHTML.includes('data-action="log-draft"'), false);
+});
+
+test("bei fehlgeschlagenem PATCH bleibt der korrigierte Direktversand-Draft offen", async () => {
+  const state = makeState({ prefill: [{ weight_kg: 60, reps: 10 }] });
+  let postRequests = 0;
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sets" && options.method === "POST") {
+        postRequests += 1;
+        if (postRequests === 1) throw new Error("response lost after server save");
+        return response(200, { client_id: JSON.parse(options.body).client_id, id: 72, weight_kg: 60, reps: 10, set_index: 1 });
+      }
+      if (url === "/api/sets/72" && options.method === "PATCH") {
+        return response(503, { detail: "Patch offline" });
+      }
+      throw new Error("Unexpected request: " + url);
+    },
+    failSetItem: (key) => key === "gym_queue",
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  await app.click("log-draft", { index: "0" });
+  app.input(0, "weight_kg", "70");
+  app.input(0, "reps", "8");
+  await app.click("log-draft", { index: "0" });
+
+  assert.equal(app.elements.get("#screen").innerHTML.includes('data-action="log-draft"'), true);
+  assert.match(app.elements.get("#screen").innerHTML, /value="70"/);
+  assert.match(app.elements.get("#screen").innerHTML, /value="8"/);
+  assert.match(app.elements.get("#notice-host").innerHTML, /Korrektur.*fehlgeschlagen/i);
+});
+
+test("Queue-Einträge werden vor dem Entfernen auf ihre korrigierten Werte gepatcht", async () => {
+  const correctedItem = { ...queuedSet, weight_kg: 70, reps: 8 };
+  const storage = new Map([["gym_queue", JSON.stringify([correctedItem])]]);
+  const serverSets = new Map([[correctedItem.client_id, {
+    ...correctedItem,
+    weight_kg: 60,
+    reps: 10,
+    id: 73,
+    set_index: 1,
+  }]]);
+  const patchBodies = [];
+  const app = createFrontend({
+    storage,
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url === "/api/sets" && options.method === "POST") {
+        const item = JSON.parse(options.body);
+        return response(200, serverSets.get(item.client_id));
+      }
+      if (url === "/api/sets/73" && options.method === "PATCH") {
+        const patch = JSON.parse(options.body);
+        patchBodies.push(patch);
+        const [clientId, existing] = serverSets.entries().next().value;
+        const saved = { ...existing, ...patch };
+        serverSets.set(clientId, saved);
+        return response(200, saved);
+      }
+      throw new Error("Unexpected request: " + url);
+    },
+  });
+
+  assert.equal(await waitFor(() => storage.get("gym_queue") === "[]"), true);
+  assert.deepEqual(patchBodies, [{ weight_kg: 70, reps: 8 }]);
+  assert.equal(serverSets.size, 1);
+  assert.deepEqual(
+    { weight_kg: [...serverSets.values()][0].weight_kg, reps: [...serverSets.values()][0].reps },
+    { weight_kg: 70, reps: 8 },
+  );
+});
+
+test("bei fehlgeschlagenem PATCH bleibt ein korrigierter Queue-Eintrag gespeichert", async () => {
+  const correctedItem = { ...queuedSet, weight_kg: 70, reps: 8 };
+  const storage = new Map([["gym_queue", JSON.stringify([correctedItem])]]);
+  const app = createFrontend({
+    storage,
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url === "/api/sets" && options.method === "POST") {
+        return response(200, { ...queuedSet, id: 74, set_index: 1 });
+      }
+      if (url === "/api/sets/74" && options.method === "PATCH") {
+        return response(503, { detail: "Patch offline" });
+      }
+      throw new Error("Unexpected request: " + url);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#notice-host").innerHTML.includes("Korrektur")), true);
+  assert.equal(storage.get("gym_queue"), JSON.stringify([correctedItem]));
+  assert.match(app.elements.get("#notice-host").innerHTML, /fehlgeschlagen/i);
+});
+
 test("nur definierte Validierungsfehler entfernen Queue-Sätze; andere Status behalten sie", async () => {
   for (const status of [400, 404, 409, 422]) {
     const storage = new Map([["gym_queue", JSON.stringify([queuedSet])]]);
@@ -564,8 +710,9 @@ test("eine erledigte Einzelserie verwendet den Singular", async () => {
 });
 
 test("Verlauf wird nach einem synchronisierten Satz neu geladen", async () => {
+  const syncedItem = { ...queuedSet, weight_kg: 62.5, reps: 9 };
   const storage = new Map([
-    ["gym_queue", JSON.stringify([queuedSet])],
+    ["gym_queue", JSON.stringify([syncedItem])],
     ["gym_view", JSON.stringify("Squats")],
   ]);
   const state = makeState();
@@ -575,7 +722,7 @@ test("Verlauf wird nach einem synchronisierten Satz neu geladen", async () => {
     fetch: async (url) => {
       if (url === "/api/state") return response(200, state);
       if (url === "/api/sets") {
-        const saved = { ...queuedSet, weight_kg: 62.5, reps: 9, id: 12, set_index: 1 };
+        const saved = { ...syncedItem, id: 12, set_index: 1 };
         state.exercises[0].logged.push(saved);
         return response(200, saved);
       }

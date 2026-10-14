@@ -472,15 +472,49 @@ function keepSavedSet(item, saved) {
   const exercise = appState?.exercises?.find((entry) => entry.name === item.exercise);
   if (!exercise || !saved?.id) return;
   removePending(item.client_id);
-  if (!exercise.logged.some((set) => set.id === saved.id)) {
-    exercise.logged.push({
-      id: saved.id,
-      weight_kg: saved.weight_kg,
-      reps: saved.reps,
-      set_index: saved.set_index,
-    });
-    exercise.logged.sort((left, right) => left.set_index - right.set_index);
+  const savedSet = {
+    id: saved.id,
+    weight_kg: saved.weight_kg,
+    reps: saved.reps,
+    set_index: saved.set_index,
+  };
+  const existing = exercise.logged.find((set) => set.id === saved.id);
+  if (existing) Object.assign(existing, savedSet);
+  else exercise.logged.push(savedSet);
+  exercise.logged.sort((left, right) => left.set_index - right.set_index);
+}
+
+async function reconcileSavedSet(item, saved) {
+  const values = {
+    weight_kg: Number(item.weight_kg),
+    reps: Number(item.reps),
+  };
+  if (Number(saved.weight_kg) === values.weight_kg && Number(saved.reps) === values.reps) {
+    return { ok: true, saved };
   }
+
+  try {
+    const { response, payload } = await requestJson(`/api/sets/${saved.id}`, "PATCH", values);
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        message: payload?.error || payload?.detail || `HTTP ${response.status}`,
+      };
+    }
+    return {
+      ok: true,
+      saved: { ...saved, ...payload, ...values },
+    };
+  } catch (_error) {
+    return { ok: false, message: "Keine Verbindung für die Korrektur." };
+  }
+}
+
+function correctionFailureNotice(result) {
+  return result.message
+    ? `Korrektur des gespeicherten Satzes fehlgeschlagen. ${result.message}`
+    : "Korrektur des gespeicherten Satzes fehlgeschlagen. Bitte erneut versuchen.";
 }
 
 async function refreshState() {
@@ -588,9 +622,18 @@ function flushQueue() {
           notice = "Der Satz konnte nicht bestätigt werden und bleibt für den nächsten Sync gespeichert.";
           break;
         }
+        const reconciled = await reconcileSavedSet(item, saved);
+        if (!reconciled.ok) {
+          if (reconciled.status === 401 || reconciled.status === 403) {
+            screenMode = "login";
+            loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
+          }
+          notice = correctionFailureNotice(reconciled);
+          break;
+        }
         queue = queue.slice(1);
         writeStored("gym_queue", queue);
-        keepSavedSet(item, saved);
+        keepSavedSet(item, reconciled.saved);
         serverChanged = true;
         continue;
       }
@@ -713,7 +756,16 @@ async function logDraft(clientId) {
           notice = "Satz nicht gespeichert. Die Serverbestätigung fehlt; bitte erneut abhaken.";
           return false;
         }
-        keepSavedSet(item, confirmation);
+        const reconciled = await reconcileSavedSet(item, confirmation);
+        if (!reconciled.ok) {
+          if (reconciled.status === 401 || reconciled.status === 403) {
+            screenMode = "login";
+            loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
+          }
+          notice = correctionFailureNotice(reconciled);
+          return false;
+        }
+        keepSavedSet(item, reconciled.saved);
         removeDraft(exercise, clientId);
         notice = "Satz synchronisiert. Die lokale Offline-Speicherung ist nicht verfügbar.";
         startTimer(exercise.rest_s);
