@@ -440,6 +440,120 @@ def test_agent_gym_and_inbox_turns_share_order_and_expire_remote_confirmation(
     assert agent.run.await_count == 1
 
 
+def test_slow_discord_image_download_expires_remote_confirmation_on_ingress(
+    monkeypatch, tmp_path,
+):
+    from communication.discord import DiscordChannel
+    from orchestrator import Orchestrator
+
+    handler, _rows, _kzg, _lzg, _agent, _fallback_channel = _handler(monkeypatch)
+    repo = _git_repo(tmp_path / "repo")
+    starts = []
+
+    def unexpected_start(*args, **_kwargs):
+        starts.append(args)
+        raise OSError("unexpected Agent-Remote launch")
+
+    remote = AgentRemoteService(
+        AgentRemoteConfig(
+            enabled=True,
+            allowed_user_ids=("123",),
+            repos={"mantis": str(repo)},
+            state_dir=tmp_path / "remote-state",
+            home_dir=tmp_path / "home",
+        ),
+        persist=handler._persist_msg,
+        popen=unexpected_start,
+    )
+    handler.agent_remote = remote
+
+    class Destination:
+        id = "discord-dm-123"
+
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, text, **_kwargs):
+            self.messages.append(text)
+            return SimpleNamespace(id=f"sent-{len(self.messages)}")
+
+    class Client:
+        user = SimpleNamespace(id=999)
+
+        def __init__(self):
+            self.events = {}
+
+        def event(self, callback):
+            self.events[callback.__name__] = callback
+            return callback
+
+    async def run():
+        destination = Destination()
+        client = Client()
+        discord = DiscordChannel(token="test-token", allowed_user_ids=("123",))
+        discord._client = client
+        discord._register_events()
+        handler.channels["discord"] = discord
+
+        orchestrator = object.__new__(Orchestrator)
+        orchestrator.msg_handler = handler
+        orchestrator.agent_remote = remote
+        orchestrator.idle_loop = SimpleNamespace(resume=Mock())
+        discord.on_message(orchestrator.handle_message)
+        discord.on_message_start(orchestrator.begin_incoming_message)
+
+        def message(text, message_id, attachments=()):
+            return SimpleNamespace(
+                author=SimpleNamespace(id=123, bot=False),
+                channel=destination,
+                guild=None,
+                content=text,
+                attachments=list(attachments),
+                id=message_id,
+                reference=None,
+            )
+
+        await client.events["on_message"](
+            message("codex: mantis analysiere README", "proposal")
+        )
+        proposal_id = remote.pending["123"].proposal_id[:4]
+
+        download_started = asyncio.Event()
+        release_download = asyncio.Event()
+
+        class DelayedImage:
+            filename = "image.png"
+            content_type = "image/png"
+            size = 4
+
+            async def read(self):
+                download_started.set()
+                await release_download.wait()
+                return b"image"
+
+        async def capture(_msg, _route, **_kwargs):
+            return {"response": "📥 Gemerkt."}
+
+        monkeypatch.setattr(
+            "core.message_handler.inbox_service.capture_discord_message", capture,
+        )
+        image_task = asyncio.create_task(client.events["on_message"](
+            message("Bild", "slow-image", (DelayedImage(),))
+        ))
+        try:
+            await asyncio.wait_for(download_started.wait(), timeout=1)
+            await client.events["on_message"](
+                message(f"ja {proposal_id}", "confirmation")
+            )
+            assert starts == []
+        finally:
+            release_download.set()
+            await image_task
+            await remote.stop()
+
+    asyncio.run(run())
+
+
 def test_inbox_delete_confirmation_wins_and_expires_remote_preview(monkeypatch, tmp_path):
     from orchestrator import Orchestrator
 

@@ -27,12 +27,22 @@ class IncomingMessage:
     reply_to_message_id: str | None = None
     attachments: tuple[IncomingAttachment, ...] = ()
     attachment_notice: str = ""
+    ingress_context: object | None = None
 
 
 MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
+MessageStartHandler = Callable[[IncomingMessage], object]
 
 
 class CommunicationChannel(ABC):
+
+    def on_message_start(self, handler: MessageStartHandler) -> None:
+        """Registriert einen synchronen Hook vor Kanal-Downloads und anderen Awaits."""
+        self._message_start_handler = handler
+
+    def _notify_message_start(self, msg: IncomingMessage) -> object | None:
+        handler = getattr(self, "_message_start_handler", None)
+        return handler(msg) if handler is not None else None
 
     @abstractmethod
     async def send(self, text: str) -> object | None:

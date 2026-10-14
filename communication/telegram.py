@@ -238,6 +238,14 @@ class TelegramChannel(CommunicationChannel):
         self._chat_id = str(update.message.chat_id)
 
         text = update.message.text or ""
+        sender_id = str(update.message.from_user.id)
+        ingress_context = self._notify_message_start(IncomingMessage(
+            text=text,
+            sender_id=sender_id,
+            timestamp=datetime.now(),
+            raw=update,
+            channel="telegram",
+        ))
 
         # URLs aus Telegram-Entities extrahieren (präziser als Regex auf Plaintext)
         urls = []
@@ -265,10 +273,11 @@ class TelegramChannel(CommunicationChannel):
 
         msg = IncomingMessage(
             text=text,
-            sender_id=str(update.message.from_user.id),
+            sender_id=sender_id,
             timestamp=datetime.now(),
             raw=update,
             channel="telegram",
+            ingress_context=ingress_context,
         )
 
         if self._handler:
@@ -288,6 +297,14 @@ class TelegramChannel(CommunicationChannel):
         if not voice:
             return
 
+        sender_id = str(update.message.from_user.id)
+        ingress_context = self._notify_message_start(IncomingMessage(
+            text="",
+            sender_id=sender_id,
+            timestamp=datetime.now(),
+            raw=update,
+            channel="telegram",
+        ))
         await self._app.bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.TYPING)
 
         try:
@@ -315,10 +332,11 @@ class TelegramChannel(CommunicationChannel):
 
         msg = IncomingMessage(
             text=text,
-            sender_id=str(update.message.from_user.id),
+            sender_id=sender_id,
             timestamp=datetime.now(),
             raw=update,
             channel="telegram",
+            ingress_context=ingress_context,
         )
         if self._handler:
             await self._handler(msg)
@@ -333,6 +351,14 @@ class TelegramChannel(CommunicationChannel):
             return
         self._chat_id = str(update.message.chat_id)
 
+        sender_id = str(update.message.from_user.id)
+        ingress_context = self._notify_message_start(IncomingMessage(
+            text="",
+            sender_id=sender_id,
+            timestamp=datetime.now(),
+            raw=update,
+            channel="telegram",
+        ))
         await self._app.bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.TYPING)
 
         # Höchste Auflösung nehmen
@@ -363,10 +389,11 @@ class TelegramChannel(CommunicationChannel):
             await self.send(description)
             msg = IncomingMessage(
                 text=meal_text,
-                sender_id=str(update.message.from_user.id),
+                sender_id=sender_id,
                 timestamp=datetime.now(),
                 raw=update,
                 channel="telegram",
+                ingress_context=ingress_context,
             )
             if self._handler:
                 await self._handler(msg)
@@ -376,10 +403,11 @@ class TelegramChannel(CommunicationChannel):
             if caption:
                 msg = IncomingMessage(
                     text=f"{description}\n\nFrage des Nutzers zum Bild: {caption}",
-                    sender_id=str(update.message.from_user.id),
+                    sender_id=sender_id,
                     timestamp=datetime.now(),
                     raw=update,
                     channel="telegram",
+                    ingress_context=ingress_context,
                 )
                 await self.send(description)
                 if self._handler:

@@ -202,22 +202,35 @@ class MessageHandler:
         self._incoming_message_sequence += 1
         message_sequence = self._incoming_message_sequence
         pending_deletion = self._take_pending_inbox_deletion(sender_key)
-        if self.agent_remote is not None:
-            inbox_confirmation = bool(
-                msg is not None
-                and pending_deletion is not None
-                and getattr(msg, "channel", None) == "discord"
-                and _discord_channel_id(msg) == pending_deletion.channel_id
-                and time.monotonic() - pending_deletion.created_at
-                < _INBOX_DELETE_CONFIRMATION_TTL
-                and (
-                    not getattr(msg, "reply_to_message_id", None)
-                    or str(msg.reply_to_message_id) == pending_deletion.prompt_message_id
-                )
-                and str(msg.text or "").casefold() in {"ja", "nein"}
+        has_attachments = bool(getattr(msg, "attachments", ()))
+        inbox_confirmation = bool(
+            msg is not None
+            and not has_attachments
+            and pending_deletion is not None
+            and getattr(msg, "channel", None) == "discord"
+            and _discord_channel_id(msg) == pending_deletion.channel_id
+            and time.monotonic() - pending_deletion.created_at
+            < _INBOX_DELETE_CONFIRMATION_TTL
+            and (
+                not getattr(msg, "reply_to_message_id", None)
+                or str(msg.reply_to_message_id) == pending_deletion.prompt_message_id
             )
-            self.agent_remote.begin_user_turn(None if inbox_confirmation else msg)
+            and str(msg.text or "").casefold() in {"ja", "nein"}
+        )
+        if not inbox_confirmation:
+            pending_deletion = None
+        if self.agent_remote is not None:
+            self.agent_remote.begin_user_turn(
+                None if msg is None or has_attachments or inbox_confirmation else msg
+            )
         return message_sequence, pending_deletion
+
+    def begin_incoming_message(
+        self, msg: IncomingMessage,
+    ) -> tuple[int, PendingInboxDeletion | None]:
+        """Reserviert den Turn synchron am Eingang eines erlaubten Kanal-Events."""
+        sender_key = str(getattr(msg, "sender_id", "") or "")
+        return self._begin_user_turn(sender_key, msg=msg)
 
     # ── Verification Bump ─────────────────────────────────────────────────────
 
@@ -253,7 +266,9 @@ class MessageHandler:
 
     async def handle(self, msg: IncomingMessage, resume_idle_cb) -> None:
         sender_key = str(getattr(msg, "sender_id", "") or "")
-        turn_context = self._begin_user_turn(sender_key, msg=msg)
+        turn_context = getattr(msg, "ingress_context", None)
+        if turn_context is None:
+            turn_context = self._begin_user_turn(sender_key, msg=msg)
         self._start_turn()
         response_channel = None
         try:

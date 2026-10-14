@@ -336,6 +336,19 @@ class DiscordChannel(CommunicationChannel):
             return
         route = self.for_message(message)
         raw_attachments = tuple(getattr(message, "attachments", ()) or ())
+        reference = getattr(message, "reference", None)
+        reference_id = getattr(reference, "message_id", None)
+        text = str(getattr(message, "content", "") or "")
+        ingress_context = self._notify_message_start(IncomingMessage(
+            text=text,
+            sender_id=str(message.author.id),
+            timestamp=datetime.now(),
+            raw=message,
+            channel="discord",
+            source_message_id=str(message.id) if getattr(message, "id", None) is not None else None,
+            reply_to_message_id=str(reference_id) if reference_id is not None else None,
+            attachments=raw_attachments,
+        ))
         incoming_attachments = []
         rejected = 0
         oversized = False
@@ -383,11 +396,8 @@ class DiscordChannel(CommunicationChannel):
             await route.send(notice)
             return
 
-        text = str(getattr(message, "content", "") or "")
         if not text and not incoming_attachments:
             return
-        reference = getattr(message, "reference", None)
-        reference_id = getattr(reference, "message_id", None)
         notice = ""
         if rejected:
             parts = []
@@ -406,6 +416,7 @@ class DiscordChannel(CommunicationChannel):
             reply_to_message_id=str(reference_id) if reference_id is not None else None,
             attachments=tuple(incoming_attachments),
             attachment_notice=notice,
+            ingress_context=ingress_context,
         )
         if self._handler:
             await self._handler(incoming)

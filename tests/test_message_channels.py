@@ -285,10 +285,12 @@ def test_orchestrator_wires_discord_for_messages_and_reminder_dms(monkeypatch):
 
 def test_orchestrator_starts_and_stops_additional_channels(monkeypatch):
     primary = SimpleNamespace(
+        on_message_start=Mock(),
         on_message=Mock(),
         start=AsyncMock(),
     )
     discord = SimpleNamespace(
+        on_message_start=Mock(),
         on_message=Mock(),
         start=AsyncMock(),
         stop=AsyncMock(),
@@ -320,7 +322,9 @@ def test_orchestrator_starts_and_stops_additional_channels(monkeypatch):
 
     asyncio.run(run())
 
+    primary.on_message_start.assert_called_once_with(orchestrator.begin_incoming_message)
     primary.on_message.assert_called_once_with(orchestrator.handle_message)
+    discord.on_message_start.assert_called_once_with(orchestrator.begin_incoming_message)
     discord.on_message.assert_called_once_with(orchestrator.handle_message)
     primary.start.assert_awaited_once()
     discord.start.assert_awaited_once()

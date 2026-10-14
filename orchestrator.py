@@ -194,6 +194,10 @@ class Orchestrator:
 
     # ── Öffentliche API (delegiert an Teilmodule) ─────────────────────────────
 
+    def begin_incoming_message(self, msg: IncomingMessage):
+        """Reserviert eine erlaubte Kanalnachricht noch vor deren Vorverarbeitung."""
+        return self.msg_handler.begin_incoming_message(msg)
+
     async def handle_message(self, msg: IncomingMessage) -> None:
         await self.msg_handler.handle(msg, resume_idle_cb=self.idle_loop.resume)
 
@@ -256,8 +260,14 @@ class Orchestrator:
         await self._init_skills()
         await self._restore_memory()
         await self._warmup()
+        register_message_start = getattr(self.channel, "on_message_start", None)
+        if callable(register_message_start):
+            register_message_start(self.begin_incoming_message)
         self.channel.on_message(self.handle_message)
         for channel in self.additional_channels.values():
+            register_message_start = getattr(channel, "on_message_start", None)
+            if callable(register_message_start):
+                register_message_start(self.begin_incoming_message)
             channel.on_message(self.handle_message)
         log_background_job_status()
         self.idle_loop.resume()
