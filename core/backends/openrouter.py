@@ -36,7 +36,9 @@ def _content_to_openai(content):
         if not isinstance(block, dict):
             continue
         if block.get("type") == "text":
-            converted.append({"type": "text", "text": str(block.get("text", ""))})
+            text = str(block.get("text", ""))
+            if text.strip():
+                converted.append({"type": "text", "text": text})
         elif block.get("type") == "image":
             source = block.get("source") or {}
             if source.get("type") == "base64" and source.get("data"):
@@ -61,7 +63,7 @@ def _msgs_to_openai(messages: list[dict]) -> list[dict]:
     for m in messages:
         role = m.get("role")
         if role == "assistant":
-            entry: dict = {"role": "assistant", "content": _content_to_openai(m.get("content"))}
+            content = _content_to_openai(m.get("content"))
             calls = []
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function", {})
@@ -72,12 +74,15 @@ def _msgs_to_openai(messages: list[dict]) -> list[dict]:
                     "type": "function",
                     "function": {"name": fn.get("name", ""), "arguments": _args_to_json(fn.get("arguments"))},
                 })
+            if not _has_openai_content(content) and not calls:
+                continue
+            entry: dict = {"role": "assistant", "content": content}
             if calls:
                 entry["tool_calls"] = calls
                 # OpenAI-kompatible Endpunkte lehnen `content: ""` neben tool_calls teils ab.
-                if not entry["content"]:
+                if not _has_openai_content(entry["content"]):
                     entry["content"] = None
-            result.append(entry)
+            _append_openai_message(result, entry)
         elif role == "tool":
             call_id = m.get("tool_use_id") or m.get("tool_call_id")
             if not call_id:
@@ -86,8 +91,52 @@ def _msgs_to_openai(messages: list[dict]) -> list[dict]:
                 pending_ids.remove(call_id)
             result.append({"role": "tool", "content": str(m.get("content", "")), "tool_call_id": call_id})
         else:
-            result.append({"role": role, "content": _content_to_openai(m.get("content", ""))})
+            content = _content_to_openai(m.get("content", ""))
+            if role == "user" and not _has_openai_content(content):
+                continue
+            entry = {"role": role, "content": content}
+            if role == "user":
+                _append_openai_message(result, entry)
+            else:
+                result.append(entry)
     return result
+
+
+def _has_openai_content(content) -> bool:
+    if isinstance(content, str):
+        return bool(content.strip())
+    return bool(content)
+
+
+def _append_openai_message(messages: list[dict], entry: dict) -> None:
+    if not messages or messages[-1].get("role") != entry.get("role"):
+        messages.append(entry)
+        return
+    previous = messages[-1]
+    old_content = previous.get("content")
+    new_content = entry.get("content")
+    if new_content is None:
+        pass
+    elif old_content is None:
+        previous["content"] = new_content
+    elif isinstance(old_content, str) and isinstance(new_content, str):
+        if old_content and new_content:
+            previous["content"] = f"{old_content}\n{new_content}"
+        elif new_content:
+            previous["content"] = new_content
+    else:
+        parts = []
+        if isinstance(old_content, str) and old_content:
+            parts.append({"type": "text", "text": old_content})
+        elif isinstance(old_content, list):
+            parts.extend(old_content)
+        if isinstance(new_content, str) and new_content:
+            parts.append({"type": "text", "text": new_content})
+        elif isinstance(new_content, list):
+            parts.extend(new_content)
+        previous["content"] = parts or None
+    if entry.get("tool_calls"):
+        previous.setdefault("tool_calls", []).extend(entry["tool_calls"])
 
 
 def _extract_tool_calls(message: dict, tools: list[dict] | None = None) -> list[dict]:

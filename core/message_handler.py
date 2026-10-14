@@ -807,6 +807,8 @@ class MessageHandler:
 
     def _persist_msg(self, role: str, content: str, channel: str = "telegram",
                      meta: dict | None = None, save_lzg: bool = True) -> None:
+        if not isinstance(content, str) or not content.strip():
+            return
         metadata = meta or {}
         if save_lzg and is_safe_for_prompt({
             "role": role, "content": content, "meta": metadata,

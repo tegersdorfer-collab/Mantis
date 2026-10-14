@@ -30,6 +30,8 @@ class KZG:
         self._needs_checkpoint: bool = False          # Orchestrator soll Summary bauen
 
     def add(self, role: str, content: str) -> None:
+        if not isinstance(content, str) or not content.strip():
+            return
         self._turns.append(Turn(role=role, content=content))
         if len(self._turns) > self.max_turns:
             # Wenn noch kein Checkpoint läuft: markieren statt hart schneiden

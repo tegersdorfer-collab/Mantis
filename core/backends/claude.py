@@ -57,24 +57,16 @@ def _ollama_msgs_to_anthropic(messages: list[dict]) -> tuple[str | None, list[di
         if role == "tool":
             # Tool-Results gehören als user-Nachricht mit tool_result-Block
             tool_use_id = m.get("tool_use_id") or f"tool_{i}"
-            result.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": str(m.get("content", "")),
-                }]
-            })
+            _append_anthropic_message(result, "user", [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": str(m.get("content", "")),
+            }])
             i += 1
             continue
 
         if role == "assistant":
-            content_parts = []
-            text = m.get("content", "")
-            if isinstance(text, list):
-                content_parts.extend(_content_to_anthropic(text))
-            elif text:
-                content_parts.append({"type": "text", "text": text})
+            content_parts = _anthropic_content_blocks(m.get("content", ""))
             # Tool-Calls aus Ollama-Format → Anthropic tool_use-Blöcke
             for tc in m.get("tool_calls", []):
                 fn = tc.get("function", {})
@@ -90,15 +82,38 @@ def _ollama_msgs_to_anthropic(messages: list[dict]) -> tuple[str | None, list[di
                     "name": fn.get("name", ""),
                     "input": args,
                 })
-            result.append({"role": "assistant", "content": content_parts or text})
+            _append_anthropic_message(result, "assistant", content_parts)
             i += 1
             continue
 
         # user
-        result.append({"role": "user", "content": _content_to_anthropic(m.get("content", ""))})
+        _append_anthropic_message(result, "user", _anthropic_content_blocks(m.get("content", "")))
         i += 1
 
     return system, result
+
+
+def _anthropic_content_blocks(content) -> list[dict]:
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content.strip() else []
+    converted = _content_to_anthropic(content)
+    if not isinstance(converted, list):
+        return [{"type": "text", "text": str(converted)}] if str(converted).strip() else []
+    return [
+        block for block in converted
+        if block.get("type") != "text" or str(block.get("text", "")).strip()
+    ]
+
+
+def _append_anthropic_message(messages: list[dict], role: str, content: list[dict]) -> None:
+    if not content:
+        return
+    if messages and messages[-1]["role"] == role:
+        messages[-1]["content"].extend(content)
+    else:
+        messages.append({"role": role, "content": content})
 
 
 def _extract_tool_calls(response, tools: list[dict] | None = None) -> list[dict]:

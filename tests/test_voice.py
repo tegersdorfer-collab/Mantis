@@ -6,10 +6,6 @@ import asyncio
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 
-# Diese Tests patchen pywhispercpp.model.Model — das Paket muss dafür importierbar
-# sein. Fehlt es (z.B. schlanke CI ohne schwere ML-Wheels), wird die Datei geskippt.
-pytest.importorskip("pywhispercpp")
-
 import core.voice as voice
 
 
@@ -31,6 +27,7 @@ def _reset_conversation_window():
 def whisper_engine(monkeypatch):
     """Zwingt den whisper.cpp-Pfad. Seit 22.09.2026 ist Parakeet der Default; die
     whisper-Tests decken weiterhin den Fallback ab, der bei fehlendem parakeet-mlx greift."""
+    pytest.importorskip("pywhispercpp")
     monkeypatch.setattr(voice.config, "STT_ENGINE", "whisper")
     yield
 
@@ -69,8 +66,49 @@ class TestTranscribeParakeet:
             asyncio.run(voice.transcribe_audio("/tmp/b.wav"))
         mod.from_pretrained.assert_called_once()
 
+    def test_laden_und_transkribieren_laufen_auf_demselben_thread(self, monkeypatch):
+        """MLX bindet seinen GPU-Stream an den Thread, der das Modell geladen hat."""
+        from concurrent.futures import ThreadPoolExecutor
+        from functools import partial
+        import itertools
+        import threading
+
+        monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
+        load_threads = []
+
+        class ThreadBoundModel:
+            def transcribe(self, _path):
+                if threading.get_ident() != load_threads[0]:
+                    raise RuntimeError("There is no Stream(gpu, 0) in current thread")
+                return MagicMock(text="Okay Mantis")
+
+        def load(_model_id):
+            load_threads.append(threading.get_ident())
+            return ThreadBoundModel()
+
+        mod = MagicMock(from_pretrained=load)
+        workers = [ThreadPoolExecutor(max_workers=1) for _ in range(2)]
+        next_worker = itertools.count()
+
+        async def alternating_to_thread(function, *args, **kwargs):
+            loop = asyncio.get_running_loop()
+            worker = workers[next(next_worker) % len(workers)]
+            return await loop.run_in_executor(worker, partial(function, *args, **kwargs))
+
+        monkeypatch.setattr(voice.asyncio, "to_thread", alternating_to_thread)
+        try:
+            with patch.dict("sys.modules", {"parakeet_mlx": mod}):
+                assert asyncio.run(voice.transcribe_audio("/tmp/fake.wav")) == "Okay Mantis"
+        finally:
+            for worker in workers:
+                worker.shutdown(wait=True)
+
+        assert len(load_threads) == 1
+        assert voice._parakeet_unavailable is False
+
     def test_faellt_auf_whisper_zurueck_wenn_paket_fehlt(self, monkeypatch):
         """Ohne parakeet-mlx muss Mantis weiter Sprache verstehen — über whisper.cpp."""
+        pytest.importorskip("pywhispercpp")
         monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
         import builtins
         real_import = builtins.__import__
@@ -91,6 +129,7 @@ class TestTranscribeParakeet:
     def test_ladefehler_schaltet_dauerhaft_auf_whisper(self, monkeypatch):
         """Ein fehlgeschlagener Modell-Download (z.B. kein Netz) darf nicht bei JEDER
         Äußerung erneut versucht werden."""
+        pytest.importorskip("pywhispercpp")
         monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
         mod = MagicMock(from_pretrained=MagicMock(side_effect=RuntimeError("kein Netz")))
         fake_whisper = MagicMock()

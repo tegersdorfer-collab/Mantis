@@ -19,6 +19,15 @@ def test_add_and_len():
     assert not k.is_empty()
 
 
+def test_empty_and_whitespace_turns_are_not_added_to_kzg():
+    k = KZG(max_turns=10)
+
+    k.add("user", "")
+    k.add("assistant", "  \n\t")
+
+    assert k.is_empty()
+
+
 def test_checkpoint_marked_when_exceeding_max():
     k = KZG(max_turns=4)
     for i in range(4):

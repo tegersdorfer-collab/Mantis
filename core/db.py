@@ -733,7 +733,6 @@ MIGRATIONS = [
     # COROS-MCP: Metriken, die über HealthKit nie ankamen (Spec 2026-08-15).
     "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS training_load_short DOUBLE PRECISION;",
     "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS training_load_long  DOUBLE PRECISION;",
-    "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS recovery_pct        DOUBLE PRECISION;",
     "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS sleep_score         INT;",
     "ALTER TABLE health_data ADD COLUMN IF NOT EXISTS stress_avg          DOUBLE PRECISION;",
 

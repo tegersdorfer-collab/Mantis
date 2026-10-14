@@ -219,6 +219,25 @@ def test_provider_ohne_credentials_wird_uebersprungen(monkeypatch):
     assert answer.model == "typesafe/jev-1.13"
 
 
+@pytest.mark.parametrize("status", [400, 422])
+def test_request_validation_error_does_not_open_jev_provider_cooldown(monkeypatch, status):
+    _enabled_typesafe(monkeypatch)
+    monkeypatch.setattr(decide, "_monotonic", lambda: 20.0, raising=False)
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.host)
+        return httpx.Response(status, json={"error": "invalid question structure"})
+
+    with patch.object(decide, "_transport", _transport(handler)):
+        for _ in range(2):
+            with pytest.raises(JevUnavailable):
+                asyncio.run(decide.decide("state", {"cat:fitness": Noul("Frage?")}))
+
+    assert calls == ["api.typesafe.ai", "api.typesafe.ai"]
+    assert decide._down_until["typesafe"] <= 20.0
+
+
 @pytest.mark.parametrize("payload", [
     {"success": False, "errors": [{"code": 1000, "message": "failed"}]},
     {"success": True},
