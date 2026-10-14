@@ -391,7 +391,7 @@ class MessageHandler:
             "SELECT id FROM tasks WHERE execution_phase='waiting_clarification' "
             "AND clarification_answer IS NULL ORDER BY created_at DESC LIMIT 1"
         )
-        if waiting:
+        if waiting and not inbox_turn:
             if not user_recorded:
                 self._record_user_message(msg.text, channel_name)
             db.execute(
@@ -409,7 +409,7 @@ class MessageHandler:
 
         # Accountability & Momentum bleibt vor dem Gym-Fast-Path.
         from domains import accountability
-        acc_reply = accountability.intercept(msg.text)
+        acc_reply = accountability.intercept(msg.text) if not inbox_turn else None
         if acc_reply is not None:
             if not user_recorded:
                 self._record_user_message(msg.text, channel_name)

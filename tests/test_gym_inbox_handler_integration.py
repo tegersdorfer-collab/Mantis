@@ -6,6 +6,8 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+
 from communication.base import IncomingMessage
 from core import db
 from core.message_handler import MessageHandler
@@ -225,3 +227,89 @@ def test_gym_turn_expires_pending_inbox_delete_confirmation(monkeypatch):
     assert kzg.added.count(("user", "Bank 80 8 8 7")) == 0
     assert lzg.saved.count(("user", "Bank 80 8 8 7")) == 0
     assert agent.run.await_count == 1
+
+
+@pytest.mark.parametrize(
+    ("open_interceptor", "text", "expected_path"),
+    [
+        ("clarification", "https://youtu.be/abc", "capture"),
+        ("clarification", "Welche Filme habe ich mir gemerkt?", "search"),
+        ("daily_anchor", "https://youtu.be/abc", "capture"),
+        ("daily_anchor", "Welche Filme habe ich mir gemerkt?", "search"),
+    ],
+)
+def test_inbox_turn_bypasses_open_clarification_and_daily_anchor(
+    monkeypatch, open_interceptor, text, expected_path,
+):
+    from domains import accountability as accountability_module
+
+    real_intercept = accountability_module.intercept
+    handler, rows, _kzg, _lzg, agent, _channel = _handler(monkeypatch)
+    captured = AsyncMock(return_value={"response": "📥 Gemerkt."})
+    monkeypatch.setattr("core.message_handler.inbox_service.capture_discord_message", captured)
+    monkeypatch.setattr(
+        "core.message_handler.skills.T.select_tools_async",
+        AsyncMock(return_value=(["inbox_search"], True)),
+    )
+
+    executed_sql = []
+    execute = db.execute
+
+    def record_execute(sql, params=()):
+        executed_sql.append(sql)
+        return execute(sql, params)
+
+    monkeypatch.setattr(db, "execute", record_execute)
+
+    anchor_reads = []
+    anchor_writes = []
+    if open_interceptor == "clarification":
+        monkeypatch.setattr(
+            db,
+            "query",
+            lambda sql, *_args, **_kwargs: (
+                [{"id": 91}] if "waiting_clarification" in sql else []
+            ),
+        )
+    else:
+        monkeypatch.setattr(accountability_module.config, "ACCOUNTABILITY_ENABLED", True)
+        monkeypatch.setattr(
+            accountability_module.config, "AUTONOMOUS_MESSAGES_ENABLED", True,
+        )
+
+        def open_daily_anchor(_day):
+            anchor_reads.append(True)
+            return {"anchor_sent_at": datetime(2026, 10, 14), "priority": None}
+
+        def record_anchor_update(_day, **fields):
+            anchor_writes.append(fields)
+
+        def intercept(text):
+            return real_intercept(text)
+
+        monkeypatch.setattr(accountability_module, "_row", open_daily_anchor)
+        monkeypatch.setattr(accountability_module, "_set", record_anchor_update)
+        monkeypatch.setattr(accountability_module, "intercept", intercept)
+
+    message = _discord_message(text, message_id=f"{open_interceptor}-{expected_path}")
+    asyncio.run(handler.handle(message, resume_idle_cb=None))
+
+    user_rows = _persisted(rows, "user")
+    assert len(user_rows) == 1
+    assert user_rows[0][1] == text
+    assert _meta(user_rows[0]) == {"use_case": "inbox"}
+    if expected_path == "capture":
+        captured.assert_awaited_once()
+        assert captured.await_args.args[0].text == text
+        assert agent.run.await_count == 0
+    else:
+        captured.assert_not_awaited()
+        assert agent.run.await_count == 1
+        assert agent.run.await_args.kwargs["allowed_tools"] == ["inbox_search"]
+        assert agent.run.await_args.kwargs["force_tools"] is True
+
+    if open_interceptor == "clarification":
+        assert not any("UPDATE tasks SET clarification_answer" in sql for sql in executed_sql)
+    else:
+        assert anchor_reads == []
+        assert anchor_writes == []
