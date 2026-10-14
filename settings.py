@@ -7,6 +7,8 @@ Verwendung:
     print(cfg.OWNER_NAME)
 """
 from __future__ import annotations
+import json
+
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -36,7 +38,7 @@ class MantisSettings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_NUM_CTX: int = 8192
     OLLAMA_NUM_CTX_OVERRIDES: str = ""
-    VOICE_MAX_TOKENS: int = 350
+    VOICE_MAX_TOKENS: int = 500
     VOICE_SILENCE_MS: int = 800
     # ── STT (Sprache → Text) ─────────────────────────────────────────────────
     # "parakeet" (Default seit 22.09.2026) oder "whisper" (whisper.cpp medium, der
@@ -285,6 +287,21 @@ class MantisSettings(BaseSettings):
                 raise ValueError(f"Doppelter Modell-Override für '{model}'")
             parsed[model] = num_ctx
         return ",".join(f"{model}={num_ctx}" for model, num_ctx in parsed.items())
+
+    @field_validator("TTS_CARTESIA_PRONUNCIATIONS", mode="before")
+    @classmethod
+    def merge_cartesia_pronunciations(cls, value):
+        defaults = {"Mantis": "Mäntis"}
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("TTS_CARTESIA_PRONUNCIATIONS muss gültiges JSON sein") from exc
+        if value is None:
+            return defaults
+        if not isinstance(value, dict):
+            raise ValueError("TTS_CARTESIA_PRONUNCIATIONS muss ein JSON-Objekt sein")
+        return {**defaults, **value}
 
     @field_validator("OWNER_NAME")
     @classmethod

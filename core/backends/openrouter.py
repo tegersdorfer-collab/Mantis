@@ -10,6 +10,7 @@ import uuid
 import httpx
 
 from core.backends.base import AgentBackend, StreamCb
+from core.voice_text import last_complete_sentence
 import config
 
 log = logging.getLogger(__name__)
@@ -252,8 +253,13 @@ class OpenRouterBackend(AgentBackend):
         resp.raise_for_status()
         data = resp.json()
         self._record_usage(data.get("usage"), data.get("id"))
-        message = (data.get("choices") or [{}])[0].get("message") or {}
-        return message.get("content") or "", _extract_tool_calls(message, tools)
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        tool_calls = _extract_tool_calls(message, tools)
+        if self._purpose == "voice" and choice.get("finish_reason") == "length" and not tool_calls:
+            content = last_complete_sentence(content)
+        return content, tool_calls
 
     async def _call_streaming(self, payload: dict, stream_cb: StreamCb) -> tuple[str, list[dict]]:
         payload = {**payload, "stream": True}
@@ -345,6 +351,8 @@ class OpenRouterBackend(AgentBackend):
             raise
 
         self._record_usage(usage, generation_id)
+        if self._purpose == "voice" and finish_reason == "length" and not tool_calls:
+            full = last_complete_sentence(full)
         return full, tool_calls
 
     def _record_usage(self, usage: dict | None, generation_id: str | None = None) -> None:

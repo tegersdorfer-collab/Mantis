@@ -9,11 +9,16 @@ from communication.base import IncomingMessage
 from communication.discord import DiscordChannel
 from core import db, log_observability
 from core.idle_loop import IdleLoop
-from core.message_handler import MessageHandler
+from core.message_handler import (
+    MessageHandler,
+    VOICE_RESPONSE_INSTRUCTIONS,
+    _messages_with_voice_reminder,
+)
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from orchestrator import Orchestrator
 from web.routers import chat, voice
+from core.prompt_builder import CacheableSystemPrompt
 
 
 def _make_orchestrator(monkeypatch):
@@ -108,6 +113,46 @@ def test_voice_turn_uses_spoken_prompt_and_configured_token_budget(
     assert call.kwargs["max_tokens"] == expected_max_tokens
     has_voice_instructions = "Deine Antworten werden vorgelesen" in call.kwargs["system"]
     assert has_voice_instructions is voice_instructions
+    if voice_instructions:
+        assert call.kwargs["system"].endswith(VOICE_RESPONSE_INSTRUCTIONS)
+
+
+def test_voice_reminder_is_temporary_and_keeps_prompt_cache_prefix(monkeypatch):
+    orchestrator, inserted, _idle_loop = _make_orchestrator(monkeypatch)
+    handler = orchestrator.msg_handler
+
+    class KZG:
+        def __init__(self):
+            self.turns = []
+
+        def add(self, role, content):
+            self.turns.append(SimpleNamespace(role=role, content=content))
+
+        def recent_messages(self, max_tokens):
+            return [SimpleNamespace(role=turn.role, content=turn.content) for turn in self.turns]
+
+    kzg = KZG()
+    handler.kzg = kzg
+    handler.lzg.save_kzg_turn = lambda *args, **kwargs: None
+    handler.prompt_builder.build = AsyncMock(return_value=CacheableSystemPrompt(
+        "stable prefix\n\ndynamic context", cache_prefix="stable prefix",
+    ))
+
+    asyncio.run(orchestrator.voice_respond("Wie war mein Schlaf?"))
+
+    call = orchestrator.voice_agent.run.await_args
+    current_user_message = call.kwargs["messages"][-1]
+    assert "Wie war mein Schlaf?" in current_user_message["content"]
+    assert "[Sprachmodus:" in current_user_message["content"]
+    assert current_user_message["content"].endswith(
+        "[Sprachmodus: höchstens drei kurze gesprochene Sätze, keine Aufzählungen; "
+        "alle Zahlen, Daten, Uhrzeiten, Dezimalzahlen und Einheiten in Wörtern]"
+    )
+    assert kzg.turns[0].content == "Wie war mein Schlaf?"
+    user_row = next(params for _sql, params in inserted if params[0] == "user")
+    assert user_row[1] == "Wie war mein Schlaf?"
+    assert call.kwargs["system"].endswith(VOICE_RESPONSE_INSTRUCTIONS)
+    assert call.kwargs["system"].cache_prefix == "stable prefix"
 
 
 def test_prompt_history_filters_empty_and_whitespace_turns():
@@ -554,3 +599,30 @@ def test_persistence_failures_are_logged_to_error_observability(monkeypatch, cap
 
     assert sum(record.levelno == logging.ERROR for record in caplog.records) == 2
     assert len(events) == 2
+
+
+def test_voice_reminder_does_not_mutate_nested_source_messages():
+    messages = [{
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": "Wie war mein Puls?",
+            "annotations": {"source": ["chat", {"turn": 4}]},
+        }],
+    }]
+    original = [{
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": "Wie war mein Puls?",
+            "annotations": {"source": ["chat", {"turn": 4}]},
+        }],
+    }]
+
+    copied = _messages_with_voice_reminder(messages, "Wie war mein Puls?")
+
+    assert copied[0] is not messages[0]
+    assert copied[0]["content"] is not messages[0]["content"]
+    assert copied[0]["content"][0] is not messages[0]["content"][0]
+    assert copied[0]["content"][0]["annotations"] is not messages[0]["content"][0]["annotations"]
+    assert messages == original

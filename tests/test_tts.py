@@ -309,6 +309,28 @@ def _fake_local_synthesis(monkeypatch):
 
 
 class TestCartesia:
+    def test_schreibt_live_zahlenbeispiele_vor_cartesia_aus(
+        self, cartesia_engine, monkeypatch
+    ):
+        requests = []
+        _mock_cartesia(
+            monkeypatch,
+            lambda request: (requests.append(request) or httpx.Response(200, content=b"WAV")),
+        )
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda _wav: b"OGG")
+        monkeypatch.setattr(tts, "_record_cartesia_usage", lambda _text: None)
+
+        result = asyncio.run(tts.synthesize(
+            "vom 12. auf den 13. Oktober, 10,4 Stunden. "
+            "Die Nacht davor waren 8 Stunden. 8:30 Uhr und 53 bpm."
+        ))
+
+        assert result == b"OGG"
+        assert json.loads(requests[0].content)["transcript"] == (
+            "vom zwölften auf den dreizehnten Oktober, zehn Komma vier Stunden. "
+            "Die Nacht davor waren acht Stunden. acht Uhr dreißig und dreiundfünfzig bpm."
+        )
+
     def test_sendet_cartesia_felder_und_gibt_ogg_zurueck(
         self, cartesia_engine, monkeypatch
     ):
@@ -622,3 +644,70 @@ def test_cartesia_pronunciation_replaces_whole_words_only(monkeypatch):
     monkeypatch.setattr(tts.config, "TTS_CARTESIA_PRONUNCIATIONS", {"Mantis": "Mäntis"})
     assert tts._apply_cartesia_pronunciations("Hallo, ich bin Mantis. mantis!") == "Hallo, ich bin Mäntis. Mäntis!"
     assert tts._apply_cartesia_pronunciations("Gottesanbeterinnen heißen Mantiden") == "Gottesanbeterinnen heißen Mantiden"
+
+
+def test_cartesia_number_spelling_has_a_fallback_without_num2words(monkeypatch):
+    monkeypatch.setattr(tts, "_num2words", None)
+
+    assert tts._number_to_german_words(53) == "dreiundfünfzig"
+
+
+def test_cartesia_numeric_date_uses_the_correct_ordinal_case():
+    assert tts._numbers_to_german_words(
+        "am 12.10. und 12. Oktober; außerdem 20%."
+    ) == "am zwölften Oktober und zwölfter Oktober; außerdem zwanzig Prozent."
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("1.234 Schritte", "tausendzweihundertvierunddreißig Schritte"),
+        ("2.000 kcal", "zweitausend kcal"),
+        ("Dein Ruhepuls ist 53.", "Dein Ruhepuls ist dreiundfünfzig."),
+        ("im 3. Satz", "im dritten Satz"),
+        ("der 3. Satz", "der dritte Satz"),
+        ("3. Satz", "Dritter Satz"),
+        ("Version 3.14", "Version drei Punkt vierzehn"),
+        ("Version 1.2.3", "Version eins Punkt zwei Punkt drei"),
+        ("Version 1.13.5", "Version eins Punkt dreizehn Punkt fünf"),
+        ("24:00 Uhr", "vierundzwanzig Uhr"),
+        ("vom 12. auf den 13. Oktober", "vom zwölften auf den dreizehnten Oktober"),
+        ("vom 12.–14.10.", "vom zwölften bis vierzehnten Oktober"),
+        ("2026", "zweitausendsechsundzwanzig"),
+        ("-3 Grad", "minus drei Grad"),
+        ("1234567", "eins zwei drei vier fünf sechs sieben"),
+        ("123 4567", "eins zwei drei, vier fünf sechs sieben"),
+        (
+            "0911 0123456",
+            "null neun eins eins, null eins zwei drei vier fünf sechs",
+        ),
+        ("2,5 kg", "zwei Komma fünf Kilo"),
+        ("2,5kg", "zwei Komma fünf Kilo"),
+        ("Wert 3.14", "Wert 3.14"),
+    ],
+)
+def test_cartesia_number_spelling_handles_review_regressions(text, expected):
+    assert tts._numbers_to_german_words(text) == expected
+
+
+def test_numbers_versions_and_two_digit_years():
+    from core import tts
+    assert tts._numbers_to_german_words("Version 3.14 und 1.2.3") == "Version drei Punkt vierzehn und eins Punkt zwei Punkt drei"
+    assert tts._numbers_to_german_words("Update auf v2.4.1 ist da") == "Update auf Version zwei Punkt vier Punkt eins ist da"
+    assert tts._numbers_to_german_words("am 12.10.26") == "am zwölften Oktober zweitausendsechsundzwanzig"
+    assert tts._numbers_to_german_words("am 12.10.2026") == "am zwölften Oktober zweitausendsechsundzwanzig"
+
+
+def test_numbers_review_round_three():
+    from core import tts
+    from core.voice_text import last_complete_sentence
+    assert tts._numbers_to_german_words("Version 1.2.3.") == "Version eins Punkt zwei Punkt drei."
+    assert tts._numbers_to_german_words("0,5 kg") == "null Komma fünf Kilo"
+    assert tts._numbers_to_german_words("10,04 Stunden") == "zehn Komma null vier Stunden"
+    assert last_complete_sentence("Termin am 3.11.26. Danach war") == "Termin am 3.11.26."
+    assert last_complete_sentence("Am 12. Oktober war") == "Am 12. Oktober war"
+
+
+def test_phone_number_before_comma():
+    from core import tts
+    assert tts._numbers_to_german_words("Ruf 0911 0123456, dann weiter.").startswith("Ruf null neun eins eins, null eins zwei drei vier fünf sechs,")

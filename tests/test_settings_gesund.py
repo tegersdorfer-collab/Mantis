@@ -61,3 +61,22 @@ def test_cartesia_tts_settings_default_to_selected_engine_and_voice(monkeypatch)
     assert settings.TTS_CARTESIA_MODEL == "sonic-3.6"
     assert settings.TTS_CARTESIA_VOICE == "afa425cf-5489-4a09-8a3f-d3cb1f82150d"
     assert settings.TTS_CARTESIA_LANGUAGE == "de"
+    assert settings.TTS_CARTESIA_PRONUNCIATIONS == {"Mantis": "Mäntis"}
+
+
+def test_cartesia_pronunciations_merge_and_allow_environment_overrides(monkeypatch):
+    monkeypatch.setenv(
+        "TTS_CARTESIA_PRONUNCIATIONS",
+        '{"Claude":"Klodd"}',
+    )
+
+    settings = MantisSettings(_env_file=None)
+
+    assert settings.TTS_CARTESIA_PRONUNCIATIONS == {
+        "Mantis": "Mäntis",
+        "Claude": "Klodd",
+    }
+
+    monkeypatch.setenv("TTS_CARTESIA_PRONUNCIATIONS", '{"Mantis":"Mäntiss"}')
+    overridden = MantisSettings(_env_file=None)
+    assert overridden.TTS_CARTESIA_PRONUNCIATIONS == {"Mantis": "Mäntiss"}

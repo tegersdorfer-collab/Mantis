@@ -8,6 +8,7 @@ import logging
 import anthropic
 
 from core.backends.base import AgentBackend, StreamCb
+from core.voice_text import last_complete_sentence
 from core.anthropic_models import ensure_anthropic_model_allowed
 import config
 
@@ -279,18 +280,25 @@ class ClaudeBackend(AgentBackend):
                 raise RuntimeError("Anthropic-Stream endete ohne Abschluss")
             self._record_usage(final)
             tool_calls = _extract_tool_calls(final, tools)
-            return _extract_text(final) or collected, tool_calls
+            content = _extract_text(final) or collected
+            if self._purpose == "voice" and stop_reason == "max_tokens" and not tool_calls:
+                content = last_complete_sentence(content)
+            return content, tool_calls
 
         response = await self._client.messages.create(**kwargs)
         self._record_usage(response)
         tool_calls = _extract_tool_calls(response, tools)
+        stop_reason = getattr(response, "stop_reason", None)
 
         # Tool-Result-Messages brauchen tool_use_id → rückwärts befüllen
         # (wird beim nächsten Call aus dem trace rekonstruiert)
         for tc in tool_calls:
             tc["tool_use_id"] = tc["id"]
 
-        return _extract_text(response), tool_calls
+        content = _extract_text(response)
+        if self._purpose == "voice" and stop_reason == "max_tokens" and not tool_calls:
+            content = last_complete_sentence(content)
+        return content, tool_calls
 
     def _record_usage(self, response) -> None:
         try:

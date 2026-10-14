@@ -207,6 +207,32 @@ def test_voice_stream_appends_real_deltas_without_splitting_words(monkeypatch):
     assert spoken == ["Es ist sonnig."]
 
 
+def test_voice_stream_does_not_speak_an_unfinished_tail_after_length_stop(monkeypatch):
+    spoken = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            await stream_cb(attempt_start("voice-limit"))
+            await stream_cb(delta(
+                "voice-limit", "Erster Satz ist fertig. Die Nacht davor waren 8",
+            ))
+            await stream_cb(attempt_end("voice-limit", final=True))
+            return "Erster Satz ist fertig.", []
+
+    async def fake_tts(sentence, **_kwargs):
+        spoken.append(sentence)
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+
+    asyncio.run(sende_streaming_antwort(
+        FakeWebSocket(), "Wie war die Nacht?", FakeOrchestrator(),
+    ))
+
+    assert spoken == ["Erster Satz ist fertig."]
+
+
 def test_voice_stream_discards_unfinished_provider_attempt_on_fallback(monkeypatch):
     spoken = []
 
