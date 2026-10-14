@@ -94,7 +94,9 @@ source_urls, platform, source_metadata (JSONB), image_description, category, tag
 status (open oder done), embedding, created_at, updated_at, completed_at,
 source_message_id und source_message_ids. source_message_id bleibt der eindeutige
 Erstbezug für Gateway-Retrys; source_message_ids enthält alle Share- und
-Bestätigungsnachrichten-IDs, auf die eine Discord-Antwort zeigen kann. Pro Discord-Nachricht entsteht höchstens ein Eintrag;
+Bestätigungsnachrichten-IDs, auf die eine Discord-Antwort zeigen kann. Die IDs der
+Bestätigungsnachrichten werden zusätzlich separat markiert, damit Lösch-Replies nur darauf
+autorisieren. Pro Discord-Nachricht entsteht höchstens ein Eintrag;
 mehrere Links bleiben gemeinsam in source_urls, Metadaten werden für den ersten Link geholt.
 Das Bild selbst wird in v1 nicht gespeichert; gespeichert werden nur die vom Vision-Modell
 erkannten Informationen. Löschen entfernt den Datensatz samt Embedding endgültig.
@@ -320,4 +322,22 @@ Discord-Chats ohne Inbox-Intent erhalten kein use_case=inbox.
    geteilt wird. Bei Bildern mit Text gilt ebenfalls nur ein ausdrücklicher Merk-Auslöser.
    Fragen und Aufträge bleiben Agent-Turns, auch wenn sie einen Link enthalten. Abfragen
    wie „Zeig mir meine gespeicherten Links“ sind keine Erfassung.
+7. **Löschungen laufen nie über den LLM-Agenten oder die Tool-Auswahl.** Der deterministische
+   Fast-Path akzeptiert nur eine vollständige Nachricht nach
+   `^(lösch(e)?|entfern(e)?)\s+(den\s+)?(merker|eintrag)?\s*#?(\d+)\s*[.!]?$`, oder einen
+   Discord-Reply auf eine gespeicherte Merker-Bestätigungsnachricht, dessen kompletter Text
+   nur `lösch(e) (das|den)?` und optional `bitte` enthält. Jede erkannte Löschung fragt zuerst
+   `🗑️ „Titel“ löschen? ja/nein`; gelöscht wird nur bei der direkt folgenden eingehenden
+   Nachricht `ja` desselben Absenders. Jede andere nächste Nachricht verwirft die Bestätigung.
+   Das Agent-Tool `inbox_delete`
+   ist entfernt. IDs für Korrektur und Erledigt-Markierung werden ausschließlich aus Text
+   außerhalb von URLs gelesen; URL-Fragmente wie `#42` zählen nicht.
+8. **Anreicherung schützt Nutzereingaben.** Kategorie und Tags werden nur aktualisiert, wenn
+   ihr DB-Wert noch dem Capture-Snapshot entspricht. `category_source` ist `auto` oder `user`;
+   eine eindeutige Metadaten-Klassifikation darf eine automatische provisorische Kategorie
+   ersetzen, solange der Nutzer die Kategorie nicht korrigiert hat. Metadaten-Timeouts
+   beenden immer die gesamte yt-dlp-Prozessgruppe, auch wenn der Leader bereits beendet ist.
+   Für yt-dlp werden YouTube-, TikTok- und Instagram-Hosts normalisiert und exakt gegen die
+   Allowlist geprüft; dazu gehören `www.youtube.com`, `m.youtube.com`,
+   `music.youtube.com`, `www.tiktok.com` und `www.instagram.com`.
 Zusätzlich: Embeddings mit dem bereits im Repo genutzten lokalen Embedding-Weg (kein neues großes Modell; RAM-Regel: nie zwei lokale Modelle > 4 GB gleichzeitig). yt-dlp 2026.06.09 ist installiert; Metadaten-Abruf mit hartem Timeout (≤ 8 s), die Bestätigung an Timo darf nicht auf langsame Metadaten warten (sofort „📥 gemerkt“, Titel/Kategorie werden nachgetragen und bei Abfragen verwendet; optional die Bestätigung per Edit aktualisieren).

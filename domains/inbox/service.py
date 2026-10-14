@@ -191,9 +191,12 @@ async def _enrich_item(
         {**metadata_values, "image_description": effective_description},
     )
     existing_category = item.get("category")
-    if existing_category in {"anschauen", "lesen", "film-serie", "kaufen", "idee", "ort", "zitat"}:
-        category = existing_category
+    note_category, _note_tags = classify_item(effective_note)
+    if note_category != "sonstiges":
+        # Explizite Hinweise im Nutztext schlagen externe Metadaten.
+        category = note_category
     elif category == "sonstiges" and existing_category:
+        # Ohne klare Metadatenklassifikation bleibt der Capture-Fallback bestehen.
         category = existing_category
     tags = list(dict.fromkeys([*(item.get("tags") or []), *tags]))
     item_platform = str(item.get("platform") or (platform_for_url(urls[0]) if urls else "unknown"))
@@ -228,7 +231,9 @@ async def _enrich_item(
             source_metadata=metadata_values if source_data else None,
             image_description=description if images else None,
             category=category,
+            category_if_current=existing_category,
             tags=tags,
+            tags_if_current=item.get("tags") or [],
             embedding=embedding,
         )
         _metric(

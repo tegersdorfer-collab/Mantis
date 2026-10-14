@@ -220,11 +220,15 @@ def _make_pinned_transport(host: str, addresses: tuple[str, ...]):
 
 
 def _ytdlp_host_allowed(url: str, platform: str) -> bool:
-    host = (urlparse(url).hostname or "").casefold().rstrip(".")
+    try:
+        host = (urlparse(url).hostname or "").encode("idna").decode("ascii")
+    except (UnicodeError, AttributeError):
+        return False
+    host = host.casefold().rstrip(".").removeprefix("www.")
     allowlist = {
-        "youtube": {"youtube.com", "youtu.be", "m.youtube.com"},
-        "tiktok": {"tiktok.com", "vm.tiktok.com", "www.tiktok.com"},
-        "instagram": {"instagram.com", "www.instagram.com"},
+        "youtube": {"youtube.com", "youtu.be", "m.youtube.com", "music.youtube.com"},
+        "tiktok": {"tiktok.com", "vm.tiktok.com"},
+        "instagram": {"instagram.com"},
     }.get(platform, ())
     return host in allowlist
 
@@ -338,6 +342,7 @@ async def _fetch_ytdlp(
 
     proc = None
     readers = []
+    kill_process_tree = False
     try:
         creation = asyncio.create_task(asyncio.create_subprocess_exec(
                 sys.executable, "-c", _YTDLP_BOOTSTRAP,
@@ -367,9 +372,15 @@ async def _fetch_ytdlp(
             asyncio.gather(*readers), timeout=max(0.001, timeout_s * 0.8),
         )
     except (asyncio.TimeoutError, _OutputTooLarge, OSError, ValueError):
+        kill_process_tree = True
         return {}
+    except asyncio.CancelledError:
+        kill_process_tree = True
+        raise
     finally:
-        if proc is not None and getattr(proc, "returncode", None) is None:
+        if proc is not None and (
+            kill_process_tree or getattr(proc, "returncode", None) is None
+        ):
             _kill_process_tree(proc)
         for task in readers:
             if not task.done():

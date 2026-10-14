@@ -142,7 +142,7 @@ def _find_message_item(message_id: str) -> dict | None:
 
 
 def add_source_message_reference(item_id: int, message_id: str) -> dict | None:
-    """Registriert die Discord-Bestätigung als Reply-Referenz auf den Merker."""
+    """Registriert Share und Discord-Bestätigung als Reply-Referenzen."""
     value = str(message_id or "").strip()
     if not value:
         return None
@@ -151,9 +151,13 @@ def add_source_message_reference(item_id: int, message_id: str) -> dict | None:
            SET source_message_ids=CASE
              WHEN %s=ANY(source_message_ids) THEN source_message_ids
              ELSE array_append(source_message_ids, %s)
+           END,
+           confirmation_message_ids=CASE
+             WHEN %s=ANY(confirmation_message_ids) THEN confirmation_message_ids
+             ELSE array_append(confirmation_message_ids, %s)
            END
            WHERE id=%s RETURNING *""",
-        (value, value, item_id),
+        (value, value, value, value, item_id),
     )
 
 
@@ -166,7 +170,9 @@ def update_enrichment(
     source_metadata: dict | None = None,
     image_description: str | None = None,
     category: str | None = None,
+    category_if_current: str | None = None,
     tags: list[str] | None = None,
+    tags_if_current: list[str] | None = None,
     embedding: list[float] | None = None,
 ) -> dict | None:
     """Ergänzt best-effort Metadaten nach dem sofortigen Commit."""
@@ -189,12 +195,15 @@ def update_enrichment(
     if image_description is not None:
         assignments.append("image_description=%s")
         params.append(image_description[:12000])
-    if category in CATEGORIES:
-        assignments.append("category=%s")
-        params.append(category)
-    if tags is not None:
-        assignments.append("tags=%s")
-        params.append(_unique_tags(tags))
+    if category in CATEGORIES and category_if_current in CATEGORIES:
+        assignments.append(
+            "category=CASE WHEN category=%s AND category_source='auto' "
+            "THEN %s ELSE category END"
+        )
+        params.extend([category_if_current, category])
+    if tags is not None and tags_if_current is not None:
+        assignments.append("tags=CASE WHEN tags=%s THEN %s ELSE tags END")
+        params.extend([_unique_tags(tags_if_current), _unique_tags(tags)])
     vector = _vector_literal(embedding)
     if vector is not None:
         assignments.append("embedding=%s::vector")
@@ -317,7 +326,7 @@ def correct_item(item_id: int, **fields) -> dict | None:
         params.append(str(changes["user_note"])[:12000])
     if "category" in changes:
         category = changes["category"] if changes["category"] in CATEGORIES else "sonstiges"
-        assignments.append("category=%s")
+        assignments.extend(["category=%s", "category_source='user'"])
         params.append(category)
     if "tags" in changes:
         assignments.append("tags=%s")
@@ -348,6 +357,21 @@ def resolve_item(
         status=status, allow_recent=allow_recent,
     )
     return {"status": "found" if item else outcome, "item": item}
+
+
+def resolve_confirmation_reference(reference: str | int | None) -> dict:
+    """Löst ausschließlich eine Discord-Antwort auf eine Inbox-Bestätigung auf."""
+    if reference is None or not str(reference).strip():
+        return {"status": "not_found", "item": None}
+    ref = str(reference).strip()
+    rows = db.query(
+        "SELECT * FROM merk_inbox_items WHERE %s=ANY(confirmation_message_ids) "
+        "ORDER BY updated_at DESC LIMIT 2",
+        (ref,),
+    )
+    if len(rows) == 1:
+        return {"status": "found", "item": rows[0]}
+    return {"status": "ambiguous" if rows else "not_found", "item": None}
 
 
 def delete_item(

@@ -88,45 +88,19 @@ def test_search_all_keeps_status_unfiltered(monkeypatch):
     assert captured[0].status is None
 
 
-def test_ambiguous_completion_and_delete_ask_before_mutation(monkeypatch):
+def test_ambiguous_completion_asks_before_mutation(monkeypatch):
     events = []
     monkeypatch.setattr(inbox_skills.store, "mark_done", lambda **_kw: {
-        "status": "ambiguous", "item": None,
-    })
-    monkeypatch.setattr(inbox_skills.store, "delete_item", lambda **_kw: {
         "status": "ambiguous", "item": None,
     })
     monkeypatch.setattr(db, "log_event", lambda *args: events.append(args))
 
     completed = inbox_skills._inbox_complete()
-    token = INBOX_TURN_CONTEXT.set(InboxTurnContext(reply_reference="confirmation-1"))
-    try:
-        deleted = inbox_skills._inbox_delete(query="Arrival")
-    finally:
-        INBOX_TURN_CONTEXT.reset(token)
 
     assert json.loads(completed)["status"] == "ambiguous"
-    assert json.loads(deleted)["status"] == "ambiguous"
-    assert [event[:2] for event in events] == [
-        ("inbox", "complete"), ("inbox", "delete"),
-    ]
-    assert all(event[2]["status"] == "ambiguous" for event in events)
-    assert all(event[2]["duration_ms"] >= 0 for event in events)
-
-
-def test_delete_requires_an_id_from_the_current_message_or_a_reply(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        inbox_skills.store, "delete_item",
-        lambda **kwargs: calls.append(kwargs) or {
-            "status": "deleted", "item": {"id": 7, "title": "Arrival"},
-        },
-    )
-    monkeypatch.setattr(db, "log_event", lambda *_a, **_k: None)
-
-    inbox_skills._inbox_delete(query="Arrival")
-
-    assert calls == []
+    assert [event[:2] for event in events] == [("inbox", "complete")]
+    assert events[0][2]["status"] == "ambiguous"
+    assert events[0][2]["duration_ms"] >= 0
 
 
 def test_correction_requires_an_id_from_the_current_message_or_a_reply(monkeypatch):
@@ -197,21 +171,6 @@ def test_correction_passes_only_fields_named_by_the_agent(monkeypatch):
     assert calls == [(23, {"title": "Arrival (2016)"})]
 
 
-def test_reply_reference_overrides_any_model_supplied_delete_target(monkeypatch):
-    calls = []
-    monkeypatch.setattr(inbox_skills.store, "delete_item", lambda **kwargs: (
-        calls.append(kwargs) or {"status": "not_found", "item": None}
-    ))
-    monkeypatch.setattr(db, "log_event", lambda *_a, **_k: None)
-    token = INBOX_TURN_CONTEXT.set(InboxTurnContext(reply_reference="confirmation-42"))
-    try:
-        inbox_skills._inbox_delete(item_id=999, reference="wrong", query="other item")
-    finally:
-        INBOX_TURN_CONTEXT.reset(token)
-
-    assert calls == [{"item_id": None, "reference": "confirmation-42", "query": None}]
-
-
 def test_reply_reference_is_forwarded_to_completion(monkeypatch):
     calls = []
     monkeypatch.setattr(inbox_skills.store, "mark_done", lambda **kwargs: (
@@ -233,7 +192,8 @@ def test_reply_reference_is_forwarded_to_completion(monkeypatch):
 def test_registered_tools_use_the_inbox_category_only():
     names = {name for name, tool in tools.REGISTRY.items() if tool.category == "inbox"}
 
-    assert names == {"inbox_search", "inbox_complete", "inbox_correct", "inbox_delete"}
+    assert names == {"inbox_search", "inbox_complete", "inbox_correct"}
+    assert "inbox_delete" not in tools.REGISTRY
     assert all(name not in names for name in ("brain_search", "brain_inbox"))
 
 

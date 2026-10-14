@@ -122,7 +122,7 @@ def test_inbox_agent_tools_are_available_without_exposing_second_brain_tools():
     selected = select_tools("Welche Filme habe ich mir gemerkt?")
 
     assert "inbox_search" in selected
-    assert set(selected) == {"inbox_search", "inbox_complete", "inbox_correct", "inbox_delete"}
+    assert set(selected) == {"inbox_search", "inbox_complete", "inbox_correct"}
 
 
 def test_inbox_search_phrase_forces_an_inbox_tool_call():
@@ -134,5 +134,5 @@ def test_inbox_search_phrase_forces_an_inbox_tool_call():
     )
 
     assert "inbox_search" in selected
-    assert set(selected) == {"inbox_search", "inbox_complete", "inbox_correct", "inbox_delete"}
+    assert set(selected) == {"inbox_search", "inbox_complete", "inbox_correct"}
     assert force is True

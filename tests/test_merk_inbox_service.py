@@ -297,6 +297,30 @@ def test_enrichment_preserves_nondefault_category_when_external_metadata_conflic
     assert updates[0][1]["tags"] == ["balkon"]
 
 
+def test_enrichment_replaces_provisional_article_category_from_clear_metadata(monkeypatch):
+    updates = []
+    item = _item(
+        title="example.org", category="lesen", tags=[], user_note="",
+        source_metadata={"type": "article", "platform": "article"},
+    )
+    monkeypatch.setattr(service.metadata, "fetch_metadata", AsyncMock(return_value={
+        "type": "article", "title": "Produkt kaufen", "description": "Shop-Angebot",
+        "platform": "article",
+    }))
+    monkeypatch.setattr(service.store, "update_enrichment", lambda item_id, **kw: updates.append((item_id, kw)))
+    monkeypatch.setattr(service.db, "log_event", lambda *_a, **_k: None)
+
+    asyncio.run(service._enrich_item(
+        item=item, urls=["https://example.org/product"], note="",
+        images=[], vision_backend=None, embedding_provider=None, needs_metadata=True,
+        needs_vision=False, needs_embedding=False, fallback_image_description="",
+    ))
+
+    assert updates[0][1]["category"] == "kaufen"
+    assert updates[0][1]["category_if_current"] == "lesen"
+    assert updates[0][1]["tags_if_current"] == []
+
+
 def test_external_title_replaces_only_the_expected_fallback_title(monkeypatch):
     updates = []
     item = _item(title="YouTube-Link", user_note="", platform="youtube")

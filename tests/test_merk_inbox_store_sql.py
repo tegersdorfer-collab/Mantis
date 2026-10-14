@@ -70,3 +70,56 @@ def test_enrichment_title_update_is_guarded_by_the_expected_fallback(monkeypatch
     sql, params = calls[0]
     assert "title=CASE WHEN title=%s THEN %s ELSE title END" in sql
     assert params[:2] == ("YouTube-Link", "Arrival")
+
+
+def test_enrichment_category_and_tags_are_guarded_by_capture_snapshot(monkeypatch):
+    calls = []
+    monkeypatch.setattr(store.db, "query_one", lambda sql, params: calls.append((sql, params)) or {})
+
+    store.update_enrichment(
+        17, category="kaufen", category_if_current="lesen",
+        tags=["favorit"], tags_if_current=["artikel"],
+    )
+
+    sql, params = calls[0]
+    assert "category=CASE WHEN category=%s AND category_source='auto' THEN %s ELSE category END" in sql
+    assert "tags=CASE WHEN tags=%s THEN %s ELSE tags END" in sql
+    assert ("lesen", "kaufen") == (params[0], params[1])
+    assert ["artikel"] == params[2]
+    assert ["favorit"] == params[3]
+
+
+def test_category_correction_marks_its_source_as_user(monkeypatch):
+    calls = []
+    monkeypatch.setattr(store.db, "query_one", lambda sql, params: calls.append((sql, params)) or {})
+
+    store.correct_item(17, category="film-serie")
+
+    assert "category_source='user'" in calls[0][0]
+    assert calls[0][1][0] == "film-serie"
+
+
+def test_discord_confirmation_reference_is_marked_separately(monkeypatch):
+    calls = []
+    monkeypatch.setattr(store.db, "query_one", lambda sql, params: calls.append((sql, params)) or {})
+
+    store.add_source_message_reference(17, "confirmation-17")
+
+    sql, params = calls[0]
+    assert "confirmation_message_ids=CASE" in sql
+    assert "array_append(confirmation_message_ids, %s)" in sql
+    assert params == ("confirmation-17", "confirmation-17", "confirmation-17", "confirmation-17", 17)
+
+
+def test_delete_confirmation_resolution_uses_only_marked_confirmation_ids(monkeypatch):
+    calls = []
+    monkeypatch.setattr(store.db, "query", lambda sql, params: calls.append((sql, params)) or [])
+
+    assert store.resolve_confirmation_reference("confirmation-17") == {
+        "status": "not_found", "item": None,
+    }
+
+    sql, params = calls[0]
+    assert "confirmation_message_ids" in sql
+    assert "source_message_ids" not in sql
+    assert params == ("confirmation-17",)

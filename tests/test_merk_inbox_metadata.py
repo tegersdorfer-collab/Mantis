@@ -4,7 +4,9 @@ import asyncio
 import json
 import socket
 import sys
+import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -124,6 +126,28 @@ def test_ytdlp_timeout_kills_child_process(monkeypatch):
 
     assert result == {}
     assert state["killed"] is True
+
+
+def test_ytdlp_timeout_kills_process_group_when_leader_already_exited(monkeypatch, tmp_path):
+    marker = tmp_path / "child-survived-timeout"
+    child = (
+        "import pathlib,time; time.sleep(0.8); "
+        f"pathlib.Path({str(marker)!r}).write_text('alive')"
+    )
+    bootstrap = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+        "print('{}', flush=True)"
+    )
+    _public_dns(monkeypatch)
+    monkeypatch.setattr(metadata, "_YTDLP_BOOTSTRAP", bootstrap)
+    monkeypatch.setattr(metadata, "_METADATA_TIMEOUT_S", 0.25)
+
+    result = asyncio.run(metadata.fetch_metadata("https://youtu.be/abc123"))
+    time.sleep(0.9)
+
+    assert result == {}
+    assert not marker.exists()
 
 
 def test_ytdlp_output_is_capped_while_reading_and_process_is_killed(monkeypatch):
@@ -343,6 +367,9 @@ def test_ytdlp_is_limited_to_exact_platform_hosts(monkeypatch):
     ("https://youtube.com/watch?v=1", "youtube"),
     ("https://youtu.be/1", "youtube"),
     ("https://m.youtube.com/watch?v=1", "youtube"),
+    ("https://www.youtube.com/watch?v=1", "youtube"),
+    ("https://WWW.YouTube.com./watch?v=1", "youtube"),
+    ("https://music.youtube.com/watch?v=1", "youtube"),
     ("https://tiktok.com/@a/video/1", "tiktok"),
     ("https://vm.tiktok.com/1", "tiktok"),
     ("https://www.tiktok.com/@a/video/1", "tiktok"),
@@ -351,6 +378,18 @@ def test_ytdlp_is_limited_to_exact_platform_hosts(monkeypatch):
 ])
 def test_ytdlp_allowlist_accepts_only_documented_platform_hosts(url, platform):
     assert metadata._ytdlp_host_allowed(url, platform) is True
+
+
+def test_www_youtube_metadata_uses_ytdlp(monkeypatch):
+    _public_dns(monkeypatch)
+    monkeypatch.setattr(metadata, "_fetch_ytdlp", AsyncMock(return_value={"title": "Video"}))
+
+    result = asyncio.run(metadata.fetch_metadata("https://www.youtube.com/watch?v=abc"))
+
+    assert result == {"title": "Video"}
+    assert metadata._fetch_ytdlp.await_args.args == (
+        "https://www.youtube.com/watch?v=abc", "youtube", metadata._METADATA_TIMEOUT_S,
+    )
 
 
 def test_ytdlp_process_resolver_rejects_private_and_mixed_dns_answers(monkeypatch):

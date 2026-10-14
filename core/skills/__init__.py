@@ -51,7 +51,7 @@ _ORDER = [
     'speak', 'add_research_query', 'fetch_and_summarize_url', 'log_body_measurement', 'body_progress', 'save_quote',
     'add_thought_to_quote', 'add_directive', 'nutrition_advice', 'claude_code_run', 'git_history_import', 'refresh_tools',
     'delegate_task', 'list_skill_procedures', 'update_skill_procedure',
-    'inbox_search', 'inbox_complete', 'inbox_correct', 'inbox_delete',
+    'inbox_search', 'inbox_complete', 'inbox_correct',
 ]
 
 _ordered = {n: T.REGISTRY[n] for n in _ORDER if n in T.REGISTRY}

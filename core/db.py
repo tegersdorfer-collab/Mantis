@@ -540,6 +540,8 @@ MIGRATIONS = [
         category            TEXT NOT NULL DEFAULT 'sonstiges'
                             CHECK (category IN ('anschauen', 'lesen', 'film-serie', 'kaufen',
                                                 'idee', 'ort', 'zitat', 'sonstiges')),
+        category_source     TEXT NOT NULL DEFAULT 'auto'
+                            CHECK (category_source IN ('auto', 'user')),
         tags                TEXT[] NOT NULL DEFAULT '{}',
         status              TEXT NOT NULL DEFAULT 'open'
                             CHECK (status IN ('open', 'done')),
@@ -548,11 +550,15 @@ MIGRATIONS = [
         updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         completed_at        TIMESTAMPTZ,
         source_message_id   TEXT UNIQUE,
-        source_message_ids  TEXT[] NOT NULL DEFAULT '{}'
+        source_message_ids  TEXT[] NOT NULL DEFAULT '{}',
+        confirmation_message_ids TEXT[] NOT NULL DEFAULT '{}'
     );""",
     "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS source_message_ids TEXT[] NOT NULL DEFAULT '{}';",
+    "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS category_source TEXT NOT NULL DEFAULT 'auto' CHECK (category_source IN ('auto', 'user'));",
+    "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS confirmation_message_ids TEXT[] NOT NULL DEFAULT '{}';",
     "UPDATE merk_inbox_items SET source_message_ids=ARRAY[source_message_id] WHERE source_message_id IS NOT NULL AND cardinality(source_message_ids)=0;",
     "CREATE INDEX IF NOT EXISTS merk_inbox_source_message_ids_idx ON merk_inbox_items USING gin (source_message_ids);",
+    "CREATE INDEX IF NOT EXISTS merk_inbox_confirmation_message_ids_idx ON merk_inbox_items USING gin (confirmation_message_ids);",
     "CREATE UNIQUE INDEX IF NOT EXISTS merk_inbox_open_dedupe_idx ON merk_inbox_items (dedupe_key) WHERE status='open' AND dedupe_key IS NOT NULL;",
     "CREATE INDEX IF NOT EXISTS merk_inbox_status_created_idx ON merk_inbox_items (status, created_at DESC);",
     "CREATE INDEX IF NOT EXISTS merk_inbox_category_idx ON merk_inbox_items (category, status, created_at DESC);",

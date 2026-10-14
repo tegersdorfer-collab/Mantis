@@ -6,12 +6,15 @@ import pytest
 from core import db
 from domains.inbox.query import SearchQuery
 from domains.inbox.store import (
+    add_source_message_reference,
     correct_item,
     create_item,
     delete_item,
     mark_done,
     resolve_item,
+    resolve_confirmation_reference,
     search_items,
+    update_enrichment,
 )
 
 
@@ -168,6 +171,37 @@ def test_correction_changes_only_named_fields(inbox_test_db):
     assert updated["category"] == "film-serie"
     assert updated["tags"] == ["scifi"]
     assert updated["source_urls"] == ["https://example.org/arrival"]
+
+
+def test_enrichment_preserves_category_and_tags_corrected_during_fetch(inbox_test_db):
+    item = create_item(**_new(
+        category="lesen", tags=["artikel"], source_message_id=_TEST_PREFIX + "stale-enrichment",
+    ))["item"]
+    assert item["category_source"] == "auto"
+
+    corrected = correct_item(item["id"], category="film-serie", tags=["favorit"])
+    update_enrichment(
+        item["id"], category="kaufen", category_if_current="lesen",
+        tags=["shop"], tags_if_current=["artikel"],
+    )
+    current = resolve_item(item_id=item["id"])["item"]
+
+    assert corrected["category_source"] == "user"
+    assert current["category"] == "film-serie"
+    assert current["category_source"] == "user"
+    assert current["tags"] == ["favorit"]
+
+
+def test_only_discord_confirmation_references_authorize_confirmation_lookup(inbox_test_db):
+    item = create_item(**_new(source_message_id=_TEST_PREFIX + "source-only"))["item"]
+    confirmation_id = _TEST_PREFIX + "confirmation"
+    add_source_message_reference(item["id"], confirmation_id)
+
+    assert resolve_confirmation_reference(_TEST_PREFIX + "source-only")["status"] == "not_found"
+    resolved = resolve_confirmation_reference(confirmation_id)
+
+    assert resolved["status"] == "found"
+    assert resolved["item"]["id"] == item["id"]
 
 
 def test_delete_requires_unique_match_and_removes_the_row(inbox_test_db):

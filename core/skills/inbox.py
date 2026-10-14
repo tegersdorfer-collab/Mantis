@@ -196,40 +196,6 @@ def _inbox_correct(
     return _tool_result({"status": "updated", "item": _external_item(updated)})
 
 
-@T.register(
-    "inbox_delete",
-    "Löscht einen Inbox-Merker nur mit Eintrags-ID aus der aktuellen Nutzernachricht oder "
-    "eindeutiger Discord-Antwortreferenz. Niemals Sammellöschung.",
-    {
-        "item_id": {"type": "integer"},
-        "reference": {"type": "string"},
-    }, [], "inbox",
-)
-def _inbox_delete(item_id: int | None = None, reference: str | None = None, query: str | None = None):
-    started = time.monotonic()
-    trusted_item_id, trusted_reference = _authorized_mutation_target()
-    if trusted_item_id is None and trusted_reference is None:
-        _metric("delete", "needs_reference", duration_ms=_elapsed_ms(started))
-        return _tool_result({
-            "status": "needs_reference",
-            "message": "Nenne die Eintrags-ID oder antworte direkt auf die Bestätigung.",
-        })
-    try:
-        result = store.delete_item(
-            item_id=trusted_item_id, reference=trusted_reference, query=None,
-        )
-    except Exception:
-        _metric("delete", "error", duration_ms=_elapsed_ms(started))
-        raise
-    status = result["status"]
-    _metric("delete", status, duration_ms=_elapsed_ms(started))
-    if status == "deleted":
-        return _tool_result({"status": "deleted", "item": _external_item(result["item"])})
-    if status == "ambiguous":
-        return _tool_result({"status": "ambiguous", "message": "Mehrere Merker passen."})
-    return _tool_result({"status": status, "message": "Kein eindeutig passender Merker gefunden."})
-
-
 def _datetime(value: str | None):
     if not value:
         return None
