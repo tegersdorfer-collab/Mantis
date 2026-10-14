@@ -60,6 +60,10 @@ def test_idempotent_migration_can_run_twice(inbox_test_db):
     assert db.query_one(
         "SELECT to_regclass('merk_inbox_items') AS table_name"
     )["table_name"] == "merk_inbox_items"
+    assert db.query_one(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name='merk_inbox_items' AND column_name='tags_source'"
+    )["column_name"] == "tags_source"
 
 
 def test_discord_retry_with_same_message_id_returns_one_item(inbox_test_db):
@@ -173,23 +177,28 @@ def test_correction_changes_only_named_fields(inbox_test_db):
     assert updated["source_urls"] == ["https://example.org/arrival"]
 
 
-def test_enrichment_preserves_category_and_tags_corrected_during_fetch(inbox_test_db):
+@pytest.mark.parametrize(("initial_tags", "computed_tags", "source_suffix"), [
+    ([], ["automatisch"], "empty"),
+    (["scifi"], ["science-fiction"], "same-value"),
+])
+def test_enrichment_preserves_explicit_tags_even_when_they_match_snapshot(
+    inbox_test_db, initial_tags, computed_tags, source_suffix,
+):
     item = create_item(**_new(
-        category="lesen", tags=["artikel"], source_message_id=_TEST_PREFIX + "stale-enrichment",
+        source_kind="text", source_urls=[], tags=initial_tags,
+        source_message_id=_TEST_PREFIX + "explicit-tags-" + source_suffix,
     ))["item"]
-    assert item["category_source"] == "auto"
+    assert item["tags_source"] == "auto"
 
-    corrected = correct_item(item["id"], category="film-serie", tags=["favorit"])
+    corrected = correct_item(item["id"], tags=initial_tags)
     update_enrichment(
-        item["id"], category="kaufen", category_if_current="lesen",
-        tags=["shop"], tags_if_current=["artikel"],
+        item["id"], tags=computed_tags, tags_if_current=initial_tags,
     )
     current = resolve_item(item_id=item["id"])["item"]
 
-    assert corrected["category_source"] == "user"
-    assert current["category"] == "film-serie"
-    assert current["category_source"] == "user"
-    assert current["tags"] == ["favorit"]
+    assert corrected["tags_source"] == "user"
+    assert current["tags"] == initial_tags
+    assert current["tags_source"] == "user"
 
 
 def test_only_discord_confirmation_references_authorize_confirmation_lookup(inbox_test_db):

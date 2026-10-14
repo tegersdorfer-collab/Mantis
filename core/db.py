@@ -543,6 +543,8 @@ MIGRATIONS = [
         category_source     TEXT NOT NULL DEFAULT 'auto'
                             CHECK (category_source IN ('auto', 'user')),
         tags                TEXT[] NOT NULL DEFAULT '{}',
+        tags_source         TEXT NOT NULL DEFAULT 'auto'
+                            CHECK (tags_source IN ('auto', 'user')),
         status              TEXT NOT NULL DEFAULT 'open'
                             CHECK (status IN ('open', 'done')),
         embedding           vector(1024),
@@ -555,6 +557,7 @@ MIGRATIONS = [
     );""",
     "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS source_message_ids TEXT[] NOT NULL DEFAULT '{}';",
     "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS category_source TEXT NOT NULL DEFAULT 'auto' CHECK (category_source IN ('auto', 'user'));",
+    "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS tags_source TEXT NOT NULL DEFAULT 'auto' CHECK (tags_source IN ('auto', 'user'));",
     "ALTER TABLE merk_inbox_items ADD COLUMN IF NOT EXISTS confirmation_message_ids TEXT[] NOT NULL DEFAULT '{}';",
     "UPDATE merk_inbox_items SET source_message_ids=ARRAY[source_message_id] WHERE source_message_id IS NOT NULL AND cardinality(source_message_ids)=0;",
     "CREATE INDEX IF NOT EXISTS merk_inbox_source_message_ids_idx ON merk_inbox_items USING gin (source_message_ids);",

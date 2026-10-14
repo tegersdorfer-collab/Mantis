@@ -34,7 +34,8 @@ def _handler(monkeypatch):
             return None
 
     channel = SimpleNamespace(
-        send=AsyncMock(), send_typing=AsyncMock(), stop_typing=AsyncMock(),
+        send=AsyncMock(return_value="discord-message-1"),
+        send_typing=AsyncMock(), stop_typing=AsyncMock(),
         supports_streaming=False,
     )
     backend = SimpleNamespace(supports_vision=True)
@@ -77,6 +78,26 @@ def _close(coro):
 
 def _meta_by_role(rows):
     return {params[0]: json.loads(params[3]) for _sql, params in rows}
+
+
+def _discord_message(
+    text, *, sender_id="123", channel_id="discord-dm-123",
+    message_id="user-message", reply_to_message_id=None,
+):
+    return IncomingMessage(
+        text, sender_id, datetime(2026, 10, 14),
+        raw=SimpleNamespace(channel=SimpleNamespace(id=channel_id)),
+        channel="discord", source_message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+def _record_delete(deleted, **kwargs):
+    deleted.append(kwargs)
+    return {
+        "status": "deleted",
+        "item": {"id": kwargs["item_id"], "title": "Arrival"},
+    }
 
 
 def test_discord_capture_uses_fast_path_and_tags_both_chat_rows(monkeypatch):
@@ -231,10 +252,7 @@ def test_exact_id_delete_prompts_and_executes_only_after_next_ja(monkeypatch):
         "core.message_handler.skills.T.select_tools_async",
         AsyncMock(side_effect=AssertionError("Löschen darf keinen Agentenaufruf starten")),
     )
-    request = IncomingMessage(
-        "Lösch Merker #42", "123", datetime(2026, 10, 14), channel="discord",
-        source_message_id="delete-request-42",
-    )
+    request = _discord_message("Lösch Merker #42", message_id="delete-request-42")
 
     asyncio.run(handler.handle(request, resume_idle_cb=None))
 
@@ -242,9 +260,8 @@ def test_exact_id_delete_prompts_and_executes_only_after_next_ja(monkeypatch):
     assert deleted == []
     assert "🗑️ „Arrival“ löschen? ja/nein" in channel.send.await_args.args[0]
 
-    confirmation = IncomingMessage(
-        "ja", "123", datetime(2026, 10, 14), channel="discord",
-        source_message_id="delete-yes-42",
+    confirmation = _discord_message(
+        "ja", message_id="delete-yes-42", reply_to_message_id="discord-message-1",
     )
     asyncio.run(handler.handle(confirmation, resume_idle_cb=None))
 
@@ -260,16 +277,10 @@ def test_next_nein_cancels_pending_delete(monkeypatch):
     deleted = []
     monkeypatch.setattr(
         "core.message_handler.inbox_service.store.delete_item",
-        lambda **kw: deleted.append(kw),
+        lambda **kw: _record_delete(deleted, **kw),
     )
-    request = IncomingMessage(
-        "Lösch #42", "123", datetime(2026, 10, 14), channel="discord",
-        source_message_id="delete-request-cancel",
-    )
-    answer = IncomingMessage(
-        "nein", "123", datetime(2026, 10, 14), channel="discord",
-        source_message_id="delete-cancel",
-    )
+    request = _discord_message("Lösch #42", message_id="delete-request-cancel")
+    answer = _discord_message("nein", message_id="delete-cancel")
 
     asyncio.run(handler.handle(request, resume_idle_cb=None))
     asyncio.run(handler.handle(answer, resume_idle_cb=None))
@@ -288,24 +299,17 @@ def test_an_intervening_discord_message_expires_delete_confirmation(monkeypatch)
     deleted = []
     monkeypatch.setattr(
         "core.message_handler.inbox_service.store.delete_item",
-        lambda **kw: deleted.append(kw),
+        lambda **kw: _record_delete(deleted, **kw),
     )
     monkeypatch.setattr(
         "core.message_handler.skills.T.select_tools_async",
         AsyncMock(return_value=([], False)),
     )
-    request = IncomingMessage(
-        "Lösch #42", "123", datetime(2026, 10, 14), channel="discord",
-        source_message_id="delete-request-interrupted",
+    request = _discord_message("Lösch #42", message_id="delete-request-interrupted")
+    interlude = _discord_message(
+        "Hallo", sender_id="456", message_id="discord-interlude",
     )
-    interlude = IncomingMessage(
-        "Hallo", "456", datetime(2026, 10, 14), channel="discord",
-        source_message_id="discord-interlude",
-    )
-    late_answer = IncomingMessage(
-        "ja", "123", datetime(2026, 10, 14), channel="discord",
-        source_message_id="late-delete-yes",
-    )
+    late_answer = _discord_message("ja", message_id="late-delete-yes")
 
     asyncio.run(handler.handle(request, resume_idle_cb=None))
     asyncio.run(handler.handle(interlude, resume_idle_cb=None))
@@ -314,6 +318,166 @@ def test_an_intervening_discord_message_expires_delete_confirmation(monkeypatch)
     assert deleted == []
     assert handler._pending_inbox_deletions == {}
     assert agent.run.await_count == 2
+
+
+def test_delete_confirmation_is_bound_to_the_original_discord_channel(monkeypatch):
+    handler, _rows, _agent, _channel = _handler(monkeypatch)
+    monkeypatch.setattr("core.message_handler.inbox_service.store.resolve_item", lambda **_kw: {
+        "status": "found", "item": {"id": 42, "title": "Arrival"},
+    })
+    deleted = []
+    monkeypatch.setattr(
+        "core.message_handler.inbox_service.store.delete_item",
+        lambda **kw: _record_delete(deleted, **kw),
+    )
+
+    asyncio.run(handler.handle(
+        _discord_message("Lösch #42", channel_id="dm-a", message_id="request-42"),
+        resume_idle_cb=None,
+    ))
+    asyncio.run(handler.handle(
+        _discord_message(
+            "ja", channel_id="dm-b", message_id="answer-42",
+            reply_to_message_id="discord-message-1",
+        ),
+        resume_idle_cb=None,
+    ))
+
+    assert deleted == []
+
+
+def test_delete_confirmation_reply_must_target_the_exact_prompt(monkeypatch):
+    handler, _rows, _agent, _channel = _handler(monkeypatch)
+    monkeypatch.setattr("core.message_handler.inbox_service.store.resolve_item", lambda **_kw: {
+        "status": "found", "item": {"id": 42, "title": "Arrival"},
+    })
+    deleted = []
+    monkeypatch.setattr(
+        "core.message_handler.inbox_service.store.delete_item",
+        lambda **kw: _record_delete(deleted, **kw),
+    )
+
+    asyncio.run(handler.handle(
+        _discord_message("Lösch #42", message_id="request-42"), resume_idle_cb=None,
+    ))
+    asyncio.run(handler.handle(
+        _discord_message(
+            "ja", message_id="answer-42", reply_to_message_id="some-other-message",
+        ),
+        resume_idle_cb=None,
+    ))
+
+    assert deleted == []
+
+
+def test_new_delete_request_replaces_the_old_prompt_target(monkeypatch):
+    handler, _rows, _agent, channel = _handler(monkeypatch)
+    resolved = []
+    monkeypatch.setattr("core.message_handler.inbox_service.store.resolve_item", lambda **kw: (
+        resolved.append(kw) or {
+            "status": "found", "item": {"id": kw["item_id"], "title": "Film"},
+        }
+    ))
+    deleted = []
+    monkeypatch.setattr(
+        "core.message_handler.inbox_service.store.delete_item",
+        lambda **kw: _record_delete(deleted, **kw),
+    )
+    channel.send.side_effect = ["prompt-42", "prompt-43", "regular-reply"]
+
+    asyncio.run(handler.handle(
+        _discord_message("Lösch #42", message_id="request-42"), resume_idle_cb=None,
+    ))
+    asyncio.run(handler.handle(
+        _discord_message("Lösch #43", message_id="request-43"), resume_idle_cb=None,
+    ))
+    asyncio.run(handler.handle(
+        _discord_message(
+            "ja", message_id="answer-old-prompt", reply_to_message_id="prompt-42",
+        ),
+        resume_idle_cb=None,
+    ))
+
+    assert resolved == [{"item_id": 42}, {"item_id": 43}]
+    assert deleted == []
+
+
+def test_delete_confirmation_expires_after_five_minutes(monkeypatch):
+    now = [1_000.0]
+    monkeypatch.setattr("core.message_handler.time.monotonic", lambda: now[0])
+    handler, _rows, _agent, _channel = _handler(monkeypatch)
+    monkeypatch.setattr("core.message_handler.inbox_service.store.resolve_item", lambda **_kw: {
+        "status": "found", "item": {"id": 42, "title": "Arrival"},
+    })
+    deleted = []
+    monkeypatch.setattr(
+        "core.message_handler.inbox_service.store.delete_item",
+        lambda **kw: _record_delete(deleted, **kw),
+    )
+
+    asyncio.run(handler.handle(
+        _discord_message("Lösch #42", message_id="request-42"), resume_idle_cb=None,
+    ))
+    now[0] += 300
+    asyncio.run(handler.handle(
+        _discord_message("ja", message_id="answer-42"), resume_idle_cb=None,
+    ))
+
+    assert deleted == []
+
+
+@pytest.mark.parametrize("channel_name", ["dashboard", "web", "voice", "telegram"])
+def test_user_turn_on_any_channel_expires_pending_delete(monkeypatch, channel_name):
+    handler, _rows, _agent, _channel = _handler(monkeypatch)
+    monkeypatch.setattr("core.message_handler.inbox_service.store.resolve_item", lambda **_kw: {
+        "status": "found", "item": {"id": 42, "title": "Arrival"},
+    })
+    deleted = []
+    monkeypatch.setattr(
+        "core.message_handler.inbox_service.store.delete_item",
+        lambda **kw: deleted.append(kw),
+    )
+
+    asyncio.run(handler.handle(
+        _discord_message("Lösch #42", message_id="request-42"), resume_idle_cb=None,
+    ))
+    asyncio.run(handler.handle(IncomingMessage(
+        "Hallo", "123", datetime(2026, 10, 14), channel=channel_name,
+    ), resume_idle_cb=None))
+    asyncio.run(handler.handle(
+        _discord_message("ja", message_id="answer-42"), resume_idle_cb=None,
+    ))
+
+    assert deleted == []
+    assert handler._pending_inbox_deletions == {}
+
+
+@pytest.mark.parametrize("channel_name", ["web", "voice"])
+def test_dashboard_or_voice_respond_expires_pending_delete(monkeypatch, channel_name):
+    handler, _rows, _agent, _channel = _handler(monkeypatch)
+    monkeypatch.setattr("core.message_handler.inbox_service.store.resolve_item", lambda **_kw: {
+        "status": "found", "item": {"id": 42, "title": "Arrival"},
+    })
+    monkeypatch.setattr(
+        "core.message_handler.skills.T.select_tools_async",
+        AsyncMock(return_value=([], False)),
+    )
+    deleted = []
+    monkeypatch.setattr(
+        "core.message_handler.inbox_service.store.delete_item",
+        lambda **kw: _record_delete(deleted, **kw),
+    )
+
+    asyncio.run(handler.handle(
+        _discord_message("Lösch #42", message_id="request-42"), resume_idle_cb=None,
+    ))
+    asyncio.run(handler.dashboard_respond("Eine andere Frage", channel_name=channel_name))
+    asyncio.run(handler.handle(
+        _discord_message("ja", message_id="answer-42"), resume_idle_cb=None,
+    ))
+
+    assert deleted == []
+    assert handler._pending_inbox_deletions == {}
 
 
 def test_delete_is_not_confirmed_before_prompt_send_finishes(monkeypatch):
@@ -341,16 +505,15 @@ def test_delete_is_not_confirmed_before_prompt_send_finishes(monkeypatch):
             if "löschen? ja/nein" in text:
                 prompt_started.set()
                 await release_prompt.wait()
-            return None
+                return "prompt-message-id"
+            return "regular-reply-id"
 
         channel.send = delayed_send
-        request = IncomingMessage(
-            "Lösch #42", "123", datetime(2026, 10, 14), channel="discord",
-            source_message_id="delete-request-prompt-pending",
+        request = _discord_message(
+            "Lösch #42", message_id="delete-request-prompt-pending",
         )
-        early_answer = IncomingMessage(
-            "ja", "123", datetime(2026, 10, 14), channel="discord",
-            source_message_id="delete-yes-before-prompt-complete",
+        early_answer = _discord_message(
+            "ja", message_id="delete-yes-before-prompt-complete",
         )
         prompt_task = asyncio.create_task(handler.handle(request, resume_idle_cb=None))
         await prompt_started.wait()

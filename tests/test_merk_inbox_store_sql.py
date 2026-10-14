@@ -83,7 +83,7 @@ def test_enrichment_category_and_tags_are_guarded_by_capture_snapshot(monkeypatc
 
     sql, params = calls[0]
     assert "category=CASE WHEN category=%s AND category_source='auto' THEN %s ELSE category END" in sql
-    assert "tags=CASE WHEN tags=%s THEN %s ELSE tags END" in sql
+    assert "tags=CASE WHEN tags=%s AND tags_source='auto' THEN %s ELSE tags END" in sql
     assert ("lesen", "kaufen") == (params[0], params[1])
     assert ["artikel"] == params[2]
     assert ["favorit"] == params[3]
@@ -97,6 +97,16 @@ def test_category_correction_marks_its_source_as_user(monkeypatch):
 
     assert "category_source='user'" in calls[0][0]
     assert calls[0][1][0] == "film-serie"
+
+
+def test_tag_correction_marks_its_source_as_user_even_when_empty(monkeypatch):
+    calls = []
+    monkeypatch.setattr(store.db, "query_one", lambda sql, params: calls.append((sql, params)) or {})
+
+    store.correct_item(17, tags=[])
+
+    assert "tags_source='user'" in calls[0][0]
+    assert calls[0][1][0] == []
 
 
 def test_discord_confirmation_reference_is_marked_separately(monkeypatch):

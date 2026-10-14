@@ -8,6 +8,7 @@ import logging
 import re
 import threading
 import time
+from dataclasses import dataclass
 
 from communication.base import IncomingMessage
 from core.background_review import run_background_review
@@ -41,6 +42,15 @@ _INBOX_DELETE_REPLY = re.compile(
     r"^(?:lösch|lösche)\s+(?:(?:das|den)\s+)?(?:bitte\s*)?[.!]?$",
     re.IGNORECASE,
 )
+_INBOX_DELETE_CONFIRMATION_TTL = 5 * 60
+
+
+@dataclass(frozen=True)
+class PendingInboxDeletion:
+    item_id: int
+    channel_id: str
+    prompt_message_id: str
+    created_at: float
 
 
 def _safe_task(coro, label: str):
@@ -73,6 +83,20 @@ def _inbox_delete_item_id(text: str) -> int | None:
 def _display_inbox_title(value: object) -> str:
     title = " ".join(str(value or "Merker").split())
     return title[:100] or "Merker"
+
+
+def _discord_channel_id(msg: IncomingMessage) -> str | None:
+    raw = getattr(msg, "raw", None)
+    channel = getattr(raw, "channel", None)
+    value = getattr(channel, "id", None)
+    return str(value) if value is not None else None
+
+
+def _sent_message_id(value: object) -> str | None:
+    if isinstance(value, (str, int)):
+        return str(value) if str(value).strip() else None
+    message_id = getattr(value, "id", None)
+    return str(message_id) if message_id is not None else None
 
 
 def _inbox_tool_for(text: str) -> str:
@@ -109,7 +133,7 @@ class MessageHandler:
         self._turn_lock        = threading.Lock()
         self._active_turns     = 0
         self._incoming_message_sequence = 0
-        self._pending_inbox_deletions: dict[str, tuple[int, int]] = {}
+        self._pending_inbox_deletions: dict[str, PendingInboxDeletion] = {}
 
     def _channel_for(self, msg: IncomingMessage):
         channel = self.channels.get(getattr(msg, "channel", "telegram"), self.channel)
@@ -140,6 +164,14 @@ class MessageHandler:
             self._active_turns -= 1
             if self._active_turns == 0:
                 self._resume_idle_loop(callback)
+
+    def _take_pending_inbox_deletion(
+        self, sender_key: str | None = None,
+    ) -> PendingInboxDeletion | None:
+        """Verbraucht eine passende Rückfrage und verwirft alle anderen."""
+        pending = self._pending_inbox_deletions.pop(sender_key, None) if sender_key else None
+        self._pending_inbox_deletions.clear()
+        return pending
 
     # ── Verification Bump ─────────────────────────────────────────────────────
 
@@ -196,15 +228,22 @@ class MessageHandler:
         sender_key = str(getattr(msg, "sender_id", "") or "")
         self._incoming_message_sequence += 1
         message_sequence = self._incoming_message_sequence
-        pending_deletion = (
-            self._pending_inbox_deletions.pop(sender_key, None)
-            if is_discord and sender_key else None
-        )
-        # Die Rückfrage gilt nur bis zur direkt folgenden eingehenden Nachricht.
-        self._pending_inbox_deletions.clear()
+        # Jeder neue Benutzer-Turn verwirft alle offenen Bestätigungen, unabhängig
+        # davon, über welchen Kanal er eingeht. Nur dieser Turn kann sie verbrauchen.
+        pending_deletion = self._take_pending_inbox_deletion(sender_key)
+        now = time.monotonic()
         pending_delete_id = None
-        if pending_deletion and pending_deletion[1] == message_sequence - 1:
-            pending_delete_id = pending_deletion[0]
+        if (
+            is_discord
+            and pending_deletion is not None
+            and now - pending_deletion.created_at < _INBOX_DELETE_CONFIRMATION_TTL
+            and _discord_channel_id(msg) == pending_deletion.channel_id
+            and (
+                not getattr(msg, "reply_to_message_id", None)
+                or str(msg.reply_to_message_id) == pending_deletion.prompt_message_id
+            )
+        ):
+            pending_delete_id = pending_deletion.item_id
         pending_delete_answer = (
             str(msg.text or "").casefold()
             if pending_delete_id is not None else ""
@@ -301,9 +340,20 @@ class MessageHandler:
                 item_id = int(target["id"])
                 title = _display_inbox_title(target.get("title"))
                 response = f"🗑️ „{title}“ löschen? ja/nein"
-                sent = await self._send_inbox_fast_reply(response, channel_name, response_channel)
-                if sent and self._incoming_message_sequence == message_sequence and sender_key:
-                    self._pending_inbox_deletions[sender_key] = (item_id, message_sequence)
+                prompt_message_id = await self._send_inbox_fast_reply(
+                    response, channel_name, response_channel,
+                )
+                channel_id = _discord_channel_id(msg)
+                if (
+                    prompt_message_id and channel_id
+                    and self._incoming_message_sequence == message_sequence and sender_key
+                ):
+                    self._pending_inbox_deletions[sender_key] = PendingInboxDeletion(
+                        item_id=item_id,
+                        channel_id=channel_id,
+                        prompt_message_id=prompt_message_id,
+                        created_at=time.monotonic(),
+                    )
                 return
 
         if capture_decision and capture_decision.capture:
@@ -417,6 +467,7 @@ class MessageHandler:
         resume_idle_cb=None,
     ) -> tuple[str, list]:
         self._start_turn()
+        self._take_pending_inbox_deletion()
         try:
             self.kzg.add("user", text)
             self._persist_msg("user", text, channel=channel_name)
@@ -576,7 +627,7 @@ class MessageHandler:
 
         return stream_cb, finalize
 
-    async def _send_inbox_fast_reply(self, response: str, channel_name: str, channel) -> bool:
+    async def _send_inbox_fast_reply(self, response: str, channel_name: str, channel) -> str | None:
         self.kzg.add("assistant", response)
         self._persist_msg(
             "assistant", response, channel=channel_name,
@@ -584,11 +635,11 @@ class MessageHandler:
         )
         BUS.emit("response", response)
         try:
-            await channel.send(response)
+            sent = await channel.send(response)
         except Exception as exc:
             log.warning("Inbox-Fast-Path-Antwort fehlgeschlagen (%s)", type(exc).__name__)
-            return False
-        return True
+            return None
+        return _sent_message_id(sent)
 
     # ── Persistenz ────────────────────────────────────────────────────────────
 

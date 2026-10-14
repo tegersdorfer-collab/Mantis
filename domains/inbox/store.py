@@ -202,7 +202,9 @@ def update_enrichment(
         )
         params.extend([category_if_current, category])
     if tags is not None and tags_if_current is not None:
-        assignments.append("tags=CASE WHEN tags=%s THEN %s ELSE tags END")
+        assignments.append(
+            "tags=CASE WHEN tags=%s AND tags_source='auto' THEN %s ELSE tags END"
+        )
         params.extend([_unique_tags(tags_if_current), _unique_tags(tags)])
     vector = _vector_literal(embedding)
     if vector is not None:
@@ -329,7 +331,7 @@ def correct_item(item_id: int, **fields) -> dict | None:
         assignments.extend(["category=%s", "category_source='user'"])
         params.append(category)
     if "tags" in changes:
-        assignments.append("tags=%s")
+        assignments.extend(["tags=%s", "tags_source='user'"])
         params.append(_unique_tags(changes["tags"] or []))
     if "source_urls" in changes:
         urls = _unique(changes["source_urls"] or [])
