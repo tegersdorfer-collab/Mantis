@@ -48,7 +48,11 @@ class TestVoiceSegmentEndpoint:
     def test_adressiert_ruft_agent_auf_und_liefert_antwort_plus_audio(self):
         fake_orch = MagicMock()
         fake_orch.voice_respond = AsyncMock(return_value=("Dein Schlaf war gut.", []))
-        with patch("web.routers.voice.transcribe_audio", new=AsyncMock(return_value="Wie war mein Schlaf?")), \
+        with patch(
+            "core.voice_fillers.choose_cached_filler",
+            side_effect=AssertionError("HTTP-Segmente dürfen keine Füller lesen"),
+        ), \
+             patch("web.routers.voice.transcribe_audio", new=AsyncMock(return_value="Wie war mein Schlaf?")), \
              patch("web.routers.voice.is_addressed_to_mantis", new=AsyncMock(return_value=True)), \
              patch("web.routers.voice.synthesize", new=AsyncMock(return_value=b"FAKE_OGG_BYTES")):
             client = _make_client(fake_orch)

@@ -183,6 +183,10 @@ async def main():
     preload_task = schedule_parakeet_preload()
     if preload_task is not None:
         orchestrator._bg_tasks.append(preload_task)
+    from core.voice_fillers import schedule_voice_fillers_preload
+    fillers_task = schedule_voice_fillers_preload(preload_task)
+    if fillers_task is not None:
+        orchestrator._bg_tasks.append(fillers_task)
     asyncio.create_task(api_server.serve())
     log.info(f"🖥️  Dashboard läuft auf http://{dashboard_host}:{cfg.DASHBOARD_PORT} (bindet auf {dashboard_host})")
     if cfg.GYM_ENABLED:

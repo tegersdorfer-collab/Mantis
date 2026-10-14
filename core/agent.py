@@ -263,6 +263,10 @@ class Agent:
                 elif dry_run_tools:
                     result = f"[Eval-Dry-Run] Tool '{name}' würde ausgeführt (Argumente akzeptiert)."
                 else:
+                    if stream_cb is not None:
+                        await stream_cb(StreamEvent(
+                            "tool_start", attempt_id or "", tool_name=name,
+                        ))
                     with voice_timing.phase("tool_exec_ms"):
                         result = await toolreg.execute(name, args)
                 trace.append({"tool": name, "args": args, "result": result[:500]})

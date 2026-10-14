@@ -40,6 +40,18 @@ class MantisSettings(BaseSettings):
     OLLAMA_NUM_CTX_OVERRIDES: str = ""
     VOICE_MAX_TOKENS: int = 500
     VOICE_SILENCE_MS: int = 800
+    VOICE_FILLERS_ENABLED: bool = True
+    VOICE_FILLER_ACK_DELAY_MS: int = 800
+    VOICE_FILLERS_ACK: list[str] = Field(
+        default_factory=lambda: ["Mhm.", "Okay.", "Moment."],
+    )
+    VOICE_FILLERS_TOOL: list[str] = Field(
+        default_factory=lambda: [
+            "Ich schau kurz nach.",
+            "Moment, ich check das.",
+            "Sekunde, ich schau nach.",
+        ],
+    )
     # ── STT (Sprache → Text) ─────────────────────────────────────────────────
     # "parakeet" (Default seit 22.09.2026) oder "whisper" (whisper.cpp medium, der
     # vorherige Stand — bleibt als Fallback, wenn parakeet-mlx fehlt).

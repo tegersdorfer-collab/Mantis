@@ -61,6 +61,10 @@ def attempt_abort(attempt_id):
     return StreamEvent("attempt_abort", attempt_id)
 
 
+def tool_start(attempt_id, name="weather"):
+    return StreamEvent("tool_start", attempt_id, tool_name=name)
+
+
 class TestSendeAntwort:
     """Der Ton wird blockweise geschickt, sobald er entsteht — statt erst am Ende.
 
@@ -84,9 +88,14 @@ class TestSendeAntwort:
         assert (b["seq"], base64.b64decode(b["b64"])) == (1, b"OGG-B")
         assert ende == {"type": "audio_end", "count": 2}
 
-    def test_ohne_streaming_bleibt_es_beim_alten_protokoll(self):
+    def test_ohne_streaming_bleibt_es_beim_alten_protokoll(self, monkeypatch):
         """Alte Clients (iOS) dürfen sich nicht ändern."""
         ws = FakeWebSocket()
+
+        def no_filler(*_args, **_kwargs):
+            raise AssertionError("Nicht-streamende Clients dürfen keine Füller lesen")
+
+        monkeypatch.setattr("core.voice_fillers.choose_cached_filler", no_filler)
         with patch("web.routers.voice.synthesize", return_value=b"KOMPLETT"):
             asyncio.run(sende_antwort(ws, "hallo", "Antwort.", False))
         assert len(ws.gesendet) == 1
@@ -182,6 +191,205 @@ def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkey
     assert logged[0][2]["total_ms"] >= logged[0][2]["first_tts_block_ms"]
     assert logged[0][2]["model"] == "openai/gpt-6-luna"
     assert logged[0][2]["stage"] == "Backend"
+
+
+def _fake_opus(duration_ms=1000):
+    pre_skip = 312
+    granule = pre_skip + int(duration_ms * 48)
+    body = b"OpusHead" + bytes((1, 1)) + pre_skip.to_bytes(2, "little") + b"\0" * 7
+    header = (
+        b"OggS\0\0" + granule.to_bytes(8, "little") + b"\0" * 12
+        + bytes((1,))
+    )
+    return header + bytes((len(body),)) + body
+
+
+class FakeClock:
+    def __init__(self):
+        self.requested_delays = []
+        self.sleep_started = asyncio.Event()
+        self.advance_event = asyncio.Event()
+
+    async def sleep(self, seconds):
+        self.requested_delays.append(seconds)
+        self.sleep_started.set()
+        if seconds:
+            await self.advance_event.wait()
+        else:
+            await asyncio.sleep(0)
+
+
+def test_ack_filler_uses_fake_clock_precedes_answer_and_is_not_text(monkeypatch):
+    from core.voice_fillers import VoiceFiller
+
+    clock = FakeClock()
+    release_answer = asyncio.Event()
+    filler_send_started = asyncio.Event()
+    release_filler_send = asyncio.Event()
+    answer_tts_started = asyncio.Event()
+    logged = []
+    filler_audio = _fake_opus()
+    chosen = []
+
+    class FillerWebSocket(FakeWebSocket):
+        async def send_json(self, data):
+            await super().send_json(data)
+            if data.get("type") == "audio_chunk" and base64.b64decode(data["b64"]) == filler_audio:
+                filler_send_started.set()
+                await release_filler_send.wait()
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            await stream_cb(attempt_start("ack-turn"))
+            await release_answer.wait()
+            await stream_cb(tool_start("ack-turn"))
+            await stream_cb(delta("ack-turn", "Das ist die Antwort."))
+            await stream_cb(attempt_end("ack-turn", final=True))
+            return "Das ist die Antwort.", []
+
+    async def fake_tts(_sentence, **_kwargs):
+        answer_tts_started.set()
+        yield b"answer-audio"
+
+    def choose(kind):
+        chosen.append(kind)
+        return VoiceFiller(kind, "Mhm.", filler_audio, 1000.0)
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+    monkeypatch.setattr("core.voice_fillers.choose_cached_filler", choose)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 800)
+    ws = FillerWebSocket()
+
+    async def run():
+        task = asyncio.create_task(sende_streaming_antwort(
+            ws, "Mantis, hörst du?", FakeOrchestrator(), sleep=clock.sleep,
+        ))
+        await clock.sleep_started.wait()
+        assert clock.requested_delays == [0.8]
+        clock.advance_event.set()
+        await filler_send_started.wait()
+        release_answer.set()
+        await answer_tts_started.wait()
+        release_filler_send.set()
+        await task
+
+    asyncio.run(run())
+
+    chunks = [message for message in ws.gesendet if message.get("type") == "audio_chunk"]
+    assert [message["seq"] for message in chunks] == [0, 1]
+    assert [base64.b64decode(message["b64"]) for message in chunks] == [
+        filler_audio, b"answer-audio",
+    ]
+    assert chosen == ["ack"]
+    assert ws.gesendet[-2]["reply"] == "Das ist die Antwort."
+    assert "Mhm." not in ws.gesendet[-2]["reply"]
+    assert logged[0][2]["filler"] == "ack"
+    assert logged[0][2]["filler_ms"] == 1000.0
+
+
+def test_tool_filler_is_queued_before_answer_and_only_one_filler_is_used(monkeypatch):
+    from core.voice_fillers import VoiceFiller
+
+    clock = FakeClock()
+    filler_audio = _fake_opus(600)
+    filler_sent = asyncio.Event()
+    logged = []
+    chosen = []
+
+    class FillerWebSocket(FakeWebSocket):
+        async def send_json(self, data):
+            await super().send_json(data)
+            if data.get("type") == "audio_chunk" and base64.b64decode(data["b64"]) == filler_audio:
+                filler_sent.set()
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            await stream_cb(attempt_start("tool-turn"))
+            await stream_cb(tool_start("tool-turn", "weather"))
+            await filler_sent.wait()
+            await stream_cb(delta("tool-turn", "Es wird sonnig."))
+            await stream_cb(attempt_end("tool-turn", final=True))
+            return "Es wird sonnig.", []
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield b"answer-audio"
+
+    def choose(kind):
+        chosen.append(kind)
+        return VoiceFiller(kind, "Ich schau kurz nach.", filler_audio, 600.0)
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+    monkeypatch.setattr("core.voice_fillers.choose_cached_filler", choose)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 800)
+    ws = FillerWebSocket()
+
+    async def run():
+        task = asyncio.create_task(sende_streaming_antwort(
+            ws, "Wie wird das Wetter?", FakeOrchestrator(), sleep=clock.sleep,
+        ))
+        await clock.sleep_started.wait()
+        await filler_sent.wait()
+        clock.advance_event.set()
+        await task
+
+    asyncio.run(run())
+
+    chunks = [message for message in ws.gesendet if message.get("type") == "audio_chunk"]
+    assert [message["seq"] for message in chunks] == [0, 1]
+    assert [base64.b64decode(message["b64"]) for message in chunks] == [
+        filler_audio, b"answer-audio",
+    ]
+    assert chosen == ["tool"]
+    assert logged[0][2]["filler"] == "tool"
+    assert logged[0][2]["filler_ms"] == 600.0
+
+
+def test_ready_answer_audio_suppresses_ack_filler(monkeypatch):
+    from core.voice_fillers import VoiceFiller
+
+    clock = FakeClock()
+    choices = []
+    logged = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            await stream_cb(attempt_start("fast-answer"))
+            await stream_cb(delta("fast-answer", "Sofort da."))
+            await stream_cb(attempt_end("fast-answer", final=True))
+            return "Sofort da.", []
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield b"answer-audio"
+
+    def choose(kind):
+        choices.append(kind)
+        return VoiceFiller(kind, "Okay.", b"filler", 400.0)
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+    monkeypatch.setattr("core.voice_fillers.choose_cached_filler", choose)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 800)
+    ws = FakeWebSocket()
+
+    async def run():
+        task = asyncio.create_task(sende_streaming_antwort(
+            ws, "Mantis, sag etwas", FakeOrchestrator(), sleep=clock.sleep,
+        ))
+        await clock.sleep_started.wait()
+        await task
+
+    asyncio.run(run())
+
+    chunks = [message for message in ws.gesendet if message.get("type") == "audio_chunk"]
+    assert [base64.b64decode(message["b64"]) for message in chunks] == [b"answer-audio"]
+    assert choices == []
+    assert logged[0][2]["filler"] is None
+    assert logged[0][2]["filler_ms"] is None
 
 
 def test_voice_stream_appends_real_deltas_without_splitting_words(monkeypatch):

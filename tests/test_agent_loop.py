@@ -87,7 +87,7 @@ def test_tool_call_then_answer(echo_tool):
     assert "tool" in roles
 
 
-def test_stream_events_mark_tool_rounds_as_nonfinal(echo_tool):
+def test_stream_events_mark_tool_rounds_as_nonfinal(echo_tool, monkeypatch):
     class StreamingBackend(FakeBackend):
         def __init__(self):
             super().__init__([("", [_tc("echo", {"text": "hi"})]), ("Fertig.", [])])
@@ -103,9 +103,18 @@ def test_stream_events_mark_tool_rounds_as_nonfinal(echo_tool):
 
     backend = StreamingBackend()
     received = []
+    timeline = []
+
+    async def execute_echo(text=""):
+        timeline.append("execute")
+        return f"ECHO:{text}"
+
+    monkeypatch.setattr(toolreg.REGISTRY["echo"], "handler", execute_echo)
 
     async def collect(update):
         received.append(update)
+        if update.kind == "tool_start":
+            timeline.append("tool_start")
 
     asyncio.run(Agent(backend).run(
         [{"role": "user", "content": "hi"}], system="s", stream_cb=collect,
@@ -113,8 +122,11 @@ def test_stream_events_mark_tool_rounds_as_nonfinal(echo_tool):
 
     assert [event.kind for event in received] == [
         "attempt_start", "delta", "attempt_end",
+        "tool_start",
         "attempt_start", "delta", "attempt_end",
     ]
+    assert next(event for event in received if event.kind == "tool_start").tool_name == "echo"
+    assert timeline == ["tool_start", "execute"]
     assert [event.text_delta for event in received if event.kind == "delta"] == [
         "Zwischenstand", "Fertig.",
     ]
