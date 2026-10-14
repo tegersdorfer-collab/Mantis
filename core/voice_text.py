@@ -31,7 +31,10 @@ def _is_date_or_abbreviation_period(value: str, match: re.Match) -> bool:
     ):
         return True
     if re.search(r"(?<!\d)\d{1,2}\.\d{1,2}$", before):
-        return True
+        # 3.11. ohne Jahr ist Teil des Datums – außer es folgt ein neuer Satz (Großbuchstabe).
+        return not re.match(r"\s+[A-ZÄÖÜ]", after)
+    if re.search(r"(?<!\d)\d{1,2}\.\d{1,2}\.\d{2,4}$", before):
+        return False
     if re.search(r"(?<!\d)\d{1,2}$", before) and _MONTH_NAME.match(after):
         return True
     return bool(_ABBREVIATION_BEFORE_PERIOD.search(before))

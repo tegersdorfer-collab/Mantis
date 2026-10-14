@@ -696,3 +696,13 @@ def test_numbers_versions_and_two_digit_years():
     assert tts._numbers_to_german_words("Update auf v2.4.1 ist da") == "Update auf Version zwei Punkt vier Punkt eins ist da"
     assert tts._numbers_to_german_words("am 12.10.26") == "am zwölften Oktober zweitausendsechsundzwanzig"
     assert tts._numbers_to_german_words("am 12.10.2026") == "am zwölften Oktober zweitausendsechsundzwanzig"
+
+
+def test_numbers_review_round_three():
+    from core import tts
+    from core.voice_text import last_complete_sentence
+    assert tts._numbers_to_german_words("Version 1.2.3.") == "Version eins Punkt zwei Punkt drei."
+    assert tts._numbers_to_german_words("0,5 kg") == "null Komma fünf Kilo"
+    assert tts._numbers_to_german_words("10,04 Stunden") == "zehn Komma null vier Stunden"
+    assert last_complete_sentence("Termin am 3.11.26. Danach war") == "Termin am 3.11.26."
+    assert last_complete_sentence("Am 12. Oktober war") == "Am 12. Oktober war"

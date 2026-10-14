@@ -313,12 +313,12 @@ def _numbers_to_german_words(text: str) -> str:
     # Ohne Label nur eindeutige Formen: vier Teile oder drei Teile mit einstelligem Ende
     # (12.10.26 bleibt ein Datum, 1.2.3 ist eine Version).
     spoken = re.sub(
-        r"(?<![\w.])(?P<label>[vV](?=\d))?(?P<number>\d+\.\d+\.\d(?:\.\d+)*|\d+(?:\.\d+){3,})(?![\w.])",
+        r"(?<![\w.])(?P<label>[vV](?=\d))?(?P<number>\d+\.\d+\.\d(?:\.\d+)*|\d+(?:\.\d+){3,})(?!\w|\.\d)",
         lambda m: version(m) if m.group("label") is not None else version_unlabeled(m),
         spoken,
     )
     spoken = re.sub(
-        r"(?P<label>\bVersion\s+)(?P<number>\d+(?:\.\d+)+)(?![\w.])",
+        r"(?P<label>\bVersion\s+)(?P<number>\d+(?:\.\d+)+)(?!\w|\.\d)",
         version,
         spoken,
         flags=re.IGNORECASE,
@@ -465,7 +465,7 @@ def _numbers_to_german_words(text: str) -> str:
         return ", ".join(_digit_sequence_to_german_words(group) for group in groups)
 
     spoken = re.sub(
-        r"(?<![\w.])\d+(?:[ \t\u00a0]+\d+)*(?!\w)",
+        r"(?<![\w.,])\d+(?:[ \t\u00a0]+\d+)*(?![\w,])",
         phone_number,
         spoken,
     )
