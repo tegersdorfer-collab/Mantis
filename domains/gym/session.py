@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from core import db
 from domains import fitness
 from domains.gym.aliases import is_pullup_name, normalize_alias, split_equipment_variant
+from domains.gym.legacy import legacy_exercise
 from domains.gym.progression import personal_records, progression_set_count, recommend_next
 
 
@@ -49,7 +50,8 @@ def summarize_session(
             continue
         if weight <= 0 or reps <= 0 or row.get("load_mode") == "bodyweight":
             continue
-        multiplier = 2 if row.get("equipment") == "dumbbell" and row.get("dumbbell_pair", True) else 1
+        pair = row.get("dumbbell_pair")
+        multiplier = 2 if row.get("equipment") == "dumbbell" and (pair is None or pair) else 1
         volume += weight * reps * multiplier
     return {
         "duration_min": _duration_minutes(started_at, last_activity_at),
@@ -101,6 +103,9 @@ def _exercise_defaults(name: str, equipment: str | None, load_mode: str) -> dict
         "kniebeuge": "barbell", "squat": "barbell", "squats": "barbell",
         "beinpresse": "machine", "leg press": "machine",
     }.get(lower)
+    legacy = legacy_exercise(canonical_name)
+    if legacy and legacy.equipment:
+        default_equipment = legacy.equipment
     if is_pullup_name(name):
         load_mode = "added"
     equipment = equipment or embedded_equipment or default_equipment
@@ -109,6 +114,8 @@ def _exercise_defaults(name: str, equipment: str | None, load_mode: str) -> dict
             "curl", "fly", "flieg", "heben", "raise", "extension", "pushdown",
         )
     ) else "compound"
+    if legacy:
+        exercise_type = legacy.exercise_type
     low, high, start = (8, 12, 10) if exercise_type == "isolation" else (6, 10, 8)
     increment = {"barbell": 2.5, "dumbbell": 1.0, "machine": 2.5}.get(equipment)
     muscle = fitness.guess_muscle(canonical_name)
@@ -119,6 +126,19 @@ def _exercise_defaults(name: str, equipment: str | None, load_mode: str) -> dict
         "load_mode": load_mode, "weight_increment_kg": increment,
         "dumbbell_pair": equipment == "dumbbell",
     }
+
+
+def _effective_metadata(row: dict) -> dict:
+    """Ergänzt fehlende Metadaten (z. B. bei Bestandsübungen) um die Defaults."""
+    defaults = _exercise_defaults(
+        row.get("exercise") or row.get("name") or "", row.get("equipment"),
+        row.get("load_mode") or "external",
+    )
+    merged = dict(row)
+    for key in ("equipment", "load_mode", "dumbbell_pair"):
+        if merged.get(key) is None:
+            merged[key] = defaults.get(key)
+    return merged
 
 
 def _equipment_variant_name(cur, name: str, equipment: str | None, load_mode: str) -> str:
@@ -292,7 +312,7 @@ def _exercise_rows(cur, exercise_id: int) -> list[dict]:
                   ws.weight_kg, COALESCE(ws.is_warmup,FALSE) AS is_warmup
            FROM workout_sets ws JOIN workouts w ON w.id=ws.workout_id
            WHERE ws.exercise_id=%s AND w.type IN ('strength','gym')
-           ORDER BY w.created_at ASC, w.id ASC, ws.set_index ASC, ws.id ASC""",
+           ORDER BY w.date ASC, w.created_at ASC, w.id ASC, ws.set_index ASC, ws.id ASC""",
         (exercise_id,),
     )
 
@@ -472,6 +492,7 @@ def finish(now: datetime | None = None) -> dict | None:
                WHERE ws.workout_id=%s ORDER BY ws.id""",
             (workout["id"],),
         )
+        sets = [_effective_metadata(row) for row in sets]
         summary = summarize_session(sets, workout.get("created_at"), last)
         prs = []
         for exercise_id in dict.fromkeys(row["exercise_id"] for row in sets):
@@ -574,17 +595,45 @@ def correct_last_load(exercise_name: str, weight_kg: float, now: datetime | None
         return {**row, "weight_kg": weight_kg, "workout_id": workout["id"], **state}
 
 
-def exercise_history(exercise_name: str, limit: int = 5) -> list[dict]:
-    rows = db.query(
-        """SELECT w.id AS workout_id, w.date, w.created_at, ws.set_index, ws.reps,
+_HISTORY_SELECT = """SELECT w.id AS workout_id, w.date, w.created_at, ws.set_index, ws.reps,
                   ws.weight_kg, COALESCE(ws.is_warmup,FALSE) AS is_warmup,
                   e.name AS exercise, e.load_mode
            FROM workout_sets ws JOIN workouts w ON w.id=ws.workout_id
-           JOIN exercises e ON e.id=ws.exercise_id
-           WHERE LOWER(e.name)=LOWER(%s) AND w.type IN ('strength','gym')
-           ORDER BY w.created_at DESC, w.id DESC, ws.set_index ASC, ws.id ASC""",
+           JOIN exercises e ON e.id=ws.exercise_id"""
+_HISTORY_ORDER = """ AND w.type IN ('strength','gym')
+           ORDER BY w.date DESC, w.created_at DESC, w.id DESC, ws.set_index ASC, ws.id ASC"""
+
+
+def _variant_exercise_ids(name: str) -> list[int]:
+    """Löst Auswahlnamen wie "LH Bankdrücken" auf die gespeicherte Übung auf."""
+    base, equipment = split_equipment_variant(name)
+    if not equipment:
+        return []
+    ids = []
+    for row in db.query("SELECT id, name, equipment, load_mode FROM exercises"):
+        row_base, embedded = split_equipment_variant(row["name"])
+        if normalize_alias(row_base) != normalize_alias(base):
+            continue
+        effective = row.get("equipment") or embedded or _exercise_defaults(
+            row_base, None, row.get("load_mode") or "external"
+        )["equipment"]
+        if effective == equipment:
+            ids.append(row["id"])
+    return ids
+
+
+def exercise_history(exercise_name: str, limit: int = 5) -> list[dict]:
+    rows = db.query(
+        _HISTORY_SELECT + "\n           WHERE LOWER(e.name)=LOWER(%s)" + _HISTORY_ORDER,
         (exercise_name,),
     )
+    if not rows:
+        ids = _variant_exercise_ids(exercise_name)
+        if ids:
+            rows = db.query(
+                _HISTORY_SELECT + "\n           WHERE e.id = ANY(%s)" + _HISTORY_ORDER,
+                (ids,),
+            )
     grouped: dict[int, list[dict]] = defaultdict(list)
     order = []
     for row in rows:
@@ -607,7 +656,7 @@ def workout_exercise_history(limit: int = 12) -> list[dict]:
            FROM workouts w JOIN workout_sets ws ON ws.workout_id=w.id
            JOIN exercises e ON e.id=ws.exercise_id
            WHERE w.type IN ('strength','gym')
-           ORDER BY w.created_at DESC, w.id DESC, ws.set_index ASC, ws.id ASC
+           ORDER BY w.date DESC, w.created_at DESC, w.id DESC, ws.set_index ASC, ws.id ASC
            LIMIT %s""",
         (limit,),
     )

@@ -7,6 +7,7 @@ import re
 import unicodedata
 
 from core import db
+from domains.gym.legacy import LEGACY_EXERCISES
 
 
 BUILTIN_ALIAS_GROUPS = {
@@ -85,8 +86,13 @@ def normalize_alias(value: str) -> str:
 
 
 def is_pullup_name(value: str | None) -> bool:
-    compact = normalize_alias(value or "").replace(" ", "")
-    return compact in {"klimmzug", "klimmzuege", "pullup", "pullups", "chinup", "chinups"}
+    normalized = normalize_alias(value or "")
+    compact = normalized.replace(" ", "")
+    if compact in {"klimmzug", "klimmzuege", "pullup", "pullups", "chinup", "chinups"}:
+        return True
+    # Bestandsnamen wie "Pull-Ups with Wide Overhand Grip"; "Assisted Pull-Ups"
+    # (Gewicht = Unterstützung) gehört bewusst nicht dazu.
+    return normalized.startswith(("pull ups with ", "pull up with "))
 
 
 def builtin_aliases() -> dict[str, list[str]]:
@@ -134,28 +140,36 @@ def load_aliases() -> dict[str, list[str]]:
         })
         record["aliases"].add(alias)
 
+    groups: dict[str, list[dict]] = {}
+    for record in records.values():
+        base, embedded_equipment = split_equipment_variant(record["name"])
+        record["equipment"] = record.get("equipment") or embedded_equipment
+        groups.setdefault(normalize_alias(base), []).append(record)
+
     variants_by_base: dict[str, list[str]] = {}
     plain_names = []
-    for record in records.values():
-        name = record["name"]
-        base, embedded_equipment = split_equipment_variant(name)
-        equipment = record.get("equipment") or embedded_equipment
-        choice = _variant_choice(name, equipment)
-        if equipment:
-            variants_by_base.setdefault(normalize_alias(base), []).append(choice)
-        else:
-            plain_names.append(name)
-        for alias in record["aliases"]:
-            key = normalize_alias(alias)
-            if key:
-                result.setdefault(key, [])
-                if choice not in result[key]:
-                    result[key].append(choice)
-        full_name = normalize_alias(name)
-        if full_name:
-            result.setdefault(full_name, [])
-            if choice not in result[full_name]:
-                result[full_name].append(choice)
+    for base_key, members in groups.items():
+        has_variants = any(member["equipment"] for member in members)
+        for record in members:
+            name = record["name"]
+            # Der Gerätepräfix dient nur der Unterscheidung mehrerer Varianten;
+            # eine einzelne Übung behält ihren echten Namen.
+            choice = _variant_choice(name, record["equipment"]) if len(members) > 1 else name
+            if has_variants:
+                variants_by_base.setdefault(base_key, []).append(choice)
+            else:
+                plain_names.append(name)
+            for alias in record["aliases"]:
+                key = normalize_alias(alias)
+                if key:
+                    result.setdefault(key, [])
+                    if choice not in result[key]:
+                        result[key].append(choice)
+            full_name = normalize_alias(name)
+            if full_name:
+                result.setdefault(full_name, [])
+                if choice not in result[full_name]:
+                    result[full_name].append(choice)
 
     for canonical_aliases in BUILTIN_ALIAS_GROUPS.values():
         keys = {normalize_alias(name) for name in canonical_aliases}
@@ -179,6 +193,18 @@ def load_aliases() -> dict[str, list[str]]:
     for base, choices in variants_by_base.items():
         unique_choices = list(dict.fromkeys(choices))
         result[base] = unique_choices
+
+    # Bestandsübungen aus dem AlphaProgression-Import: ihr Name ist kanonisch,
+    # deutsche Namen und Abkürzungen sind Aliasse darauf.
+    by_name = {normalize_alias(record["name"]): record["name"] for record in records.values()}
+    for entry in LEGACY_EXERCISES:
+        stored = by_name.get(normalize_alias(entry.name))
+        if stored is None:
+            continue
+        for alias in (entry.name, *entry.aliases):
+            key = normalize_alias(alias)
+            if key:
+                result[key] = [stored]
     return result
 
 

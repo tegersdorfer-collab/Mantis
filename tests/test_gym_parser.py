@@ -216,7 +216,7 @@ def test_built_in_alias_is_ambiguous_when_multiple_existing_exercises_match(monk
             return []
         return [
             {"alias": "Bank", "exercise": "Bank"},
-            {"alias": "Bench Press", "exercise": "Bench Press"},
+            {"alias": "Bankdrücken", "exercise": "Bankdrücken"},
         ]
 
     monkeypatch.setattr(db, "query", query)
@@ -226,7 +226,7 @@ def test_built_in_alias_is_ambiguous_when_multiple_existing_exercises_match(monk
 
     assert parsed is not None
     assert parsed.exercise is None
-    assert set(parsed.ambiguous) == {"Bank", "Bench Press"}
+    assert set(parsed.ambiguous) == {"Bank", "Bankdrücken"}
 
 
 def test_parser_and_alias_resolution_stay_under_300ms_p95():
@@ -320,3 +320,21 @@ def test_alias_without_equipment_is_ambiguous_when_database_has_multiple_variant
     assert dumbbell is not None
     assert dumbbell.ambiguous == ()
     assert dumbbell.equipment == "dumbbell"
+
+
+@pytest.mark.parametrize("text", ["Bank 80 kg 8kg", "Bank 80kg 8kg", "Bank 80 kg 8 kg"])
+def test_second_attached_unit_prevents_direct_saving(text):
+    assert parse_set_message(text) is None
+
+
+def test_pullup_added_load_with_x_is_one_set_with_added_weight():
+    parsed = parse_set_message("Klimmzüge 10 kg x 8")
+
+    assert parsed is not None
+    assert [(item.weight_kg, item.reps) for item in parsed.sets] == [(10.0, 8)]
+    assert parsed.load_mode == "added"
+
+
+def test_unit_after_a_set_count_stays_unclear():
+    assert parse_set_message("Klimmzüge 3x8 kg") is None
+    assert parse_set_message("Bank 3x8 kg") is None

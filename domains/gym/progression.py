@@ -99,13 +99,32 @@ def recommend_next(
             except (TypeError, ValueError):
                 return False
 
-        best_by_position: dict[int, int] = {}
+        # Warm-ups verbrauchen einen set_index; die Position zählt daher nur
+        # unter den Arbeitssätzen derselben Einheit.
+        ranks: dict = {}
+        positions = []
+        seen_rows: set[int] = set()
+        unique_history = []
+        for row in history:
+            if id(row) not in seen_rows:  # "previous" steckt auch in "historical"
+                seen_rows.add(id(row))
+                unique_history.append(row)
+        history = unique_history
         for offset, row in enumerate(history):
+            workout_id = row.get("workout_id")
+            if workout_id is None:
+                positions.append(row.get("set_index") or offset + 1)
+            else:
+                ranks[workout_id] = ranks.get(workout_id, 0) + 1
+                positions.append(ranks[workout_id])
+
+        best_by_position: dict[int, int] = {}
+        for row, position in zip(history, positions):
             if not same_load(row):
                 continue
             try:
                 reps = int(row.get("reps") or 0)
-                position = int(row.get("set_index") or offset + 1)
+                position = int(position)
             except (TypeError, ValueError):
                 continue
             best_by_position[position] = max(best_by_position.get(position, 0), reps)

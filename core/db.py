@@ -763,6 +763,25 @@ MIGRATIONS = [
 ]
 
 
+def _backfill_legacy_exercise_metadata(cur) -> None:
+    """Füllt Gym-Metadaten der Import-Bestandsübungen, nur wo sie noch NULL sind.
+
+    Idempotent; vorhandene Werte, Namen und Sätze bleiben unangetastet.
+    """
+    from domains.gym.legacy import LEGACY_EXERCISES
+
+    for item in LEGACY_EXERCISES:
+        cur.execute(
+            """UPDATE exercises SET
+                 equipment=COALESCE(equipment,%s),
+                 exercise_type=COALESCE(exercise_type,%s),
+                 load_mode=COALESCE(load_mode,%s)
+               WHERE LOWER(name)=LOWER(%s)
+                 AND (equipment IS NULL OR exercise_type IS NULL OR load_mode IS NULL)""",
+            (item.equipment, item.exercise_type, item.load_mode, item.name),
+        )
+
+
 def run_migrations() -> None:
     """Führt alle Migrationen idempotent aus."""
     init_pool()
@@ -770,6 +789,7 @@ def run_migrations() -> None:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
         for stmt in MIGRATIONS:
             cur.execute(stmt)
+        _backfill_legacy_exercise_metadata(cur)
     log.info(f"Migrationen ausgeführt ({len(MIGRATIONS)} Statements)")
 
 

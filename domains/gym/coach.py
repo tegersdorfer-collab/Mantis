@@ -15,6 +15,7 @@ from domains.gym import session
 from domains.gym.aliases import (
     builtin_aliases, is_pullup_name, load_aliases, normalize_alias, resolve_alias,
 )
+from domains.gym.legacy import legacy_exercise
 from domains.gym.parser import ParsedLog, ParsedSet, has_non_exercise_start, parse_set_message
 from domains.gym.progression import estimate_1rm
 
@@ -178,6 +179,9 @@ class GymCoach:
 
     @staticmethod
     def _correction_intent(text: str, aliases: dict[str, list[str]]) -> GymIntent | None:
+        # normalize_alias entfernt das Minus; negative Zahlen sind nie eine Korrektur.
+        if re.search(r"(?<!\w)[-−–]\s*\d", text):
+            return None
         normalized = normalize_alias(text).strip()
         match = re.fullmatch(
             r"(?:falsch\s+)?letzter satz\s+(\d{1,2})\s+nicht\s+(\d{1,2})",
@@ -209,6 +213,9 @@ class GymCoach:
     @staticmethod
     def _needs_curl_equipment_clarification(parsed: ParsedLog) -> bool:
         if parsed.equipment:
+            return False
+        if legacy_exercise(parsed.exercise):
+            # Bestandsübung aus dem Import: der Name ist bereits eindeutig.
             return False
         return any(
             "curl" in normalize_alias(value or "")
@@ -705,19 +712,25 @@ class GymCoach:
         if split and set(split) <= {"Upper", "Lower"}:
             upper = {"chest", "shoulders", "back", "arms", "biceps", "triceps", "forearms"}
             lower = {"legs", "glutes", "quads", "hamstrings", "calves"}
+            lower_names = (
+                "kniebeug", "squat", "beinpresse", "leg press", "beincurl", "leg curl",
+                "beinstreck", "leg extension", "waden", "calf", "kreuzheb", "deadlift",
+                "lunge", "ausfallschritt", "hip ", "hack",
+            )
+            upper_names = (
+                "brust", "bankdrueck", "schulter", "rudern", "klimmzug", "latzug",
+                "curl", "trizeps", "bizeps", "shoulder", "bench", "row",
+            )
             found = set()
             for row in rows:
                 muscle = str(row.get("muscle") or "").lower()
-                name = normalize_alias(row.get("exercise") or "")
-                if muscle in upper or any(word in name for word in (
-                    "brust", "bankdrueck", "schulter", "rudern", "klimmzug", "latzug",
-                    "curl", "trizeps", "bizeps", "shoulder", "bench", "row",
-                )):
-                    found.add("Upper")
-                if muscle in lower or any(word in name for word in (
-                    "kniebeug", "squat", "beinpresse", "leg press", "beincurl", "waden",
-                )):
+                name = normalize_alias(row.get("exercise") or "") + " "
+                # Beinübungen mit "curl" im Namen (Beincurls) sind keine Armübung;
+                # ein bekannter Muskel schlägt die Namenssuche.
+                if any(word in name for word in lower_names) or muscle in lower:
                     found.add("Lower")
+                elif muscle in upper or (not muscle and any(word in name for word in upper_names)):
+                    found.add("Upper")
             if found == {"Upper"}:
                 return "Upper"
             if found == {"Lower"}:
@@ -793,14 +806,31 @@ class GymCoach:
 
     @staticmethod
     def _split_sequence(split: Any) -> list[str]:
+        """Liest einen Split nur, wenn die ganze Nachricht aus Split-Namen besteht."""
+        names = {
+            "push": ["Push"], "pull": ["Pull"], "beine": ["Beine"], "legs": ["Beine"],
+            "upper": ["Upper"], "lower": ["Lower"], "oberkoerper": ["Upper"],
+            "unterkoerper": ["Lower"], "ganzkoerper": ["Ganzkörper"],
+            "full body": ["Ganzkörper"], "fullbody": ["Ganzkörper"],
+            "ppl": ["Push", "Pull", "Beine"], "push pull legs": ["Push", "Pull", "Beine"],
+        }
         if isinstance(split, list):
-            raw = split
+            words = [word for item in split for word in normalize_alias(item).split()]
         else:
-            raw = re.split(r"[/,>\s]+", str(split or ""))
-        labels = {"push": "Push", "pull": "Pull", "beine": "Beine", "legs": "Beine",
-                  "upper": "Upper", "lower": "Lower", "ganzkörper": "Ganzkörper",
-                  "ganzkoerper": "Ganzkörper", "full body": "Ganzkörper"}
-        return [labels[normalize_alias(item)] for item in raw if normalize_alias(item) in labels]
+            words = normalize_alias(str(split or "")).split()
+        result: list[str] = []
+        index = 0
+        while index < len(words):
+            two = " ".join(words[index:index + 2])
+            if two in names:
+                result.extend(names[two])
+                index += 2
+            elif words[index] in names:
+                result.extend(names[words[index]])
+                index += 1
+            else:
+                return []
+        return result
 
     @staticmethod
     def _next_workout_reply(category: str, history: list[dict], now: datetime) -> GymResult:

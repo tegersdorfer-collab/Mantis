@@ -180,3 +180,20 @@ def test_bodyweight_sets_do_not_make_weight_or_e1rm_prs():
 
     assert records == {"weight": False, "reps": True, "e1rm": False}
 
+
+
+def test_warmup_does_not_shift_historic_positions():
+    def row(workout_id, index, weight, reps, warmup=False):
+        return {"workout_id": workout_id, "set_index": index, "weight_kg": weight,
+                "reps": reps, "is_warmup": warmup}
+
+    # Frühere Einheit: Warm-up belegt set_index 1, die Arbeitssätze 2-4.
+    previous = [row(1, 2, 80, 8), row(1, 3, 80, 8), row(1, 4, 80, 8)]
+    current = [row(2, 1, 80, 7), row(2, 2, 80, 8), row(2, 3, 80, 7)]
+
+    suggestion = recommend_next(
+        current, previous, {"exercise_type": "compound"},
+        set_count=3, historical_sets=previous,
+    )
+
+    assert suggestion["target_reps"] == [8, 8, 8]

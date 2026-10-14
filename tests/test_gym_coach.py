@@ -495,3 +495,79 @@ def test_history_trend_uses_creation_time_for_workouts_on_the_same_date(monkeypa
     result = GymCoach()._history("Bank")
 
     assert "e1RM +6.3 kg" in result.text
+
+
+@pytest.mark.parametrize("text", [
+    "letzter Satz -7 nicht 8", "falsch, letzter Satz 7 nicht -8", "Bank war -82,5",
+])
+def test_negative_numbers_are_never_a_correction(monkeypatch, text):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_a, **_k: {"id": 1})
+
+    assert GymCoach().classify(text) is None
+
+
+def test_leg_curls_do_not_turn_a_lower_session_into_full_body():
+    rows = [{"exercise": "Beincurls", "muscle": "legs"}]
+
+    assert GymCoach._workout_category(rows, ["Lower", "Upper"]) == "Lower"
+
+
+def test_leg_curls_without_muscle_metadata_still_count_as_lower():
+    rows = [{"exercise": "Seated Leg Curls", "muscle": None}]
+
+    assert GymCoach._workout_category(rows, ["Lower", "Upper"]) == "Lower"
+
+
+def test_lower_upper_rotation_after_leg_curls_suggests_upper(monkeypatch):
+    monkeypatch.setattr(coach_module.db, "get_setting", lambda _key: "Lower/Upper")
+    monkeypatch.setattr(coach_module.fitness, "active_plan", lambda: None)
+    monkeypatch.setattr(coach_module.session, "workout_exercise_history", lambda **_kwargs: [
+        {"workout_id": 9, "date": "2026-10-14", "created_at": "2026-10-14T10:00:00+02:00",
+         "exercise": "Beincurls", "muscle": "legs", "reps": 10, "weight_kg": 40},
+    ])
+
+    result = GymCoach()._next_workout(datetime(2026, 10, 14, 12, tzinfo=timezone.utc))
+
+    assert "Nächste Einheit: Upper" in result.text
+
+
+@pytest.mark.parametrize("text", [
+    "Bitte push den Commit", "Push und dann Feierabend", "Beine hoch",
+    "Upper Lower bitte", "Das war ein Ganzkörper Tag oder",
+])
+def test_open_split_question_ignores_messages_that_are_not_only_split_names(monkeypatch, text):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    coach = GymCoach()
+    coach._latest_pending = lambda: {
+        "kind": "split", "expires_at": "2099-10-14T10:10:00+02:00",
+    }
+
+    intent = coach.classify(text, now=datetime(2026, 10, 14, 8, tzinfo=timezone.utc))
+
+    assert intent is None
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("Push/Pull/Beine", ["Push", "Pull", "Beine"]),
+    ("PPL", ["Push", "Pull", "Beine"]),
+    ("Upper/Lower", ["Upper", "Lower"]),
+    ("Ganzkörper", ["Ganzkörper"]),
+    ("Push, Pull, Legs", ["Push", "Pull", "Beine"]),
+    ("Bitte push den Commit", []),
+    ("Push Pull und Beine", []),
+])
+def test_split_names_must_make_up_the_whole_message(text, expected):
+    assert GymCoach._split_sequence(text) == expected
+
+
+def test_complete_split_name_answers_the_open_question(monkeypatch):
+    monkeypatch.setattr(coach_module, "load_aliases", _aliases)
+    coach = GymCoach()
+    coach._latest_pending = lambda: {
+        "kind": "split", "expires_at": "2099-10-14T10:10:00+02:00",
+    }
+
+    intent = coach.classify("Push/Pull/Beine", now=datetime(2026, 10, 14, 8, tzinfo=timezone.utc))
+
+    assert intent is not None and intent.action == "split_answer"

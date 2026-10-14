@@ -226,9 +226,15 @@ def _parse_chunk(chunk: str, allow_bodyweight: bool) -> list[ParsedSet] | None:
             return None
         return [ParsedSet(weight, reps) for _ in range(count)]
 
+    # Ein explizites kg gehört zur ersten Zahl: "10 kg x 8" ist Last × Wdh.,
+    # nie eine Satzanzahl; "3x8 kg" bleibt unklar.
+    has_kg = bool(re.search(r"(?<=\d)\s*(?:kg|kilo)\b", chunk, re.I))
+    if has_kg and not re.match(r"\s*[+]?\d+(?:[.,]\d+)?\s*(?:kg|kilo)\b", chunk, re.I):
+        return None
+
     # Setanzahl × Wiederholungen ohne zusätzliche Last.
     set_rep = re.fullmatch(r"(\d{1,2})\s*x\s*(\d{1,2})", cleaned, re.I)
-    if set_rep and int(set_rep.group(1)) <= 10:
+    if set_rep and not has_kg and int(set_rep.group(1)) <= 10:
         count, reps = int(set_rep.group(1)), int(set_rep.group(2))
         if not 1 <= count <= 10 or not 1 <= reps <= 30:
             return None
@@ -389,7 +395,7 @@ def parse_set_message(
             r"\d", chunk[rep_markers[0].end():]
         ):
             return None
-        kg_markers = list(re.finditer(r"\b(?:kg|kilo)\b", chunk, re.I))
+        kg_markers = list(re.finditer(r"(?<![^\W\d_])(?:kg|kilo)\b", chunk, re.I))
         if kg_markers:
             marker = kg_markers[0]
             load_token = chunk[:marker.start()].strip()
