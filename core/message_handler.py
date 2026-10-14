@@ -781,21 +781,18 @@ class MessageHandler:
             tool_selection_task = asyncio.create_task(
                 _timed_select(), name=f"tool-selection-{channel_name}",
             )
-            try:
-                system = await _timed_build()
-            except BaseException:
-                tool_selection_task.cancel()
-                raise
-        else:
-            system, (allowed, force_tools) = await asyncio.gather(
-                _timed_build(), _timed_select(),
-            )
-        if voice_turn:
-            system += "\n\n" + VOICE_RESPONSE_INSTRUCTIONS
-        messages = self.kzg.recent_messages(max_tokens=3000)
-        if voice_turn:
-            messages = _messages_with_voice_reminder(messages, text)
         try:
+            if supports_full_catalog:
+                system = await _timed_build()
+            else:
+                system, (allowed, force_tools) = await asyncio.gather(
+                    _timed_build(), _timed_select(),
+                )
+            if voice_turn:
+                system += "\n\n" + VOICE_RESPONSE_INSTRUCTIONS
+            messages = self.kzg.recent_messages(max_tokens=3000)
+            if voice_turn:
+                messages = _messages_with_voice_reminder(messages, text)
             run_kwargs = dict(
                 messages=messages,
                 system=system, stream_cb=stream_cb,
@@ -804,15 +801,22 @@ class MessageHandler:
             )
             if tool_selection_task is not None:
                 run_kwargs["tool_selection_task"] = tool_selection_task
-            return await agent.run(**run_kwargs)
-        except BaseException as e:
-            if tool_selection_task is not None and not tool_selection_task.done():
-                tool_selection_task.cancel()
-            if not isinstance(e, Exception):
-                raise
-            log.error("Agent-Fehler (%s): %s", channel_name, redact_error_text(e))
-            db.log_error(f"agent_turn/{channel_name}", e)
-            return "⚠️ Technisches Problem, versuch es nochmal.", []
+            try:
+                return await agent.run(**run_kwargs)
+            except BaseException as e:
+                if not isinstance(e, Exception):
+                    raise
+                log.error("Agent-Fehler (%s): %s", channel_name, redact_error_text(e))
+                db.log_error(f"agent_turn/{channel_name}", e)
+                return "⚠️ Technisches Problem, versuch es nochmal.", []
+        finally:
+            if tool_selection_task is not None:
+                if not tool_selection_task.done():
+                    tool_selection_task.cancel()
+                try:
+                    await tool_selection_task
+                except asyncio.CancelledError:
+                    pass
 
     def _finish_turn(self, user_text: str, response: str, trace: list,
                      channel_name: str, agent=None, meta: dict | None = None) -> None:

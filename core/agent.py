@@ -176,6 +176,10 @@ class Agent:
 
         msgs: list[dict] = [{"role": "system", "content": system}] + norm
 
+        # Globale Tool-Sperre: eine nachgereichte Auswahl darf Tools nie wieder aktivieren.
+        if not use_tools:
+            tool_selection_task = None
+
         if not use_tools or (allowed_tools == [] and tool_selection_task is None):
             schemas = None
         elif tool_selection_task is not None:

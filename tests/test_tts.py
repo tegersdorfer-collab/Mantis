@@ -202,6 +202,14 @@ class TestStreamingSplit:
         assert bloecke[0] == "Der Messwert beträgt ungefähr 10,4 Stunden,"
         assert "10,4" in bloecke[0]
 
+    @pytest.mark.parametrize(("text", "zahl"), [
+        ("Dein Termin ist heute um 18:30 Uhr, danach fahren wir nach Hause.", "18:30"),
+        ("Deine Arbeitszeit läuft von 10–12 Uhr, danach ist Pause.", "10–12"),
+    ])
+    def test_fruehe_schnittgrenze_zerlegt_keine_uhrzeiten_oder_zahlenbereiche(self, text, zahl):
+        bloecke = tts._split_for_streaming(text)
+        assert any(zahl in block for block in bloecke)
+
     def test_fruehe_schnittgrenze_braucht_mindestens_25_zeichen(self):
         text = "Das ist kurz, dann geht es weiter."
         assert tts._split_for_streaming(text) == [text]

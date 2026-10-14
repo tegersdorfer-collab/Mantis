@@ -140,7 +140,20 @@ class FallbackBackend(AgentBackend):
             ):
                 from core import tools as toolreg
 
-                allowed, selected_force = await tool_selection_task
+                selection_budget = deadline - time.monotonic() if deadline is not None else None
+                if selection_budget is not None and selection_budget <= 0:
+                    raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen")
+                try:
+                    if selection_budget is None:
+                        allowed, selected_force = await tool_selection_task
+                    else:
+                        allowed, selected_force = await asyncio.wait_for(
+                            tool_selection_task, timeout=selection_budget,
+                        )
+                except asyncio.TimeoutError as exc:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("Gesamt-Timeout der Cloud-Kette abgelaufen") from exc
+                    raise
                 stage_tools = toolreg.ollama_schemas(only=allowed)
                 stage_force_tool_call = stage_force_tool_call or selected_force
             remaining = deadline - time.monotonic() if deadline is not None else None

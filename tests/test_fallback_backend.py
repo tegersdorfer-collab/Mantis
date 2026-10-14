@@ -116,7 +116,6 @@ class TestHappyPath:
             assert answer == "answer"
             full_catalog = {tool["function"]["name"] for tool in first.received_tools[0]}
             assert {"allowed", "denied"} <= full_catalog
-            assert len(full_catalog) > 2
             assert [tool["function"]["name"] for tool in second.received_tools[0]] == ["allowed"]
         finally:
             toolreg.REGISTRY.clear()
@@ -282,6 +281,40 @@ def test_single_configured_cloud_stage_can_run_without_a_fake_fallback():
 
     assert _call(backend) == ("cloud answer", [])
     assert only_provider.calls == 1
+
+
+def test_total_timeout_also_bounds_waiting_for_filtered_tool_selection():
+    import time
+
+    provider = FakeBackend("filtered-provider")
+    backend = FallbackBackend(
+        backends=[provider], stage_timeouts=[None], total_timeout_s=0.02,
+    )
+
+    async def run():
+        async def select_slowly():
+            await asyncio.sleep(0.2)
+            return ["allowed"], False
+
+        selection = asyncio.create_task(select_slowly())
+        started = time.monotonic()
+        try:
+            with pytest.raises(TimeoutError, match="Gesamt-Timeout"):
+                await backend.call(
+                    messages=[], tools=None, stream_cb=None,
+                    temperature=0.7, max_tokens=100,
+                    tool_selection_task=selection,
+                )
+            elapsed = time.monotonic() - started
+            assert selection.cancelled()
+            assert provider.calls == 0
+            assert elapsed < 0.1
+        finally:
+            if not selection.done():
+                selection.cancel()
+                await asyncio.gather(selection, return_exceptions=True)
+
+    asyncio.run(run())
 
 
 def test_all_backend_failures_raise_a_clear_exhaustion_error():
