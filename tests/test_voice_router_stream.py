@@ -648,6 +648,44 @@ def test_voice_latency_event_contains_phase_timings(monkeypatch):
     assert detail["llm_calls"][0]["output_tokens"] == 9
 
 
+def test_voice_latency_records_partial_reuse_and_saved_context_time(monkeypatch):
+    from core.voice_prework import VoiceTurnPrework
+
+    logged = []
+    prework = VoiceTurnPrework(
+        text="Was steht heute an",
+        system="Vorgewärmter Kontext",
+        keyword_tools=("get_task",),
+        force_tools=False,
+        elapsed_ms=64.5,
+    )
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None, prework=None):
+            assert prework is not None
+            assert prework.system == "Vorgewärmter Kontext"
+            return "Die Termine.", []
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+
+    asyncio.run(sende_streaming_antwort(
+        FakeWebSocket(),
+        "Was steht heute an, bitte",
+        FakeOrchestrator(),
+        prework=prework,
+        partial_runs=2,
+    ))
+
+    detail = logged[0][2]
+    assert detail["partial_runs"] == 2
+    assert detail["partial_reused"] is True
+    assert detail["saved_ms"] == 64.5
+
+
 def test_streaming_voice_turn_resets_timing_context(monkeypatch):
     from core import voice_timing
 

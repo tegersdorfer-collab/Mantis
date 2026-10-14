@@ -472,6 +472,38 @@ class TestTranscribeAudio:
         assert text == ""
 
 
+class TestPartialTranscription:
+    def test_teil_stt_keine_wartezeit_wenn_finaler_executor_belegt_ist(self):
+        async def run():
+            await voice._whisper_lock.acquire()
+            try:
+                assert voice.partial_stt_executor_available() is False
+                return await asyncio.wait_for(
+                    voice.transcribe_audio_partial("/tmp/nicht-zu-oeffnen.wav"),
+                    timeout=0.05,
+                )
+            finally:
+                voice._whisper_lock.release()
+
+        assert asyncio.run(run()) is None
+
+    def test_teil_stt_nutzt_den_gemeinsamen_lock_und_normalisiert_text(self, monkeypatch):
+        monkeypatch.setattr(voice.config, "STT_ENGINE", "whisper")
+        calls = []
+
+        async def fake_whisper(path):
+            calls.append((path, voice._whisper_lock.locked()))
+            return "Bantas, los."
+
+        monkeypatch.setattr(voice, "_transcribe_whisper_locked", fake_whisper)
+
+        result = asyncio.run(voice.transcribe_audio_partial("/tmp/fake.wav"))
+
+        assert result == "Mantis, los."
+        assert calls == [("/tmp/fake.wav", True)]
+        assert voice.partial_stt_executor_available() is True
+
+
 class TestIsAddressedToMantis:
     def test_namensnennung_liefert_true_ohne_llm_call(self):
         with patch("core.decisions.voice_address", new=AsyncMock()) as mock_jev, \

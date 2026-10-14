@@ -21,6 +21,9 @@ class TurnTiming:
         self.llm_calls: list[dict] = []
         self.pending_tokens: int | None = None
         self.reflex = False
+        self.partial_runs = 0
+        self.partial_reused = False
+        self.saved_ms = 0.0
 
     def snapshot(self) -> dict:
         return {
@@ -29,6 +32,9 @@ class TurnTiming:
             "llm_calls": [dict(c) for c in self.llm_calls],
             "tool_exec_ms": round(self.tool_exec_ms, 1),
             "reflex": self.reflex,
+            "partial_runs": self.partial_runs,
+            "partial_reused": self.partial_reused,
+            "saved_ms": round(self.saved_ms, 1),
         }
 
 

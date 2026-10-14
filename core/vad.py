@@ -4,6 +4,7 @@ docs/superpowers/specs/2026-07-05-vad-wakeword-streaming-design.md)."""
 from __future__ import annotations
 
 import struct
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,84 @@ import config
 SAMPLE_RATE = 16000
 MIN_SEGMENT_MS = 300
 PREROLL_MS = 400
+
+_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_INCOMPLETE_ENDINGS = frozenset({
+    "und", "oder", "aber", "dass", "weil", "ob", "wenn", "obwohl",
+    "falls", "während", "sobald", "damit", "denn", "ähm", "hm", "also",
+    "an", "auf", "aus", "bei", "durch", "für", "gegen", "hinter", "in",
+    "neben", "ohne", "über", "um", "unter", "von", "vor", "zwischen",
+    "mit", "nach", "zu", "der", "die", "das", "den", "dem", "des",
+    "ein", "eine", "einen", "einem", "einer", "eines", "mein", "meine",
+    "meinen", "meinem", "meiner", "dein", "deine", "unser", "unsere",
+    "noch", "vielleicht",
+})
+_SUBORDINATORS = frozenset({
+    "dass", "weil", "ob", "wenn", "obwohl", "falls", "während", "sobald",
+    "damit",
+})
+_QUESTION_WORDS = frozenset({
+    "wie", "was", "wer", "wen", "wem", "wessen", "wo", "wohin", "woher",
+    "wann", "warum", "wieso", "weshalb", "welche", "welcher", "welches",
+})
+_QUESTION_VERBS = frozenset({
+    "bin", "bist", "ist", "sind", "seid", "war", "waren", "wird", "werden",
+    "habe", "hast", "hat", "haben", "hatte", "steht", "stehen", "gibt",
+    "geht", "gehts", "kommt", "kostet", "macht", "kann", "kannst", "können",
+    "soll", "sollst", "liege", "liegt", "schläft", "schlaf",
+})
+_SEPARABLE_COMMANDS = frozenset({
+    "mach", "mache", "schalt", "schalte", "dreh", "drehe", "stell", "stelle",
+    "lies", "lese", "zeig", "zeige", "hol", "hole", "ruf", "rufe", "hör", "höre",
+})
+_SEPARABLE_PARTICLES = frozenset({"an", "aus", "ein", "mit", "vor", "zurück"})
+_SEPARABLE_QUESTION_VERBS = frozenset({"steht", "fängt", "kommt", "ruft", "sieht", "hört"})
+_MODAL_OR_WISH_VERBS = frozenset({
+    "wollte", "wollten", "möchte", "möchten", "muss", "musst", "müssen",
+    "müsste", "müssten", "sollte", "sollten", "könnte", "könnten", "hätte",
+})
+
+
+def utterance_is_complete(text: str) -> bool:
+    """Einfache lokale Heuristik für ein wahrscheinlich abgeschlossenes Satzende."""
+    value = str(text or "").strip()
+    words = [word.casefold() for word in _WORD_RE.findall(value)]
+    if not words:
+        return False
+
+    first, last = words[0], words[-1]
+    if last in _SEPARABLE_PARTICLES:
+        if first in _SEPARABLE_COMMANDS and len(words) >= 4:
+            return True
+        if first in _QUESTION_WORDS and any(
+            word in _SEPARABLE_QUESTION_VERBS for word in words[1:-1]
+        ):
+            return True
+    if last in _INCOMPLETE_ENDINGS:
+        return False
+
+    if first in _SUBORDINATORS | {"und", "oder", "aber"} and "," not in value:
+        return False
+
+    if len(words) >= 2 and words[-2] in {"der", "die", "das", "ein", "eine"} and last.endswith(
+        ("e", "en", "er", "es")
+    ):
+        return False
+
+    if first in {"ich", "wir"} and any(word in _MODAL_OR_WISH_VERBS for word in words):
+        if last.endswith(("en", "ern", "eln")):
+            return False
+
+    if first in _QUESTION_WORDS:
+        return any(word in _QUESTION_VERBS for word in words[1:])
+
+    # Modalfragen mit abschließendem Infinitiv sind grammatisch komplett.
+    if first in {"kannst", "könnt", "können", "sollst", "soll", "willst"} and last.endswith(
+        ("en", "ern", "eln")
+    ):
+        return len(words) >= 4
+
+    return True
 
 # Silero VAD's ONNX export requires exactly this many samples per inference
 # call (32ms @ 16kHz) — confirmed empirically against the downloaded model.
@@ -106,10 +185,38 @@ class VadSegmenter:
         self._speech_ms = 0.0
         self._buffer: list[bytes] = []
         self._preroll: list[bytes] = []
+        self._partial_transcript = ""
+        self._current_chunk_is_speech = False
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._speaking
+
+    @property
+    def current_audio(self) -> bytes:
+        return b"".join(self._buffer)
+
+    @property
+    def current_chunk_is_speech(self) -> bool:
+        return self._current_chunk_is_speech
+
+    def set_partial_transcript(self, text: str) -> None:
+        self._partial_transcript = str(text or "").strip()
+
+    def _silence_threshold_ms(self) -> int:
+        base = int(getattr(config, "VOICE_SILENCE_MS", 800))
+        if not getattr(config, "VOICE_ADAPTIVE_SILENCE", True):
+            return base
+        if not self._partial_transcript:
+            return base
+        if utterance_is_complete(self._partial_transcript):
+            return int(getattr(config, "VOICE_SILENCE_FAST_MS", 450))
+        return int(getattr(config, "VOICE_SILENCE_SLOW_MS", 1200))
 
     def process_chunk(self, pcm_chunk: bytes) -> SegmentEvent | None:
         prob = self._vad.speech_probability(pcm_chunk)
         is_speech = prob >= self.SPEECH_THRESHOLD
+        self._current_chunk_is_speech = is_speech
 
         if is_speech:
             self._silence_ms = 0.0
@@ -122,11 +229,12 @@ class VadSegmenter:
         elif self._speaking:
             self._buffer.append(pcm_chunk)
             self._silence_ms += self._chunk_ms
-            if self._silence_ms >= config.VOICE_SILENCE_MS:
+            if self._silence_ms >= self._silence_threshold_ms():
                 self._speaking = False
                 total_ms = self._speech_ms + self._silence_ms
                 segment = b"".join(self._buffer)
                 self._buffer = []
+                self._partial_transcript = ""
                 if self._speech_ms >= MIN_SEGMENT_MS:
                     return SegmentEvent(audio=segment, duration_ms=total_ms)
                 return None

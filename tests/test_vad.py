@@ -139,3 +139,76 @@ class TestVadSegmenter:
         seg = vad.VadSegmenter(fake, chunk_ms=100)
         events = [seg.process_chunk(silence_chunk()) for _ in range(len(probs))]
         assert all(e is None for e in events)
+
+    def test_completed_german_utterances_use_fast_silence(self, monkeypatch):
+        import config
+        from core.vad import utterance_is_complete
+
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True)
+        monkeypatch.setattr(config, "VOICE_SILENCE_FAST_MS", 450)
+        monkeypatch.setattr(config, "VOICE_SILENCE_SLOW_MS", 1200)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800)
+        completed = [
+            "wie spät ist es",
+            "mach das Licht an",
+            "was steht heute an",
+            "Wie wird das Wetter morgen",
+            "spiel meine Lieblingsmusik",
+            "lies mir die Termine vor",
+            "wie war mein Schlaf",
+            "kannst du die Aufgabe abhaken",
+            "was gibt es heute zum Abendessen",
+            "stell den Timer auf zehn Minuten",
+        ]
+
+        assert all(utterance_is_complete(text) for text in completed)
+        seg = vad.VadSegmenter(FakeVAD([0.9] * 3 + [0.1] * 8), chunk_ms=100)
+        seg.set_partial_transcript("mach das Licht an")
+        events = [seg.process_chunk(silence_chunk()) for _ in range(11)]
+        emitted_at = next(i for i, event in enumerate(events) if event is not None) - 2
+        assert emitted_at == 5
+
+    def test_unfinished_german_utterances_use_slow_silence(self, monkeypatch):
+        import config
+        from core.vad import utterance_is_complete
+
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True)
+        monkeypatch.setattr(config, "VOICE_SILENCE_FAST_MS", 450)
+        monkeypatch.setattr(config, "VOICE_SILENCE_SLOW_MS", 1200)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800)
+        unfinished = [
+            "erinner mich an",
+            "kannst du mir und",
+            "ich wollte fragen ob",
+            "wenn ich morgen Zeit habe",
+            "weil ich heute",
+            "stell den Timer auf",
+            "ich muss noch",
+            "kannst du vielleicht",
+            "das neue",
+            "und danach",
+            "ähm also",
+        ]
+
+        assert not any(utterance_is_complete(text) for text in unfinished)
+        seg = vad.VadSegmenter(FakeVAD([0.9] * 3 + [0.1] * 13), chunk_ms=100)
+        seg.set_partial_transcript("ich wollte fragen ob")
+        events = [seg.process_chunk(silence_chunk()) for _ in range(16)]
+        emitted_at = next(i for i, event in enumerate(events) if event is not None) - 2
+        assert emitted_at == 12
+
+    def test_no_partial_text_keeps_800ms_and_adaptive_setting_can_be_disabled(self, monkeypatch):
+        import config
+
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800)
+        no_partial = vad.VadSegmenter(FakeVAD([0.9] * 3 + [0.1] * 9), chunk_ms=100)
+        events = [no_partial.process_chunk(silence_chunk()) for _ in range(12)]
+        assert next(i for i, event in enumerate(events) if event is not None) - 2 == 8
+
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", False)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 300)
+        disabled = vad.VadSegmenter(FakeVAD([0.9] * 3 + [0.1] * 4), chunk_ms=100)
+        disabled.set_partial_transcript("mach das Licht an")
+        events = [disabled.process_chunk(silence_chunk()) for _ in range(7)]
+        assert next(i for i, event in enumerate(events) if event is not None) - 2 == 3

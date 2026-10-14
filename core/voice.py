@@ -87,6 +87,30 @@ async def transcribe_audio(audio_path: str) -> str:
     return _normalize_voice_transcript(await _transcribe_whisper(audio_path))
 
 
+def partial_stt_executor_available() -> bool:
+    """Teil-STT darf nur starten, wenn weder finaler noch anderer STT-Lauf aktiv ist."""
+    return not _whisper_lock.locked()
+
+
+async def transcribe_audio_partial(audio_path: str) -> str | None:
+    """Nicht-blockierender Teil-STT-Versuch; bei belegtem STT-Pfad wird er verworfen."""
+    global _parakeet_unavailable
+    if _whisper_lock.locked():
+        return None
+
+    await _whisper_lock.acquire()
+    try:
+        engine = getattr(config, "STT_ENGINE", "parakeet")
+        if engine == "parakeet" and not _parakeet_unavailable:
+            text = await _transcribe_parakeet(audio_path)
+            if not _parakeet_unavailable:
+                return _normalize_voice_transcript(text)
+        text = await _transcribe_whisper_locked(audio_path)
+        return _normalize_voice_transcript(text)
+    finally:
+        _whisper_lock.release()
+
+
 def _edit_distance_at_most_one(left: str, right: str) -> int:
     if abs(len(left) - len(right)) > 1:
         return 2
@@ -229,6 +253,12 @@ async def _transcribe_parakeet(audio_path: str) -> str:
 
 async def _transcribe_whisper(audio_path: str) -> str:
     """whisper.cpp medium — der Stand vor dem 22.09.2026, jetzt Fallback."""
+    async with _whisper_lock:
+        return await _transcribe_whisper_locked(audio_path)
+
+
+async def _transcribe_whisper_locked(audio_path: str) -> str:
+    """Whisper-Transkription bei bereits gehaltenem `_whisper_lock`."""
     global _whisper_model
     try:
         from pywhispercpp.model import Model
@@ -243,19 +273,18 @@ async def _transcribe_whisper(audio_path: str) -> str:
     # löst häufiger überlappende Segmente aus, die vorher selten gleichzeitig
     # eintrafen). Modell-Laden UND Transkription laufen daher beide unter
     # demselben Lock, nicht nur das Laden.
-    async with _whisper_lock:
-        if _whisper_model is None:
-            log.info("🔊 Lade whisper.cpp-Modell 'medium' …")
-            _whisper_model = await asyncio.to_thread(
-                Model, "medium", language="de", print_realtime=False, print_progress=False
-            )
+    if _whisper_model is None:
+        log.info("🔊 Lade whisper.cpp-Modell 'medium' …")
+        _whisper_model = await asyncio.to_thread(
+            Model, "medium", language="de", print_realtime=False, print_progress=False
+        )
 
-        try:
-            segments = await asyncio.to_thread(_whisper_model.transcribe, audio_path)
-            return " ".join(s.text for s in segments).strip()
-        except Exception as e:
-            log.error(f"Whisper-Transkription fehlgeschlagen: {e}")
-            return ""
+    try:
+        segments = await asyncio.to_thread(_whisper_model.transcribe, audio_path)
+        return " ".join(s.text for s in segments).strip()
+    except Exception as e:
+        log.error(f"Whisper-Transkription fehlgeschlagen: {e}")
+        return ""
 
 
 async def is_addressed_to_mantis(text: str) -> bool:

@@ -50,3 +50,20 @@ def last_complete_sentence(text: str) -> str:
     if not endings:
         return value
     return value[:endings[-1].end()].strip()
+
+
+def _transcript_words(text: str) -> list[str]:
+    return re.findall(r"[^\W_]+", str(text or "").casefold(), flags=re.UNICODE)
+
+
+def partial_text_matches_final(partial: str, final: str) -> bool:
+    """Prüft, ob ein finales Transkript einem Teiltext entspricht oder ihn
+    höchstens um drei vollständige Wörter erweitert."""
+    partial_words = _transcript_words(partial)
+    final_words = _transcript_words(final)
+    if not partial_words or len(final_words) < len(partial_words):
+        return False
+    return (
+        final_words[:len(partial_words)] == partial_words
+        and len(final_words) - len(partial_words) <= 3
+    )

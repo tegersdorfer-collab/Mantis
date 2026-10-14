@@ -119,3 +119,196 @@ class TestVoiceStreamSession:
 
         session._segmenter.process_chunk.assert_called_once()
         session._wakeword.check.assert_not_called()
+
+    def test_partial_transcription_is_throttled_and_never_awaited_before_final(self, monkeypatch):
+        import core.voice_stream as vs
+
+        class FakeClock:
+            now = 0.0
+
+            def __call__(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        class SpeechSegmenter:
+            is_speaking = False
+            current_chunk_is_speech = False
+            current_audio = b""
+            finish_next = False
+
+            def process_chunk(self, frame):
+                if self.finish_next:
+                    self.finish_next = False
+                    self.is_speaking = False
+                    self.current_chunk_is_speech = False
+                    return SegmentEvent(audio=b"FINAL-AUDIO", duration_ms=900)
+                self.is_speaking = True
+                self.current_chunk_is_speech = True
+                self.current_audio += frame
+                return None
+
+        async def run():
+            clock = FakeClock()
+            partial_started = asyncio.Event()
+            release_partial = asyncio.Event()
+            partial_calls = []
+            final_calls = []
+
+            async def partial_stt(audio):
+                partial_calls.append(audio)
+                partial_started.set()
+                await release_partial.wait()
+                return "Mantis, was steht heute an"
+
+            async def final_stt(audio):
+                final_calls.append(audio)
+                return "Mantis, was steht heute an"
+
+            segmenter = SpeechSegmenter()
+            session = VoiceStreamSession(
+                vad_segmenter=segmenter,
+                wakeword_detector=MagicMock(),
+                conversation_active_fn=lambda: True,
+                partial_interval_ms=700,
+                partial_transcriber=partial_stt,
+                partial_executor_available=lambda: True,
+                clock=clock,
+            )
+            monkeypatch.setattr(vs, "transcribe_pcm", final_stt)
+
+            await session.handle_chunk(vad_frame(1), muted=False)
+            clock.advance(0.699)
+            await session.handle_chunk(vad_frame(2), muted=False)
+            assert partial_calls == []
+
+            clock.advance(0.001)
+            await session.handle_chunk(vad_frame(3), muted=False)
+            await partial_started.wait()
+            assert len(partial_calls) == 1
+
+            clock.advance(0.7)
+            await session.handle_chunk(vad_frame(4), muted=False)
+            assert len(partial_calls) == 1
+
+            segmenter.finish_next = True
+            result = await asyncio.wait_for(
+                session.handle_chunk(vad_frame(5), muted=False),
+                timeout=0.1,
+            )
+            assert result["text"] == "Mantis, was steht heute an"
+            assert final_calls == [b"FINAL-AUDIO"]
+            assert result["partial_runs"] == 1
+
+            release_partial.set()
+            await asyncio.sleep(0)
+            return partial_calls, result
+
+        partial_calls, _result = asyncio.run(run())
+        assert partial_calls == [vad_frame(1) + vad_frame(2) + vad_frame(3)]
+
+    def test_partial_transcription_is_skipped_when_executor_is_busy(self, monkeypatch):
+        import core.voice_stream as vs
+
+        class FakeClock:
+            now = 10.0
+
+            def __call__(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        class SpeechSegmenter:
+            is_speaking = False
+            current_chunk_is_speech = False
+            current_audio = b""
+
+            def process_chunk(self, frame):
+                self.current_audio += frame
+                self.is_speaking = True
+                self.current_chunk_is_speech = True
+                return None
+
+        partial_calls = []
+
+        async def partial_stt(audio):
+            partial_calls.append(audio)
+            return "Teiltext"
+
+        async def final_stt(_audio):
+            return "Final"
+
+        clock = FakeClock()
+        session = VoiceStreamSession(
+            vad_segmenter=SpeechSegmenter(),
+            wakeword_detector=MagicMock(),
+            conversation_active_fn=lambda: True,
+            partial_interval_ms=1,
+            partial_transcriber=partial_stt,
+            partial_executor_available=lambda: False,
+            clock=clock,
+        )
+        monkeypatch.setattr(vs, "transcribe_pcm", final_stt)
+
+        async def run():
+            await session.handle_chunk(vad_frame(), muted=False)
+            clock.advance(0.002)
+            return await session.handle_chunk(vad_frame(), muted=False)
+
+        result = asyncio.run(run())
+
+        assert partial_calls == []
+        assert result is None
+
+    def test_partial_transcription_only_runs_on_vad_speech_frames(self):
+        class FakeClock:
+            now = 0.0
+
+            def __call__(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        class SpeechThenSilence:
+            is_speaking = False
+            current_chunk_is_speech = False
+            current_audio = b""
+
+            def process_chunk(self, frame):
+                if not self.is_speaking:
+                    self.is_speaking = True
+                    self.current_chunk_is_speech = True
+                    self.current_audio += frame
+                else:
+                    self.current_chunk_is_speech = False
+                return None
+
+        clock = FakeClock()
+        partial_calls = []
+
+        async def partial_stt(audio):
+            partial_calls.append(audio)
+            return "Teiltext"
+
+        session = VoiceStreamSession(
+            vad_segmenter=SpeechThenSilence(),
+            wakeword_detector=MagicMock(),
+            conversation_active_fn=lambda: True,
+            partial_interval_ms=700,
+            partial_transcriber=partial_stt,
+            partial_executor_available=lambda: True,
+            clock=clock,
+        )
+
+        async def run():
+            await session.handle_chunk(vad_frame(1), muted=False)
+            clock.advance(0.7)
+            await session.handle_chunk(vad_frame(2), muted=False)
+            await asyncio.sleep(0)
+
+        asyncio.run(run())
+
+        assert partial_calls == []
