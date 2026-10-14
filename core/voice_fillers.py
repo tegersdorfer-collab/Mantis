@@ -125,7 +125,7 @@ async def preload_voice_fillers() -> None:
             try:
                 if path.is_file() and path.stat().st_size:
                     continue
-                audio = await tts.synthesize(text)
+                audio = await tts.synthesize_filler(text)
                 if not audio:
                     continue
                 path.parent.mkdir(parents=True, exist_ok=True)
