@@ -42,3 +42,22 @@ def test_background_flags_can_be_enabled_from_environment(monkeypatch):
     monkeypatch.setenv("INSIGHTS_ENABLED", "true")
 
     assert MantisSettings(_env_file=None).INSIGHTS_ENABLED is True
+
+
+def test_cartesia_tts_settings_default_to_selected_engine_and_voice(monkeypatch):
+    for name in (
+        "TTS_ENGINE",
+        "CARTESIA_API_KEY",
+        "TTS_CARTESIA_MODEL",
+        "TTS_CARTESIA_VOICE",
+        "TTS_CARTESIA_LANGUAGE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = MantisSettings(_env_file=None)
+
+    assert settings.TTS_ENGINE == "cartesia"
+    assert settings.CARTESIA_API_KEY == ""
+    assert settings.TTS_CARTESIA_MODEL == "sonic-3.6"
+    assert settings.TTS_CARTESIA_VOICE == "afa425cf-5489-4a09-8a3f-d3cb1f82150d"
+    assert settings.TTS_CARTESIA_LANGUAGE == "de"

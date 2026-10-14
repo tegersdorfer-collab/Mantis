@@ -11,6 +11,16 @@ def test_redacts_bot_tokens(monkeypatch):
     assert "discord-secret-token" not in text
 
 
+def test_redacts_cartesia_key_from_error_text(monkeypatch):
+    synthetic_key = "sk_car-synthetic-test-key"
+    monkeypatch.setattr(config, "CARTESIA_API_KEY", synthetic_key, raising=False)
+
+    text = redact_error_text(f"Request failed with {synthetic_key} (Bearer {synthetic_key})")
+
+    assert synthetic_key not in text
+    assert text.count("[REDACTED]") == 2
+
+
 @pytest.mark.db
 def test_db_log_error_redacts_synthetic_api_key_in_summary_and_detail(monkeypatch):
     from core import db

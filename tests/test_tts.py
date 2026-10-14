@@ -3,8 +3,11 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asyncio
+import json
+import logging
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 import core.tts as tts
@@ -17,6 +20,8 @@ def _reset_engine_state(monkeypatch):
     monkeypatch.setattr(tts, "_kokoro", None)
     monkeypatch.setattr(tts, "_kokoro_unavailable", False)
     monkeypatch.setattr(tts, "_voice", None)
+    monkeypatch.setattr(tts, "_cartesia_paused_until", 0.0, raising=False)
+    monkeypatch.setattr(tts, "_cartesia_pause_warned", False, raising=False)
     yield
 
 
@@ -254,3 +259,359 @@ class TestSynthesizeStream:
         async def sammeln():
             return [c async for c in tts.synthesize_stream("Alles klar, die Lampe ist aus.")]
         assert asyncio.run(sammeln()) == [b"OGG:PIPER"]
+
+
+def _mock_cartesia(monkeypatch, handler):
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    timeouts = []
+
+    def make_client(**kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        return real_async_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(
+        tts.httpx,
+        "AsyncClient",
+        make_client,
+    )
+    return timeouts
+
+
+@pytest.fixture
+def cartesia_engine(monkeypatch):
+    monkeypatch.setattr(tts.config, "TTS_ENGINE", "cartesia", raising=False)
+    monkeypatch.setattr(tts.config, "CARTESIA_API_KEY", "sk_car_test_key", raising=False)
+    monkeypatch.setattr(tts.config, "TTS_CARTESIA_MODEL", "sonic-3.6", raising=False)
+    monkeypatch.setattr(
+        tts.config,
+        "TTS_CARTESIA_VOICE",
+        "afa425cf-5489-4a09-8a3f-d3cb1f82150d",
+        raising=False,
+    )
+    monkeypatch.setattr(tts.config, "TTS_CARTESIA_LANGUAGE", "de", raising=False)
+    # Test-Fakes sind keine echten WAVs: nur echte RIFF-Daten werden wirklich geparst.
+    real_nframes = tts._wav_nframes
+    monkeypatch.setattr(
+        tts, "_wav_nframes", lambda wav: real_nframes(wav) if wav.startswith(b"RIFF") else 1
+    )
+
+
+def _fake_local_synthesis(monkeypatch):
+    monkeypatch.setattr(tts, "_load_kokoro", lambda: MagicMock())
+    monkeypatch.setattr(
+        tts,
+        "_synth_kokoro",
+        lambda text, speed: b"KOKORO_WAV:" + text.encode(),
+    )
+    monkeypatch.setattr(tts, "_synth", lambda text, speed: pytest.fail("Piper unerwartet"))
+    monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OGG:" + wav)
+
+
+class TestCartesia:
+    def test_sendet_cartesia_felder_und_gibt_ogg_zurueck(
+        self, cartesia_engine, monkeypatch
+    ):
+        monkeypatch.setattr(tts, "_load_kokoro", lambda: pytest.fail("Kokoro darf nicht laden"))
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OggS" + wav)
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, content=b"CARTESIA_WAV")
+
+        timeouts = _mock_cartesia(monkeypatch, handler)
+        usage = []
+        from core import llm_usage
+        monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: usage.append((args, kwargs)))
+
+        result = asyncio.run(tts.synthesize("**Hallo** [Timo](https://example.com)!"))
+
+        assert result == b"OggSCARTESIA_WAV"
+        assert len(requests) == 1
+        request = requests[0]
+        assert request.url == "https://api.cartesia.ai/tts/bytes"
+        assert request.headers["Authorization"] == "Bearer sk_car_test_key"
+        assert request.headers["Cartesia-Version"] == "2025-04-16"
+        assert timeouts == [5.0]
+        assert json.loads(request.content) == {
+            "model_id": "sonic-3.6",
+            "transcript": "Hallo Timo!",
+            "voice": {"mode": "id", "id": "afa425cf-5489-4a09-8a3f-d3cb1f82150d"},
+            "language": "de",
+            "output_format": {
+                "container": "wav",
+                "encoding": "pcm_s16le",
+                "sample_rate": 44100,
+            },
+        }
+        assert len(usage) == 1
+        args, kwargs = usage[0]
+        assert args[:4] == ("cartesia", "sonic-3.6", len("Hallo Timo!"), 0)
+        assert kwargs["purpose"] == "tts"
+        assert kwargs["actual_cost"] == pytest.approx(len("Hallo Timo!") * 65 / 1_000_000)
+        assert tts._kokoro is None
+
+    def test_cartesia_key_macht_tts_ohne_lokale_modelle_verfuegbar(
+        self, cartesia_engine, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(tts, "_MODEL_DIR", tmp_path)
+        monkeypatch.setattr(tts, "_KOKORO_DIR", tmp_path)
+
+        assert tts.is_available() is True
+
+    def test_faellt_ohne_api_key_auf_kokoro_zurueck(self, cartesia_engine, monkeypatch):
+        monkeypatch.setattr(tts.config, "CARTESIA_API_KEY", "")
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        _fake_local_synthesis(monkeypatch)
+        monkeypatch.setattr(
+            tts.httpx,
+            "AsyncClient",
+            lambda **kwargs: pytest.fail("Ohne Key darf kein HTTP-Aufruf erfolgen"),
+        )
+
+        assert asyncio.run(tts.synthesize("Hallo")) == b"OGG:KOKORO_WAV:Hallo"
+
+    @pytest.mark.parametrize(
+        "failure",
+        ["network", "timeout", "http_400", "http_401", "http_402", "http_403", "http_429", "http_500"],
+    )
+    def test_faellt_bei_cartesia_fehlern_auf_kokoro_zurueck(
+        self, cartesia_engine, monkeypatch, failure
+    ):
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        _fake_local_synthesis(monkeypatch)
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if failure == "network":
+                raise httpx.ConnectError("offline", request=request)
+            if failure == "timeout":
+                raise httpx.ReadTimeout("zu langsam", request=request)
+            status = int(failure.removeprefix("http_"))
+            return httpx.Response(status, content=b"Cartesia-Fehler")
+
+        _mock_cartesia(monkeypatch, handler)
+
+        assert asyncio.run(tts.synthesize("Hallo")) == b"OGG:KOKORO_WAV:Hallo"
+        assert len(requests) == 1
+
+    @pytest.mark.parametrize("status", [401, 402, 403, 429])
+    def test_auth_und_kontingent_pausieren_cartesia_30_minuten_einmalig(
+        self, cartesia_engine, monkeypatch, caplog, status
+    ):
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        _fake_local_synthesis(monkeypatch)
+        monkeypatch.setattr(tts.time, "monotonic", lambda: 1000.0)
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(status, content=b"Fehler")
+
+        _mock_cartesia(monkeypatch, handler)
+        caplog.set_level(logging.WARNING, logger=tts.__name__)
+
+        for _ in range(2):
+            assert asyncio.run(tts.synthesize("Hallo")) == b"OGG:KOKORO_WAV:Hallo"
+
+        assert len(requests) == 1
+        assert tts._cartesia_paused_until == 1000.0 + 30 * 60
+        warnings = [record for record in caplog.records if "Cartesia TTS pausiert" in record.message]
+        assert len(warnings) == 1
+
+    def test_stream_gibt_jeden_cartesia_block_sofort_in_reihenfolge(
+        self, cartesia_engine, monkeypatch
+    ):
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        requested = []
+
+        async def fake_cartesia(text):
+            requested.append(text)
+            return b"WAV:" + text.encode()
+
+        monkeypatch.setattr(tts, "_cartesia_synthesize", fake_cartesia)
+        monkeypatch.setattr(tts, "_record_cartesia_usage", lambda text: None)
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OGG:" + wav)
+        text = " ".join(
+            f"Das ist Satz Nummer {i} mit einigen zusätzlichen Wörtern."
+            for i in range(1, 8)
+        )
+        expected = tts._split_for_streaming(tts._clean_for_speech(text))
+
+        async def collect():
+            stream = tts.synthesize_stream(text)
+            first = await anext(stream)
+            assert requested == expected[:1]
+            rest = [chunk async for chunk in stream]
+            return [first, *rest]
+
+        chunks = asyncio.run(collect())
+
+        assert requested == expected
+        assert chunks == [b"OGG:WAV:" + block.encode() for block in expected]
+
+
+class TestCartesiaKonvertierung:
+    @staticmethod
+    def _fake_converter(monkeypatch, threads=None):
+        import subprocess
+        import threading
+
+        def convert(wav):
+            if threads is not None:
+                threads.append(threading.get_ident())
+            if wav == b"":
+                return b""
+            if wav.startswith(b"GARBAGE"):
+                raise subprocess.CalledProcessError(1, "ffmpeg")
+            return b"OGG:" + wav
+
+        monkeypatch.setattr(tts, "_wav_to_ogg", convert)
+
+    @pytest.mark.parametrize("body", [b"", b"GARBAGE-bytes"])
+    def test_kaputte_cartesia_audio_faellt_lokal_zurueck(
+        self, cartesia_engine, monkeypatch, caplog, body
+    ):
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        _fake_local_synthesis(monkeypatch)
+        self._fake_converter(monkeypatch)
+        local = []
+        monkeypatch.setattr(
+            tts, "_synth_kokoro", lambda text, speed: local.append(text) or b"KOKORO_WAV:" + text.encode()
+        )
+        _mock_cartesia(monkeypatch, lambda request: httpx.Response(200, content=body))
+        caplog.set_level(logging.WARNING, logger=tts.__name__)
+
+        result = asyncio.run(tts.synthesize("Hallo"))
+
+        assert result == b"OGG:KOKORO_WAV:Hallo"
+        assert local == ["Hallo"]
+        assert tts._cartesia_paused_until == 0.0
+        assert any("Cartesia" in r.message for r in caplog.records)
+
+    def test_stream_ersetzt_nur_kaputten_block_lokal_und_haelt_reihenfolge(
+        self, cartesia_engine, monkeypatch
+    ):
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        _fake_local_synthesis(monkeypatch)
+        self._fake_converter(monkeypatch)
+        text = " ".join(
+            f"Das ist Satz Nummer {i} mit einigen zusätzlichen Wörtern."
+            for i in range(1, 8)
+        )
+        expected = tts._split_for_streaming(tts._clean_for_speech(text))
+        assert len(expected) >= 3
+        kaputt = expected[1]
+
+        async def fake_cartesia(t):
+            return b"GARBAGE" if t == kaputt else b"WAV:" + t.encode()
+
+        monkeypatch.setattr(tts, "_cartesia_synthesize", fake_cartesia)
+        monkeypatch.setattr(tts, "_record_cartesia_usage", lambda t: None)
+        local = []
+        monkeypatch.setattr(
+            tts, "_synth_kokoro", lambda t, speed: local.append(t) or b"KOKORO_WAV:" + t.encode()
+        )
+
+        async def collect():
+            return [c async for c in tts.synthesize_stream(text)]
+
+        chunks = asyncio.run(collect())
+
+        assert local == [kaputt]
+        assert chunks[1] == b"OGG:KOKORO_WAV:" + kaputt.encode()
+        assert chunks[0] == b"OGG:WAV:" + expected[0].encode()
+        assert len(chunks) == len(expected)
+
+    def test_konvertierung_laeuft_nicht_im_event_loop_thread(
+        self, cartesia_engine, monkeypatch
+    ):
+        import threading
+
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        threads = []
+        self._fake_converter(monkeypatch, threads)
+        _mock_cartesia(monkeypatch, lambda request: httpx.Response(200, content=b"WAV"))
+        monkeypatch.setattr(tts, "_record_cartesia_usage", lambda t: None)
+        loop_thread = []
+
+        async def run():
+            loop_thread.append(threading.get_ident())
+            return await tts.synthesize("Hallo")
+
+        assert asyncio.run(run()) == b"OGG:WAV"
+        assert threads and threads[0] != loop_thread[0]
+
+    def test_kosten_nutzen_einstellung_pro_million_zeichen(
+        self, cartesia_engine, monkeypatch
+    ):
+        monkeypatch.setattr(tts.config, "TTS_CARTESIA_USD_PER_MILLION_CHARS", 100.0, raising=False)
+        usage = []
+        from core import llm_usage
+        monkeypatch.setattr(llm_usage, "record", lambda *a, **k: usage.append(k))
+
+        tts._record_cartesia_usage("x" * 1000)
+
+        assert usage[0]["actual_cost"] == pytest.approx(0.1)
+
+    def test_kosten_default_ist_65_usd(self):
+        import settings
+
+        assert settings.MantisSettings.model_fields["TTS_CARTESIA_USD_PER_MILLION_CHARS"].default == 65.0
+
+
+def _leeres_wav() -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(44100)
+    data = buf.getvalue()
+    assert len(data) == 44
+    return data
+
+
+class TestCartesiaLeeresWav:
+    def test_synthesize_nutzt_lokal_bei_wav_ohne_samples(self, cartesia_engine, monkeypatch, caplog):
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        _fake_local_synthesis(monkeypatch)
+        # Konverter liefert (wie ffmpeg) trotzdem ein nicht-leeres OGG.
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OGG:" + (wav if not wav.startswith(b"RIFF") else b"EMPTYOGG"))
+        wav = _leeres_wav()
+        _mock_cartesia(monkeypatch, lambda request: httpx.Response(200, content=wav))
+        caplog.set_level(logging.WARNING, logger=tts.__name__)
+
+        assert asyncio.run(tts.synthesize("Hallo")) == b"OGG:KOKORO_WAV:Hallo"
+        assert tts._cartesia_paused_until == 0.0
+        assert any("Cartesia" in r.message for r in caplog.records)
+
+    def test_stream_nutzt_lokal_bei_wav_ohne_samples(self, cartesia_engine, monkeypatch):
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        _fake_local_synthesis(monkeypatch)
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OGG:" + (wav if not wav.startswith(b"RIFF") else b"EMPTYOGG"))
+        text = " ".join(
+            f"Das ist Satz Nummer {i} mit einigen zusätzlichen Wörtern."
+            for i in range(1, 8)
+        )
+        expected = tts._split_for_streaming(tts._clean_for_speech(text))
+        leer = _leeres_wav()
+
+        async def fake_cartesia(t):
+            return leer if t == expected[1] else b"WAV:" + t.encode()
+
+        monkeypatch.setattr(tts, "_cartesia_synthesize", fake_cartesia)
+        monkeypatch.setattr(tts, "_record_cartesia_usage", lambda t: None)
+
+        async def collect():
+            return [c async for c in tts.synthesize_stream(text)]
+
+        chunks = asyncio.run(collect())
+
+        assert len(chunks) == len(expected)
+        assert chunks[1] == b"OGG:KOKORO_WAV:" + expected[1].encode()
+        assert chunks[0] == b"OGG:WAV:" + expected[0].encode()
