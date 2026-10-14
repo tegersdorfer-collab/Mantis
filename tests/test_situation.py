@@ -103,8 +103,23 @@ def test_prompt_context_reads_only_memory_and_explains_freshness(monkeypatch):
 
     assert context.startswith("## Lagebild")
     assert "Zahnarzt" in context
-    assert "direkt aus diesem Snapshot" in context
-    assert "Stand älter" in context
+    assert "vollständig und exakt" in context
+    assert "veraltet oder unvollständig" in context
+
+
+def test_prompt_context_requires_exact_snapshot_data_or_immediate_tool_use(monkeypatch):
+    _enable(monkeypatch, situation.SituationSnapshot(
+        refreshed_at=_NOW,
+        text="Stand: Mittwoch, 14.10.2026, 09:30 Uhr\nWetter Nürnberg heute: 13°C, klar",
+        incomplete=False,
+    ))
+
+    context = situation.prompt_context(now=_NOW)
+
+    assert "vollständig und exakt" in context
+    assert "SOFORT das passende Tool" in context
+    assert "niemals aus ähnlichen oder älteren angaben schätzen oder raten" in context.casefold()
+    assert "nicht nachfragen, ob du nachsehen sollst" in context
 
 
 def test_prompt_context_marks_partial_or_stale_snapshot_for_tool_fallback(monkeypatch):

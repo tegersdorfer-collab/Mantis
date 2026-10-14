@@ -62,3 +62,31 @@ def test_prompt_builder_marks_static_prefix_and_keeps_live_context_in_dynamic_su
     extended = prompt + "\n\nVoice instructions"
     assert extended.cache_prefix == prompt.cache_prefix
     assert extended.endswith("Voice instructions")
+
+
+def test_prompt_builder_skips_long_term_memory_embedding_for_bare_acknowledgement():
+    embed = AsyncMock(return_value=[0.1, 0.2])
+    searches = []
+    builder = PromptBuilder(
+        embed_llm=SimpleNamespace(embed=embed),
+        lzg=SimpleNamespace(
+            search_hybrid=lambda *args, **kwargs: searches.append((args, kwargs)) or [],
+            format_for_context=lambda _memories: "MEMORY_CONTEXT",
+        ),
+        kzg=SimpleNamespace(get_recent_turns=lambda **_kwargs: []),
+        kg=SimpleNamespace(
+            format_for_context=lambda: "",
+            format_directives=lambda: "",
+            warm_profile=lambda: "",
+        ),
+        reflection=SimpleNamespace(behavior_notes=lambda: ""),
+        dashboard=SimpleNamespace(format_for_context=lambda: ""),
+        forgetting=SimpleNamespace(bump_recall=lambda _memory_id: None),
+        identity="IDENTITY",
+    )
+    builder._task_ctx = lambda: ""
+
+    asyncio.run(builder.build("ja"))
+
+    assert embed.await_count == 0
+    assert searches == []

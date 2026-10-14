@@ -28,7 +28,7 @@ import time
 import wave
 
 import config
-from core import decisions, fast
+from core import decisions, fast, fast_commands
 
 log = logging.getLogger(__name__)
 
@@ -270,7 +270,7 @@ async def is_addressed_to_mantis(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
-    if "mantis" in stripped.lower():
+    if fast_commands.has_voice_wakeword(stripped) or "mantis" in stripped.lower():
         return True
     if time.monotonic() < _conversation_active_until:
         return True
