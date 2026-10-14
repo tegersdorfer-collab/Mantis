@@ -706,3 +706,8 @@ def test_numbers_review_round_three():
     assert tts._numbers_to_german_words("10,04 Stunden") == "zehn Komma null vier Stunden"
     assert last_complete_sentence("Termin am 3.11.26. Danach war") == "Termin am 3.11.26."
     assert last_complete_sentence("Am 12. Oktober war") == "Am 12. Oktober war"
+
+
+def test_phone_number_before_comma():
+    from core import tts
+    assert tts._numbers_to_german_words("Ruf 0911 0123456, dann weiter.").startswith("Ruf null neun eins eins, null eins zwei drei vier fünf sechs,")

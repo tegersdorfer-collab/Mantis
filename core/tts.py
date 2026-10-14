@@ -465,7 +465,7 @@ def _numbers_to_german_words(text: str) -> str:
         return ", ".join(_digit_sequence_to_german_words(group) for group in groups)
 
     spoken = re.sub(
-        r"(?<![\w.,])\d+(?:[ \t\u00a0]+\d+)*(?![\w,])",
+        r"(?<![\w.])(?<!\d,)\d+(?:[ \t\u00a0]+\d+)*(?!\w|,\d)",
         phone_number,
         spoken,
     )
