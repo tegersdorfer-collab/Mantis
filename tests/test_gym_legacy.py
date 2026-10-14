@@ -1,5 +1,6 @@
 """Alias-Zuordnung auf die englischen Bestandsübungen (AlphaProgression-Import)."""
 
+import asyncio
 from datetime import date, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -15,10 +16,11 @@ from domains.gym.legacy import LEGACY_EXERCISES
 from domains.gym.parser import parse_set_message
 
 
-def _legacy_db(monkeypatch, names, equipment=None):
+def _legacy_db(monkeypatch, names, equipment=None, set_counts=None):
     rows = [
-        {"exercise_id": index, "alias": name, "exercise": name,
-         "equipment": (equipment or {}).get(name)}
+        {"id": index, "exercise_id": index, "alias": name, "name": name, "exercise": name,
+         "equipment": (equipment or {}).get(name),
+         "set_count": (set_counts or {}).get(name)}
         for index, name in enumerate(names, 1)
     ]
 
@@ -133,7 +135,7 @@ def test_bare_bank_asks_when_a_second_variant_exists(monkeypatch):
     parsed = parse_set_message("Bank 80 8", aliases)
 
     assert parsed.exercise is None
-    assert set(parsed.ambiguous) == {"Bankdrücken", "KH Bankdrücken"}
+    assert set(parsed.ambiguous) == {"Bench Press", "KH Bankdrücken"}
 
 
 def test_legacy_alias_keeps_bench_variants_ambiguous_until_equipment_is_given(monkeypatch):
@@ -147,8 +149,135 @@ def test_legacy_alias_keeps_bench_variants_ambiguous_until_equipment_is_given(mo
     assert bare is not None and bare.action == "ambiguous_exercise"
     assert set(bare.parsed.ambiguous) == {"Bench Press", "Bench Press (Kurzhantel)"}
     assert prefixed is not None and prefixed.action == "set_logged"
-    assert prefixed.parsed.exercise == "Bench Press"
+    assert prefixed.parsed.exercise == "Bench Press (Kurzhantel)"
     assert prefixed.parsed.equipment == "dumbbell"
+
+
+@pytest.mark.parametrize(("text", "legacy_name", "legacy_equipment", "variant"), [
+    ("KH Bank 30 10", "Bench Press", "barbell", "Bankdrücken (KH)"),
+    ("KH Schulterdrücken 22,5 10", "Shoulder Press", None, "Schulterdrücken (KH)"),
+    ("SZ Curls 15 10", "Curls", None, "Curls (SZ)"),
+])
+def test_mismatched_legacy_equipment_requires_variant_confirmation(
+    monkeypatch, text, legacy_name, legacy_equipment, variant,
+):
+    _legacy_db(monkeypatch, [legacy_name], {legacy_name: legacy_equipment})
+    aliases = load_aliases()
+    monkeypatch.setattr(coach_module, "load_aliases", lambda: aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: None)
+    saved = []
+
+    def add_sets(parsed, *, allow_create, now):
+        saved.append((parsed, allow_create))
+        return {
+            "exercise": parsed.exercise,
+            "sets": [{"weight_kg": parsed.sets[0].weight_kg, "reps": parsed.sets[0].reps}],
+            "previous_sets": [], "progression": {}, "records": {},
+            "metadata": {"equipment": parsed.equipment},
+        }
+
+    monkeypatch.setattr(coach_module.session, "add_sets", add_sets)
+    coach = GymCoach()
+    intent = coach.classify(text)
+
+    assert intent is not None and intent.action == "confirm_new_exercise"
+    assert intent.parsed.exercise == variant
+    assert intent.parsed.known is False
+    confirmation = asyncio.run(coach.process(intent))
+    assert confirmation.text == f"Neue Variante „{variant}“ anlegen? ja/nein"
+
+    saved_intent = coach_module.GymIntent("pending_confirmed", payload=confirmation.pending)
+    result = asyncio.run(coach.process(saved_intent))
+
+    assert result.action == "set_logged"
+    assert saved[0][0].exercise == variant
+    assert saved[0][0].equipment == intent.parsed.equipment
+    assert saved[0][1] is True
+
+
+def test_explicit_prefix_selects_unused_matching_legacy_variant(monkeypatch):
+    _legacy_db(
+        monkeypatch,
+        ["Bench Press", "KH Bankdrücken"],
+        {"Bench Press": "barbell", "KH Bankdrücken": "dumbbell"},
+        {"Bench Press": 272, "KH Bankdrücken": 0},
+    )
+    aliases = load_aliases()
+    monkeypatch.setattr(coach_module, "load_aliases", lambda: aliases)
+
+    intent = GymCoach().classify("KH Bank 30 10")
+
+    assert intent is not None and intent.action == "set_logged"
+    assert intent.parsed.exercise == "KH Bankdrücken"
+    assert intent.parsed.equipment == "dumbbell"
+
+
+def test_german_bank_rows_are_legacy_duplicates_and_empty_rows_are_not_variants(monkeypatch):
+    _legacy_db(
+        monkeypatch,
+        ["Bench Press", "Bankdrücken", "Bankdrücken Langhantel"],
+        {"Bench Press": "barbell", "Bankdrücken": "barbell",
+         "Bankdrücken Langhantel": "barbell"},
+        {"Bench Press": 272, "Bankdrücken": 2, "Bankdrücken Langhantel": 0},
+    )
+
+    aliases = load_aliases()
+    parsed = parse_set_message("Bank 80 8 8 7", aliases)
+    monkeypatch.setattr(coach_module, "load_aliases", lambda: aliases)
+
+    intent = GymCoach().classify("Bank 80 8 8 7")
+
+    assert aliases["bank"] == ["Bench Press"]
+    assert parsed.exercise == "Bench Press" and parsed.ambiguous == ()
+    assert intent is not None and intent.action == "set_logged"
+
+
+def test_used_dumbbell_bank_variant_remains_a_real_ambiguity(monkeypatch):
+    _legacy_db(
+        monkeypatch,
+        ["Bench Press", "Bankdrücken", "KH Bankdrücken"],
+        {"Bench Press": "barbell", "Bankdrücken": "barbell",
+         "KH Bankdrücken": "dumbbell"},
+        {"Bench Press": 272, "Bankdrücken": 2, "KH Bankdrücken": 1},
+    )
+    aliases = load_aliases()
+    monkeypatch.setattr(coach_module, "load_aliases", lambda: aliases)
+
+    intent = GymCoach().classify("Bank 80 8")
+
+    assert intent is not None and intent.action == "ambiguous_exercise"
+    assert set(intent.parsed.ambiguous) == {"Bench Press", "KH Bankdrücken"}
+
+
+def test_unused_dumbbell_bank_variant_does_not_create_ambiguity(monkeypatch):
+    _legacy_db(
+        monkeypatch,
+        ["Bench Press", "KH Bankdrücken"],
+        {"Bench Press": "barbell", "KH Bankdrücken": "dumbbell"},
+        {"Bench Press": 272, "KH Bankdrücken": 0},
+    )
+    aliases = load_aliases()
+    monkeypatch.setattr(coach_module, "load_aliases", lambda: aliases)
+
+    intent = GymCoach().classify("Bank 80 8")
+
+    assert intent is not None and intent.action == "set_logged"
+    assert intent.parsed.exercise == "Bench Press"
+
+
+@pytest.mark.parametrize("text", [
+    "Bank Verlauf", "wie lief Bank?", "Verlauf Bankdrücken",
+])
+def test_history_requests_resolve_legacy_german_aliases(monkeypatch, text):
+    _legacy_db(monkeypatch, ["Bench Press"], {"Bench Press": "barbell"}, {"Bench Press": 272})
+    aliases = load_aliases()
+    monkeypatch.setattr(coach_module, "load_aliases", lambda: aliases)
+    monkeypatch.setattr(coach_module.session, "open_session", lambda *_args, **_kwargs: None)
+
+    intent = GymCoach().classify(text)
+
+    assert intent is not None and intent.action == "history"
+    assert intent.payload["exercise"] == "Bench Press"
 
 
 @pytest.mark.parametrize(("stock", "typed"), [
@@ -169,10 +298,10 @@ def test_legacy_alias_keeps_all_equipment_variants_ambiguous(monkeypatch, stock,
     assert set(intent.parsed.ambiguous) == {stock, variant}
 
 
-def test_single_stored_exercise_with_equipment_keeps_its_real_name(monkeypatch):
+def test_single_german_bank_row_resolves_to_its_legacy_name(monkeypatch):
     _legacy_db(monkeypatch, ["Bankdrücken"], {"Bankdrücken": "barbell"})
 
-    assert load_aliases()["bank"] == ["Bankdrücken"]
+    assert load_aliases()["bank"] == ["Bench Press"]
 
 
 # ── Datenbank: synthetische Bestandsdaten im Stil des Imports ────────────────
@@ -207,6 +336,11 @@ def _stock_exercise(created, name):
     )
     created["exercises"].append(exercise_id)
     return exercise_id
+
+
+def _stock_exercise_with_existing_history(created, name):
+    row = db.query_one("SELECT id FROM exercises WHERE name=%s", (name,))
+    return row["id"] if row else _stock_exercise(created, name)
 
 
 def _stock_workout(created, exercise_id, day, sets, *, workout_type="strength"):
@@ -281,6 +415,66 @@ def test_bank_verlauf_shows_the_stock_history(stock_database):
     assert "08.09." in reply.text and "01.09." in reply.text
     assert "80 kg×8" in reply.text
     assert "noch keinen" not in reply.text
+
+
+@pytest.mark.db
+def test_legacy_german_duplicate_history_drives_progression_and_prs_read_only(stock_database):
+    bench = _stock_exercise_with_existing_history(stock_database, "Bench Press")
+    german = _stock_exercise_with_existing_history(stock_database, "Bankdrücken")
+    duplicate_sets_before = db.query_one(
+        "SELECT COUNT(*) AS n FROM workout_sets WHERE exercise_id=%s", (german,),
+    )["n"]
+    duplicate_workout = _stock_workout(
+        stock_database, german, date(2099, 12, 30), [(1000, 1)],
+    )
+
+    parsed = parse_set_message("Bank 1000 2", {"bank": ["Bench Press"]})
+    result = session.add_sets(
+        parsed, allow_create=True,
+        now=datetime(2100, 1, 1, 10, tzinfo=ZoneInfo("Europe/Berlin")),
+    )
+    stock_database["workouts"].append(result["workout_id"])
+    logged = db.query_one(
+        "SELECT DISTINCT exercise_id FROM workout_sets WHERE workout_id=%s",
+        (result["workout_id"],),
+    )
+    history = session.exercise_history("Bench Press", limit=5)
+    duplicate_sets_after = db.query_one(
+        "SELECT COUNT(*) AS n FROM workout_sets WHERE exercise_id=%s", (german,),
+    )["n"]
+
+    assert result["exercise"] == "Bench Press"
+    assert logged["exercise_id"] == bench
+    assert len(result["previous_sets"]) == 1
+    previous_set = result["previous_sets"][0]
+    assert {
+        key: previous_set[key]
+        for key in ("workout_id", "set_index", "reps", "is_warmup")
+    } == {
+        "workout_id": duplicate_workout, "set_index": 1, "reps": 1,
+        "is_warmup": False,
+    }
+    assert float(previous_set["weight_kg"]) == 1000.0
+    assert result["records"]["reps"] is True
+    assert any(
+        row["workout_id"] == duplicate_workout
+        and row["sets"][0]["weight_kg"] == 1000
+        for row in history
+    )
+    assert duplicate_sets_after == duplicate_sets_before + 1
+
+
+def test_legacy_history_id_selection_includes_german_duplicates_only():
+    exercise_rows = [
+        {"id": 1, "name": "Bench Press", "equipment": "barbell"},
+        {"id": 2, "name": "Bankdrücken", "equipment": None},
+        {"id": 3, "name": "Bankdrücken Langhantel", "equipment": None},
+        {"id": 4, "name": "KH Bankdrücken", "equipment": "dumbbell"},
+    ]
+
+    legacy_ids = session._legacy_duplicate_ids(exercise_rows, "Bench Press", "barbell")
+
+    assert legacy_ids == [1, 2, 3]
 
 
 @pytest.mark.db
