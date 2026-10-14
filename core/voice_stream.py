@@ -10,10 +10,10 @@ import tempfile
 import time
 import wave
 import logging
-from collections import deque
 from collections.abc import Awaitable, Callable
 
 import config
+from core import stt_runtime
 from core.vad import VadSegmenter
 
 SAMPLE_RATE = 16000
@@ -101,7 +101,6 @@ class VoiceStreamSession:
         self._partial_text = ""
         self._partial_audio_end_sample_index: int | None = None
         self._partial_run_generation: int | None = None
-        self._partial_ms_per_audio_second: deque[float] = deque(maxlen=5)
         self._finalizing = False
         self._closed = False
         self._segment_generation = 0
@@ -236,15 +235,10 @@ class VoiceStreamSession:
         current_audio = getattr(self._segmenter, "current_audio", None)
         if not isinstance(current_audio, (bytes, bytearray)) or not current_audio:
             return
-        average_ms_per_audio_second = (
-            sum(self._partial_ms_per_audio_second) / len(self._partial_ms_per_audio_second)
-            if self._partial_ms_per_audio_second else None
-        )
-        if average_ms_per_audio_second is not None:
-            audio_seconds = len(current_audio) / (2 * SAMPLE_RATE)
-            predicted_ms = average_ms_per_audio_second * audio_seconds
-            if predicted_ms > float(getattr(config, "VOICE_PARTIAL_MAX_MS", 600)):
-                return
+        audio_seconds = len(current_audio) / (2 * SAMPLE_RATE)
+        predicted_ms = stt_runtime.estimate_stt_runtime_ms(audio_seconds)
+        if predicted_ms > float(getattr(config, "VOICE_PARTIAL_MAX_MS", 600)):
+            return
         generation = self._segment_generation
         audio = bytes(current_audio)
         audio_end_sample_index = len(audio) // 2
@@ -272,7 +266,7 @@ class VoiceStreamSession:
             audio_seconds = len(audio) / (2 * SAMPLE_RATE)
             elapsed_ms = max(0.0, (self._clock() - started_at) * 1000)
             if audio_seconds > 0:
-                self._partial_ms_per_audio_second.append(elapsed_ms / audio_seconds)
+                stt_runtime.record_stt_runtime(audio_seconds, elapsed_ms)
 
         if text is None:
             return None

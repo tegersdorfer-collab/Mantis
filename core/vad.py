@@ -6,6 +6,7 @@ from __future__ import annotations
 import struct
 import re
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import numpy as np
@@ -23,8 +24,11 @@ _INCOMPLETE_ENDINGS = frozenset({
     "neben", "ohne", "über", "um", "unter", "von", "vor", "zwischen",
     "mit", "nach", "zu", "der", "die", "das", "den", "dem", "des",
     "ein", "eine", "einen", "einem", "einer", "eines", "mein", "meine",
-    "meinen", "meinem", "meiner", "dein", "deine", "unser", "unsere",
-    "noch", "vielleicht",
+    "meinen", "meinem", "meiner", "meines", "dein", "deine", "deinen",
+    "deinem", "deiner", "deines", "unser", "unsere", "unseren", "unserem",
+    "unserer", "unseres", "ich", "du", "er", "sie", "es", "wir", "ihr",
+    "mich", "mir", "dich", "dir", "ihn", "ihm", "uns", "euch", "viel",
+    "wieviel", "gerne", "gern", "danach", "vielleicht",
 })
 _SUBORDINATORS = frozenset({
     "dass", "weil", "ob", "wenn", "obwohl", "falls", "während", "sobald",
@@ -44,7 +48,7 @@ _SEPARABLE_COMMANDS = frozenset({
     "mach", "mache", "schalt", "schalte", "dreh", "drehe", "stell", "stelle",
     "lies", "lese", "zeig", "zeige", "hol", "hole", "ruf", "rufe", "hör", "höre",
 })
-_SEPARABLE_PARTICLES = frozenset({"an", "aus", "ein", "mit", "vor", "zurück"})
+_SEPARABLE_PARTICLES = frozenset({"an", "aus", "ein", "mit", "vor", "zu", "zurück"})
 _MODAL_OR_WISH_VERBS = frozenset({
     "will", "willst", "wollen", "wollt", "wollte", "wollten", "würde",
     "würdest", "würden", "möchte", "möchtest", "möchten", "muss", "musst",
@@ -72,7 +76,8 @@ _FULL_VERBS = frozenset({
     "erklären", "erinnern", "erzählen", "finden", "gehen", "hören", "kochen",
     "lesen", "machen", "mitbringen", "öffnen", "planen", "reden", "schicken",
     "schlafen", "schreiben", "sehen", "senden", "spielen", "stoppen", "suchen",
-    "trinken", "vorlesen", "warten", "zeigen", "zuhören",
+    "trinken", "vorlesen", "warten", "zeigen", "zuhören", "mergen", "merge",
+    "reviewen", "testen", "fixen", "pushen", "deployen", "builden",
 })
 _FINITE_FULL_VERBS = frozenset({
     "bin", "bist", "ist", "sind", "seid", "war", "waren", "stehe", "steht",
@@ -91,30 +96,95 @@ _CONTENT_FUNCTION_WORDS = _QUESTION_FUNCTION_WORDS | frozenset({
 })
 
 
-def utterance_is_complete(text: str) -> bool:
-    """Konservative Heuristik: FAST nur bei positiv erkannten fertigen Äußerungen."""
+class UtteranceStatus(str, Enum):
+    COMPLETE = "COMPLETE"
+    INCOMPLETE = "INCOMPLETE"
+    UNKNOWN = "UNKNOWN"
+
+
+_MODAL_VERBS = frozenset({
+    "will", "willst", "wollen", "wollt", "wollte", "wollten", "würde",
+    "würdest", "würden", "möchte", "möchtest", "möchten", "muss", "musst",
+    "müssen", "müsste", "müsstest", "müssten", "soll", "sollst", "sollt",
+    "sollen", "sollte", "solltest", "sollten", "kann", "kannst", "können",
+    "könnt", "könnte", "könntest", "könnten",
+})
+_DETERMINERS = frozenset({
+    "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen",
+    "einem", "einer", "eines", "mein", "meine", "meinen", "meinem",
+    "meiner", "meines", "dein", "deine", "deinen", "deinem", "deiner",
+    "deines", "unser", "unsere", "unseren", "unserem", "unserer", "unseres",
+    "dieser", "diese", "dieses", "diesen", "diesem", "welcher", "welche",
+    "welches", "welchen", "welchem",
+})
+_ATTRIBUTIVE_ADJECTIVES = frozenset({
+    "beste", "besten", "bester", "bestes", "bestem", "gut", "gute", "guten",
+    "guter", "gutes", "gutem", "neu", "neue", "neuen", "neuer", "neues",
+    "neuem", "schön", "schöne", "schönen", "schöner", "schönes", "schönem",
+    "groß", "große", "großen", "großer", "großes", "großem", "klein", "kleine",
+    "kleinen", "kleiner", "kleines", "kleinem", "aktuell", "aktuelle", "aktuellen",
+    "aktueller", "aktuelles", "aktuellem", "wichtig", "wichtige", "wichtigen",
+    "wichtiger", "wichtiges", "wichtigem", "passend", "passende", "passenden",
+    "passender", "passendes", "passendem", "richtig", "richtige", "richtigen",
+    "richtiger", "richtiges", "richtigem",
+})
+_SUPERLATIVE_ADJECTIVE_RE = re.compile(r"^.+(?:ste|sten|ster|stes|stem)$")
+
+
+def _ends_in_determiner_adjective(words: list[str]) -> bool:
+    return (
+        len(words) >= 2
+        and words[-2] in _DETERMINERS
+        and (
+            words[-1] in _ATTRIBUTIVE_ADJECTIVES
+            or _SUPERLATIVE_ADJECTIVE_RE.fullmatch(words[-1]) is not None
+        )
+    )
+
+
+def _ends_in_open_question_phrase(words: list[str]) -> bool:
+    return (
+        len(words) >= 2
+        and words[-2:] in (["am", "besten"], ["am", "schnellsten"])
+    ) or _ends_in_determiner_adjective(words)
+
+
+def _has_modal_without_full_verb(words: list[str]) -> bool:
+    return any(
+        word in _MODAL_VERBS
+        and not any(later in _FULL_VERBS for later in words[index + 1:])
+        for index, word in enumerate(words)
+    )
+
+
+def classify_utterance(text: str) -> UtteranceStatus:
+    """Ordnet Teiltexte nur bei klaren Mustern COMPLETE oder INCOMPLETE zu."""
     value = str(text or "").strip()
     words = [word.casefold() for word in _WORD_RE.findall(value)]
     if not words:
-        return False
+        return UtteranceStatus.UNKNOWN
 
     first, last = words[0], words[-1]
     if " ".join(words) in _SHORT_COMPLETE_UTTERANCES:
-        return True
+        return UtteranceStatus.COMPLETE
+
+    if first in _SUBORDINATORS | {"und", "oder", "aber"} and "," not in value:
+        return UtteranceStatus.INCOMPLETE
+    if _has_modal_without_full_verb(words):
+        return UtteranceStatus.INCOMPLETE
+    if first in _QUESTION_WORDS and _ends_in_open_question_phrase(words):
+        return UtteranceStatus.INCOMPLETE
 
     if first in _COMMAND_VERBS and last in _SEPARABLE_PARTICLES | _COMMAND_COMPLEMENTS:
-        return any(word not in _CONTENT_FUNCTION_WORDS for word in words[1:-1])
+        if any(word not in _CONTENT_FUNCTION_WORDS for word in words[1:-1]):
+            return UtteranceStatus.COMPLETE
+        return UtteranceStatus.INCOMPLETE
     if first in _QUESTION_WORDS and last in _SEPARABLE_PARTICLES:
         for index, word in enumerate(words[1:-1], start=1):
             if word in _QUESTION_VERBS and any(
                 item not in _QUESTION_FUNCTION_WORDS for item in words[index + 1:-1]
             ):
-                return True
-
-    if last in _INCOMPLETE_ENDINGS:
-        return False
-    if first in _SUBORDINATORS | {"und", "oder", "aber"} and "," not in value:
-        return False
+                return UtteranceStatus.COMPLETE
 
     if first in _QUESTION_WORDS:
         for index, word in enumerate(words[1:], start=1):
@@ -122,46 +192,61 @@ def utterance_is_complete(text: str) -> bool:
                 continue
             after_verb = words[index + 1:]
             if any(item not in _QUESTION_FUNCTION_WORDS for item in after_verb):
-                return True
+                return UtteranceStatus.COMPLETE
             if words == ["wie", "spät", "ist", "es"]:
-                return True
-        return False
+                return UtteranceStatus.COMPLETE
 
     if first in _COMMAND_VERBS:
         command_content = [
             word for word in words[1:] if word not in _CONTENT_FUNCTION_WORDS
         ]
+        if not command_content:
+            return UtteranceStatus.INCOMPLETE
         if last in _SEPARABLE_PARTICLES | _COMMAND_COMPLEMENTS:
-            return bool(command_content)
-        if first in {"spiel", "spiele"}:
-            return bool(command_content)
+            return UtteranceStatus.COMPLETE
         # Ein Befehl mit Zeit-/Wertangabe braucht neben dem Objekt noch einen
         # konkreten Zusatz: "stell den Timer auf zehn Minuten".
-        return (
-            first in {"stell", "stelle"}
-            and "auf" in words[1:-1]
-            and len(command_content) >= 3
-        )
+        if first in {"stell", "stelle"}:
+            if "auf" in words[1:-1] and len(command_content) >= 3:
+                return UtteranceStatus.COMPLETE
+            return UtteranceStatus.INCOMPLETE
+        return UtteranceStatus.COMPLETE
 
     if last in _FULL_VERBS:
         content_before_verb = [
             word for word in words[:-1] if word not in _CONTENT_FUNCTION_WORDS
         ]
         if content_before_verb:
-            return True
-        return (
+            return UtteranceStatus.COMPLETE
+        if (
             len(words) >= 3
             and words[0] in {"ich", "du", "er", "sie", "wir", "ihr"}
             and any(word in _MODAL_OR_WISH_VERBS for word in words[:-1])
-        )
+        ):
+            return UtteranceStatus.COMPLETE
 
     if last in _FINITE_FULL_VERBS and last not in _MODAL_OR_WISH_VERBS:
-        return len(words) >= 2 and (
+        if len(words) >= 2 and (
             first in {"ich", "du", "er", "sie", "wir", "ihr"}
             or any(word not in _CONTENT_FUNCTION_WORDS for word in words[:-1])
-        )
+        ):
+            return UtteranceStatus.COMPLETE
 
-    return False
+    if _ends_in_determiner_adjective(words):
+        return UtteranceStatus.INCOMPLETE
+
+    if last in _INCOMPLETE_ENDINGS:
+        return UtteranceStatus.INCOMPLETE
+
+    if first in _QUESTION_WORDS:
+        return UtteranceStatus.UNKNOWN
+
+    return UtteranceStatus.UNKNOWN
+
+
+def utterance_is_complete(text: str) -> bool:
+    """Kompatibilitätshelfer: True nur für positiv erkannte Abschlüsse."""
+    return classify_utterance(text) is UtteranceStatus.COMPLETE
 
 # Silero VAD's ONNX export requires exactly this many samples per inference
 # call (32ms @ 16kHz) — confirmed empirically against the downloaded model.
@@ -296,7 +381,8 @@ class VadSegmenter:
             return base
         if not self._partial_transcript:
             return base
-        if utterance_is_complete(self._partial_transcript):
+        status = classify_utterance(self._partial_transcript)
+        if status is UtteranceStatus.COMPLETE:
             last_speech = self._last_speech_sample_index
             covered = self._partial_transcript_sample_index
             max_stale_samples = int(
@@ -309,7 +395,9 @@ class VadSegmenter:
             ):
                 return int(getattr(config, "VOICE_SILENCE_FAST_MS", 450))
             return base
-        return int(getattr(config, "VOICE_SILENCE_SLOW_MS", 1200))
+        if status is UtteranceStatus.INCOMPLETE:
+            return int(getattr(config, "VOICE_SILENCE_SLOW_MS", 1200))
+        return base
 
     def process_chunk(self, pcm_chunk: bytes) -> SegmentEvent | None:
         prob = self._vad.speech_probability(pcm_chunk)

@@ -28,7 +28,7 @@ import time
 import wave
 
 import config
-from core import decisions, fast
+from core import decisions, fast, stt_runtime
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,23 @@ VOICE_ADDRESS_TIMEOUT_S = 3.0
 _conversation_active_until = 0.0
 
 
+def _audio_duration_seconds(audio_path: str) -> float:
+    """Liest die Dauer einer WAV-Datei, ohne ihren Audioinhalt einzulesen."""
+    try:
+        with wave.open(str(audio_path), "rb") as audio_file:
+            sample_rate = audio_file.getframerate()
+            if sample_rate > 0:
+                return audio_file.getnframes() / sample_rate
+    except (OSError, EOFError, wave.Error):
+        pass
+    return 0.0
+
+
+def _record_stt_runtime(audio_path: str, started_at: float) -> None:
+    elapsed_ms = max(0.0, (time.perf_counter() - started_at) * 1000)
+    stt_runtime.record_stt_runtime(_audio_duration_seconds(audio_path), elapsed_ms)
+
+
 async def _await_worker_completion(awaitable):
     """Hält den STT-Lock, bis ein nativer Worker-Thread wirklich fertig ist.
 
@@ -69,8 +86,17 @@ async def _await_worker_completion(awaitable):
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Ein weiterer cancel() darf den Lock nicht freigeben, solange
+                # der nicht abbrechbare Native-Worker noch auf dem Modell läuft.
+                continue
+            except BaseException:
+                break
         try:
-            await asyncio.shield(task)
+            task.result()
         except BaseException:
             pass
         raise
@@ -191,7 +217,13 @@ def _warmup_parakeet(model) -> None:
             wav_file.setsampwidth(2)
             wav_file.setframerate(16_000)
             wav_file.writeframes(b"\0\0" * 16_000)
-        model.transcribe(wav_path)
+        started_at = time.perf_counter()
+        try:
+            model.transcribe(wav_path)
+        finally:
+            stt_runtime.record_stt_runtime(
+                1.0, max(0.0, (time.perf_counter() - started_at) * 1000),
+            )
     finally:
         if wav_path is not None:
             Path(wav_path).unlink(missing_ok=True)
@@ -261,9 +293,13 @@ async def _transcribe_parakeet(audio_path: str) -> str:
 
     try:
         loop = asyncio.get_running_loop()
-        result = await _await_worker_completion(
-            loop.run_in_executor(_parakeet_executor, _parakeet_model.transcribe, audio_path)
-        )
+        started_at = time.perf_counter()
+        try:
+            result = await _await_worker_completion(
+                loop.run_in_executor(_parakeet_executor, _parakeet_model.transcribe, audio_path)
+            )
+        finally:
+            _record_stt_runtime(audio_path, started_at)
         return (result.text or "").strip()
     except Exception as e:
         # Laufzeitfehler (kaputte Datei o.ä.) — kein Grund, die Engine zu wechseln.
@@ -300,9 +336,13 @@ async def _transcribe_whisper_locked(audio_path: str) -> str:
         ))
 
     try:
-        segments = await _await_worker_completion(
-            asyncio.to_thread(_whisper_model.transcribe, audio_path)
-        )
+        started_at = time.perf_counter()
+        try:
+            segments = await _await_worker_completion(
+                asyncio.to_thread(_whisper_model.transcribe, audio_path)
+            )
+        finally:
+            _record_stt_runtime(audio_path, started_at)
         return " ".join(s.text for s in segments).strip()
     except Exception as e:
         log.error(f"Whisper-Transkription fehlgeschlagen: {e}")

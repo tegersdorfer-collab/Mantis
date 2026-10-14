@@ -4,6 +4,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import struct
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import core.vad as vad
 
 
@@ -280,3 +282,74 @@ def test_utterance_completion_accepts_explicitly_finished_patterns():
     ]
 
     assert [text for text in completed if not utterance_is_complete(text)] == []
+
+
+@pytest.mark.parametrize(("text", "expected_state"), [
+    ("Wie spät ist es?", "COMPLETE"),
+    ("Was steht heute an?", "COMPLETE"),
+    ("Wie wird das Wetter morgen?", "COMPLETE"),
+    ("Mach das Licht an", "COMPLETE"),
+    ("Schalte den Ventilator aus", "COMPLETE"),
+    ("Stell den Timer auf zehn Minuten", "COMPLETE"),
+    ("Kannst du die Aufgabe abhaken", "COMPLETE"),
+    ("Ich möchte die Aufgabe abhaken", "COMPLETE"),
+    ("Lies mir die Termine vor", "COMPLETE"),
+    ("Spiele meine Lieblingsmusik", "COMPLETE"),
+    ("Mantis läuft", "COMPLETE"),
+    ("Was kostet der Kaffee?", "COMPLETE"),
+    ("Danke", "COMPLETE"),
+    ("Pause", "COMPLETE"),
+    ("Mach den Branch Merge", "COMPLETE"),
+    ("Ich würde gerne", "INCOMPLETE"),
+    ("Kannst du", "INCOMPLETE"),
+    ("Ich möchte", "INCOMPLETE"),
+    ("Wie viel", "INCOMPLETE"),
+    ("Was ist mit", "INCOMPLETE"),
+    ("Wie kann ich am besten", "INCOMPLETE"),
+    ("Was ist der beste", "INCOMPLETE"),
+    ("Erinner mich an", "INCOMPLETE"),
+    ("Kannst du mir und", "INCOMPLETE"),
+    ("Wenn ich morgen Zeit habe", "INCOMPLETE"),
+    ("Weil ich heute", "INCOMPLETE"),
+    ("Stell den Timer auf", "INCOMPLETE"),
+    ("Ich muss noch", "INCOMPLETE"),
+    ("Kannst du den Branch", "INCOMPLETE"),
+    ("Das neue", "INCOMPLETE"),
+    ("Guten Morgen", "UNKNOWN"),
+    ("Alles klar", "UNKNOWN"),
+    ("Okay", "UNKNOWN"),
+    ("Wie bitte?", "UNKNOWN"),
+    ("Ja", "UNKNOWN"),
+    ("Ja, genau", "UNKNOWN"),
+    ("Mhm", "UNKNOWN"),
+    ("Aha", "UNKNOWN"),
+    ("Interessant", "UNKNOWN"),
+    ("Kaffee mit Milch", "UNKNOWN"),
+    ("Die aktuelle Version", "UNKNOWN"),
+    ("Der Branch ist sauber", "UNKNOWN"),
+    ("Das klingt gut", "UNKNOWN"),
+    ("Du bist nett", "UNKNOWN"),
+    ("Der Branch ist online", "UNKNOWN"),
+])
+def test_german_utterances_use_complete_incomplete_and_unknown_silence_classes(
+    monkeypatch, text, expected_state,
+):
+    import config
+
+    monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True)
+    monkeypatch.setattr(config, "VOICE_SILENCE_FAST_MS", 450)
+    monkeypatch.setattr(config, "VOICE_SILENCE_SLOW_MS", 1200)
+    monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800)
+    segmenter = vad.VadSegmenter(FakeVAD([]), chunk_ms=100)
+    segmenter.set_partial_transcript(text, audio_end_sample_index=0)
+    segmenter._last_speech_sample_index = 0
+
+    expected_silence_ms = {
+        "COMPLETE": 450,
+        "INCOMPLETE": 1200,
+        "UNKNOWN": 800,
+    }[expected_state]
+
+    assert vad.classify_utterance(text).value == expected_state
+    assert vad.utterance_is_complete(text) is (expected_state == "COMPLETE")
+    assert segmenter._silence_threshold_ms() == expected_silence_ms

@@ -383,6 +383,45 @@ def test_voice_settings_default_to_short_answers_and_stt_preload(monkeypatch):
     assert settings.STT_PRELOAD is True
 
 
+def test_stt_runtime_estimate_learns_from_warmup_and_final_runs(monkeypatch, tmp_path):
+    import time
+    import wave
+    from collections import deque
+
+    from core import stt_runtime
+
+    monkeypatch.setattr(
+        stt_runtime, "_samples", deque(maxlen=stt_runtime._SAMPLE_WINDOW),
+    )
+    monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
+    monkeypatch.setattr(voice, "_parakeet_unavailable", False)
+
+    def timed_transcribe(_path):
+        time.sleep(0.02)
+        return MagicMock(text="Okay Mantis")
+
+    model = MagicMock()
+    model.transcribe.side_effect = timed_transcribe
+    monkeypatch.setattr(voice, "_parakeet_model", model)
+
+    voice._warmup_parakeet(model)
+
+    assert len(stt_runtime._samples) == 1
+    assert stt_runtime.estimate_stt_runtime_ms(1.0) < 550
+
+    audio_path = tmp_path / "one-second.wav"
+    with wave.open(str(audio_path), "wb") as audio_file:
+        audio_file.setnchannels(1)
+        audio_file.setsampwidth(2)
+        audio_file.setframerate(16_000)
+        audio_file.writeframes(b"\0\0" * 16_000)
+
+    assert asyncio.run(voice.transcribe_audio(str(audio_path))) == "Okay Mantis"
+
+    assert len(stt_runtime._samples) == 2
+    assert stt_runtime.estimate_stt_runtime_ms(1.0) < 550
+
+
 def test_whisper_voice_transcript_also_normalizes_the_initial_wake_word(monkeypatch):
     monkeypatch.setattr(voice.config, "STT_ENGINE", "whisper")
     monkeypatch.setattr(

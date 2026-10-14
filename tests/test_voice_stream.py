@@ -2,10 +2,22 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asyncio
+from collections import deque
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from core.voice_stream import VoiceStreamSession, VAD_FRAME_BYTES, WAKEWORD_FRAME_BYTES
 from core.vad import SegmentEvent
+
+
+@pytest.fixture(autouse=True)
+def _isolate_process_wide_stt_runtime(monkeypatch):
+    from core import stt_runtime
+
+    monkeypatch.setattr(
+        stt_runtime, "_samples", deque(maxlen=stt_runtime._SAMPLE_WINDOW),
+    )
 
 
 def make_session(segment_events, wake_hits, conversation_active=False):
@@ -420,6 +432,132 @@ class TestVoiceStreamSession:
         assert len(partial_calls) == 1
         assert partial_runs == 1
 
+    def test_initial_runtime_estimate_skips_first_run_over_configured_budget(
+        self, monkeypatch,
+    ):
+        import config
+        import core.voice_stream as vs
+        from core import stt_runtime
+
+        assert stt_runtime.estimate_stt_runtime_ms(1.25) == 650.0
+
+        class FakeClock:
+            now = 0.0
+
+            def __call__(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        class SpeechSegmenter:
+            is_speaking = False
+            current_chunk_is_speech = False
+            current_audio = b"\0" * 40_000  # 1.25 s vor den zwei Test-Frames
+
+            def process_chunk(self, frame):
+                self.is_speaking = True
+                self.current_chunk_is_speech = True
+                self.current_audio += frame
+                return None
+
+        async def run():
+            monkeypatch.setattr(config, "VOICE_PARTIAL_MAX_MS", 600, raising=False)
+            clock = FakeClock()
+            partial_calls = []
+
+            async def partial_stt(audio):
+                partial_calls.append(audio)
+                return "Teiltext"
+
+            session = VoiceStreamSession(
+                vad_segmenter=SpeechSegmenter(),
+                wakeword_detector=MagicMock(),
+                conversation_active_fn=lambda: True,
+                partial_interval_ms=700,
+                partial_transcriber=partial_stt,
+                partial_executor_available=lambda: True,
+                clock=clock,
+            )
+            monkeypatch.setattr(vs, "transcribe_pcm", AsyncMock(return_value="Final"))
+
+            await session.handle_chunk(vad_frame(1), muted=False)
+            clock.advance(0.7)
+            await session.handle_chunk(vad_frame(2), muted=False)
+            await asyncio.sleep(0)
+            return partial_calls, session._partial_runs
+
+        partial_calls, partial_runs = asyncio.run(run())
+
+        assert partial_calls == []
+        assert partial_runs == 0
+
+    def test_partial_runtime_estimate_is_shared_with_new_sessions(self, monkeypatch):
+        import config
+        import core.voice_stream as vs
+
+        class FakeClock:
+            now = 0.0
+
+            def __call__(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        class SpeechSegmenter:
+            is_speaking = False
+            current_chunk_is_speech = False
+            current_audio = b""
+
+            def process_chunk(self, frame):
+                self.is_speaking = True
+                self.current_chunk_is_speech = True
+                self.current_audio += frame
+                return None
+
+        async def run():
+            monkeypatch.setattr(config, "VOICE_PARTIAL_MAX_MS", 600, raising=False)
+            clock = FakeClock()
+            partial_calls = []
+
+            async def partial_stt(audio):
+                partial_calls.append(audio)
+                clock.advance(0.8)
+                return "Teiltext"
+
+            def new_session():
+                return VoiceStreamSession(
+                    vad_segmenter=SpeechSegmenter(),
+                    wakeword_detector=MagicMock(),
+                    conversation_active_fn=lambda: True,
+                    partial_interval_ms=700,
+                    partial_transcriber=partial_stt,
+                    partial_executor_available=lambda: True,
+                    clock=clock,
+                )
+
+            monkeypatch.setattr(vs, "transcribe_pcm", AsyncMock(return_value="Final"))
+            first_session = new_session()
+            await first_session.handle_chunk(vad_frame(1), muted=False)
+            clock.advance(0.7)
+            await first_session.handle_chunk(vad_frame(2), muted=False)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            second_session = new_session()
+            await second_session.handle_chunk(vad_frame(3), muted=False)
+            clock.advance(0.7)
+            await second_session.handle_chunk(vad_frame(4), muted=False)
+
+            return partial_calls, first_session._partial_runs, second_session._partial_runs
+
+        partial_calls, first_runs, second_runs = asyncio.run(run())
+
+        assert len(partial_calls) == 1
+        assert first_runs == 1
+        assert second_runs == 0
+
     def test_partial_run_counter_changes_only_after_stt_task_is_admitted(self, monkeypatch):
         import pytest
         import core.voice_stream as vs
@@ -630,6 +768,56 @@ class TestVoiceStreamSession:
                 with pytest.raises(asyncio.CancelledError):
                     await task
                 assert not voice._whisper_lock.locked()
+            finally:
+                release.set()
+                if not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(run())
+
+    def test_repeated_cancellation_keeps_native_inference_lock_until_thread_finishes(
+        self, monkeypatch,
+    ):
+        import threading
+        from types import SimpleNamespace
+
+        import pytest
+        import config
+        import core.voice as voice
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingModel:
+            def transcribe(self, _path):
+                started.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("fake inference timed out")
+                return SimpleNamespace(text="Teiltext")
+
+        monkeypatch.setattr(config, "STT_ENGINE", "parakeet")
+        monkeypatch.setattr(voice, "_parakeet_unavailable", False)
+        monkeypatch.setattr(voice, "_parakeet_model", BlockingModel())
+
+        async def run():
+            task = asyncio.create_task(voice.transcribe_audio_partial("fake.wav"))
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+
+                task.cancel()
+                await asyncio.sleep(0)
+
+                assert not task.done()
+                assert voice.partial_stt_executor_available() is False
+                assert await voice.transcribe_audio_partial("second.wav") is None
+
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert voice.partial_stt_executor_available() is True
             finally:
                 release.set()
                 if not task.done():
