@@ -10,6 +10,7 @@ from domains.gym.aliases import (
     builtin_aliases, is_pullup_name, normalize_alias, resolve_alias,
     split_equipment_variant,
 )
+from domains.gym.legacy import legacy_exercise_for_alias
 
 
 _NUMBER = re.compile(r"(?<![\w.])[+]?\d+(?:[.,]\d+)?(?![\d.])")
@@ -96,6 +97,14 @@ def has_non_exercise_start(text: str) -> bool:
     return bool(_NON_EXERCISE_START.match(prefix))
 
 
+def _candidate_equipment(name: str) -> str | None:
+    base, equipment = split_equipment_variant(name)
+    if equipment:
+        return equipment
+    legacy = legacy_exercise_for_alias(base)
+    return legacy.equipment if legacy else None
+
+
 def _numeric_value(raw: str) -> float | None:
     value = raw.strip().lstrip("+").replace(",", ".")
     # Im deutschsprachigen Gym-Kontext ist 1.000 eine übliche Tausendergruppe.
@@ -135,6 +144,15 @@ def _prefix_and_remainder(text: str, aliases: dict[str, list[str]]):
         original_alias = " ".join(words[:boundary])
         rest = " ".join(words[boundary:])
         exercise, ambiguous, fuzzy = resolve_alias(original_alias, aliases, allow_typo=False)
+        if ambiguous and equipment:
+            compatible = tuple(
+                choice for choice in ambiguous
+                if _candidate_equipment(choice) == equipment
+            )
+            if len(compatible) == 1:
+                exercise, ambiguous = compatible[0], ()
+            elif compatible:
+                ambiguous = compatible
         return original_alias, rest, equipment, exercise, ambiguous, fuzzy, bool(exercise)
 
     first_number = _NUMBER.search(remainder)

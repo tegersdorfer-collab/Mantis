@@ -2,6 +2,8 @@
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from domains.gym.session import _exercise_defaults, session_timeout_end, summarize_session
 from domains.gym import session
 from domains.gym.parser import ParsedLog, ParsedSet
@@ -67,6 +69,11 @@ def test_equipment_variants_do_not_reuse_or_mutate_a_different_equipment_exercis
             "equipment": "barbell", "rep_min": 6, "rep_max": 10, "rep_start": 8,
             "load_mode": "external", "weight_increment_kg": 2.5, "dumbbell_pair": False,
         },
+        2: {
+            "id": 2, "name": "Bench Press", "exercise_type": "compound",
+            "equipment": "barbell", "rep_min": 6, "rep_max": 10, "rep_start": 8,
+            "load_mode": "external", "weight_increment_kg": 2.5, "dumbbell_pair": False,
+        },
     }
 
     class Cursor:
@@ -108,6 +115,7 @@ def test_equipment_variants_do_not_reuse_or_mutate_a_different_equipment_exercis
     monkeypatch.setattr(session, "_fetchall", fetchall)
     monkeypatch.setattr(session, "_fetchone", fetchone)
     original = rows[1].copy()
+    legacy_original = rows[2].copy()
 
     dumbbell = session._ensure_exercise(
         cur, "Synthetic Press", "Synthetic Press", "dumbbell", "external", allow_create=True
@@ -118,11 +126,18 @@ def test_equipment_variants_do_not_reuse_or_mutate_a_different_equipment_exercis
     barbell = session._ensure_exercise(
         cur, "Synthetic Press", "Synthetic Press", "barbell", "external", allow_create=True
     )
+    legacy_dumbbell = session._ensure_exercise(
+        cur, "Bankdrücken (KH)", "Bank", "dumbbell", "external", allow_create=True
+    )
 
     assert dumbbell["name"] == "Synthetic Press (Kurzhantel)"
     assert repeated["id"] == dumbbell["id"]
     assert barbell["id"] == 1
+    assert legacy_dumbbell["name"] == "Bankdrücken (KH)"
+    assert legacy_dumbbell["id"] != 2
+    assert legacy_dumbbell["equipment"] == "dumbbell"
     assert rows[1] == original
+    assert rows[2] == legacy_original
 
 
 def test_equipment_prefix_resolves_to_a_legacy_exercise_name_without_duplication(monkeypatch):
@@ -137,6 +152,25 @@ def test_equipment_prefix_resolves_to_a_legacy_exercise_name_without_duplication
     )
 
     assert resolved == "KH Schulterdrücken"
+
+
+@pytest.mark.parametrize(("name", "legacy_name", "legacy_equipment", "equipment", "expected"), [
+    ("Bankdrücken", "Bench Press", "barbell", "dumbbell", "Bankdrücken (KH)"),
+    ("Schulterdrücken", "Shoulder Press", None, "dumbbell", "Schulterdrücken (KH)"),
+    ("Curls", "Curls", None, "ez_bar", "Curls (SZ)"),
+])
+def test_new_legacy_variant_keeps_its_confirmed_name(
+    monkeypatch, name, legacy_name, legacy_equipment, equipment, expected,
+):
+    rows = [{
+        "id": 1, "name": legacy_name, "equipment": legacy_equipment,
+        "load_mode": "external",
+    }]
+    monkeypatch.setattr(session, "_fetchall", lambda *_args, **_kwargs: rows)
+
+    variant = session._equipment_variant_name(None, name, equipment, "external")
+
+    assert variant == expected
 
 
 def test_reps_correction_conflict_does_not_issue_an_update(monkeypatch):

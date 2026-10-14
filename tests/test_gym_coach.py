@@ -498,14 +498,21 @@ def test_upper_lower_rotation_classifies_workouts_from_exercise_categories(monke
 
 
 def test_history_trend_uses_creation_time_for_workouts_on_the_same_date(monkeypatch):
-    monkeypatch.setattr(coach_module.session.db, "query", lambda *_args, **_kwargs: [
+    history_rows = [
         {"workout_id": 2, "date": "2026-10-14", "created_at": "2026-10-14T11:00:00+02:00",
          "set_index": 1, "reps": 8, "weight_kg": 85, "is_warmup": False,
          "exercise": "Bank", "load_mode": "external"},
         {"workout_id": 1, "date": "2026-10-14", "created_at": "2026-10-14T10:00:00+02:00",
          "set_index": 1, "reps": 8, "weight_kg": 80, "is_warmup": False,
          "exercise": "Bank", "load_mode": "external"},
-    ])
+    ]
+
+    def query(sql, *_args, **_kwargs):
+        if "FROM exercises" in sql:
+            return [{"id": 1, "name": "Bank", "equipment": None}]
+        return history_rows
+
+    monkeypatch.setattr(coach_module.session.db, "query", query)
 
     result = GymCoach()._history("Bank")
 
