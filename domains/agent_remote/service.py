@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import ctypes
 import hashlib
 import json
 import logging
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -23,6 +21,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from communication.base import IncomingMessage
+from domains.agent_remote.process import (
+    process_group_exists as _process_group_exists,
+    process_identity as _process_identity,
+    signal_verified_process_group as _verified_signal_group,
+)
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +33,7 @@ MAX_REMOTE_RUNS = 2
 DEFAULT_TIMEOUT_SECONDS = 45 * 60
 CONFIRMATION_TTL_SECONDS = 10 * 60
 TERMINATION_GRACE_SECONDS = 3
+TERMINATION_VERIFY_SECONDS = 1
 _REMOTE_ID_RE = re.compile(r"^remote-[a-f0-9]{12}$")
 _CODEX_ID_RE = re.compile(r"^codex-task\.[A-Za-z0-9_-]+$")
 _ALIAS_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,31}$")
@@ -52,7 +56,13 @@ _READ_WORDS = re.compile(
 )
 _CONFIRMATIONS = {"ja", "start"}
 _REJECTIONS = {"nein"}
-_REGISTRY_FIELDS = {"pid", "start", "dir", "run", "title"}
+_REGISTRY_FIELDS = {"pid", "start", "dir", "session", "run", "title"}
+_GIT_HARDENING = (
+    ("core.fsmonitor", ""),
+    ("core.hooksPath", "/dev/null"),
+    ("core.sshCommand", ""),
+    ("protocol.allow", "never"),
+)
 
 
 @dataclass
@@ -68,7 +78,6 @@ class AgentRemoteConfig:
     ps_binary: str | Path = "~/.local/bin/codex-ps"
     model: str = "gpt-6-luna"
     effort: str = "max"
-    test_args: Mapping[str, Sequence[str]] = field(default_factory=dict)
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     max_running: int = MAX_REMOTE_RUNS
 
@@ -78,13 +87,6 @@ class AgentRemoteConfig:
         import config
 
         repos = _parse_json_mapping(getattr(config, "AGENT_REMOTE_REPOS", ""))
-        tests = _parse_json_mapping(getattr(config, "AGENT_REMOTE_TEST_ARGS", ""))
-        valid_tests: dict[str, tuple[str, ...]] = {}
-        for alias, vector in tests.items():
-            if isinstance(vector, list) and vector and all(
-                isinstance(part, str) and part for part in vector
-            ):
-                valid_tests[alias] = tuple(vector)
         return cls(
             enabled=bool(getattr(config, "AGENT_REMOTE_ENABLED", False)),
             allowed_user_ids=getattr(config, "DISCORD_ALLOWED_USER_IDS", ()),
@@ -95,7 +97,6 @@ class AgentRemoteConfig:
             ps_binary=Path.home() / ".local" / "bin" / "codex-ps",
             model=getattr(config, "CODEX_TASK_MODEL", "") or "gpt-6-luna",
             effort=getattr(config, "CODEX_TASK_EFFORT", "") or "max",
-            test_args=valid_tests,
         )
 
 
@@ -151,13 +152,7 @@ class RunRecord:
     registry_run: str | None = None
     ended_at: float | None = None
     notification_sent_at: float | None = None
-    test_status: str | None = None
-    test_pid: int | None = None
-    test_pgid: int | None = None
-    test_identity: str | None = None
-    test_deadline: float | None = None
-    test_output: str | None = None
-    test_exit_code: int | None = None
+    termination_reason: str | None = None
 
 
 def _parse_json_mapping(value: Any) -> dict[str, Any]:
@@ -208,92 +203,6 @@ def _read_text(path: Path, limit: int | None = None) -> str | None:
     return text if limit is None else text[-limit:]
 
 
-def _process_identity(pid: int) -> str | None:
-    """Liefert eine hochauflösende Prozessstart-ID; eine wiederverwendete PID passt nicht."""
-    if sys.platform == "darwin":
-        class ProcBSDInfo(ctypes.Structure):
-            _fields_ = [
-                ("pbi_flags", ctypes.c_uint32),
-                ("pbi_status", ctypes.c_uint32),
-                ("pbi_xstatus", ctypes.c_uint32),
-                ("pbi_pid", ctypes.c_uint32),
-                ("pbi_ppid", ctypes.c_uint32),
-                ("pbi_uid", ctypes.c_uint32),
-                ("pbi_gid", ctypes.c_uint32),
-                ("pbi_ruid", ctypes.c_uint32),
-                ("pbi_rgid", ctypes.c_uint32),
-                ("pbi_svuid", ctypes.c_uint32),
-                ("pbi_svgid", ctypes.c_uint32),
-                ("rfu_1", ctypes.c_uint32),
-                ("pbi_comm", ctypes.c_char * 16),
-                ("pbi_name", ctypes.c_char * 32),
-                ("pbi_nfiles", ctypes.c_uint32),
-                ("pbi_pgid", ctypes.c_uint32),
-                ("pbi_pjobc", ctypes.c_uint32),
-                ("e_tdev", ctypes.c_uint32),
-                ("e_tpgid", ctypes.c_uint32),
-                ("pbi_nice", ctypes.c_int32),
-                ("pbi_start_tvsec", ctypes.c_uint64),
-                ("pbi_start_tvusec", ctypes.c_uint64),
-            ]
-
-        try:
-            libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
-            proc_pidinfo = libproc.proc_pidinfo
-            proc_pidinfo.argtypes = [
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_uint64,
-                ctypes.POINTER(ProcBSDInfo),
-                ctypes.c_int,
-            ]
-            proc_pidinfo.restype = ctypes.c_int
-            info = ProcBSDInfo()
-            size = proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
-            if size != ctypes.sizeof(info) or info.pbi_pid != pid:
-                return None
-            return f"darwin:{info.pbi_start_tvsec}.{info.pbi_start_tvusec:06d}"
-        except (AttributeError, OSError, ValueError):
-            return None
-    if sys.platform.startswith("linux"):
-        try:
-            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-            fields = stat_text[stat_text.rfind(")") + 2:].split()
-            return f"linux:{fields[19]}" if len(fields) > 19 else None
-        except (OSError, IndexError):
-            return None
-    try:
-        result = subprocess.run(
-            ["/bin/ps", "-p", str(pid), "-o", "lstart="],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            shell=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    identity = result.stdout.strip()
-    return identity if result.returncode == 0 and identity else None
-
-
-def _verified_signal_group(pid: int, pgid: int, kind: str, expected_identity: str) -> bool:
-    """Signale nur die bekannte Session, nachdem PID, PGID und Startzeit gepasst haben."""
-    try:
-        if pid <= 0 or pgid != pid or os.getpgid(pid) != pgid:
-            return False
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    if _process_identity(pid) != expected_identity:
-        return False
-    sig = signal.SIGTERM if kind == "TERM" else signal.SIGKILL
-    try:
-        os.killpg(pgid, sig)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    return True
-
-
 class AgentRemoteService:
     """DM-Dispatcher, Statusspeicher und Prozessaufsicht für codex-task."""
 
@@ -310,6 +219,7 @@ class AgentRemoteService:
         process_identity: Callable[[int], str | None] | None = None,
         process_group: Callable[[int], int] | None = None,
         signal_process_group: Callable[[int, int, str, str], bool] | None = None,
+        process_group_exists: Callable[[int], bool] | None = None,
     ):
         self.config = config
         self.discord_channel = discord_channel
@@ -321,6 +231,7 @@ class AgentRemoteService:
         self._process_identity = process_identity or _process_identity
         self._process_group = process_group or os.getpgid
         self._signal_process_group = signal_process_group or _verified_signal_group
+        self._process_group_exists = process_group_exists or _process_group_exists
         home = Path(config.home_dir or Path.home()).expanduser().resolve()
         self.home_dir = home
         state = config.state_dir or home / "Library" / "Caches" / "mantis" / "agent-remote"
@@ -348,8 +259,7 @@ class AgentRemoteService:
     @property
     def active_count(self) -> int:
         return sum(
-            record.status in {"preparing", "running", "cancelling"}
-            or record.test_status in {"preparing", "running", "cancelling"}
+            record.status in {"starting", "preparing", "running", "cancelling"}
             for record in self.runs.values()
         )
 
@@ -386,7 +296,6 @@ class AgentRemoteService:
         for kind, pattern in (
             ("cancel", r"^abbrechen\s+(\S+)$"),
             ("diff", r"^diff\s+(\S+)$"),
-            ("tests", r"^tests\s+in\s+(\S+)$"),
             ("result", r"^was\s+kam\s+bei\s+(\S+)\s+raus\??$"),
         ):
             match = re.match(pattern, normalized, re.IGNORECASE)
@@ -453,19 +362,16 @@ class AgentRemoteService:
             return None
         if not repo.is_dir():
             return None
-        git = shutil.which("git")
-        if not git:
-            return None
         try:
-            result = self._command_runner(
-                [git, "-C", str(repo), "rev-parse", "--show-toplevel"],
+            result = self._run_git(
+                repo,
+                ["rev-parse", "--show-toplevel"],
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=10,
-                shell=False,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, FileNotFoundError):
             return None
         if result.returncode != 0:
             return None
@@ -540,7 +446,12 @@ class AgentRemoteService:
         if self.persist is None:
             return
         try:
-            self.persist(role, text, channel="discord", meta={"use_case": "agent"})
+            self.persist(
+                role,
+                text,
+                channel="discord",
+                meta={"use_case": "agent", "untrusted": role == "assistant"},
+            )
         except Exception:
             log.exception("Agent-Remote-Nachricht konnte nicht persistiert werden")
 
@@ -748,6 +659,8 @@ class AgentRemoteService:
             self.pending.pop(user_id, None)
             self.clarifications.pop(user_id, None)
             return True
+        if not is_confirmation:
+            self.pending.pop(user_id, None)
         await self._persist("user", text)
         if body is not None:
             await self._handle_start_request(msg, route, body)
@@ -825,38 +738,138 @@ class AgentRemoteService:
             try:
                 state.chmod(0o600)
                 data = json.loads(state.read_text(encoding="utf-8"))
-                record = RunRecord(**data)
+                allowed = {item.name for item in RunRecord.__dataclass_fields__.values()}
+                record = RunRecord(**{key: value for key, value in data.items() if key in allowed})
+                if record.status == "preparing":
+                    record.status = "starting"
                 if record.remote_id != folder.name or not _REMOTE_ID_RE.fullmatch(record.remote_id):
                     continue
                 self.runs[record.remote_id] = record
             except (OSError, ValueError, TypeError):
                 log.warning("Ungültiger Agent-Remote-Status ignoriert: %s", folder.name)
 
-    def _make_environment(self, tmp_dir: Path) -> dict[str, str]:
+    def _refresh_launch_identity(self, record: RunRecord) -> bool:
+        path = self._record_path(record.remote_id)
+        if path.is_symlink() or not path.is_file():
+            return False
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if state.get("remote_id") != record.remote_id:
+                return False
+            pid = state.get("pid")
+            pgid = state.get("pgid")
+            identity = state.get("process_identity")
+            if not isinstance(pid, int) or not isinstance(pgid, int) or not identity:
+                return False
+            record.pid = pid
+            record.pgid = pgid
+            record.process_identity = identity
+            record.status = state.get("status", record.status)
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def _base_path(self) -> str:
         bundle = Path(
             "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin"
         )
-        paths = [
+        return ":".join([
             "/opt/homebrew/bin",
             "/usr/local/bin",
             "/usr/bin",
             "/bin",
             str(self.home_dir / ".local" / "bin"),
             str(bundle),
-        ]
+        ])
+
+    def _make_environment(self, tmp_dir: Path | None = None) -> dict[str, str]:
         env = {
             "HOME": str(self.home_dir),
-            "PATH": ":".join(paths),
-            "TMPDIR": str(tmp_dir),
+            "PATH": self._base_path(),
             "LANG": "en_US.UTF-8",
-            "CODEX_TASK_MODEL": self.config.model,
-            "CODEX_TASK_EFFORT": self.config.effort,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": str(len(_GIT_HARDENING)),
         }
-        for name in ("USER", "LOGNAME"):
-            value = os.environ.get(name)
-            if value:
-                env[name] = value
+        for index, (key, value) in enumerate(_GIT_HARDENING):
+            env[f"GIT_CONFIG_KEY_{index}"] = key
+            env[f"GIT_CONFIG_VALUE_{index}"] = value
+        if tmp_dir is not None:
+            env["TMPDIR"] = str(tmp_dir)
         return env
+
+    def _git_args(self, cwd: Path, args: Sequence[str], config: Sequence[tuple[str, str]] = ()) -> list[str]:
+        git = shutil.which("git", path=self._base_path())
+        if not git:
+            raise FileNotFoundError("git nicht verfügbar")
+        command = [git]
+        for key, value in (*_GIT_HARDENING, *config):
+            command.extend(("-c", f"{key}={value}"))
+        command.extend(("-C", str(cwd), *args))
+        return command
+
+    def _run_git(
+        self,
+        cwd: Path,
+        args: Sequence[str],
+        *,
+        config: Sequence[tuple[str, str]] = (),
+        **kwargs,
+    ) -> subprocess.CompletedProcess:
+        return self._command_runner(
+            self._git_args(cwd, args, config),
+            env=self._make_environment(),
+            shell=False,
+            **kwargs,
+        )
+
+    def _checkout_filter_config(self, repo: Path) -> list[tuple[str, str]]:
+        """Leert lokal konfigurierte Filtertreiber, bevor der erste Checkout läuft."""
+        git_dir = repo / ".git"
+        config_path = git_dir / "config"
+        if git_dir.is_symlink() or not git_dir.is_dir() or config_path.is_symlink():
+            raise ValueError("Git-Konfigurationspfad ist ungültig")
+        try:
+            text = config_path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("Git-Konfiguration kann nicht sicher gelesen werden") from exc
+        names: set[str] = set()
+        for line in text.splitlines():
+            section = re.match(r'^\s*\[\s*filter\s+"([^"\\]+)"\s*\]\s*(?:[#;].*)?$', line, re.I)
+            if section:
+                names.add(section.group(1))
+            elif re.match(r"^\s*\[\s*filter(?:\s|\])", line, re.I):
+                raise ValueError("Filtertreibername in Git-Konfiguration ist nicht sicher lesbar")
+        result = self._run_git(
+            repo,
+            [
+                "config", "--local", "--name-only", "--get-regexp",
+                r"^filter\..*\.(smudge|process|required)$",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode not in {0, 1}:
+            raise ValueError("Git-Filterkonfiguration konnte nicht sicher geprüft werden")
+        for key in result.stdout.splitlines():
+            match = re.fullmatch(r"filter\.([A-Za-z0-9_.-]+)\.(?:smudge|process|required)", key.strip(), re.I)
+            if match:
+                names.add(match.group(1))
+            elif key.strip().casefold().startswith("filter."):
+                raise ValueError("Filtertreibername in Git-Konfiguration ist nicht zulässig")
+        overrides = []
+        for name in sorted(names):
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+                raise ValueError("Filtertreibername in Git-Konfiguration ist ungültig")
+            overrides.extend((
+                (f"filter.{name}.smudge", ""),
+                (f"filter.{name}.process", ""),
+                (f"filter.{name}.required", "false"),
+            ))
+        return overrides
 
     def _create_worktree(self, proposal: Proposal) -> str:
         if proposal.worktree is None or proposal.branch is None:
@@ -874,17 +887,14 @@ class AgentRemoteService:
         target = Path(proposal.worktree)
         if target.exists() or target.is_symlink():
             raise FileExistsError("Worktree-Ziel existiert bereits")
-        git = shutil.which("git")
-        if not git:
-            raise FileNotFoundError("git nicht verfügbar")
         try:
-            result = self._command_runner(
-                [git, "-C", str(repo), "worktree", "add", "-b", proposal.branch, str(target), "main"],
+            result = self._run_git(
+                repo,
+                ["worktree", "add", "--no-checkout", "-b", proposal.branch, str(target), "main"],
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=30,
-                shell=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError("Git konnte den Worktree nicht anlegen") from exc
@@ -895,7 +905,52 @@ class AgentRemoteService:
             resolved_target.relative_to(repo)
         except ValueError as exc:
             raise RuntimeError("Aufgelöster Worktree liegt außerhalb des Allowlist-Repos") from exc
+        if not self._worktree_gitdir_matches(repo, resolved_target):
+            raise RuntimeError("Git-Worktree-Verweis passt nicht zum Allowlist-Repo")
+        filters = self._checkout_filter_config(repo)
+        try:
+            checkout = self._run_git(
+                resolved_target,
+                ["checkout", "--no-recurse-submodules", proposal.branch],
+                config=filters,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("Git konnte den Worktree nicht sicher auschecken") from exc
+        if checkout.returncode != 0 or not self._worktree_gitdir_matches(repo, resolved_target):
+            raise RuntimeError("Git konnte den Worktree nicht sicher auschecken")
         return str(resolved_target)
+
+    @staticmethod
+    def _worktree_gitdir_matches(repo: Path, worktree: Path) -> bool:
+        try:
+            root = repo.resolve(strict=True)
+            target = worktree.resolve(strict=True)
+            target.relative_to(root / ".worktrees")
+            repository_gitdir = root / ".git"
+            pointer = target / ".git"
+            if (
+                repository_gitdir.is_symlink()
+                or not repository_gitdir.is_dir()
+                or pointer.is_symlink()
+                or not pointer.is_file()
+            ):
+                return False
+            value = pointer.read_text(encoding="utf-8", errors="strict")[:4096].strip()
+            prefix, separator, raw_gitdir = value.partition(":")
+            if prefix.casefold() != "gitdir" or not separator or not raw_gitdir.strip():
+                return False
+            actual = Path(raw_gitdir.strip())
+            if not actual.is_absolute():
+                actual = target / actual
+            actual = actual.resolve(strict=True)
+            expected = (repository_gitdir.resolve(strict=True) / "worktrees" / target.name).resolve(strict=True)
+            return actual == expected and actual.is_dir()
+        except (OSError, UnicodeError, ValueError, RuntimeError):
+            return False
 
     def _recover_registry_before_pid_save(self, record: RunRecord) -> bool:
         """Schließt das Startfenster über TMPDIR/meta, ohne einen Auftrag neu zu starten."""
@@ -907,19 +962,22 @@ class AgentRemoteService:
                 run_cwd = Path(meta.get("dir", "")).resolve(strict=True)
                 expected_cwd = Path(record.cwd).resolve(strict=True)
                 tmp = Path(record.tmp_dir).resolve(strict=True)
-                pgid = self._process_group(pid)
-                identity = self._process_identity(pid)
             except (OSError, ValueError, RuntimeError):
                 continue
             status = (_read_text(folder / "status", 64) or "").strip()
             if (
-                run_path != folder.resolve(strict=True)
+                run_path.name != folder.name
                 or run_path.parent != tmp
                 or run_cwd != expected_cwd
-                or pgid != pid
-                or not identity
                 or status not in {"running", "ok", "fail", "quota"}
             ):
+                continue
+            try:
+                pgid = self._process_group(pid)
+                identity = self._process_identity(pid)
+            except (OSError, ProcessLookupError, PermissionError):
+                pgid, identity = pid, None
+            if status == "running" and (pgid != pid or not identity):
                 continue
             record.pid = pid
             record.pgid = pgid
@@ -938,6 +996,8 @@ class AgentRemoteService:
     def _task_prompt(self, task: str) -> str:
         return (
             f"{task}\n\n"
+            "Führe passende Tests während dieses Laufs selbst aus und nenne am Ende eine "
+            "klare Testzeile mit Befehl und Ergebnis.\n"
             "Zusätzliche Sicherheitsgrenze: keine Commits, Merges oder Pushes ausführen."
         )
 
@@ -959,7 +1019,7 @@ class AgentRemoteService:
                 mode=proposal.mode,
                 model=proposal.model,
                 effort=proposal.effort,
-                status="preparing",
+                status="starting",
                 created_at=now,
                 deadline=now + min(DEFAULT_TIMEOUT_SECONDS, max(1, self.config.timeout_seconds)),
                 tmp_dir=str(tmp_dir),
@@ -984,15 +1044,29 @@ class AgentRemoteService:
             if proposal.mode == "write":
                 record.cwd = self._create_worktree(proposal)
                 record.worktree = record.cwd
+                self._save_run(record)
             tmp_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
             tmp_dir.chmod(0o700)
+            if proposal.mode == "write" and not self._worktree_gitdir_matches(
+                Path(record.repo_path), Path(record.cwd),
+            ):
+                raise RuntimeError("Git-Worktree-Verweis wurde vor dem Start verändert")
             if self._process_identity(os.getpid()) is None:
                 raise RuntimeError("Prozessidentität kann nicht sicher geprüft werden")
             binary = str(Path(self.config.task_binary).expanduser().resolve())
-            args = [binary, "-C", record.cwd, "-m", proposal.model, "-e", proposal.effort]
+            task_args = ["-C", record.cwd, "-m", proposal.model, "-e", proposal.effort]
             if proposal.mode == "read":
-                args.append("-r")
-            args.append(self._task_prompt(proposal.task))
+                task_args.append("-r")
+            task_args.append(self._task_prompt(proposal.task))
+            launcher = str(Path(__file__).with_name("launcher.py").resolve())
+            args = [
+                sys.executable,
+                launcher,
+                str(self._record_path(remote_id)),
+                remote_id,
+                binary,
+                *task_args,
+            ]
             process = self._popen(
                 args,
                 cwd=record.cwd,
@@ -1011,7 +1085,7 @@ class AgentRemoteService:
             record.deadline = self._clock() + min(
                 DEFAULT_TIMEOUT_SECONDS, max(1, self.config.timeout_seconds),
             )
-            record.status = "running" if process.poll() is None else "failed"
+            record.status = "running" if process.poll() is None and record.process_identity else "failed"
             if record.status == "failed":
                 record.ended_at = self._clock()
             try:
@@ -1032,7 +1106,7 @@ class AgentRemoteService:
                 record.pgid = int(process.pid)
                 if record.process_identity is None:
                     record.process_identity = self._process_identity(record.pid)
-                record.status = "running"
+                record.status = "running" if record.process_identity else "interrupted"
                 try:
                     self._save_run(record)
                 except OSError:
@@ -1065,20 +1139,17 @@ class AgentRemoteService:
         task.add_done_callback(done)
 
     def _registry_candidates(self, record: RunRecord) -> list[Path]:
-        tmp_dir = Path(record.tmp_dir)
+        registry_dir = self.home_dir / ".local" / "state" / "codex-task" / "runs"
         try:
-            resolved_tmp = tmp_dir.resolve(strict=True)
-            record_dir = self._record_path(record.remote_id).parent.resolve(strict=True)
-            resolved_tmp.relative_to(record_dir)
-        except (OSError, ValueError):
-            return []
-        try:
-            return [
-                item for item in resolved_tmp.glob("codex-task.*")
-                if item.is_dir() and not item.is_symlink()
-            ]
+            if registry_dir.is_symlink() or not registry_dir.is_dir():
+                return []
+            items = list(registry_dir.iterdir())
         except OSError:
             return []
+        return [
+            item for item in items
+            if _CODEX_ID_RE.fullmatch(item.name) and item.is_dir() and not item.is_symlink()
+        ]
 
     def _sync_registry(self, record: RunRecord) -> dict[str, str]:
         for folder in self._registry_candidates(record):
@@ -1092,7 +1163,7 @@ class AgentRemoteService:
                 continue
             if (
                 meta_pid != record.pid
-                or run_path != folder.resolve(strict=True)
+                or run_path.name != folder.name
                 or run_path.parent != tmp
                 or repo_path != Path(record.cwd).resolve(strict=True)
             ):
@@ -1114,18 +1185,26 @@ class AgentRemoteService:
             return
         while record.status == "running" and process.poll() is None:
             if self._clock() >= record.deadline:
-                terminated = await self._terminate(record, process)
-                if not terminated and process.poll() is not None:
-                    await self._finish_run(record, int(process.returncode or 0))
-                    return
-                record.status = "timed_out" if terminated else "interrupted"
-                record.ended_at = self._clock()
+                record.status = "cancelling"
+                record.termination_reason = "timed_out"
                 self._save_run(record)
-                await self._notify_completion(record)
+                if await self._terminate(record, process):
+                    await self._complete_termination(record)
+                else:
+                    self._track(asyncio.create_task(self._monitor_cancelling(remote_id)))
                 return
             self._sync_registry(record)
             await self._sleep(min(1.0, max(0.05, record.deadline - self._clock())))
         if record.status != "running":
+            return
+        if self._process_group_exists(record.pgid):
+            record.status = "cancelling"
+            record.termination_reason = "interrupted"
+            self._save_run(record)
+            if await self._terminate(record, process):
+                await self._complete_termination(record)
+            else:
+                self._track(asyncio.create_task(self._monitor_cancelling(remote_id)))
             return
         await self._finish_run(record, int(process.returncode or 0))
 
@@ -1135,13 +1214,25 @@ class AgentRemoteService:
             return
         while self._identity_matches(record.pid, record.pgid, record.process_identity):
             if self._clock() >= record.deadline:
-                terminated = await self._terminate(record)
-                record.status = "timed_out" if terminated else "interrupted"
-                record.ended_at = self._clock()
+                record.status = "cancelling"
+                record.termination_reason = "timed_out"
                 self._save_run(record)
-                await self._notify_completion(record)
+                terminated = await self._terminate(record)
+                if terminated:
+                    await self._complete_termination(record)
+                else:
+                    self._track(asyncio.create_task(self._monitor_cancelling(remote_id)))
                 return
             await self._sleep(1.0)
+        if self._process_group_exists(record.pgid):
+            record.status = "cancelling"
+            record.termination_reason = "interrupted"
+            self._save_run(record)
+            if await self._terminate(record):
+                await self._complete_termination(record)
+            else:
+                self._track(asyncio.create_task(self._monitor_cancelling(remote_id)))
+            return
         self._finish_from_registry(record)
         if record.status != "running":
             await self._notify_completion(record)
@@ -1156,24 +1247,74 @@ class AgentRemoteService:
 
     async def _terminate(self, record: RunRecord, process=None) -> bool:
         return await self._terminate_identity(
-            record.pid, record.pgid, record.process_identity, process,
+            record.pid,
+            record.pgid,
+            record.process_identity,
+            process,
+            allow_orphan=record.status == "cancelling",
         )
 
-    async def _terminate_identity(self, pid, pgid, identity, process=None) -> bool:
-        if not self._identity_matches(pid, pgid, identity):
+    async def _complete_termination(self, record: RunRecord) -> None:
+        record.status = record.termination_reason or "cancelled"
+        record.termination_reason = None
+        record.ended_at = self._clock()
+        self._save_run(record)
+        await self._notify_completion(record)
+
+    async def _monitor_cancelling(self, remote_id: str) -> None:
+        record = self.runs.get(remote_id)
+        if record is None:
+            return
+        while record.status == "cancelling":
+            if await self._terminate(record):
+                await self._complete_termination(record)
+                return
+            await self._sleep(0.5)
+
+    async def _terminate_identity(
+        self,
+        pid,
+        pgid,
+        identity,
+        process=None,
+        *,
+        allow_orphan: bool = False,
+    ) -> bool:
+        if not isinstance(pid, int) or not isinstance(pgid, int) or pgid != pid or not identity:
             return False
-        if not self._signal_process_group(pid, pgid, "TERM", identity):
+        current_identity = self._process_identity(pid)
+        leader_matches = current_identity == identity and self._identity_matches(pid, pgid, identity)
+        group_alive = self._process_group_exists(pgid)
+        if leader_matches:
+            signal_kind = "TERM"
+        elif current_identity is None and not group_alive:
+            return True
+        elif current_identity is None and allow_orphan:
+            signal_kind = "TERM_ORPHAN"
+        else:
             return False
+        if not self._signal_process_group(pid, pgid, signal_kind, identity):
+            return not self._process_group_exists(pgid)
         deadline = self._clock() + TERMINATION_GRACE_SECONDS
         while self._clock() < deadline:
-            if process is not None and process.poll() is not None:
-                return True
-            if not self._identity_matches(pid, pgid, identity):
+            if process is not None:
+                process.poll()  # Reap the group leader without ending group supervision.
+            if not self._process_group_exists(pgid):
                 return True
             await self._sleep(min(0.1, max(0.01, deadline - self._clock())))
-        if self._identity_matches(pid, pgid, identity):
-            return self._signal_process_group(pid, pgid, "KILL", identity)
-        return True
+
+        if not self._process_group_exists(pgid):
+            return True
+        if not self._signal_process_group(pid, pgid, "KILL", identity):
+            return False
+        deadline = self._clock() + TERMINATION_VERIFY_SECONDS
+        while self._clock() < deadline:
+            if process is not None:
+                process.poll()
+            if not self._process_group_exists(pgid):
+                return True
+            await self._sleep(min(0.05, max(0.01, deadline - self._clock())))
+        return not self._process_group_exists(pgid)
 
     async def _finish_run(self, record: RunRecord, return_code: int) -> None:
         registry_status = self._registry_state(record)
@@ -1272,28 +1413,24 @@ class AgentRemoteService:
         for record in list(self.runs.values()):
             if record.status == "cancelling":
                 if await self._terminate(record):
-                    record.status = "cancelled"
-                    record.ended_at = self._clock()
-                    self._save_run(record)
+                    await self._complete_termination(record)
                 else:
-                    self._finish_from_registry(record)
-            if record.test_status == "cancelling":
-                if await self._terminate_identity(
-                    record.test_pid, record.test_pgid, record.test_identity,
-                ):
-                    record.test_status = "cancelled"
-                else:
-                    record.test_status = "interrupted"
-                self._save_run(record)
-            if record.status == "preparing":
+                    self._track(asyncio.create_task(self._monitor_cancelling(record.remote_id)))
+            if record.status in {"starting", "preparing"}:
+                if record.status == "starting" and not record.pid:
+                    for _attempt in range(20):
+                        if self._refresh_launch_identity(record):
+                            break
+                        await self._sleep(0.05)
                 recovered = self._recover_registry_before_pid_save(record)
-                if recovered and record.status == "running":
-                    self._track(asyncio.create_task(self._monitor_recovered(record.remote_id)))
-                elif recovered:
-                    pass
-                elif record.pid:
+                if not recovered and record.pid and self._identity_matches(
+                    record.pid, record.pgid, record.process_identity,
+                ):
+                    record.status = "running"
+                    self._save_run(record)
+                elif not recovered and record.pid:
                     self._finish_from_registry(record)
-                else:
+                elif not recovered:
                     record.status = "interrupted"
                     record.ended_at = self._clock()
                     self._save_run(record)
@@ -1303,9 +1440,7 @@ class AgentRemoteService:
                     self._track(asyncio.create_task(self._monitor_recovered(record.remote_id)))
                 else:
                     self._finish_from_registry(record)
-            if record.status == "running" and record.test_status == "running":
-                self._track(asyncio.create_task(self._monitor_recovered_test(record.remote_id)))
-            if record.status not in {"running", "preparing"}:
+            if record.status not in {"running", "starting", "preparing", "cancelling"}:
                 await self._notify_completion(record)
 
     async def stop(self) -> None:
@@ -1346,11 +1481,6 @@ class AgentRemoteService:
                 await self._reply(route, "Zu dieser ID gibt es keinen Remote-Worktree-Diff.")
                 return
             await self._show_diff(route, record)
-        elif kind == "tests":
-            if record is None:
-                await self._reply(route, "Tests sind nur für eine bekannte Remote-ID verfügbar.")
-                return
-            await self._start_tests(route, record)
         elif kind == "result":
             if record is not None:
                 await self._show_result(route, record.remote_id)
@@ -1478,25 +1608,19 @@ class AgentRemoteService:
         if not self._valid_worktree(record, worktree):
             await self._reply(route, "Der gespeicherte Worktree-Pfad ist nicht mehr gültig.")
             return
-        git = shutil.which("git")
-        if not git:
-            await self._reply(route, "git ist nicht verfügbar.")
-            return
         try:
-            result = self._command_runner(
-                [git, "-C", str(worktree), "diff", "--stat"],
+            result = self._run_git(
+                worktree,
+                ["diff", "--stat"],
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=15,
-                shell=False,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, FileNotFoundError):
             await self._reply(route, "Diff konnte nicht gelesen werden.")
             return
         output = result.stdout.strip() or "Keine Änderungen im git diff."
-        if record.test_output:
-            output += f"\nLetzte lokale Testausgabe: {record.test_output}"
         await self._reply(route, f"{record.remote_id}\n{output}")
 
     def _valid_worktree(self, record: RunRecord, worktree: Path) -> bool:
@@ -1504,186 +1628,33 @@ class AgentRemoteService:
             root = Path(record.repo_path).resolve(strict=True)
             target = worktree.resolve(strict=True)
             target.relative_to(root / ".worktrees")
-            return target.is_dir() and record.mode == "write"
+            return (
+                target.is_dir()
+                and record.mode == "write"
+                and self._worktree_gitdir_matches(root, target)
+            )
         except (OSError, ValueError, RuntimeError):
             return False
 
     async def _cancel(self, record: RunRecord, route) -> None:
         if record.status == "running" and record.pid and record.process_identity:
+            recorded_identity = record.process_identity
             record.status = "cancelling"
+            record.termination_reason = "cancelled"
             self._save_run(record)
             if not await self._terminate(record):
-                self._finish_from_registry(record)
+                current_identity = self._process_identity(record.pid)
+                if current_identity is not None and current_identity != recorded_identity:
+                    record.status = "interrupted"
+                    record.termination_reason = None
+                    record.ended_at = self._clock()
+                    self._save_run(record)
+                    await self._reply(route, f"Lauf {record.remote_id} ließ sich nicht sicher signalisieren.")
+                    return
+                self._track(asyncio.create_task(self._monitor_cancelling(record.remote_id)))
                 await self._reply(route, f"Lauf {record.remote_id} ließ sich nicht sicher signalisieren.")
                 return
-            record.status = "cancelled"
-            record.ended_at = self._clock()
-            self._save_run(record)
+            await self._complete_termination(record)
             await self._reply(route, f"Lauf {record.remote_id} wurde abgebrochen.")
             return
-        if record.test_status == "running" and record.test_pid and record.test_identity:
-            record.test_status = "cancelling"
-            self._save_run(record)
-            if not await self._terminate_identity(
-                record.test_pid, record.test_pgid, record.test_identity,
-            ):
-                await self._reply(route, f"Testlauf für {record.remote_id} ließ sich nicht sicher signalisieren.")
-                return
-            record.test_status = "cancelled"
-            self._save_test_output(record)
-            self._save_run(record)
-            await self._reply(route, f"Testlauf für {record.remote_id} wurde abgebrochen.")
-            return
         await self._reply(route, f"Lauf {record.remote_id} läuft nicht mehr.")
-
-    async def _start_tests(self, route, record: RunRecord) -> None:
-        vector = self.config.test_args.get(record.repo_alias)
-        if (
-            not isinstance(vector, (list, tuple))
-            or not vector
-            or not all(isinstance(part, str) and part for part in vector)
-        ):
-            await self._reply(route, "Für dieses Repo ist kein vertrauenswürdiger Test-Argumentvektor konfiguriert.")
-            return
-        if record.status != "succeeded" or not record.worktree or not self._valid_worktree(
-            record, Path(record.worktree),
-        ):
-            await self._reply(route, "Tests sind nur für einen abgeschlossenen Remote-Worktree verfügbar.")
-            return
-        async with self._lock:
-            if self.active_count >= min(MAX_REMOTE_RUNS, self.config.max_running):
-                await self._reply(route, "Es laufen bereits zwei Agent-Remote-Prozesse.")
-                return
-            record.test_status = "preparing"
-            record.test_deadline = self._clock() + min(
-                DEFAULT_TIMEOUT_SECONDS, max(1, self.config.timeout_seconds),
-            )
-            test_file = Path(record.tmp_dir).parent / "tests.log"
-            try:
-                self._save_run(record)
-            except OSError as exc:
-                record.test_status = None
-                await self._reply(route, "Der persistente Teststatus ist nicht beschreibbar; Tests wurden nicht gestartet.")
-                log.warning("Agent-Remote-Teststatus konnte nicht gespeichert werden (%s)", type(exc).__name__)
-                return
-        process = None
-        monitor_started = False
-        try:
-            if self._process_identity(os.getpid()) is None:
-                raise RuntimeError("Prozessidentität kann nicht sicher geprüft werden")
-            output = test_file.open("ab")
-            try:
-                process = self._popen(
-                    list(vector),
-                    cwd=record.worktree,
-                    env=self._make_environment(Path(record.tmp_dir)),
-                    stdin=subprocess.DEVNULL,
-                    stdout=output,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                    close_fds=True,
-                    umask=0o077,
-                    shell=False,
-                )
-            finally:
-                output.close()
-            record.test_pid = int(process.pid)
-            record.test_pgid = int(process.pid)
-            record.test_identity = self._process_identity(record.test_pid)
-            record.test_status = "running" if process.poll() is None else "failed"
-            try:
-                self._save_run(record)
-            except OSError as exc:
-                log.warning("Agent-Remote-Test-PID konnte nicht persistiert werden (%s)", type(exc).__name__)
-            if record.test_status == "running":
-                self._track(asyncio.create_task(self._monitor_test_process(record.remote_id, process)))
-                monitor_started = True
-                await self._reply(route, f"Lokaler Testlauf für {record.remote_id} gestartet.")
-            else:
-                await self._finish_test(record, int(process.returncode or 1))
-        except Exception as exc:
-            if process is not None and process.poll() is None:
-                record.test_pid = int(process.pid)
-                record.test_pgid = int(process.pid)
-                if record.test_identity is None:
-                    record.test_identity = self._process_identity(record.test_pid)
-                record.test_status = "running"
-                try:
-                    self._save_run(record)
-                except OSError:
-                    log.error("Agent-Remote-Test-PID bleibt nicht persistent gespeichert")
-                if not monitor_started:
-                    self._track(asyncio.create_task(self._monitor_test_process(record.remote_id, process)))
-                await self._reply(route, f"Lokaler Testlauf für {record.remote_id} gestartet; Status folgt.")
-                return
-            record.test_status = "failed"
-            try:
-                self._save_run(record)
-            except OSError:
-                log.error("Agent-Remote-Testfehler konnte nicht persistiert werden")
-            log.warning("Agent-Remote-Teststart fehlgeschlagen (%s)", type(exc).__name__)
-            await self._reply(route, "Der lokale Testlauf konnte nicht gestartet werden.")
-
-    async def _monitor_test_process(self, remote_id: str, process) -> None:
-        record = self.runs.get(remote_id)
-        if record is None:
-            return
-        while record.test_status == "running" and process.poll() is None:
-            if record.test_deadline is not None and self._clock() >= record.test_deadline:
-                terminated = await self._terminate_identity(
-                    record.test_pid, record.test_pgid, record.test_identity, process,
-                )
-                if not terminated and process.poll() is not None:
-                    await self._finish_test(record, int(process.returncode or 0))
-                    return
-                record.test_status = "timed_out" if terminated else "interrupted"
-                record.test_exit_code = None
-                self._save_test_output(record)
-                self._save_run(record)
-                return
-            await self._sleep(1.0)
-        if record.test_status != "running":
-            return
-        await self._finish_test(record, int(process.returncode or 0))
-
-    async def _monitor_recovered_test(self, remote_id: str) -> None:
-        record = self.runs.get(remote_id)
-        if record is None:
-            return
-        while self._identity_matches(record.test_pid, record.test_pgid, record.test_identity):
-            if record.test_deadline is not None and self._clock() >= record.test_deadline:
-                terminated = await self._terminate_identity(
-                    record.test_pid, record.test_pgid, record.test_identity,
-                )
-                record.test_status = "timed_out" if terminated else "interrupted"
-                self._save_test_output(record)
-                self._save_run(record)
-                return
-            await self._sleep(1.0)
-        record.test_status = "interrupted"
-        self._save_test_output(record)
-        self._save_run(record)
-
-    def _save_test_output(self, record: RunRecord) -> None:
-        path = Path(record.tmp_dir).parent / "tests.log"
-        content = _read_text(path, 8192)
-        if content:
-            record.test_output = next((line.strip() for line in reversed(content.splitlines()) if line.strip()), None)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-
-    async def _finish_test(self, record: RunRecord, return_code: int) -> None:
-        record.test_status = "succeeded" if return_code == 0 else "failed"
-        record.test_exit_code = return_code
-        self._save_test_output(record)
-        self._save_run(record)
-        if record.test_status == "succeeded":
-            result = "bestanden"
-        else:
-            result = "fehlgeschlagen"
-        route = self._routes.get(record.remote_id)
-        if route is not None:
-            await self._reply(route, f"Lokaler Pytest-Lauf für {record.remote_id}: {result}.")
-

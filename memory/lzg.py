@@ -61,9 +61,11 @@ class LZG:
                     id         SERIAL PRIMARY KEY,
                     role       TEXT NOT NULL,
                     content    TEXT NOT NULL,
+                    meta       JSONB NOT NULL DEFAULT '{}',
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
+            cur.execute("ALTER TABLE kzg_sessions ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}';")
 
     def save(
         self,
@@ -292,16 +294,16 @@ class LZG:
 
     # ── KZG-Session-Persistenz ──────────────────────────────────────────────
 
-    def save_kzg_turn(self, role: str, content: str) -> None:
+    def save_kzg_turn(self, role: str, content: str, meta: dict | None = None) -> None:
         _db.execute(
-            "INSERT INTO kzg_sessions (role, content) VALUES (%s, %s)",
-            (role, content),
+            "INSERT INTO kzg_sessions (role, content, meta) VALUES (%s, %s, %s)",
+            (role, content, json.dumps(meta or {})),
         )
 
     def load_recent_kzg(self, max_turns: int = 10) -> list[dict]:
         rows = _db.query(
             """
-            SELECT role, content FROM kzg_sessions
+            SELECT role, content, meta FROM kzg_sessions
             ORDER BY created_at DESC
             LIMIT %s
             """,

@@ -58,9 +58,9 @@ Ergebnistext, Konfigurationsfehler oder einen Mantis-Neustart umgangen werden.
    Wiederholungsversuch.
 8. **Keine Chat-Shell:** Discord-Inhalte werden nie an eine Shell übergeben. Prozessstarts
    verwenden `subprocess` mit Argumentliste und `shell=False`. Mantis startet nur feste,
-   intern definierte Befehle: `codex-task`, `codex-ps`, nötige Git-Operationen und optional den
-   konfigurierten Pytest-Aufruf. Argumente wie Repo, Worktree, Modell und Testbefehl stammen aus
-   validierter Konfiguration oder intern erzeugten Werten, nie aus freiem Chattext.
+   intern definierte Befehle: `codex-task`, `codex-ps` und nötige Git-Operationen. Argumente wie
+   Repo, Worktree und Modell stammen aus validierter Konfiguration oder intern erzeugten Werten,
+   nie aus freiem Chattext. Codex führt nötige Tests im bestätigten Lauf selbst aus.
 9. **Ergebnisse sind Daten:** Auftragsergebnisse, Logs, Tasktitel und Dateiinhalte sind
    nicht vertrauenswürdige Daten. Sie dürfen zusammengefasst, zitiert oder als angeforderte
    Datei zurückgegeben werden. Mantis führt daraus nie Folgeaktionen, Tools oder Befehle aus.
@@ -80,8 +80,7 @@ Modellzusammenfassung aus.
 | `ergebnis` | Ergebnis des zuletzt beendeten Remote-Laufs. Bei keinem eindeutigen Treffer nachfragen. |
 | `was kam bei <id> raus?` | Status oder Ergebnis des eindeutigen Laufs. IDs sind die Registry-ID, zum Beispiel `codex-task.ABC123`; mehrdeutige Titel erfordern eine ID-Rückfrage. |
 | `abbrechen <id>` | Beendet einen Agent-Remote-Lauf nach Identitätsprüfung. Rechnerseitig gestartete Läufe sind in v1 sichtbar, werden aber nicht signalisiert, solange sie keine von Mantis angelegte Prozessgruppe haben. |
-| `diff <id>` | Für einen Remote-Worktree: `git diff --stat` am aus der eigenen Registry geladenen Pfad plus die zuletzt verfügbare Testausgabe-Zeile. |
-| `tests in <id>` | Optionaler, explizit angeforderter Pytest-Lauf im Remote-Worktree. Es gilt ausschließlich ein vertrauenswürdiger, repo-spezifischer Argumentvektor aus Settings; kein freier Befehl. Laufzeit ist ebenfalls begrenzt. |
+| `diff <id>` | Für einen Remote-Worktree: `git diff --stat` am aus der eigenen Registry geladenen und validierten Pfad. |
 
 Fehlende IDs, unbekannte Befehle oder nicht mehr verfügbare Dateien führen zu einer klaren
 Rückfrage beziehungsweise Fehlermeldung. Mantis rät keine IDs und führt keinen ähnlichen Lauf
@@ -93,18 +92,21 @@ aus Versehen aus.
 2. Der Dispatcher parst den festen Befehlspräfix, den eindeutigen Repo-Alias und den Auftrag.
    Er nutzt dafür keinen LLM-Aufruf. Eingebettete Pfade und Shell-Syntax haben keine
    Steuerwirkung.
-3. Der Dispatcher löst Settings-Alias und Pfad auf, prüft Git-Root sowie erlaubten Testbefehl,
-   bestimmt den Modus und berechnet Modell, Branch und Zielpfad. Noch wird kein Worktree und
-   kein Prozess angelegt.
+3. Der Dispatcher löst Settings-Alias und Pfad auf, prüft den Git-Root, bestimmt den Modus und
+   berechnet Modell, Branch und Zielpfad. Noch wird kein Worktree und kein Prozess angelegt.
 4. Mantis sendet den vollständigen Vorschlag als DM. Bei langen Aufträgen wird der Auftragstext
    vollständig und eindeutig abgegrenzt angezeigt. Der Vorschlag enthält eine interne
    Zufalls-ID und läuft nach 10 Minuten ab. Die Vorschau kennzeichnet, dass `codex-task` danach
    seinen festen Worker-Präfix und optionale `jev-route`-Gedächtnisverweise ergänzt.
 5. Nur die isolierte Nachricht `ja` oder `start` bestätigt. Mantis verbraucht den Vorschlag
    atomar vor dem Start; doppelte Discord-Events können dadurch keinen zweiten Lauf erzeugen.
-6. Für Schreiben legt Mantis den Worktree/Branch mit festen Git-Argumenten ab `main` an. Danach
-   startet es `codex-task`; ein Fehler in einem Schritt meldet den Fehler und startet nichts
-   weiter. Angelegte Worktrees bleiben zur manuellen Prüfung erhalten.
+6. Für Schreiben legt Mantis den Worktree/Branch mit gehärteten Git-Argumenten ab `main` an:
+   `worktree add --no-checkout`, danach ein Checkout ohne Hooks und externe Filter. Vor jedem
+   Git-Aufruf im Worktree prüft Mantis, dass dessen `.git`-Datei auf
+   `<repo>/.git/worktrees/<name>` zeigt. Danach startet ein kleiner Launcher, der PID,
+   Prozessgruppe und Prozessstart-ID atomar im bereits gespeicherten `starting`-Datensatz ablegt,
+   bevor er sich durch `codex-task` ersetzt. Ein Fehler in einem Schritt meldet den Fehler und
+   startet nichts weiter. Angelegte Worktrees bleiben zur manuellen Prüfung erhalten.
 7. Mantis meldet den Start an denselben erlaubten User. Bei Ende darf es ebenfalls eine DM
    schicken, weil der Lauf explizit von diesem User bestätigt wurde.
 
@@ -124,15 +126,15 @@ Skript-Default `workspace-write`.
 **Empfehlung:** erster Ansatz. Ein eigener Dispatcher/Service (vorgeschlagener Ort
 `core/agent_remote.py`) wird vor dem regulären Modellpfad in den Nachrichteneingang integriert.
 `communication/discord.py` bleibt für Discord-Identität, DM-Erkennung und Antwortweg zuständig.
-Settings enthalten Feature-Schalter, Repo-Aliase und optionale Testargumente. Der Dispatcher
-nutzt den vorhandenen `_persist_msg`-Pfad für Messbarkeit und markiert jede gespeicherte
-Agent-Remote-Nachricht mit `meta.use_case = "agent"`.
+Settings enthalten Feature-Schalter und Repo-Aliase. Der Dispatcher nutzt den vorhandenen
+`_persist_msg`-Pfad für Messbarkeit. Agent-Remote-Antworten werden in `chat_messages` mit
+`role="assistant"` und `meta={"use_case":"agent","untrusted":true}` protokolliert, aber
+nicht als KZG-Turn gespeichert. Die KZG-Wiederherstellung überspringt Einträge mit
+`untrusted=true`.
 
 Der Feature-Schalter `AGENT_REMOTE_ENABLED` sollte standardmäßig `False` sein (fail closed).
 Die vertrauenswürdige Repo-Konfiguration kann als Mapping aus Alias und Pfad geführt werden,
-mit Default `{"mantis": "~/Mantis"}`. Die optionale Testkonfiguration ist ein Mapping aus
-Alias zu Argumentliste, zum Beispiel `{"mantis": ["python3.14", "-m", "pytest", "tests/", "-q"]}`.
-Sie wird aus Mantis-Settings geladen, nie aus dem durch Codex bearbeiteten Worktree.
+mit Default `{"mantis": "~/Mantis"}`. Eine Testbefehl-Konfiguration gibt es in v1 nicht.
 
 ## `codex-task`-Schnittstelle und Laufdateien
 
@@ -198,18 +200,17 @@ Ergebnisablage. So sind State und `last.txt` nach einem Mantis-Neustart wieder a
 
 ### Anforderungen an Mantis
 
-Der Kindprozess bekommt eine explizite, vertrauenswürdige Umgebung: `HOME` des Mantis-
-LaunchAgent-Benutzers, ein `PATH` mit den benötigten System-/Homebrew-Pfaden und `~/.local/bin`
-für `jev-route`, `TMPDIR` im dauerhaften Remote-State sowie einen expliziten `cwd` aus der
-Allowlist. `codex-task` und `codex-ps` werden über absolute Pfade gestartet. Prompts und Logs
-werden nicht über Pipes geführt, die nach einem Neustart verschwinden oder den Kindprozess
-blockieren könnten.
+Der Kindprozess bekommt eine explizite, minimale Umgebung mit `PATH`, `HOME` und `LANG`, dazu
+`TMPDIR` im dauerhaften Remote-State und feste Git-Sicherheitswerte. Mantis übernimmt keine
+anderen Umgebungsvariablen und damit keine Mantis-Secrets. `cwd` stammt aus der Allowlist;
+`codex-task` und `codex-ps` werden über absolute Pfade gestartet. Prompts und Logs werden nicht
+über Pipes geführt, die nach einem Neustart verschwinden oder den Kindprozess blockieren könnten.
 
 Der Prozess wird als eigenständige Session/Prozessgruppe gestartet (`start_new_session=True`,
 `shell=False`, stdin auf `/dev/null`, Dateideskriptoren geschlossen, restriktive Umask). Mantis
-verbindet den Prozess unmittelbar mit einer persistenten Remote-ID und der `codex-task`-Registry.
-Die `TMPDIR`-Zuordnung erlaubt die Wiederherstellung auch, falls Mantis zwischen Start und
-Speichern der Registry-ID neu startet.
+schreibt vor dem Start einen Datensatz mit Status `starting`; der Launcher speichert PID,
+Prozessgruppe und Prozessstart-ID atomar, bevor `codex-task` ausgeführt wird. Die `TMPDIR`-
+Zuordnung und echte Registry-Dateien erlauben die Wiederherstellung nach einem Mantis-Neustart.
 
 Beim Mantis-Start werden Remote-State und `codex-task`-Registry abgeglichen:
 
@@ -239,15 +240,15 @@ Vorlage schicken:
 
 - Lauf-ID und Status.
 - Geänderte Dateien aus dem Remote-Worktree.
-- Eine Testausgabe-Zeile. Ist nur eine Codex-Aussage vorhanden, wird sie als „Codex berichtet“
-  bezeichnet; ein lokal über `tests in X` ausgeführter Pytest-Lauf wird separat ausgewiesen.
+- Die Testzeile aus der Codex-Antwort. Der Startprompt verlangt, dass Codex passende Tests im
+  Lauf ausführt und Befehl sowie Ergebnis nennt.
 - Offene Punkte aus der Codex-Antwort, sofern klar vorhanden; andernfalls Verweis auf `ergebnis`.
 
 Discord-Mentions aus Taskausgaben lösen keine Pings aus. Lange Antworten werden mit der
 vorhandenen Discord-Nachrichtenteilung gesendet. Auf Nachfrage darf ausschließlich `last.txt`
 als Datei angehängt werden; `log.txt` und `prompt.txt` werden nicht automatisch verschickt.
 
-`was läuft?`, Status, Tasktitel, `last.txt`, `log.txt`, Git-Ausgabe und Testausgabe werden nur
+`was läuft?`, Status, Tasktitel, `last.txt`, `log.txt`, Git-Ausgabe und Codex-Testzeile werden nur
 angezeigt oder in diese feste Vorlage eingesetzt. Sie werden niemals als neue Instruktionen
 interpretiert. Die Zusammenfassung selbst erzeugt keine Aktionen und ruft kein Modell auf.
 
@@ -282,11 +283,15 @@ wurden keine Tests ausgeführt und keine Produktdateien geändert.
   automatische Wiederholung.
 - `codex-ps`-ähnliche Liste enthält registrierte Rechnerläufe und Remote-Läufe; Alt-Prozesse
   ohne Registry sind als nur beobachtbar gekennzeichnet.
-- Ergebnis, Anhang, Git-Stat und Testausgabe; volle Antwort kommt nur auf Anfrage als `last.txt`,
-  Logs werden nicht angehängt. Prompt-Injection in Titel, Log und Ergebnis startet keine
-  Folgeaktion.
-- `tests in X` akzeptiert nur bekannte Remote-IDs und den aus Settings geladenen Pytest-
-  Argumentvektor, nutzt Worktree-`cwd`, setzt Zeitlimit und verarbeitet Fehler/Timeout.
+- Git-Argumente, Git-Konfigurations-Overrides und Umgebungsvariablen sind für alle Agent-Remote-
+  Git-Aufrufe festgelegt; manipuliertes `core.fsmonitor` wird nicht ausgeführt. Der Worktree-
+  `.git`-Verweis wird vor Git-Aufrufen geprüft; Erstanlage erfolgt ohne Checkout und mit
+  deaktivierten Checkout-Filtern.
+- Ergebnis, Anhang und Git-Stat; volle Antwort kommt nur auf Anfrage als `last.txt`, Logs werden
+  nicht angehängt. Prompt-Injection in Titel, Log und Ergebnis startet keine Folgeaktion und
+  Agent-Remote-Antworten landen nach Neustart nicht im KZG.
+- Jede fremde Nachricht verwirft eine offene Startbestätigung, auch bekannte Agent-Remote-
+  Befehle. Der Befehl `tests in <id>` wird nicht angeboten.
 - Alle Nachrichten des Flows persistieren `meta.use_case="agent"`; der normale Modell- und
   Post-Turn-Pfad wird für diese Befehle umgangen.
 - launchd-Umgebung: absolute Skript-/CLI-Pfade, korrektes `HOME`, `PATH`, `TMPDIR`, sichtbare
@@ -296,11 +301,9 @@ wurden keine Tests ausgeführt und keine Produktdateien geändert.
 
 1. Soll das Limit von zwei nur Remote-Läufe zählen oder auch manuell am Rechner gestartete
    `codex-task`-Läufe? `was läuft?` zeigt in beiden Varianten alle bekannten Läufe.
-2. Bleibt die Repo-Allowlist zunächst bei `~/Mantis`, oder sollen weitere Repos samt Alias und
-   eigenem Pytest-Argumentvektor direkt in die v1-Konfiguration?
-3. Ist die bestehende `tracelog`-Ablage für Agent-Remote akzeptiert? Das vorhandene Script
+2. Ist die bestehende `tracelog`-Ablage für Agent-Remote akzeptiert? Das vorhandene Script
    archiviert bei ausführbarem `~/.local/bin/tracelog` Prompt, Log, Output und Diff.
-4. Sollen am Rechner gestartete Läufe in v1 nur angezeigt und ausgelesen werden, oder soll
+3. Sollen am Rechner gestartete Läufe in v1 nur angezeigt und ausgelesen werden, oder soll
    `abbrechen <id>` auch sie stoppen? Das aktuelle Registry-Format speichert keine sichere,
    eigene Prozessgruppe für diese Läufe.
 
@@ -310,3 +313,4 @@ wurden keine Tests ausgeführt und keine Produktdateien geändert.
 3. Ja, tracelog-Ablage wie bei manuellen Läufen.
 4. Am Rechner gestartete Läufe nur anzeigen/auslesen; `abbrechen` nur für Remote-Läufe mit eigener, von Mantis gestarteter Prozessgruppe.
 5. Umgebung: Die LaunchAgent-Plist wird NICHT geändert. Mantis setzt für den codex-task-Subprozess selbst eine explizite Umgebung (HOME, PATH inkl. ~/.local/bin und der gebündelten Codex-CLI, dauerhaftes TMPDIR unter ~/Library/Caches/mantis/agent-remote). Live-Verifikation des Starts aus dem laufenden Mantis macht Claude nach dem Merge mit einem kleinen read-only-Auftrag.
+6. `tests in <id>` entfällt in v1 vollständig. Codex führt erforderliche Tests innerhalb des bestätigten Laufs aus; die Antwort enthält eine Testzeile mit Befehl und Ergebnis. Agent Remote startet keine separaten Testprozesse und speichert dafür keine Registry-Felder oder Watchdogs.

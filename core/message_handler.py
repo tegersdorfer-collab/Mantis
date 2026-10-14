@@ -345,14 +345,16 @@ class MessageHandler:
 
     def _persist_msg(self, role: str, content: str, channel: str = "telegram",
                      meta: dict | None = None) -> None:
-        try:
-            self.lzg.save_kzg_turn(role, content)
-        except Exception as e:
-            log.error(f"KZG-Turn nicht gespeichert: {e}")
+        metadata = meta or {}
+        if not metadata.get("untrusted", False):
+            try:
+                self.lzg.save_kzg_turn(role, content)
+            except Exception as e:
+                log.error(f"KZG-Turn nicht gespeichert: {e}")
         try:
             db.execute(
                 "INSERT INTO chat_messages (role, content, channel, meta) VALUES (%s,%s,%s,%s)",
-                (role, content, channel, json.dumps(meta or {})),
+                (role, content, channel, json.dumps(metadata)),
             )
         except Exception as e:
             log.error(f"Chat-Nachricht nicht persistiert: {e}")
