@@ -10,6 +10,7 @@ def test_gym_migrations_add_idempotent_columns_and_alias_table():
     assert "alter table workouts add column if not exists ended_at" in sql
     assert "create table if not exists exercise_aliases" in sql
     assert "alter table exercises add column if not exists exercise_type" in sql
+    assert "alter table exercises add column if not exists instructions" in sql
     assert "create unique index if not exists gym_single_open_idx" in sql
 
 
@@ -31,10 +32,9 @@ def test_gym_v2_plan_tables_are_idempotent_and_stay_separate_from_legacy_columns
     assert "create unique index if not exists gym_one_active_plan_idx" in sql
     gym_migrations = [statement for statement in statements if "gym_plan" in statement or "gym_workout_exercises" in statement]
     assert all("drop table" not in statement and "drop column" not in statement for statement in gym_migrations)
-    # Einzige erlaubte Änderung bestehender Gym-Tabellen: idempotentes target_unit.
+    # Bestehende Gym-Spalten werden ausschließlich idempotent erweitert.
     altering = [statement for statement in gym_migrations if "alter table" in statement]
     assert altering
-    assert all(
-        "add column if not exists target_unit" in statement and "drop" not in statement
-        for statement in altering
-    )
+    assert all("add column if not exists" in statement and "drop" not in statement for statement in altering)
+    assert any("add column if not exists target_unit" in statement for statement in altering)
+    assert any("add column if not exists removed" in statement for statement in altering)

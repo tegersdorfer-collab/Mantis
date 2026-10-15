@@ -4,6 +4,9 @@ import test from "node:test";
 import vm from "node:vm";
 
 const appSource = await readFile(new URL("../web/gym/app.js", import.meta.url), "utf8");
+const cssSource = await readFile(new URL("../web/gym/app.css", import.meta.url), "utf8");
+const htmlSource = await readFile(new URL("../web/gym/index.html", import.meta.url), "utf8");
+const manifestSource = await readFile(new URL("../web/gym/manifest.webmanifest", import.meta.url), "utf8");
 let generatedClientIdSequence = 0;
 
 function response(status, payload) {
@@ -22,7 +25,7 @@ async function waitFor(predicate) {
   return predicate();
 }
 
-function makeState({ session = { id: 1, started_at: "2026-10-14T10:00:00Z" }, logged = [], prefill = [] } = {}) {
+function makeState({ session = { id: 1, started_at: "2026-10-14T10:00:00Z" }, logged = [], prefill = [], home } = {}) {
   return {
     session,
     exercises: ["Squats", "Bench Press", "Deadlifts"].map((name) => ({
@@ -31,6 +34,7 @@ function makeState({ session = { id: 1, started_at: "2026-10-14T10:00:00Z" }, lo
       prefill: name === "Squats" ? prefill : [],
       logged: name === "Squats" ? logged : [],
     })),
+    ...(home ? { home } : {}),
   };
 }
 
@@ -44,32 +48,55 @@ function createFrontend({
   const documentListeners = new Map();
   const windowListeners = new Map();
   const draftInputs = [];
+  const tenRmValues = [];
+  const vibrations = [];
+  let fakeNow = Date.parse("2035-10-01T12:00:00Z");
+  const intervals = new Map();
+  class FakeDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [fakeNow])); }
+    static now() { return fakeNow; }
+  }
   const screen = {
     _innerHTML: "",
     get innerHTML() { return this._innerHTML; },
     set innerHTML(value) {
       this._innerHTML = value;
       draftInputs.length = 0;
+      tenRmValues.length = 0;
+      const datasetFromAttributes = (attributes) => Object.fromEntries(
+        [...attributes.matchAll(/\bdata-([a-z0-9-]+)="([^"]*)"/g)].map(([, name, value]) => [
+          name.replace(/-([a-z])/g, (_match, character) => character.toUpperCase()),
+          value,
+        ]),
+      );
       for (const match of value.matchAll(/<input\b(?=[^>]*\bdata-draft-input\b)([^>]*)>/g)) {
         const attributes = match[1];
         const attribute = (name) => attributes.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1];
         let currentValue = attribute("value") ?? "";
         draftInputs.push({
-          dataset: {
-            clientId: attribute("data-client-id"),
-            index: attribute("data-index"),
-            field: attribute("data-field"),
-          },
+          dataset: datasetFromAttributes(attributes),
           matches: (selector) => selector === "[data-draft-input]",
           writeCount: 0,
           get value() { return currentValue; },
           set value(value) { currentValue = String(value); this.writeCount += 1; },
         });
       }
+      for (const match of value.matchAll(/<span\b(?=[^>]*\bdata-tenrm-row\b)([^>]*)>([\s\S]*?)<\/span>/g)) {
+        const attributes = match[1];
+        let currentText = match[2];
+        tenRmValues.push({
+          dataset: datasetFromAttributes(attributes),
+          matches: (selector) => selector === "[data-tenrm-row]",
+          get textContent() { return currentText; },
+          set textContent(value) { currentText = String(value); },
+        });
+      }
     },
     querySelector: () => null,
     querySelectorAll(selector) {
-      return selector === "[data-draft-input]" ? draftInputs : [];
+      if (selector === "[data-draft-input]") return draftInputs;
+      if (selector === "[data-tenrm-row]") return tenRmValues;
+      return [];
     },
   };
   const elements = new Map([
@@ -77,6 +104,7 @@ function createFrontend({
     ["#timer-host", { innerHTML: "" }],
     ["#sync-host", { innerHTML: "" }],
     ["#notice-host", { innerHTML: "" }],
+    ["#tab-bar", { innerHTML: "", hidden: false }],
   ]);
   let reloads = 0;
   let intervalId = 0;
@@ -92,7 +120,7 @@ function createFrontend({
       confirm: () => true,
       addEventListener: (name, callback) => windowListeners.set(name, callback),
     },
-    navigator: {},
+    navigator: { vibrate: (pattern) => vibrations.push(pattern) },
     localStorage: {
       getItem(key) {
         if (failGetItem(key)) throw new Error("storage unavailable");
@@ -111,12 +139,17 @@ function createFrontend({
     },
     FormData: class {
       constructor(form) { this.form = form; }
-      get(key) { return key === "token" ? this.form.token : null; }
+      get(key) { return key === "token" ? this.form.token : (this.form[key] ?? null); }
     },
     URLSearchParams,
+    Date: FakeDate,
     crypto: { randomUUID: () => `vm-generated-client-id-${++generatedClientIdSequence}` },
-    setInterval: () => { intervalId += 1; return intervalId; },
-    clearInterval() {},
+    setInterval(callback, delay) {
+      intervalId += 1;
+      intervals.set(intervalId, { callback, delay });
+      return intervalId;
+    },
+    clearInterval(id) { intervals.delete(id); },
   });
   vm.runInContext(appSource, context);
 
@@ -127,6 +160,7 @@ function createFrontend({
     storage,
     windowListeners,
     get reloads() { return reloads; },
+    vibrations,
     click(action, data = {}) {
       const dataset = { action, ...data };
       if (action === "log-draft" && data.index !== undefined) {
@@ -153,6 +187,42 @@ function createFrontend({
         && entry.dataset.field === field);
     },
     draftInputs() { return [...draftInputs]; },
+    tenRmValue(rowId) { return tenRmValues.find((entry) => entry.dataset.tenrmRow === rowId)?.textContent; },
+    beginTouch({ y = 0, scrollTop = 0, innerScrollTop, handle = false } = {}) {
+      const sheet = { scrollTop, parentElement: null };
+      const scrollContainer = innerScrollTop === undefined
+        ? sheet
+        : { className: "picker-list", scrollTop: innerScrollTop, parentElement: sheet };
+      const target = {
+        className: handle ? "sheet-grabber" : "picker-row",
+        scrollTop: 0,
+        parentElement: scrollContainer,
+        closest(selector) {
+          let element = this;
+          while (element) {
+            if (selector === ".sheet-dismissable, .workout-sheet" && element === sheet) return sheet;
+            if (selector === ".sheet-grabber" && element.className === "sheet-grabber") return element;
+            element = element.parentElement;
+          }
+          return null;
+        },
+      };
+      documentListeners.get("touchstart")({ target, changedTouches: [{ clientY: y }] });
+      return target;
+    },
+    endTouch(target, y) {
+      documentListeners.get("touchend")({ target, changedTouches: [{ clientY: y }] });
+    },
+    advanceClock(milliseconds) {
+      const ticks = Math.floor(milliseconds / 1000);
+      for (let index = 0; index < ticks; index += 1) {
+        fakeNow += 1000;
+        for (const interval of [...intervals.values()]) {
+          if (interval.delay === 1000) interval.callback();
+        }
+      }
+      fakeNow += milliseconds % 1000;
+    },
     submit(token) {
       return documentListeners.get("submit")({
         target: { id: "login-form", token },
@@ -191,12 +261,13 @@ test("Zeitwerte im Trainingsverlauf werden als Sekunden angezeigt und bearbeitet
     render();
   `);
 
-  assert.match(app.elements.get("#screen").innerHTML, /20 kg × 45 s/);
+  assert.match(app.elements.get("#screen").innerHTML, />KG<\/span><span>SECS<\/span>/);
+  assert.match(app.elements.get("#screen").innerHTML, /<span>20<\/span><span>45<\/span>/);
   await app.click("edit-history-set", { setId: "7" });
-  assert.match(app.elements.get("#screen").innerHTML, /<label>s<input data-history-edit/);
+  assert.match(app.elements.get("#screen").innerHTML, /<label>SECS<input data-history-edit/);
   assert.doesNotMatch(app.elements.get("#screen").innerHTML, /Wdh\.<input data-history-edit/);
   await app.run(`historyEditSet.reps = "601"; saveHistorySet()`);
-  assert.match(app.elements.get("#notice-host").innerHTML, /Sekunden/);
+  assert.match(app.elements.get("#notice-host").innerHTML, /duration/);
   assert.equal(app.calls.some((call) => call.method === "PATCH"), false);
 
   app.run(`
@@ -211,7 +282,7 @@ test("Zeitwerte im Trainingsverlauf werden als Sekunden angezeigt und bearbeitet
   `);
 
   assert.match(app.elements.get("#screen").innerHTML, /20×45 s/);
-  assert.match(app.elements.get("#screen").innerHTML, /keine gewichtete e1RM-Historie/);
+  assert.match(app.elements.get("#screen").innerHTML, /No weighted 1RM history/);
   assert.doesNotMatch(app.elements.get("#screen").innerHTML, /<svg class="e1rm-chart"/);
 });
 
@@ -236,7 +307,7 @@ test("401 und 403 lassen Queue-Sätze stehen und ein Login startet den Sync erne
       },
     });
 
-    assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Zugangsschlüssel")), true);
+    assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Access key")), true);
     assert.equal(storage.get("gym_queue"), JSON.stringify([queuedSet]));
     assert.equal(setRequests, 1);
 
@@ -279,8 +350,8 @@ test("Training beenden wartet auf einen laufenden Queue-Sync", async () => {
   await finishing;
 
   assert.equal(finishRequested, true);
-  assert.equal(app.elements.get("#screen").innerHTML.includes("Training beendet"), true);
-  assert.match(app.elements.get("#screen").innerHTML, /<span>Satz<\/span><strong>1<\/strong>/);
+  assert.equal(app.elements.get("#screen").innerHTML.includes("Workout complete"), true);
+  assert.match(app.elements.get("#screen").innerHTML, /<span>set<\/span><strong>1<\/strong>/);
 });
 
 test("Training beenden wird bei nicht leerbarer Queue mit Synchronisationshinweis abgelehnt", async () => {
@@ -300,11 +371,11 @@ test("Training beenden wird bei nicht leerbarer Queue mit Synchronisationshinwei
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#sync-host").innerHTML.includes("nicht synchronisiert")), true);
+  assert.equal(await waitFor(() => app.elements.get("#sync-host").innerHTML.includes("waiting to sync")), true);
   await app.click("finish");
 
   assert.equal(finishRequested, false);
-  assert.match(app.elements.get("#notice-host").innerHTML, /Erst synchronisieren/);
+  assert.match(app.elements.get("#notice-host").innerHTML, /Sync your sets/);
   assert.equal(storage.get("gym_queue"), JSON.stringify([queuedSet]));
 });
 
@@ -328,7 +399,7 @@ test("bei fehlgeschlagener Queue-Persistenz bleibt ein erfolgloser Direktversand
   assert.equal(app.calls.filter((call) => call.url === "/api/sets").length, 1);
   assert.equal(app.elements.get("#screen").innerHTML.includes("set-row-complete"), false);
   assert.equal(app.elements.get("#screen").innerHTML.includes("data-action=\"log-draft\""), true);
-  assert.match(app.elements.get("#notice-host").innerHTML, /nicht gespeichert/i);
+  assert.match(app.elements.get("#notice-host").innerHTML, /set not saved/i);
 });
 
 test("bei fehlgeschlagener Queue-Persistenz zeigt ein erfolgreicher Direktversand den gespeicherten Satz", async () => {
@@ -439,7 +510,7 @@ test("bei fehlgeschlagenem PATCH bleibt der korrigierte Direktversand-Draft offe
   assert.equal(app.elements.get("#screen").innerHTML.includes('data-action="log-draft"'), true);
   assert.match(app.elements.get("#screen").innerHTML, /value="70"/);
   assert.match(app.elements.get("#screen").innerHTML, /value="8"/);
-  assert.match(app.elements.get("#notice-host").innerHTML, /Korrektur.*fehlgeschlagen/i);
+  assert.match(app.elements.get("#notice-host").innerHTML, /Could not update the saved set/i);
 });
 
 test("Queue-Einträge werden vor dem Entfernen auf ihre korrigierten Werte gepatcht", async () => {
@@ -499,9 +570,9 @@ test("bei fehlgeschlagenem PATCH bleibt ein korrigierter Queue-Eintrag gespeiche
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#notice-host").innerHTML.includes("Korrektur")), true);
+  assert.equal(await waitFor(() => app.elements.get("#notice-host").innerHTML.includes("Could not update")), true);
   assert.equal(storage.get("gym_queue"), JSON.stringify([correctedItem]));
-  assert.match(app.elements.get("#notice-host").innerHTML, /fehlgeschlagen/i);
+  assert.match(app.elements.get("#notice-host").innerHTML, /Could not update/i);
 });
 
 test("PATCH 409 verwirft den Queue-Eintrag, zeigt Serverwerte und synchronisiert den nächsten Satz", async () => {
@@ -628,7 +699,7 @@ test("nur definierte Validierungsfehler entfernen Queue-Sätze; andere Status be
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#notice-host").innerHTML.includes("nicht synchronisiert")), true);
+  assert.equal(await waitFor(() => app.elements.get("#notice-host").innerHTML.includes("could not sync")), true);
   assert.equal(storage.get("gym_queue"), JSON.stringify([queuedSet]));
 });
 
@@ -777,7 +848,7 @@ test("Training beenden wartet auf einen laufenden Direktversand und blockiert be
   await finishing;
 
   assert.equal(finishRequested, false);
-  assert.match(app.elements.get("#notice-host").innerHTML, /nicht gespeichert/i);
+  assert.match(app.elements.get("#notice-host").innerHTML, /set not saved/i);
 });
 
 test("hinzugefügte Satzzeilen unterstützen ebenfalls Änderungen und automatische Übernahme", async () => {
@@ -921,7 +992,7 @@ test("Entwürfe werden nach erfolgreichem Loggen und Abschließen der Session ge
 
   await app.click("back");
   await app.click("finish");
-  assert.equal(app.elements.get("#screen").innerHTML.includes("Training beendet"), true);
+  assert.equal(app.elements.get("#screen").innerHTML.includes("Workout complete"), true);
   assert.equal(app.storage.has("gym_drafts"), false);
 });
 
@@ -1138,8 +1209,8 @@ test("eine erledigte Einzelserie verwendet den Singular", async () => {
   assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
 
-  assert.match(app.elements.get("#screen").innerHTML, /1 Satz erledigt/);
-  assert.doesNotMatch(app.elements.get("#screen").innerHTML, /1 Sätze erledigt/);
+  assert.match(app.elements.get("#screen").innerHTML, /1 set completed/);
+  assert.doesNotMatch(app.elements.get("#screen").innerHTML, /1 sets completed/);
 });
 
 test("Verlauf wird nach einem synchronisierten Satz neu geladen", async () => {
@@ -1170,7 +1241,7 @@ test("Verlauf wird nach einem synchronisierten Satz neu geladen", async () => {
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("62,5×9")), true,
+  assert.equal(await waitFor(() => /<span>62,5<\/span>\s*<span>9<\/span>/.test(app.elements.get("#screen").innerHTML)), true,
     `historyRequests=${historyRequests}; html=${app.elements.get("#screen").innerHTML}`);
   assert.ok(historyRequests >= 2);
 });
@@ -1206,13 +1277,13 @@ test("eine ältere Verlauf-Anfrage überschreibt nicht das Ergebnis nach dem Syn
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("70×6")), true);
+  assert.equal(await waitFor(() => /<span>70<\/span>\s*<span>6<\/span>/.test(app.elements.get("#screen").innerHTML)), true);
   assert.equal(typeof resolveInitialHistory, "function");
   resolveInitialHistory(response(200, []));
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.match(app.elements.get("#screen").innerHTML, /70×6/);
-  assert.doesNotMatch(app.elements.get("#screen").innerHTML, /Noch keine früheren Trainings/);
+  assert.match(app.elements.get("#screen").innerHTML, /<span>70<\/span>\s*<span>6<\/span>/);
+  assert.doesNotMatch(app.elements.get("#screen").innerHTML, /No previous workouts/);
 });
 
 test("ein fehlgeschlagener Verlauf zeigt den Hinweis 'Verlauf nicht verfügbar'", async () => {
@@ -1225,7 +1296,7 @@ test("ein fehlgeschlagener Verlauf zeigt den Hinweis 'Verlauf nicht verfügbar'"
   });
   assert.equal(await waitFor(() => failedHistoryApp.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await failedHistoryApp.click("open-exercise", { exercise: "Squats" });
-  assert.equal(await waitFor(() => failedHistoryApp.elements.get("#screen").innerHTML.includes("Verlauf nicht verfügbar")), true);
+  assert.equal(await waitFor(() => failedHistoryApp.elements.get("#screen").innerHTML.includes("Workout history is unavailable")), true);
 });
 
 test("reconnect reloads state and flushes queued sets from the error screen", async () => {
@@ -1303,7 +1374,7 @@ test("reconnect reloads state and flushes queued sets from the error screen", as
 
   vm.runInNewContext(appSource, context);
   const screen = elements.get("#screen");
-  assert.equal(await waitFor(() => screen.innerHTML.includes("Verbindung unterbrochen")), true);
+  assert.equal(await waitFor(() => screen.innerHTML.includes("Connection lost")), true);
 
   windowListeners.get("online")();
 
@@ -1342,11 +1413,11 @@ test("Tabwechsel aus der Trainingszusammenfassung öffnet den gewählten Bereich
 
   assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   app.run('screenMode = "summary"; finishSummary = { sets: 1, duration_min: 1, volume_kg: 10 }; render();');
-  assert.match(app.elements.get("#screen").innerHTML, /Training beendet/);
+  assert.match(app.elements.get("#screen").innerHTML, /Workout complete/);
 
   await app.click("tab", { tab: "history" });
 
-  assert.match(app.elements.get("#screen").innerHTML, /Noch keine abgeschlossenen Trainings/);
+  assert.match(app.elements.get("#screen").innerHTML, /No completed workouts yet/);
 });
 
 test("offene Session zeigt auch ohne aktiven Plan oben Fortsetzen", async () => {
@@ -1358,7 +1429,7 @@ test("offene Session zeigt auch ohne aktiven Plan oben Fortsetzen", async () => 
   });
 
   assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("data-action=\"continue-session\"")), true);
-  assert.match(app.elements.get("#screen").innerHTML, /Fortsetzen/);
+  assert.match(app.elements.get("#screen").innerHTML, /Continue/);
 });
 
 test("Zielanzeige: Sekunden-Übungen zeigen 's', reine Ziele ohne Spanne", async () => {
@@ -1380,11 +1451,11 @@ test("Zielanzeige: Sekunden-Übungen zeigen 's', reine Ziele ohne Spanne", async
 
   assert.equal(await waitFor(() => screen().includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Weighted Deadhang" });
-  assert.match(screen(), /Ziel 30–40 s/);
+  assert.match(screen(), /Target 30–40 s/);
   assert.doesNotMatch(screen(), /Wdh\./);
 
   await app.click("open-exercise", { exercise: "Bench Press" });
-  assert.match(screen(), /Ziel 4 Wdh\./);
+  assert.match(screen(), /Target 4 reps/);
 });
 
 test("Sekunden-Übungen lassen bis 600 s zu, Wdh.-Übungen nur bis 100", async () => {
@@ -1419,4 +1490,718 @@ test("Sekunden-Übungen lassen bis 600 s zu, Wdh.-Übungen nur bis 100", async (
   app.input(0, "reps", "150");
   await app.click("log-draft", { index: "0" });
   assert.equal(app.calls.filter((call) => call.url === "/api/sets").length, 1);
+});
+
+test("Start zeigt die Wochenleiste, Plantage und vier Navigation-Icons ohne Text", async () => {
+  const home = {
+    active_plan: {
+      id: 7,
+      name: "Lower A",
+      active: true,
+      days: [{ id: 8, name: "Lower A", exercises: [{ name: "Squats" }, { name: "Leg Press" }] }],
+    },
+    week_number: 8,
+    week_days: [
+      { date: "2035-06-11", label: "Mon", trained: true, today: false },
+      { date: "2035-06-12", label: "Tue", trained: false, today: true },
+    ],
+    next_day: { id: 8, name: "Lower A" },
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ home }));
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Lower A")), true);
+  const screen = app.elements.get("#screen").innerHTML;
+  const tabs = app.elements.get("#tab-bar").innerHTML;
+  assert.match(screen, /data-action="start-day" data-day-id="8"/);
+  assert.match(screen, /Week 8/);
+  assert.match(screen, /data-action="open-library"/);
+  assert.deepEqual([...tabs.matchAll(/data-tab="([^"]+)"/g)].map((item) => item[1]), [
+    "training", "history", "profile", "plans",
+  ]);
+  assert.doesNotMatch(tabs, /<strong>/);
+});
+
+test("Trainings-Sheet rechnet einen Satz als 10RM um und erlaubt ein anderes Ziel", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ prefill: [{ weight_kg: 60, reps: 8 }] }));
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes("class=\"exercise-list\"")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+
+  assert.match(screen(), /class="workout-sheet"/);
+  assert.match(screen(), /data-tenrm-value="57"/);
+  await app.click("edit-tenrm-target");
+  assert.match(screen(), /data-tenrm-target/);
+  app.run("tenRmTarget = 8; render();");
+  assert.match(screen(), /data-tenrm-value="60"/);
+  assert.match(screen(), /data-tenrm-target/);
+});
+
+test("live 10RM updates through the browser camelCase dataset property", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ prefill: [{ weight_kg: 60, reps: 8 }] }));
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes('class="exercise-list"')), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  const rowId = app.draftInputs()[0].dataset.clientId;
+
+  app.input(0, "weight_kg", "70");
+
+  assert.equal(app.tenRmValue(rowId), "66,5 kg");
+});
+
+test("Zeitübungen im Trainings-Sheet zeigen SECS und keine 10RM-Spalte", async () => {
+  const state = {
+    session: { id: 1, title: "Lower A", started_at: "2026-10-14T10:00:00Z" },
+    exercises: [{
+      name: "Weighted Deadhang", rest_s: 180, rep_min: 30, rep_max: 40,
+      target_unit: "seconds", prefill: [{ weight_kg: 20, reps: 34 }], logged: [],
+    }],
+    home: { active_plan: { name: "Lower A", days: [] }, week_days: [] },
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes("class=\"exercise-list\"")), true);
+  await app.click("open-exercise", { exercise: "Weighted Deadhang" });
+
+  assert.match(screen(), />SECS</);
+  assert.doesNotMatch(screen(), /10RM/);
+});
+
+test("gültiges Abhaken gibt ein kurzes Vibrationssignal aus", async () => {
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, makeState({ prefill: [{ weight_kg: 40, reps: 8 }] }));
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sets") {
+        return response(200, { id: 91, weight_kg: 40, reps: 8, set_index: 1 });
+      }
+      throw new Error(`Unexpected request: ${url} ${options.method || "GET"}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  await app.click("log-draft", { index: "0" });
+
+  assert.deepEqual(app.vibrations, [12]);
+});
+
+test("Verlauf zeigt Wochenchart, Zeitfilter und Trainingskacheln", async () => {
+  const workouts = [{
+    id: 8, title: "Upper A", date: "2035-06-12", duration_min: 42, set_count: 12,
+    exercise_count: 4, volume_kg: 5800,
+    exercises: [{ id: 1, name: "Bench Press", muscle: "Chest" }, { id: 2, name: "Cable Row", muscle: "Back" }, { id: 3, name: "Press", muscle: "Shoulders" }],
+  }];
+  const overview = {
+    workout_count: 1, streak_weeks: 1,
+    weekly: [{ week_start: "2035-06-11", workout_count: 1, volume_kg: 5800 }],
+    latest_measurement: null,
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url === "/api/workouts?limit=50") return response(200, workouts);
+      if (url.startsWith("/api/overview?weeks=")) return response(200, overview);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  await app.click("tab", { tab: "history" });
+  assert.match(screen(), /<h1>Training<\/h1>/);
+  assert.match(screen(), /1 workout/);
+  assert.match(screen(), /class="week-chart"/);
+  assert.match(screen(), /Tue, Jun 12/);
+  assert.match(screen(), /\+1/);
+  await app.click("set-chart-metric", { metric: "volume" });
+  assert.match(screen(), /aria-label="Weekly volume chart"/);
+  await app.click("set-overview-weeks", { weeks: "12" });
+  assert.ok(app.calls.some((call) => call.url === "/api/overview?weeks=12"));
+});
+
+test("Profil zeigt Streak, Messwerte und speichert einen synthetischen Eintrag", async () => {
+  const overview = {
+    workout_count: 28, streak_weeks: 4, weekly: [],
+    latest_measurement: { date: "2035-06-12", weight_kg: 72.5, body_fat: 18.2 },
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url.startsWith("/api/overview?")) return response(200, overview);
+      if (url === "/api/measurements") return response(200, overview.latest_measurement);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  await app.click("tab", { tab: "profile" });
+  assert.match(screen(), /28/);
+  assert.match(screen(), /4w/);
+  assert.match(screen(), /72,5 kg/);
+  assert.match(screen(), /18,2%/);
+  await app.click("toggle-measurement-form");
+  assert.match(screen(), /id="new-measurement-form"/);
+  await app.documentListeners.get("submit")({
+    target: { id: "new-measurement-form", weight_kg: "73.1", body_fat: "17.9", date: "2035-06-13" },
+    preventDefault() {},
+  });
+  const request = app.calls.find((call) => call.url === "/api/measurements");
+  assert.equal(request.method, "POST");
+  assert.deepEqual(JSON.parse(request.body), { weight_kg: 73.1, body_fat: 17.9, date: "2035-06-13" });
+});
+
+test("Übungsdetail hebt zugeordnete Muskeln hervor und speichert Instructions", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url === "/api/exercises/77") return response(200, {
+        id: 77, name: "Synthetic Press", muscle: "Chest and triceps", equipment: "barbell",
+        category: "strength", rep_min: 6, rep_max: 10, instructions: "Keep the wrists straight.", history: [],
+      });
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screenElement = app.elements.get("#screen");
+  await waitFor(() => screenElement.innerHTML.includes('class="exercise-list"'));
+  app.run(`activeTab="exercises"; exerciseDirectory=[{id:78,name:"Other",muscle:"Chest"}]; exerciseDetail={
+    id:77,name:"Synthetic Press",muscle:"Chest and triceps",equipment:"barbell",category:"strength",
+    rep_min:6,rep_max:10,instructions:"Keep the wrists straight.",history:[]};
+    exerciseInstructionsDraft="Keep the wrists straight."; render();`);
+
+  assert.match(screenElement.innerHTML, /data-muscle="chest" d="[^"]+"\>.*?<\/path>/);
+  assert.match(screenElement.innerHTML, /class="muscle-region is-highlighted" data-muscle="chest"/);
+  for (const muscle of ["shoulders", "biceps", "triceps", "forearms", "abs", "quads", "hams", "glutes", "calves", "lats", "traps", "lower back", "neck"]) {
+    assert.match(screenElement.innerHTML, new RegExp(`data-muscle="${muscle}"`));
+  }
+  await app.click("exercise-detail-tab", { detailTab: "instructions" });
+  assert.match(screenElement.innerHTML, /Keep the wrists straight\./);
+  screenElement.querySelector = () => ({ value: "Pause at the bottom." });
+  await app.click("save-exercise-instructions");
+  const update = app.calls.find((call) => call.url === "/api/exercises/77");
+  assert.equal(update.method, "PATCH");
+  assert.deepEqual(JSON.parse(update.body), { instructions: "Pause at the bottom." });
+});
+
+test("Session-Übung kann über den Picker ersetzt werden", async () => {
+  const state = makeState();
+  state.exercises[0].session_exercise_id = 101;
+  state.exercises[0].sort_order = 0;
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url === "/api/history?exercise=Synthetic+Cable+Row&limit=5") return response(200, []);
+      if (url === "/api/exercises") return response(200, [{ id: 55, name: "Synthetic Cable Row", muscle: "Back" }]);
+      if (url === "/api/sessions/1/exercises/101" && options.method === "PATCH") {
+        assert.deepEqual(JSON.parse(options.body), { exercise_id: 55 });
+        state.exercises[0].name = "Synthetic Cable Row";
+        state.exercises[0].exercise_id = 55;
+        return response(200, state.exercises[0]);
+      }
+      throw new Error(`Unexpected request: ${url} ${options.method || "GET"}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  await app.click("open-exercise", { exercise: "Squats" });
+  assert.match(screen(), /data-action="open-session-exercise-picker"/);
+  await app.click("open-exercise-menu");
+  await app.click("replace-session-exercise");
+  await app.click("pick-exercise", { kind: "replace", exerciseId: "55" });
+  assert.ok(app.calls.some((call) => call.url === "/api/sessions/1/exercises/101" && call.method === "PATCH"));
+  assert.match(screen(), /Synthetic Cable Row/);
+});
+
+test("Rep-Ziel einer Session-Übung lässt sich speichern", async () => {
+  const state = makeState();
+  state.exercises[0].session_exercise_id = 101;
+  state.exercises[0].sort_order = 0;
+  state.exercises[0].rep_min = 6;
+  state.exercises[0].rep_max = 10;
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sessions/1/exercises/101" && options.method === "PATCH") {
+        return response(200, { ...state.exercises[0], rep_min: 8, rep_max: 12 });
+      }
+      throw new Error(`Unexpected request: ${url} ${options.method || "GET"}`);
+    },
+  });
+  const screenElement = app.elements.get("#screen");
+
+  await waitFor(() => screenElement.innerHTML.includes('class="exercise-list"'));
+  await app.click("open-exercise", { exercise: "Squats" });
+  await app.click("edit-rep-target");
+  assert.match(screenElement.innerHTML, /data-rep-target="rep_min"/);
+  screenElement.querySelector = (selector) => ({ value: selector.includes("rep_min") ? "8" : "12" });
+  await app.click("save-session-target");
+  const update = app.calls.find((call) => call.url === "/api/sessions/1/exercises/101");
+  assert.equal(update.method, "PATCH");
+  assert.deepEqual(JSON.parse(update.body), { rep_min: 8, rep_max: 12 });
+  assert.doesNotMatch(screenElement.innerHTML, /data-rep-target=/);
+});
+
+test("Session-Übung kann ohne gespeicherte Sätze entfernt werden", async () => {
+  const state = makeState();
+  state.exercises[0].session_exercise_id = 101;
+  state.exercises[0].sort_order = 0;
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url === "/api/sessions/1/exercises/101" && options.method === "DELETE") {
+        state.exercises = [];
+        return response(204, null);
+      }
+      throw new Error(`Unexpected request: ${url} ${options.method || "GET"}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  await app.click("open-exercise", { exercise: "Squats" });
+  await app.click("open-exercise-menu");
+  await app.click("remove-session-exercise");
+  assert.ok(app.calls.some((call) => call.url === "/api/sessions/1/exercises/101" && call.method === "DELETE"));
+  assert.match(screen(), /class="workout-sheet empty-training"/);
+  assert.match(screen(), /data-action="open-session-exercise-picker"[^>]*>Add exercise</);
+  assert.match(screen(), /data-action="finish"[^>]*>Finish workout</);
+});
+
+test("AP home shows plan days in one card with compact week labels and English navigation", async () => {
+  const home = {
+    active_plan: {
+      name: "New plan",
+      days: [
+        { id: 4, name: "Lower A", exercises: [{ name: "Leg Press", muscle: "Quads" }, { name: "RDL", muscle: "Hams" }, { name: "Calf Raise", muscle: "Calves" }, { name: "Plank", muscle: "Abs" }] },
+        { id: 5, name: "Upper A", exercises: [{ name: "Bench Press", muscle: "Chest" }] },
+      ],
+    },
+    week_number: 8,
+    next_day: { id: 4 },
+    week_days: [
+      { date: "2035-10-01", today: true, trained: true },
+      { date: "2035-10-02", trained: false },
+      { date: "2035-10-03", trained: false },
+      { date: "2035-10-04", trained: false },
+      { date: "2035-10-05", trained: false },
+      { date: "2035-10-06", trained: false },
+      { date: "2035-10-07", trained: false },
+    ],
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ session: null, home }));
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes("Lower A")), true);
+  assert.match(screen(), /class="plan-day-list-card"/);
+  assert.match(screen(), /class="plan-day-row/);
+  assert.match(screen(), /Week 8/);
+  assert.match(screen(), /All plans/);
+  assert.match(screen(), /Exercises/);
+  assert.match(screen(), /Help/);
+  assert.match(screen(), /\+1/);
+  assert.doesNotMatch(screen(), /Mantis Gym|>Gym<|2 exercises|1 exercise/);
+
+  const heading = screen().match(/<section class="home-plan-heading">([\s\S]*?)<\/section>/)?.[1] ?? "";
+  assert.ok(heading.indexOf("plan-menu-button") < heading.indexOf("week-number"));
+  assert.match(screen(), /week-day is-today is-trained/);
+  assert.match(cssSource, /\.home-links\s*\{[^}]*display:\s*grid;[^}]*justify-items:\s*start;/s);
+  assert.match(cssSource, /\.week-day\.is-today\s+strong\s*\{[^}]*background:\s*transparent;/s);
+});
+
+test("Gym app shell uses English accessibility labels and no legacy brand name", () => {
+  assert.match(htmlSource, /<html lang="en">/);
+  assert.match(htmlSource, /aria-label="Workout navigation"/);
+  assert.match(htmlSource, /<meta name="description" content="Workouts, sets, and history in one place\."/);
+  assert.doesNotMatch(htmlSource, /Mantis Gym|Gym-Bereiche/);
+  assert.doesNotMatch(manifestSource, /Mantis Gym-Tracker/);
+});
+
+test("set entry uses large numeric pills and keeps both fields wide from 360 to 430 px", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ prefill: [{ weight_kg: 60, reps: 8 }] }));
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes('class="exercise-list"')), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+
+  assert.doesNotMatch(screen(), /data-action="adjust-draft"/);
+  assert.match(screen(), /data-draft-input[^>]*inputmode="decimal"/);
+  assert.match(screen(), /data-draft-input[^>]*inputmode="numeric"/);
+
+  const grid = cssSource.match(/\.set-heading,\s*\.set-row\s*\{[^}]*grid-template-columns:\s*([^;]+);[^}]*gap:\s*(\d+(?:\.\d+)?)px/s);
+  assert.ok(grid, "set rows define a measurable grid");
+  const tracks = grid[1].trim().split(/\s+/);
+  assert.equal(tracks.length, 5);
+  const flexibleCount = tracks.filter((track) => /fr\)$/.test(track)).length;
+  const fixedWidth = tracks.reduce((total, track) => total + (Number(track.match(/^(\d+(?:\.\d+)?)px$/)?.[1]) || 0), 0);
+  const gapWidth = Number(grid[2]) * (tracks.length - 1);
+  for (const viewport of [360, 375, 430]) {
+    const sheetPadding = viewport <= 360 ? 14 : 20;
+    const contentWidth = viewport - sheetPadding * 2;
+    const fieldWidth = (contentWidth - fixedWidth - gapWidth) / flexibleCount;
+    assert.ok(fieldWidth >= 80, `${viewport}px gives each KG/REPS pill ${fieldWidth.toFixed(1)}px`);
+  }
+});
+
+test("typing into a set updates its 10RM and auto-filled following rows immediately", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({
+        prefill: [{ weight_kg: 60, reps: 8 }, { weight_kg: 60, reps: 8 }],
+      }));
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes('class="exercise-list"')), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  const first = app.draftInput(0, "weight_kg");
+  const second = app.draftInput(1, "weight_kg");
+  assert.equal(app.tenRmValue(first.dataset.clientId), "57 kg");
+  assert.equal(app.tenRmValue(second.dataset.clientId), "57 kg");
+
+  app.input(0, "weight_kg", "70");
+
+  assert.equal(app.tenRmValue(first.dataset.clientId), "66,5 kg");
+  assert.equal(app.tenRmValue(second.dataset.clientId), "66,5 kg");
+  assert.equal(app.draftInput(1, "weight_kg").value, "70");
+});
+
+test("empty active workout offers exercise picker and finish action", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, {
+        session: { id: 12, title: "Lower A", started_at: "2035-10-01T12:00:00Z" },
+        exercises: [],
+        home: { active_plan: { name: "Lower A", days: [] }, week_days: [] },
+      });
+      if (url === "/api/exercises") return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes('class="exercise-list"') || screen().includes('class="empty-training"')), true);
+  assert.match(screen(), /class="workout-sheet empty-training"/);
+  assert.match(screen(), /data-action="open-session-exercise-picker"[^>]*>[^<]*Add exercise/);
+  assert.match(screen(), /data-action="finish"[^>]*>[^<]*Finish workout/);
+  await app.click("open-session-exercise-picker");
+  assert.match(screen(), /class="picker-modal exercise-picker"/);
+});
+
+test("sheet swipe ignores scrolling gestures but closes from the grip", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes('class="exercise-list"')), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  const scrolledContent = app.beginTouch({ y: 30, scrollTop: 42 });
+  app.endTouch(scrolledContent, 150);
+  assert.equal(app.run("selectedExercise"), "Squats");
+
+  const grip = app.beginTouch({ y: 30, scrollTop: 42, handle: true });
+  app.endTouch(grip, 150);
+  assert.equal(app.run("selectedExercise"), null);
+});
+
+test("workout history uses plan-day names and the set editor is a compact dialog", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  app.run(`activeTab = "history"; workoutDetail = {
+    title: "Upper B · Day 4 · Week 8 · New plan", date: "2026-10-08", duration_min: 64,
+    set_count: 2, volume_kg: 720,
+    sets: [
+      { id: 71, exercise_id: 5, exercise: "Bench Press", set_index: 1, weight_kg: 60, reps: 8, unit: "reps", is_warmup: false },
+      { id: 72, exercise_id: 5, exercise: "Bench Press", set_index: 2, weight_kg: 60, reps: 8, unit: "reps", is_warmup: false },
+    ],
+  }; render();`);
+
+  assert.match(screen(), /<h1>Upper B<\/h1>/);
+  assert.match(screen(), /Thu, Oct 8th · 64 min/);
+  assert.match(screen(), /class="workout-exercise-card"/);
+  assert.match(screen(), />#<\/span>[\s\S]*>KG<\/span>[\s\S]*>REPS<\/span>/);
+  assert.doesNotMatch(screen(), /Day 4|Week 8|data-action="delete-history-set"|>Bearbeiten<|>Löschen</);
+
+  await app.click("edit-history-set", { setId: "71" });
+  assert.match(screen(), /class="history-set-dialog"[^>]*role="dialog"/);
+  assert.match(screen(), /data-action="delete-history-set"/);
+  assert.match(screen(), /data-history-edit[^>]*inputmode="decimal"/);
+  assert.match(screen(), /data-history-edit[^>]*inputmode="numeric"/);
+});
+
+test("history list shortens workout titles and formats ordinal English dates", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  app.run(`activeTab = "history"; workoutHistory = [{ id: 8,
+    title: "Upper B · Day 4 · Week 8 · New plan", date: "2026-10-08", exercise_count: 1,
+    exercises: [{ name: "Bench Press", muscle: "Chest" }],
+  }]; overviewData = { workout_count: 1, weekly: [], streak_weeks: 0 }; render();`);
+
+  assert.match(screen(), /<strong>Upper B<\/strong>/);
+  assert.match(screen(), /Thu, Oct 8th/);
+  assert.doesNotMatch(screen(), /Day 4|Week 8|Mantis Gym/);
+  assert.match(screen(), /class="workout-list-card"/);
+});
+
+test("exercise library is an English sheet with search, muscle pills and equipment rows", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  app.run(`activeTab = "exercises"; exerciseDirectory = [
+    { id: 41, name: "Bench Press", muscle: "Chest", equipment: "barbell" },
+    { id: 42, name: "Lat Pulldown", muscle: "Back", equipment: "cable" },
+  ]; render();`);
+
+  assert.match(screen(), /class="exercise-library-page sheet-dismissable"/);
+  assert.match(screen(), />Close<\/button>/);
+  assert.match(screen(), /<h1>Exercises<\/h1>/);
+  assert.match(screen(), /placeholder="Search exercises"/);
+  assert.match(screen(), /data-action="filter-library-muscle"/);
+  assert.match(screen(), /class="exercise-library-card"/);
+  assert.match(screen(), /class="exercise-library-tile"/);
+  assert.match(screen(), /<small>Barbell<\/small>/);
+  assert.match(cssSource, /\.sheet-dismissable\.history-page,\s*\.sheet-dismissable\.exercise-detail-page,\s*\.sheet-dismissable\.exercise-library-page\s*\{[^}]*position:\s*fixed;/s);
+  assert.doesNotMatch(screen(), /Mantis Gym|>Übungen<|>Suche<|>Muskel</);
+
+  const librarySheet = app.beginTouch({ y: 20, scrollTop: 0 });
+  app.endTouch(librarySheet, 140);
+  assert.equal(app.run("activeTab"), "training");
+});
+
+test("pause timer updates once for each fake second", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes('class="exercise-list"')), true);
+  app.run("startTimer(9)");
+  const timer = () => app.elements.get("#timer-host").innerHTML;
+  assert.match(timer(), />00:09</);
+  app.advanceClock(1000);
+  assert.match(timer(), />00:08</);
+  app.advanceClock(1000);
+  assert.match(timer(), />00:07</);
+});
+
+test("plan names from untrusted state stay HTML escaped", async () => {
+  const dangerousName = '<img src=x onerror="alert(1)">';
+  const home = {
+    active_plan: { name: "Safe plan", days: [{ id: 1, name: dangerousName, exercises: [] }] },
+    week_number: 1,
+    week_days: [],
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ session: null, home }));
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes("Safe plan")), true);
+  assert.match(screen(), /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
+  assert.doesNotMatch(screen(), /<img src=x/);
+});
+
+const apHome = {
+  active_plan: { name: "New plan", days: [{ id: 4, name: "Lower A", exercises: [{ name: "Leg Press", muscle: "Quads" }] }] },
+  week_number: 8,
+  next_day: { id: 4 },
+  week_days: [{ date: "2035-10-01", today: true, trained: true }],
+};
+
+test("closing an empty training sheet keeps it closed and the running-workout bar reopens it", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, {
+        session: { id: 12, title: "Lower A", started_at: "2035-10-01T12:00:00Z" },
+        exercises: [],
+        home: apHome,
+      });
+      if (url === "/api/exercises") return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes("empty-training")), true);
+  await app.click("close-training");
+  assert.doesNotMatch(screen(), /empty-training/);
+  assert.match(screen(), /data-action="continue-session"/);
+  assert.match(screen(), /class="exercise-list"/);
+  app.run("render()");
+  assert.doesNotMatch(screen(), /empty-training/);
+
+  await app.click("continue-session");
+  assert.match(screen(), /empty-training/);
+});
+
+test("touch close gesture ignores drags that start inside a scrolled inner list", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes('class="exercise-list"')), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+
+  const inner = app.beginTouch({ y: 30, scrollTop: 0, innerScrollTop: 42 });
+  app.endTouch(inner, 200);
+  assert.equal(app.run("selectedExercise"), "Squats");
+
+  const atTop = app.beginTouch({ y: 30, scrollTop: 0, innerScrollTop: 0 });
+  app.endTouch(atTop, 200);
+  assert.equal(app.run("selectedExercise"), null);
+});
+
+test("history set editor uses a text field that shows and accepts decimal commas", async () => {
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (options.method === "PATCH") return response(200, {});
+      if (url.startsWith("/api/workouts/")) return response(200, {
+        title: "Lower A", date: "2026-10-08", duration_min: 5, set_count: 1, volume_kg: 0,
+        sets: [{ id: 71, exercise_id: 5, exercise: "Bench Press", set_index: 1, weight_kg: 62.5, reps: 8, unit: "reps" }],
+      });
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  app.run(`activeTab = "history"; selectedWorkoutId = 9; workoutDetail = {
+    title: "Lower A", date: "2026-10-08", duration_min: 5, set_count: 1, volume_kg: 0,
+    sets: [{ id: 71, exercise_id: 5, exercise: "Bench Press", set_index: 1, weight_kg: 62.5, reps: 8, unit: "reps" }],
+  }; render();`);
+  await app.click("edit-history-set", { setId: "71" });
+
+  assert.match(screen(), /data-field="weight_kg" type="text" inputmode="decimal"[^>]*value="62,5"|data-field="weight_kg"[^>]*type="text"[^>]*value="62,5"/);
+  assert.doesNotMatch(screen(), /data-field="weight_kg"[^>]*type="number"/);
+  await app.run("saveHistorySet()");
+  const patch = app.calls.find((call) => call.method === "PATCH");
+  assert.ok(patch);
+  assert.equal(JSON.parse(patch.body).weight_kg, 62.5);
+});
+
+test("last workout of an exercise is a vertical card with a dated plan-day header", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ session: { id: 1, title: "Lower A", started_at: "2026-10-14T10:00:00Z" } }));
+      if (url.startsWith("/api/history?")) return response(200, [
+        { date: "2026-09-22", sets: [{ weight_kg: 60, reps: 8 }, { weight_kg: 62.5, reps: 6 }] },
+      ]);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  await app.click("open-exercise", { exercise: "Squats" });
+  await waitFor(() => screen().includes("history-table-row"));
+
+  assert.match(screen(), /<article class="last-workout-card"><header class="last-workout-head">Tue, Sep 22nd · Lower A<\/header>/);
+  assert.doesNotMatch(screen(), /class="history-line"/);
+  assert.match(cssSource, /\.last-workout-card\s*\{[^}]*display:\s*block/s);
+});
+
+test("home screen uses its own day classes, ring number and blue week link", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ session: null, home: apHome }));
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  assert.equal(await waitFor(() => screen().includes("Lower A")), true);
+
+  assert.match(screen(), /<strong class="home-day-name">Lower A<\/strong>/);
+  assert.doesNotMatch(screen(), /class="plan-day-name">Lower A/);
+  assert.match(cssSource, /\.home-day-name\s*\{(?=[^}]*font-size:\s*22px)(?=[^}]*font-weight:\s*400)(?=[^}]*color:\s*#fff)/s);
+  assert.match(cssSource, /\.plan-day-number\s*\{[^}]*border:\s*1\.5px solid #636366;[^}]*background:\s*transparent/s);
+  assert.match(cssSource, /\.week-number\s*\{(?=[^}]*font-size:\s*20px)(?=[^}]*font-weight:\s*600)(?=[^}]*color:\s*#0A84FF)/si);
+});
+
+test("library pills are capitalised for display only and unset equipment shows no subtitle", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  app.run(`activeTab = "exercises"; exerciseDirectory = [
+    { id: 1, name: "Treadmill", muscle: "cardio", equipment: "" },
+    { id: 2, name: "Bench Press", muscle: "Chest", equipment: "barbell" },
+  ]; render();`);
+
+  assert.match(screen(), /data-muscle="cardio"[^>]*>Cardio</);
+  assert.doesNotMatch(screen(), /Equipment not set/);
+  assert.match(screen(), /<small><\/small>|<small>Barbell<\/small>/);
+  assert.doesNotMatch(screen(), /<strong>Treadmill<\/strong><small>[^<]+/);
 });

@@ -81,6 +81,9 @@ def test_library_search_e1rm_and_workout_history(library_database):
     assert workout_summary["id"] == data["workout_id"]
     assert workout_summary["set_count"] == 1
     assert workout_summary["volume_kg"] == 1000
+    assert workout_summary["exercises"] == [{
+        "id": data["exercise_id"], "name": data["exercise_name"], "muscle": "Brust",
+    }]
     workout = library.workout_detail(data["workout_id"])
     assert workout["set_count"] == 1
     assert workout["volume_kg"] == 1000

@@ -1,10 +1,12 @@
 """HTTP-Vertrag und Authentifizierung der eigenständigen Gym-App."""
 
+from datetime import date
+
 from fastapi.testclient import TestClient
 import pytest
 
 import config
-from domains.gym import plans, tracker
+from domains.gym import library, overview, plans, tracker
 from web.gym_app import create_gym_app
 
 
@@ -101,3 +103,111 @@ def test_v2_routes_remain_authenticated_and_reject_a_foreign_write_origin(logged
     )
 
     assert response.status_code == 403
+
+
+def test_overview_is_authenticated_and_exposes_chart_and_profile_data(client, logged_in, monkeypatch):
+    data = {
+        "workout_count": 12,
+        "streak_weeks": 3,
+        "weekly": [{"week_start": "2035-06-11", "workout_count": 2, "volume_kg": 2400}],
+        "latest_measurement": {"date": "2035-06-12", "weight_kg": 72.5, "body_fat": 18.0},
+    }
+    monkeypatch.setattr(overview, "dashboard", lambda weeks=4: data)
+    unauthenticated = TestClient(create_gym_app())
+
+    assert unauthenticated.get("/api/overview").status_code == 401
+    response = logged_in.get("/api/overview?weeks=4")
+
+    assert response.status_code == 200
+    assert response.json() == data
+
+
+def test_measurement_route_enforces_origin_and_validates_values(logged_in, monkeypatch):
+    saved = {"date": "2035-06-12", "weight_kg": 72.5, "body_fat": 18.0}
+    calls = []
+
+    def save_measurement(weight_kg, body_fat, date_=None):
+        calls.append((weight_kg, body_fat, date_))
+        return saved
+
+    monkeypatch.setattr(overview, "save_measurement", save_measurement)
+
+    blocked = logged_in.post(
+        "/api/measurements",
+        json={"weight_kg": 72.5},
+        headers={"Origin": "http://evil.example"},
+    )
+    accepted = logged_in.post(
+        "/api/measurements",
+        json={"weight_kg": 72.5, "body_fat": 18.0, "date": "2035-06-12"},
+        headers={"Origin": "http://testserver"},
+    )
+    invalid = logged_in.post(
+        "/api/measurements",
+        json={"body_fat": 101},
+        headers={"Origin": "http://testserver"},
+    )
+
+    assert blocked.status_code == 403
+    assert accepted.status_code == 200
+    assert accepted.json() == saved
+    assert calls == [(72.5, 18.0, date(2035, 6, 12))]
+    assert invalid.status_code == 422
+
+
+def test_exercise_instructions_route_requires_auth_and_returns_saved_text(client, logged_in, monkeypatch):
+    saved = {"id": 9, "name": "Synthetic Row", "instructions": "Rücken neutral halten."}
+    calls = []
+
+    def update_instructions(exercise_id, instructions):
+        calls.append((exercise_id, instructions))
+        return saved
+
+    monkeypatch.setattr(library, "update_instructions", update_instructions)
+    unauthenticated = TestClient(create_gym_app())
+
+    assert unauthenticated.patch(
+        "/api/exercises/9", json={"instructions": "Rücken neutral halten."}
+    ).status_code == 401
+    response = logged_in.patch("/api/exercises/9", json={"instructions": "Rücken neutral halten."})
+
+    assert response.status_code == 200
+    assert response.json() == saved
+    assert calls == [(9, "Rücken neutral halten.")]
+
+
+def test_session_exercise_can_be_replaced_and_target_updated(logged_in, monkeypatch):
+    saved = {"exercise_id": 44, "name": "Synthetic Cable Row", "rep_min": 8, "rep_max": 12}
+    calls = []
+
+    def update_session_exercise(workout_id, entry_id, **values):
+        calls.append((workout_id, entry_id, values))
+        return saved
+
+    monkeypatch.setattr(plans, "update_session_exercise", update_session_exercise)
+    response = logged_in.patch(
+        "/api/sessions/5/exercises/7",
+        json={"exercise_id": 44, "target_sets": 4, "rep_min": 8, "rep_max": 12},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == saved
+    assert calls == [(5, 7, {"exercise_id": 44, "target_sets": 4, "rep_min": 8, "rep_max": 12})]
+
+
+def test_session_exercise_remove_requires_auth_and_rejects_foreign_origin(logged_in, monkeypatch):
+    removed = []
+    monkeypatch.setattr(plans, "remove_session_exercise", lambda workout, entry: removed.append((workout, entry)))
+    unauthenticated = TestClient(create_gym_app())
+
+    assert unauthenticated.delete("/api/sessions/5/exercises/7").status_code == 401
+    blocked = logged_in.delete(
+        "/api/sessions/5/exercises/7", headers={"Origin": "http://evil.example"}
+    )
+    accepted = logged_in.delete(
+        "/api/sessions/5/exercises/7", headers={"Origin": "http://testserver"}
+    )
+
+    assert blocked.status_code == 403
+    assert accepted.status_code == 204
+    assert removed == [(5, 7)]
