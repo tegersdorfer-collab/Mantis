@@ -183,7 +183,11 @@ def _is_complete_command_particle(words: list[str]) -> bool:
 
 
 _EIN_COMMAND_VERBS = frozenset({"schalte", "schalt", "stell", "stelle", "trag", "trage", "richte", "richt"})
-_EIN_BLOCKERS = frozenset({"mir", "dir", "uns", "euch", "ihm", "ihr", "auf", "aus", "in", "an", "mit", "von", "zu", "für", "heute"})
+_EIN_BLOCKERS = frozenset({
+    "mir", "dir", "uns", "euch", "ihm", "ihr", "heute",
+    "auf", "aus", "in", "an", "mit", "von", "zu", "für", "bis", "um", "nach", "vor",
+    "über", "unter", "durch", "gegen", "ohne", "seit", "ab", "bei", "zwischen",
+})
 
 
 def _is_complete_ein_command(words: list[str]) -> bool:
@@ -194,7 +198,10 @@ def _is_complete_ein_command(words: list[str]) -> bool:
         and 2 <= len(middle) <= 4
         and middle[0] in _DETERMINERS
         and middle[-1] not in _DETERMINERS
-        and not any(word in _EIN_BLOCKERS for word in middle)
+        and not any(
+            word in _EIN_BLOCKERS | _OPEN_PREPOSITIONS | _OPEN_CONJUNCTIONS | {"und", "oder", "aber"}
+            for word in middle
+        )
     )
 
 
