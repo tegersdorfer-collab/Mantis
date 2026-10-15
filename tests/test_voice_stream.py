@@ -269,6 +269,62 @@ class TestVoiceStreamSession:
         assert result is None
         assert final_calls == []
 
+    def test_sustained_detector_signal_after_discarded_segment_is_not_a_new_hit(
+        self, monkeypatch,
+    ):
+        import config
+        import core.voice_stream as vs
+        from core.vad import VadSegmenter
+
+        class FakeVAD:
+            def speech_probability(self, frame):
+                return 1.0 if frame != b"\0" * len(frame) else 0.0
+
+        class SustainedWake:
+            """Detektor bleibt nach einem Treffer True (eine Erkennung, keine neue Flanke)."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def check(self, _frame):
+                self.calls += 1
+                return self.calls <= 200
+
+        final_calls = []
+
+        async def final_stt(audio):
+            final_calls.append(audio)
+            return "Mach das Licht an", False
+
+        async def run():
+            session = VoiceStreamSession(
+                vad_segmenter=VadSegmenter(FakeVAD(), chunk_ms=32),
+                wakeword_detector=SustainedWake(),
+                conversation_active_fn=lambda: False,
+                partial_executor_available=lambda: False,
+            )
+            short_speech = b"\xe8\x03" * (160 * 16)
+            silence_40ms = b"\0\0" * 640
+            command_speech = b"\xe8\x03" * (3 * 16_000)
+
+            await session.handle_chunk(short_speech, muted=False)
+            for _ in range(26):
+                await session.handle_chunk(silence_40ms, muted=False)
+            await session.handle_chunk(command_speech, muted=False)
+            result = None
+            for _ in range(30):
+                result = result or await session.handle_chunk(silence_40ms, muted=False)
+            await session.close()
+            return result
+
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800, raising=False)
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", False, raising=False)
+        monkeypatch.setattr(vs, "transcribe_pcm", final_stt)
+
+        result = asyncio.run(run())
+
+        assert result is None or not result.get("wakeword_triggered")
+
     @pytest.mark.parametrize(
         ("silence_before_speech_ms", "expected_wakeword"),
         [(1000, True), (2000, False)],

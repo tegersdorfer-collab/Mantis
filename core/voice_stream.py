@@ -244,7 +244,7 @@ class VoiceStreamSession:
     def _discard_wakeword_hits_through(self, sample_index: int) -> None:
         while self._wakeword_hits and self._wakeword_hits[0] <= sample_index:
             self._wakeword_hits.popleft()
-        self._wakeword_detected = False
+        # _wakeword_detected bleibt: Ein anhaltendes Detektorsignal ist keine neue Flanke.
 
     def _wakeword_fired_for_segment(self, start_sample: int, end_sample: int) -> bool:
         preroll_samples = int(
