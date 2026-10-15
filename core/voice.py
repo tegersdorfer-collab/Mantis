@@ -140,9 +140,9 @@ def _conversation_active(conversation: VoiceConversationWindow | None = None) ->
 
 
 async def transcribe_audio_with_hint(
-    audio_path: str, *, normalize_wakeword: bool = True,
+    audio_path: str, *, wakeword_triggered: bool = False,
 ) -> tuple[str, bool]:
-    """Liefert den normalisierten Text und einen nicht-freigebenden Namenshinweis."""
+    """Liefert Text, normalisiert einen Namen aber nur nach akustischem Wakeword-Treffer."""
     global _parakeet_unavailable
     engine = getattr(config, "STT_ENGINE", "parakeet")
 
@@ -152,14 +152,15 @@ async def transcribe_audio_with_hint(
                 raw_text = await _transcribe_parakeet(audio_path)
                 if not _parakeet_unavailable:
                     return (
-                        _normalize_voice_transcript(raw_text)
-                        if normalize_wakeword else raw_text,
+                        _normalize_voice_transcript(
+                            raw_text, wakeword_triggered=wakeword_triggered,
+                        ),
                         has_voice_wakeword_hint(raw_text),
                     )
         log.warning("Parakeet nicht verfügbar – ab jetzt whisper.cpp")
 
     raw_text = await _transcribe_whisper(audio_path)
-    text = _normalize_voice_transcript(raw_text) if normalize_wakeword else raw_text
+    text = _normalize_voice_transcript(raw_text, wakeword_triggered=wakeword_triggered)
     return text, has_voice_wakeword_hint(raw_text)
 
 
@@ -175,7 +176,7 @@ def partial_stt_executor_available() -> bool:
 
 
 async def transcribe_audio_partial_with_hint(
-    audio_path: str, *, normalize_wakeword: bool = True,
+    audio_path: str, *, wakeword_triggered: bool = False,
 ) -> tuple[str, bool] | None:
     """Teil-STT plus Weckworthinweis; bei belegtem STT-Pfad wird er verworfen."""
     global _parakeet_unavailable
@@ -189,12 +190,13 @@ async def transcribe_audio_partial_with_hint(
             raw_text = await _transcribe_parakeet(audio_path)
             if not _parakeet_unavailable:
                 return (
-                    _normalize_voice_transcript(raw_text)
-                    if normalize_wakeword else raw_text,
+                    _normalize_voice_transcript(
+                        raw_text, wakeword_triggered=wakeword_triggered,
+                    ),
                     has_voice_wakeword_hint(raw_text),
                 )
         raw_text = await _transcribe_whisper_locked(audio_path)
-        text = _normalize_voice_transcript(raw_text) if normalize_wakeword else raw_text
+        text = _normalize_voice_transcript(raw_text, wakeword_triggered=wakeword_triggered)
         return text, has_voice_wakeword_hint(raw_text)
     finally:
         _whisper_lock.release()
@@ -224,8 +226,10 @@ def _edit_distance_at_most_one(left: str, right: str) -> int:
     return previous[-1]
 
 
-def _normalize_voice_transcript(text: str) -> str:
+def _normalize_voice_transcript(text: str, *, wakeword_triggered: bool = False) -> str:
     """Korrigiert einen Mantis-ähnlichen Anredenamen am Anfang eines Voice-Transkripts."""
+    if not wakeword_triggered:
+        return text
     match = _INITIAL_WORD_RE.match(text)
     if match is None:
         return text

@@ -6,6 +6,7 @@ Backends (core/backends/) übernehmen den LLM-spezifischen Teil:
     OpenRouterBackend → OpenRouter Chat Completions
     ClaudeBackend    → Anthropic Messages
     ChatGPTPlanBackend → ChatGPT Responses
+    GeminiBackend    → Vertex AI Gemini REST
 
 Dieser Loop kennt nur backend.call() — egal welcher Anbieter dahintersteckt.
 """

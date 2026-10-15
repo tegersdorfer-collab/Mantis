@@ -203,39 +203,18 @@ def _latest_user_text(kzg, current_text: str = "") -> str:
     return previous_user_text
 
 
-def _tool_selection_context(kzg, text: str) -> tuple[str, bool, bool]:
-    """Liefert Auswahltext sowie Kennzeichen, ob und wofür Kontext genutzt wird."""
+def _tool_selection_context(kzg, text: str) -> tuple[str, bool]:
+    """Liefert Auswahltext und ob eine kurze Rückfrage geerbten Kontext nutzt."""
     previous_user_text = _latest_user_text(kzg, text)
     if not previous_user_text:
-        return text, False, False
+        return text, False
     if _is_short_voice_followup(text):
-        return f"{previous_user_text}\n{text}", True, True
-    return text, False, True
-
-
-def _has_direct_voice_tool_intent(text: str) -> bool:
-    """Prüft, ob der aktuelle Satz selbst ein konkretes Toolziel erkennen lässt."""
-    try:
-        if skills.T.is_action(text):
-            return True
-        lower = str(text or "").casefold()
-        for keywords in skills.T._CATEGORY_KEYWORDS.values():
-            for keyword in keywords:
-                value = str(keyword).strip().casefold()
-                if value and re.search(rf"(?<!\w){re.escape(value)}\w*", lower):
-                    return True
-    except Exception:
-        pass
-    return bool(re.search(
-        r"\d\s*(?:[+*/×÷]|[-−]|plus\b|mal\b|geteilt\s+durch\b)\s*\d",
-        str(text or ""),
-        re.IGNORECASE,
-    ))
+        return f"{previous_user_text}\n{text}", True
+    return text, False
 
 
 def _apply_voice_tool_context_policy(
-    text: str, names, force: bool, *, inherited_context: bool,
-    has_previous_user: bool,
+    names, force: bool, *, inherited_context: bool,
 ) -> tuple[list[str], bool]:
     if inherited_context:
         read_only = dict.fromkeys(
@@ -247,14 +226,12 @@ def _apply_voice_tool_context_policy(
 
 
 def _voice_keyword_tool_selection(
-    text: str, selection_text: str, *, inherited_context: bool,
-    has_previous_user: bool,
+    selection_text: str, *, inherited_context: bool,
 ) -> tuple[list[str], bool]:
     names, force = _keyword_tool_selection(selection_text)
     return _apply_voice_tool_context_policy(
-        text, names, force,
+        names, force,
         inherited_context=inherited_context,
-        has_previous_user=has_previous_user,
     )
 
 
@@ -819,13 +796,12 @@ class MessageHandler:
     async def prepare_voice_turn(self, text: str) -> VoiceTurnPrework:
         """Baut Voice-Kontext und lokale Tool-Vorauswahl ohne Cloud-Klassifikation."""
         started = time.perf_counter()
-        selection_text, inherited_context, has_previous_user = _tool_selection_context(
+        selection_text, inherited_context = _tool_selection_context(
             getattr(self, "kzg", None), text,
         )
         keyword_tools, force_tools = _voice_keyword_tool_selection(
-            text, selection_text,
+            selection_text,
             inherited_context=inherited_context,
-            has_previous_user=has_previous_user,
         )
         system = await self.prompt_builder.build(text, speculative=True)
         return VoiceTurnPrework(
@@ -959,11 +935,11 @@ class MessageHandler:
             and partial_text_matches_final(prework.text, text)
         )
         if voice_turn:
-            selection_text, inherited_context, has_previous_user = (
+            selection_text, inherited_context = (
                 _tool_selection_context(getattr(self, "kzg", None), text)
             )
         else:
-            selection_text, inherited_context, has_previous_user = text, False, False
+            selection_text, inherited_context = text, False
 
         async def build_context():
             if execution_gate is not None:
@@ -1090,9 +1066,8 @@ class MessageHandler:
                 names, force = _keyword_tool_selection(selection_text)
             if voice_turn:
                 return _apply_voice_tool_context_policy(
-                    text, names, force,
+                    names, force,
                     inherited_context=inherited_context,
-                    has_previous_user=has_previous_user,
                 )
             return names, force
 
@@ -1108,9 +1083,8 @@ class MessageHandler:
                     return _keyword_selection()
                 if voice_turn:
                     return _apply_voice_tool_context_policy(
-                        text, names, force,
+                        names, force,
                         inherited_context=inherited_context,
-                        has_previous_user=has_previous_user,
                     )
                 return names, force
 
