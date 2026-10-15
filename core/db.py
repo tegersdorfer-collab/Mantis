@@ -863,6 +863,10 @@ MIGRATIONS.extend([
     );
     """,
     "CREATE INDEX IF NOT EXISTS gym_workout_exercises_order_idx ON gym_workout_exercises (workout_id, sort_order, id);",
+    # Zieleinheit je Planübung: Wiederholungen oder Sekunden (zeitbasierte Übungen).
+    # Inline-CHECK mit IF NOT EXISTS: kein zweiter Constraint bei erneutem Lauf.
+    "ALTER TABLE gym_plan_exercises ADD COLUMN IF NOT EXISTS target_unit TEXT NOT NULL DEFAULT 'reps' CHECK (target_unit IN ('reps','seconds'));",
+    "ALTER TABLE gym_workout_exercises ADD COLUMN IF NOT EXISTS target_unit TEXT NOT NULL DEFAULT 'reps' CHECK (target_unit IN ('reps','seconds'));",
 ])
 
 

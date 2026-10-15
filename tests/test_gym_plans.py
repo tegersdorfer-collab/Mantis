@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from core import db
-from domains.gym import plans, session
+from domains.gym import ap_text_import, plans, session
 from domains.gym.aliases import normalize_alias
 
 
@@ -251,3 +251,95 @@ def test_plan_session_snapshots_day_and_reorders_session_exercises(plan_database
 
     reordered = plans.session_exercises(started["id"], started["title"])
     assert [item["exercise_id"] for item in reordered] == [alias_id, canonical_id]
+
+
+def _export_text(name, rows):
+    """Baut einen synthetischen AP-Export; rows = (Tag, Datum, [(Übung, Ziel)])."""
+    lines = []
+    for index, (day, day_date, exercises) in enumerate(rows):
+        number = plans.PLAN_DAY_ORDER.index(day) + 1
+        lines.append(f'"{day} · Day {number} · Week {7 - index} · {name}";"{day_date} 19:37 h";"1 hr"')
+        for position, (label, target) in enumerate(exercises, 1):
+            suffix = f" · {target} reps" if target else ""
+            lines.extend([f'"{position}. {label}{suffix}"', "#;KG;REPS", "1;50;8"])
+        lines.append("")
+    return "\n".join(lines)
+
+
+@pytest.mark.db
+def test_seed_takes_rep_targets_from_latest_ap_export_workout_of_same_day(plan_database):
+    name = plan_database["name"]
+    export = _export_text(name, [
+        ("Lower A", "2026-10-05", [(f"{name} Canonical", 5)]),
+        ("Upper B", "2026-10-08", [(f"{name} Alias", 7)]),
+        ("Upper B", "2026-10-02", [(f"{name} Alias", 9)]),
+    ])
+    workouts = ap_text_import.parse_export(export)
+
+    preview = plans.preview_seed(name, ap_workouts=workouts)
+    seeded = plans.seed_plan(name, ap_workouts=workouts)
+
+    lower_a = preview["days"][0]["exercises"][0]
+    upper_b = preview["days"][3]["exercises"][0]
+    assert (lower_a["rep_min"], lower_a["rep_max"]) == (5, 5)
+    assert (upper_b["rep_min"], upper_b["rep_max"]) == (7, 7)
+    stored = seeded["days"][3]["exercises"][0]
+    assert (stored["rep_min"], stored["rep_max"], stored["target_unit"]) == (7, 7, "reps")
+
+
+@pytest.mark.db
+def test_seed_without_ap_export_keeps_exercise_defaults(plan_database):
+    seeded = plans.seed_plan(plan_database["name"])
+
+    assert all(
+        item["target_unit"] == "reps"
+        for day in seeded["days"] for item in day["exercises"]
+    )
+    first = seeded["days"][0]["exercises"][0]
+    assert (first["rep_min"], first["rep_max"]) == (8, 12)
+
+
+@pytest.mark.db
+def test_seed_includes_time_based_exercises_with_seconds_target(plan_database):
+    name = plan_database["name"]
+    hang_id = db.insert_returning(
+        """INSERT INTO exercises (name,category,unit,rep_min,rep_max,load_mode)
+           VALUES (%s,'strength','min',6,10,'added') RETURNING id""",
+        (f"{name} Hang",),
+    )
+    started = None
+    try:
+        upper_b = db.query_one(
+            "SELECT id FROM workouts WHERE title LIKE %s ORDER BY date DESC LIMIT 1", (f"Upper B%{name}",)
+        )["id"]
+        for index, seconds in ((5, 34), (6, 27)):
+            db.execute(
+                """INSERT INTO workout_sets
+                     (workout_id,exercise_id,set_index,reps,weight_kg,duration_s,is_warmup)
+                   VALUES (%s,%s,%s,NULL,20,%s,FALSE)""",
+                (upper_b, hang_id, index, seconds),
+            )
+
+        seeded = plans.seed_plan(name)
+        items = seeded["days"][3]["exercises"]
+        hang = next(item for item in items if item["exercise_id"] == hang_id)
+
+        assert hang["target_unit"] == "seconds"
+        assert hang["target_sets"] == 2
+        assert (hang["rep_min"], hang["rep_max"]) == (30, 40)
+        assert [item["target_unit"] for item in items if item is not hang] == ["reps"]
+
+        started = plans.start_plan_session(
+            seeded["days"][3]["id"], datetime(2026, 10, 15, 10, 0, tzinfo=ZoneInfo("Europe/Berlin"))
+        )
+        plan_database["workouts"].append(started["id"])
+        state = plans.session_exercises(started["id"], started["title"])
+        entry = next(item for item in state if item["exercise_id"] == hang_id)
+        assert entry["target_unit"] == "seconds"
+        assert entry["prefill"] == [{"weight_kg": 20.0, "reps": 34}, {"weight_kg": 20.0, "reps": 27}]
+    finally:
+        if started:
+            db.execute("DELETE FROM workouts WHERE id=%s", (started["id"],))
+        db.execute("DELETE FROM gym_plans WHERE name=%s", (name,))
+        db.execute("DELETE FROM workout_sets WHERE exercise_id=%s", (hang_id,))
+        db.execute("DELETE FROM exercises WHERE id=%s", (hang_id,))

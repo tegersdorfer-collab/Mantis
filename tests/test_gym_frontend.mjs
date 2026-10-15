@@ -1315,3 +1315,29 @@ test("offene Session zeigt auch ohne aktiven Plan oben Fortsetzen", async () => 
   assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("data-action=\"continue-session\"")), true);
   assert.match(app.elements.get("#screen").innerHTML, /Fortsetzen/);
 });
+
+test("Zielanzeige: Sekunden-Übungen zeigen 's', reine Ziele ohne Spanne", async () => {
+  const state = {
+    session: { id: 1, started_at: "2026-10-14T10:00:00Z" },
+    exercises: [
+      { name: "Weighted Deadhang", rest_s: 180, rep_min: 30, rep_max: 40, target_unit: "seconds", prefill: [{ weight_kg: 20, reps: 34 }], logged: [] },
+      { name: "Bench Press", rest_s: 180, rep_min: 4, rep_max: 4, target_unit: "reps", prefill: [], logged: [] },
+    ],
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes("class=\"exercise-list\"")), true);
+  await app.click("open-exercise", { exercise: "Weighted Deadhang" });
+  assert.match(screen(), /Ziel 30–40 s/);
+  assert.doesNotMatch(screen(), /Wdh\./);
+
+  await app.click("open-exercise", { exercise: "Bench Press" });
+  assert.match(screen(), /Ziel 4 Wdh\./);
+});

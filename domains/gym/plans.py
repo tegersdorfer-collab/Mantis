@@ -9,6 +9,7 @@ from statistics import median
 
 from core import db
 from domains.gym import session
+from domains.gym.ap_text_import import APWorkout, resolve_exercise_row
 from domains.gym.aliases import normalize_alias
 from domains.gym.tracker import EXERCISES, REST_SECONDS, TrackerError
 
@@ -16,6 +17,9 @@ from domains.gym.tracker import EXERCISES, REST_SECONDS, TrackerError
 PLAN_DAY_ORDER = ("Lower A", "Upper A", "Lower B", "Upper B")
 DEFAULT_PLAN_NAME = "New plan"
 DEFAULT_REST_SECONDS = 180
+SECONDS_RANGE_WIDTH = 10
+MAX_REPS = 100
+MAX_SECONDS = 600
 
 
 def _date_value(value) -> date:
@@ -168,7 +172,43 @@ def _rotation_next_day(days: list[dict], workouts: list[dict]) -> tuple[str | No
     return last_day, next_day
 
 
-def _seed_data(cur, plan_name: str) -> dict:
+def _is_timed(source: dict, sets: list[dict]) -> bool:
+    """Zeitbasierte Kraftübung: Einheit 'min', Sätze mit Dauer, ohne Strecke."""
+    return (
+        str(source.get("unit") or "").casefold() == "min"
+        and bool(sets)
+        and all(row.get("duration_s") is not None and row.get("distance_km") is None for row in sets)
+    )
+
+
+def _ap_rep_targets(cur, ap_workouts, plan_name: str, exercise_by_id, canonical_ids) -> dict:
+    """Mappt AP-Exportziele ('x reps') je (Plantag, Übungs-ID); jüngstes Workout gewinnt."""
+    if not ap_workouts:
+        return {}
+    from domains.gym.aliases import load_aliases
+
+    aliases = load_aliases()
+    rows = [dict(row) for row in exercise_by_id.values()]
+    wanted = plan_name.casefold()
+    ordered = sorted(
+        (w for w in ap_workouts if wanted in w.title.casefold() and _day_from_title(w.title)),
+        key=lambda w: w.started_at, reverse=True,
+    )
+    targets: dict[tuple[str, int], int] = {}
+    for workout in ordered:
+        day = _day_from_title(workout.title)
+        for item in workout.exercises:
+            if not item.target_reps:
+                continue
+            row = resolve_exercise_row(item, aliases, rows)
+            if row is None or row.get("id") is None:
+                continue
+            exercise_id = canonical_ids.get(int(row["id"]), int(row["id"]))
+            targets.setdefault((day, exercise_id), item.target_reps)
+    return targets
+
+
+def _seed_data(cur, plan_name: str, ap_workouts: list[APWorkout] | None = None) -> dict:
     cur.execute(
         """SELECT id,date,title,created_at FROM workouts
            WHERE type IN ('gym','strength') AND title ILIKE %s""",
@@ -200,6 +240,7 @@ def _seed_data(cur, plan_name: str) -> dict:
     }
     cur.execute(
         """SELECT ws.id,ws.workout_id,ws.exercise_id,ws.set_index,
+                  ws.duration_s,ws.distance_km,
                   COALESCE(ws.is_warmup,FALSE) AS is_warmup
            FROM workout_sets ws WHERE ws.workout_id=ANY(%s)
            ORDER BY ws.workout_id,ws.set_index,ws.id""",
@@ -213,6 +254,7 @@ def _seed_data(cur, plan_name: str) -> dict:
     valid_by_day: dict[str, list[dict]] = {day: [] for day in PLAN_DAY_ORDER}
     counts_by_workout: dict[int, dict[int, int]] = {}
     ordered_exercises: dict[int, list[int]] = {}
+    timed_ids: set[int] = set()
     for workout in current_workouts:
         workout_id = int(workout["id"])
         day = _day_from_title(workout.get("title"))
@@ -230,7 +272,13 @@ def _seed_data(cur, plan_name: str) -> dict:
             if str(source.get("category") or "strength").casefold() == "cardio":
                 continue
             if str(source.get("unit") or "reps").casefold() != "reps":
-                continue
+                workout_rows = [
+                    r for r in sets_by_workout.get(workout_id, [])
+                    if int(r["exercise_id"]) == source_id and not r["is_warmup"]
+                ]
+                if not _is_timed(source, workout_rows):
+                    continue
+                timed_ids.add(canonical_ids.get(source_id, source_id))
             exercise_id = canonical_ids.get(source_id, source_id)
             target = exercise_by_id.get(exercise_id)
             if not target:
@@ -241,6 +289,7 @@ def _seed_data(cur, plan_name: str) -> dict:
         counts_by_workout[workout_id] = counts
         ordered_exercises[workout_id] = exercise_order
 
+    ap_targets = _ap_rep_targets(cur, ap_workouts, plan_name, exercise_by_id, canonical_ids)
     days = []
     for sort_order, day_name in enumerate(PLAN_DAY_ORDER):
         workouts = sorted(valid_by_day[day_name], key=_workout_sort_key, reverse=True)
@@ -261,8 +310,23 @@ def _seed_data(cur, plan_name: str) -> dict:
                 ))
             else:
                 target = 3
-            low = int(exercise.get("rep_min") or 6)
-            high = int(exercise.get("rep_max") or 10)
+            target_unit = "seconds" if exercise_id in timed_ids else "reps"
+            if target_unit == "seconds":
+                # Kein AP-Ziel für Haltezeiten: Median der letzten Sätze, auf 5 s gerundet,
+                # plus 10 s Spielraum als Obergrenze.
+                durations = [
+                    int(row["duration_s"]) for row in sets_by_workout.get(int(latest["id"]), [])
+                    if not row["is_warmup"] and row.get("duration_s") is not None
+                    and canonical_ids.get(int(row["exercise_id"]), int(row["exercise_id"])) == exercise_id
+                ]
+                low = max(5, int(round(median(durations) / 5.0)) * 5) if durations else 30
+                high = low + SECONDS_RANGE_WIDTH
+            elif (day_name, exercise_id) in ap_targets:
+                # AP kennt genau ein Ziel: reines Ziel (min == max) statt erfundener Spanne.
+                low = high = ap_targets[(day_name, exercise_id)]
+            else:
+                low = int(exercise.get("rep_min") or 6)
+                high = int(exercise.get("rep_max") or 10)
             entries.append({
                 "exercise_id": exercise_id,
                 "name": exercise["name"],
@@ -271,6 +335,7 @@ def _seed_data(cur, plan_name: str) -> dict:
                 "rep_min": low,
                 "rep_max": max(low, high),
                 "rest_s": DEFAULT_REST_SECONDS,
+                "target_unit": target_unit,
             })
         days.append({"name": day_name, "sort_order": sort_order, "exercises": entries})
     return {
@@ -281,16 +346,20 @@ def _seed_data(cur, plan_name: str) -> dict:
     }
 
 
-def preview_seed(plan_name: str = DEFAULT_PLAN_NAME) -> dict:
+def preview_seed(
+    plan_name: str = DEFAULT_PLAN_NAME, ap_workouts: list[APWorkout] | None = None,
+) -> dict:
     """Liest AP-Workouts und leitet den Seed ohne Änderungen an der DB ab."""
     with db.cursor() as cur:
-        return _seed_data(cur, plan_name)
+        return _seed_data(cur, plan_name, ap_workouts)
 
 
-def seed_plan(plan_name: str = DEFAULT_PLAN_NAME) -> dict:
+def seed_plan(
+    plan_name: str = DEFAULT_PLAN_NAME, ap_workouts: list[APWorkout] | None = None,
+) -> dict:
     """Ersetzt den benannten Seed-Plan atomar und aktiviert ihn idempotent."""
     with db.cursor() as cur:
-        data = _seed_data(cur, plan_name)
+        data = _seed_data(cur, plan_name, ap_workouts)
         cur.execute("UPDATE gym_plans SET active=FALSE WHERE active=TRUE")
         cur.execute(
             """INSERT INTO gym_plans (name,start_date,active)
@@ -312,10 +381,10 @@ def seed_plan(plan_name: str = DEFAULT_PLAN_NAME) -> dict:
             for item in day["exercises"]:
                 cur.execute(
                     """INSERT INTO gym_plan_exercises
-                         (day_id,exercise_id,sort_order,target_sets,rep_min,rep_max,rest_s)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                         (day_id,exercise_id,sort_order,target_sets,rep_min,rep_max,rest_s,target_unit)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (day_id, item["exercise_id"], item["sort_order"], item["target_sets"],
-                     item["rep_min"], item["rep_max"], item["rest_s"]),
+                     item["rep_min"], item["rep_max"], item["rest_s"], item["target_unit"]),
                 )
     return get_plan(plan_id)
 
@@ -346,7 +415,7 @@ def get_plan(plan_id: int) -> dict:
         day["sort_order"] = int(day["sort_order"])
         day["exercises"] = db.query(
             """SELECT pe.id,pe.exercise_id,e.name,e.muscle,e.equipment,
-                      pe.sort_order,pe.target_sets,pe.rep_min,pe.rep_max,pe.rest_s
+                      pe.sort_order,pe.target_sets,pe.rep_min,pe.rep_max,pe.rest_s,pe.target_unit
                FROM gym_plan_exercises pe JOIN exercises e ON e.id=pe.exercise_id
                WHERE pe.day_id=%s ORDER BY pe.sort_order,pe.id""",
             (day["id"],),
@@ -484,11 +553,13 @@ def reorder_days(plan_id: int, day_ids: list[int]) -> dict:
     return get_plan(plan_id)
 
 
-def _validate_plan_exercise_values(target_sets, rep_min, rep_max, rest_s) -> tuple[int, int, int, int]:
+def _validate_plan_exercise_values(
+    target_sets, rep_min, rep_max, rest_s, target_unit: str = "reps",
+) -> tuple[int, int, int, int]:
     values = (target_sets, rep_min, rep_max, rest_s)
     if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
         raise TrackerError(400, "Sätze, Wiederholungsbereich und Pausenzeit müssen ganze Zahlen sein")
-    if not 1 <= target_sets <= 20 or not 1 <= rep_min <= rep_max <= 100 or not 0 <= rest_s <= 900:
+    if not 1 <= target_sets <= 20 or not 1 <= rep_min <= rep_max <= (MAX_SECONDS if target_unit == "seconds" else MAX_REPS) or not 0 <= rest_s <= 900:
         raise TrackerError(400, "Sätze, Wiederholungsbereich oder Pausenzeit liegen außerhalb des gültigen Bereichs")
     return target_sets, rep_min, rep_max, rest_s
 
@@ -501,19 +572,26 @@ def add_exercise(
     day = db.query_one("SELECT id FROM gym_plan_days WHERE id=%s", (day_id,))
     if not day:
         raise TrackerError(404, "Plantag nicht gefunden")
-    exercise = db.query_one("SELECT id,rep_min,rep_max FROM exercises WHERE id=%s", (exercise_id,))
+    exercise = db.query_one("SELECT id,rep_min,rep_max,unit FROM exercises WHERE id=%s", (exercise_id,))
     if not exercise:
         raise TrackerError(404, "Übung nicht gefunden")
-    low = int(exercise.get("rep_min") or 6) if rep_min is None else rep_min
-    high = int(exercise.get("rep_max") or 10) if rep_max is None else rep_max
-    target_sets, low, high, rest_s = _validate_plan_exercise_values(target_sets, low, high, rest_s)
+    target_unit = "seconds" if str(exercise.get("unit") or "").casefold() == "min" else "reps"
+    if target_unit == "seconds":
+        low = 30 if rep_min is None else rep_min
+        high = low + SECONDS_RANGE_WIDTH if rep_max is None else rep_max
+    else:
+        low = int(exercise.get("rep_min") or 6) if rep_min is None else rep_min
+        high = int(exercise.get("rep_max") or 10) if rep_max is None else rep_max
+    target_sets, low, high, rest_s = _validate_plan_exercise_values(
+        target_sets, low, high, rest_s, target_unit,
+    )
     order = db.query_one("SELECT COALESCE(MAX(sort_order),-1)+1 AS next FROM gym_plan_exercises WHERE day_id=%s", (day_id,))["next"]
     try:
         item_id = db.insert_returning(
             """INSERT INTO gym_plan_exercises
-                 (day_id,exercise_id,sort_order,target_sets,rep_min,rep_max,rest_s)
-               VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-            (day_id, exercise_id, order, target_sets, low, high, rest_s),
+                 (day_id,exercise_id,sort_order,target_sets,rep_min,rep_max,rest_s,target_unit)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (day_id, exercise_id, order, target_sets, low, high, rest_s, target_unit),
         )
     except Exception as error:
         if "unique" in str(error).lower():
@@ -521,7 +599,7 @@ def add_exercise(
         raise
     return db.query_one(
         """SELECT pe.id,pe.exercise_id,e.name,e.muscle,e.equipment,pe.sort_order,
-                  pe.target_sets,pe.rep_min,pe.rep_max,pe.rest_s
+                  pe.target_sets,pe.rep_min,pe.rep_max,pe.rest_s,pe.target_unit
            FROM gym_plan_exercises pe JOIN exercises e ON e.id=pe.exercise_id WHERE pe.id=%s""",
         (item_id,),
     )
@@ -532,7 +610,7 @@ def update_plan_exercise(entry_id: int, **values) -> dict:
     if not values or values.keys() - allowed:
         raise TrackerError(400, "Ungültige Planübung-Änderung")
     item = db.query_one(
-        "SELECT id,day_id,sort_order,target_sets,rep_min,rep_max,rest_s FROM gym_plan_exercises WHERE id=%s",
+        "SELECT id,day_id,sort_order,target_sets,rep_min,rep_max,rest_s,target_unit FROM gym_plan_exercises WHERE id=%s",
         (entry_id,),
     )
     if not item:
@@ -545,7 +623,8 @@ def update_plan_exercise(entry_id: int, **values) -> dict:
     if updated["sort_order"] < 0:
         raise TrackerError(400, "Ungültige Übungsreihenfolge")
     _validate_plan_exercise_values(
-        updated["target_sets"], updated["rep_min"], updated["rep_max"], updated["rest_s"]
+        updated["target_sets"], updated["rep_min"], updated["rep_max"], updated["rest_s"],
+        item["target_unit"],
     )
     if "sort_order" in values:
         rows = db.query(
@@ -576,7 +655,7 @@ def update_plan_exercise(entry_id: int, **values) -> dict:
     )
     return db.query_one(
         """SELECT pe.id,pe.exercise_id,e.name,e.muscle,e.equipment,pe.sort_order,
-                  pe.target_sets,pe.rep_min,pe.rep_max,pe.rest_s
+                  pe.target_sets,pe.rep_min,pe.rep_max,pe.rest_s,pe.target_unit
            FROM gym_plan_exercises pe JOIN exercises e ON e.id=pe.exercise_id WHERE pe.id=%s""",
         (entry_id,),
     )
@@ -682,17 +761,25 @@ def _last_sets(exercise_id: int, *, exclude_workout_id: int | None = None) -> li
     if not recent:
         return []
     return db.query(
-        """SELECT ws.weight_kg,ws.reps,ws.set_index FROM workout_sets ws
+        """SELECT ws.weight_kg,ws.reps,ws.duration_s,ws.set_index FROM workout_sets ws
            WHERE ws.workout_id=%s AND ws.exercise_id=ANY(%s)
              AND COALESCE(ws.is_warmup,FALSE)=FALSE ORDER BY ws.set_index,ws.id""",
         (recent["workout_id"], ids),
     )
 
 
+def _set_amount(row: dict) -> int:
+    """Wdh. eines Satzes; bei zeitbasierten Sätzen ohne Wdh. die Dauer in Sekunden."""
+    value = row.get("reps")
+    if value is None:
+        value = row.get("duration_s")
+    return int(value or 0)
+
+
 def _session_entry_state(entry: dict, workout_id: int) -> dict:
     ids = _exercise_ids(int(entry["exercise_id"]))
     logged = db.query(
-        """SELECT id,client_id,weight_kg,reps,set_index FROM workout_sets
+        """SELECT id,client_id,weight_kg,reps,duration_s,set_index FROM workout_sets
            WHERE workout_id=%s AND exercise_id=ANY(%s) AND COALESCE(is_warmup,FALSE)=FALSE
            ORDER BY set_index,id""",
         (workout_id, ids),
@@ -707,19 +794,20 @@ def _session_entry_state(entry: dict, workout_id: int) -> dict:
         "target_sets": int(entry.get("target_sets") or 3),
         "rep_min": int(entry.get("rep_min") or 6),
         "rep_max": int(entry.get("rep_max") or 10),
+        "target_unit": entry.get("target_unit") or "reps",
         "sort_order": int(entry.get("sort_order") or 0),
         "session_exercise_id": int(entry.get("session_exercise_id") or 0),
         "note": entry.get("note") or "",
         "skipped": bool(entry.get("skipped")),
         "prefill": [
             {"weight_kg": float(row["weight_kg"]) if row.get("weight_kg") is not None else None,
-             "reps": int(row["reps"])}
+             "reps": _set_amount(row)}
             for row in _last_sets(int(entry["exercise_id"]), exclude_workout_id=workout_id)
         ],
         "logged": [
             {"id": int(row["id"]), "client_id": row.get("client_id"),
              "weight_kg": float(row["weight_kg"]) if row.get("weight_kg") is not None else None,
-             "reps": int(row["reps"]), "set_index": int(row["set_index"])}
+             "reps": _set_amount(row), "set_index": int(row["set_index"])}
             for row in logged
         ],
     }
@@ -728,8 +816,8 @@ def _session_entry_state(entry: dict, workout_id: int) -> dict:
 def _snapshot_day(cur, workout_id: int, day_id: int) -> None:
     cur.execute(
         """INSERT INTO gym_workout_exercises
-             (workout_id,exercise_id,sort_order,target_sets,rep_min,rep_max,rest_s)
-           SELECT %s,exercise_id,sort_order,target_sets,rep_min,rep_max,rest_s
+             (workout_id,exercise_id,sort_order,target_sets,rep_min,rep_max,rest_s,target_unit)
+           SELECT %s,exercise_id,sort_order,target_sets,rep_min,rep_max,rest_s,target_unit
            FROM gym_plan_exercises WHERE day_id=%s
            ON CONFLICT (workout_id,exercise_id) DO NOTHING""",
         (workout_id, day_id),
@@ -739,7 +827,7 @@ def _snapshot_day(cur, workout_id: int, day_id: int) -> None:
 def session_exercises(workout_id: int, title: str | None, fallback: list[dict] | None = None) -> list[dict]:
     rows = db.query(
         """SELECT we.id AS session_exercise_id,we.exercise_id,we.sort_order,we.target_sets,
-                  we.rep_min,we.rep_max,we.rest_s,we.note,we.skipped,
+                  we.rep_min,we.rep_max,we.rest_s,we.target_unit,we.note,we.skipped,
                   e.name,e.muscle,e.equipment
            FROM gym_workout_exercises we JOIN exercises e ON e.id=we.exercise_id
            WHERE we.workout_id=%s ORDER BY we.sort_order,we.id""",

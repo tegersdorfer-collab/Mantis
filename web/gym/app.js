@@ -452,23 +452,33 @@ function renderLoggedRow(set) {
   </div>`;
 }
 
-function renderDraftRow(draft, index, setNumber) {
+function repUnit(entry) {
+  return entry && entry.target_unit === "seconds" ? "s" : "Wdh.";
+}
+
+function targetLabel(entry) {
+  if (!entry || !entry.rep_min || !entry.rep_max) return "";
+  const span = entry.rep_min === entry.rep_max ? `${entry.rep_min}` : `${entry.rep_min}–${entry.rep_max}`;
+  return ` · Ziel ${span} ${repUnit(entry)}`;
+}
+
+function renderDraftRow(draft, index, setNumber, unit = "Wdh.") {
   return `<div class="set-row">
     <span class="set-number">${setNumber}</span>
     ${measureControl("weight_kg", draft.weight_kg, "draft", index, "kg", draft.client_id)}
-    ${measureControl("reps", draft.reps, "draft", index, "Wdh.", draft.client_id)}
+    ${measureControl("reps", draft.reps, "draft", index, unit, draft.client_id)}
     <button class="check-button" type="button" data-action="log-draft" data-client-id="${escapeHtml(draft.client_id)}" data-index="${index}"
       aria-label="Satz ${setNumber} speichern">✓</button>
   </div>`;
 }
 
-function renderEditPanel(set) {
+function renderEditPanel(set, unit = "Wdh.") {
   if (!editingSet || String(set.id) !== String(editingSet.id)) return "";
   return `<section class="edit-panel" aria-label="Satz bearbeiten">
     <h2>Satz bearbeiten</h2>
     <div class="edit-controls">
       ${measureControl("weight_kg", editingSet.weight_kg, "edit", "", "kg")}
-      ${measureControl("reps", editingSet.reps, "edit", "", "Wdh.")}
+      ${measureControl("reps", editingSet.reps, "edit", "", unit)}
     </div>
     <div class="edit-actions">
       <button class="button button-primary" type="button" data-action="save-edit">Änderung speichern</button>
@@ -498,12 +508,10 @@ function renderExercise() {
   const completedLabel = exercise.logged.length === 1 ? "Satz erledigt" : "Sätze erledigt";
   const logged = exercise.logged.map(renderLoggedRow).join("");
   const draftRows = openDrafts.map((draft, index) =>
-    renderDraftRow(draft, index, exercise.logged.length + index + 1)
+    renderDraftRow(draft, index, exercise.logged.length + index + 1, repUnit(exercise))
   ).join("");
-  const editPanel = exercise.logged.map((set) => renderEditPanel(set)).join("");
-  const repRange = exercise.rep_min && exercise.rep_max
-    ? ` · Ziel ${exercise.rep_min}–${exercise.rep_max} Wdh.`
-    : "";
+  const editPanel = exercise.logged.map((set) => renderEditPanel(set, repUnit(exercise))).join("");
+  const repRange = targetLabel(exercise);
   const sessionActions = appState.session ? `<section class="session-exercise-tools" aria-label="Übungsoptionen">
       <button class="small-button" type="button" data-action="move-session-exercise" data-direction="-1" ${exerciseIndex <= 0 ? "disabled" : ""}>↑ Reihenfolge</button>
       <button class="small-button" type="button" data-action="move-session-exercise" data-direction="1" ${exerciseIndex >= appState.exercises.length - 1 ? "disabled" : ""}>↓ Reihenfolge</button>
@@ -697,8 +705,8 @@ function renderPlanTab() {
       ${(day.exercises ?? []).map((item, itemIndex) => `<div class="plan-exercise-editor">
         <strong>${escapeHtml(item.name)}</strong><div class="plan-exercise-fields">
           <label>Sätze<input type="number" min="1" max="20" data-plan-value="target_sets" data-entry-id="${item.id}" value="${item.target_sets}"></label>
-          <label>Wdh. min<input type="number" min="1" max="100" data-plan-value="rep_min" data-entry-id="${item.id}" value="${item.rep_min}"></label>
-          <label>Wdh. max<input type="number" min="1" max="100" data-plan-value="rep_max" data-entry-id="${item.id}" value="${item.rep_max}"></label>
+          <label>${item.target_unit === "seconds" ? "Sek." : "Wdh."} min<input type="number" min="1" max="${item.target_unit === "seconds" ? 600 : 100}" data-plan-value="rep_min" data-entry-id="${item.id}" value="${item.rep_min}"></label>
+          <label>${item.target_unit === "seconds" ? "Sek." : "Wdh."} max<input type="number" min="1" max="${item.target_unit === "seconds" ? 600 : 100}" data-plan-value="rep_max" data-entry-id="${item.id}" value="${item.rep_max}"></label>
           <label>Pause<input type="number" min="0" max="900" step="30" data-plan-value="rest_s" data-entry-id="${item.id}" value="${item.rest_s}"></label></div>
         <div class="editor-tools"><button class="small-button" type="button" data-action="save-plan-exercise" data-entry-id="${item.id}">Speichern</button>
           <button class="small-button" type="button" data-action="move-plan-exercise" data-day-id="${day.id}" data-entry-id="${item.id}" data-entry-index="${itemIndex}" data-direction="-1" ${itemIndex === 0 ? "disabled" : ""}>↑</button>
