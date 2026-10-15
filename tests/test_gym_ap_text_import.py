@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -16,12 +16,15 @@ from domains.gym.ap_text_import import (
     APSet,
     APExercise,
     APWorkout,
+    ImportReport,
+    WorkoutReportEntry,
     _canonical_exercise,
     _equipment_code,
     _variant_name,
     import_workouts,
     parse_export,
 )
+from scripts import import_ap_text
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "ap_export_synthetic.txt"
@@ -43,7 +46,7 @@ def _exercise(name, equipment):
 
 @pytest.fixture
 def synthetic_import_database(monkeypatch):
-    def install(exercise_rows):
+    def install(exercise_rows, workout_rows=()):
         class Cursor:
             def execute(self, sql, _params=()):
                 self.sql = sql
@@ -53,6 +56,8 @@ def synthetic_import_database(monkeypatch):
             def fetchall(self):
                 if "FROM exercises" in self.sql:
                     return [dict(row) for row in exercise_rows]
+                if "FROM workouts" in self.sql:
+                    return [dict(row) for row in workout_rows]
                 return []
 
             def fetchone(self):
@@ -110,6 +115,51 @@ def test_import_prefers_existing_variant_for_exact_equipment(synthetic_exercise_
     )
 
 
+def test_import_resolves_full_equipment_alias_before_base_alias():
+    exercise = APExercise(
+        "Incline Press", "Smith machine", "reps", (APSet(1, 60, 8),),
+    )
+    aliases = {
+        ap_text_import.normalize_alias("Incline Press · Smith machine"):
+            ["Smith Incline Press"],
+        ap_text_import.normalize_alias("Incline Press"):
+            ["Generic Incline Press"],
+    }
+    rows = [
+        {"id": 40, "name": "Incline Press", "equipment": "smith_machine",
+         "unit": "reps", "load_mode": "external"},
+        {"id": 41, "name": "Smith Incline Press", "equipment": "smith_machine",
+         "unit": "reps", "load_mode": "external"},
+        {"id": 42, "name": "Generic Incline Press", "equipment": "smith_machine",
+         "unit": "reps", "load_mode": "external"},
+    ]
+
+    canonical, equipment, matched = _canonical_exercise(exercise, aliases, rows)
+
+    assert (canonical, equipment, matched["id"]) == (
+        "Smith Incline Press", "smith_machine", 41,
+    )
+
+
+def test_import_falls_back_to_base_alias_when_full_equipment_alias_is_missing():
+    exercise = APExercise("Incline Press", "Smith machine", "reps", ())
+    aliases = {
+        ap_text_import.normalize_alias("Incline Press"): ["Generic Incline Press"],
+    }
+    rows = [
+        {"id": 40, "name": "Incline Press", "equipment": "smith_machine",
+         "unit": "reps", "load_mode": "external"},
+        {"id": 42, "name": "Generic Incline Press", "equipment": "smith_machine",
+         "unit": "reps", "load_mode": "external"},
+    ]
+
+    canonical, equipment, matched = _canonical_exercise(exercise, aliases, rows)
+
+    assert (canonical, equipment, matched["id"]) == (
+        "Generic Incline Press", "smith_machine", 42,
+    )
+
+
 def test_import_dry_run_counts_unknown_name_as_new(
     synthetic_import_database,
 ):
@@ -124,6 +174,145 @@ def test_import_dry_run_counts_unknown_name_as_new(
     assert (canonical, equipment, matched) == (name, "cable", None)
     assert _variant_name(canonical, equipment, []) == name
     assert report.exercises_created == 1
+    assert [(item.date.isoformat(), item.title) for item in report.new_workouts] == [
+        ("2098-04-03", "Synthetic AP resolver"),
+    ]
+
+
+def test_import_detects_duplicate_even_if_time_and_title_differ(
+    synthetic_import_database,
+):
+    exercise_name = "Synthetic Press"
+    started_at = datetime(2098, 4, 3, 17, 22, tzinfo=ZoneInfo("Europe/Berlin"))
+    exercise_rows = [{
+        "id": 18, "name": exercise_name, "equipment": None,
+        "unit": "reps", "load_mode": "external",
+    }]
+    workout_rows = [
+        {"workout_id": 7, "title": "Gym", "created_at": started_at,
+         "exercise_id": 18, "exercise_name": exercise_name,
+         "weight_kg": 60.0, "reps": 8},
+        {"workout_id": 7, "title": "Gym", "created_at": started_at,
+         "exercise_id": 18, "exercise_name": exercise_name,
+         "weight_kg": 60.0, "reps": 8},
+    ]
+    synthetic_import_database(exercise_rows, workout_rows)
+    ap_workout = APWorkout(
+        "Synthetic AP plan", started_at.replace(minute=20), 45,
+        (APExercise(exercise_name, None, "reps", (
+            APSet(1, 60, 8), APSet(2, 60, 8),
+        )),),
+    )
+
+    report = import_workouts([ap_workout], dry_run=True)
+
+    assert (report.workouts_created, report.workouts_skipped) == (0, 1)
+    assert [(item.title, item.existing_title) for item in report.skipped_workouts] == [
+        ("Synthetic AP plan", "Gym"),
+    ]
+    assert report.unclear_workouts == ()
+
+
+def test_import_reports_partial_set_overlap_as_unclear(synthetic_import_database):
+    exercise_name = "Synthetic Bench Press"
+    started_at = datetime(2098, 4, 3, 17, 22, tzinfo=ZoneInfo("Europe/Berlin"))
+    exercise_rows = [{
+        "id": 18, "name": exercise_name, "equipment": None,
+        "unit": "reps", "load_mode": "external",
+    }]
+    workout_rows = [{
+        "workout_id": 7, "title": "Gym", "created_at": started_at,
+        "exercise_id": 18, "weight_kg": 60.0, "reps": 8,
+    }]
+    synthetic_import_database(exercise_rows, workout_rows)
+    ap_workout = APWorkout(
+        "Synthetic AP plan", started_at.replace(minute=20), 45,
+        (APExercise(exercise_name, None, "reps", (
+            APSet(1, 60, 8), APSet(2, 62, 7), APSet(3, 64, 6),
+        )),),
+    )
+
+    report = import_workouts([ap_workout], dry_run=True)
+
+    assert (report.workouts_created, report.workouts_skipped) == (0, 0)
+    assert report.new_workouts == ()
+    assert [(item.title, item.existing_title) for item in report.unclear_workouts] == [
+        ("Synthetic AP plan", "Gym"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("existing_start", "expected_category"),
+    (("18:50", "unclear"), ("18:51", "new")),
+)
+def test_import_uses_ninety_minute_boundary(
+    synthetic_import_database, existing_start, expected_category,
+):
+    exercise_name = "Synthetic Boundary Press"
+    existing_at = datetime.fromisoformat(
+        f"2098-04-03T{existing_start}:00+02:00",
+    )
+    synthetic_import_database(
+        [{"id": 18, "name": exercise_name, "equipment": None,
+          "unit": "reps", "load_mode": "external"}],
+        [{"workout_id": 7, "title": "Gym", "created_at": existing_at,
+          "exercise_id": None, "weight_kg": None, "reps": None}],
+    )
+    ap_workout = APWorkout(
+        "Synthetic AP plan",
+        datetime(2098, 4, 3, 17, 20, tzinfo=ZoneInfo("Europe/Berlin")),
+        45,
+        (APExercise(exercise_name, None, "reps", (APSet(1, 60, 8),)),),
+    )
+
+    report = import_workouts([ap_workout], dry_run=True)
+
+    if expected_category == "unclear":
+        assert [(item.title, item.existing_title) for item in report.unclear_workouts] == [
+            ("Synthetic AP plan", "Gym"),
+        ]
+        assert report.new_workouts == ()
+    else:
+        assert [(item.title, item.existing_title) for item in report.new_workouts] == [
+            ("Synthetic AP plan", None),
+        ]
+        assert report.unclear_workouts == ()
+
+
+def test_import_skips_exact_title_on_same_date_without_time_or_sets(
+    synthetic_import_database,
+):
+    ap_workout = APWorkout(
+        "Same title", datetime(2098, 4, 3, 17, 20, tzinfo=ZoneInfo("Europe/Berlin")),
+        45, (),
+    )
+    synthetic_import_database(
+        [],
+        [{"workout_id": 7, "title": "Same title", "created_at": None,
+          "exercise_id": None, "weight_kg": None, "reps": None}],
+    )
+
+    report = import_workouts([ap_workout], dry_run=True)
+
+    assert (report.workouts_created, report.workouts_skipped) == (0, 1)
+    assert [(item.title, item.existing_title) for item in report.skipped_workouts] == [
+        ("Same title", "Same title"),
+    ]
+
+
+def test_dry_run_detects_duplicates_inside_the_same_import(synthetic_import_database):
+    synthetic_import_database([])
+    workout = _workout("Synthetic Press", "Cable")
+
+    report = import_workouts([workout, workout], dry_run=True)
+
+    assert (report.workouts_created, report.workouts_skipped) == (1, 1)
+    assert [(item.title, item.existing_title) for item in report.new_workouts] == [
+        ("Synthetic AP resolver", None),
+    ]
+    assert [(item.title, item.existing_title) for item in report.skipped_workouts] == [
+        ("Synthetic AP resolver", "Synthetic AP resolver"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -189,6 +378,44 @@ def test_parser_converts_workout_duration_variants(duration, expected_minutes):
     text = f'"Synthetic workout";"2098-04-03 17:20 h";"{duration}"'
 
     assert parse_export(text)[0].duration_min == expected_minutes
+
+
+def test_parser_accepts_single_digit_hour_in_workout_start_time():
+    workout = parse_export('"Synthetic workout";"2098-04-03 9:05 h";"46 min"')[0]
+
+    assert workout.started_at == datetime(
+        2098, 4, 3, 9, 5, tzinfo=ZoneInfo("Europe/Berlin"),
+    )
+
+
+def test_import_cli_prints_new_skipped_and_unclear_workouts(
+    tmp_path, monkeypatch, capsys,
+):
+    export_path = tmp_path / "synthetic.txt"
+    export_path.write_text("synthetic", encoding="utf-8")
+    report = ImportReport(
+        workouts_created=1, workouts_skipped=1, exercises_created=0,
+        sets_created=0, dry_run=True,
+        new_workouts=(WorkoutReportEntry(date(2098, 4, 3), "New AP workout"),),
+        skipped_workouts=(WorkoutReportEntry(
+            date(2098, 4, 3), "AP plan", "Gym",
+        ),),
+        unclear_workouts=(WorkoutReportEntry(
+            date(2098, 4, 3), "Maybe AP plan", "Evening session",
+        ),),
+    )
+    monkeypatch.setattr(import_ap_text, "parse_export", lambda _text: ["parsed"])
+    monkeypatch.setattr(
+        import_ap_text, "import_workouts", lambda _workouts, dry_run: report,
+    )
+
+    assert import_ap_text.main([str(export_path), "--dry-run"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Dry-run: 1 neue Workouts, 1 übersprungen, 1 unklar" in output
+    assert "Neu: 2098-04-03 — New AP workout" in output
+    assert "Übersprungen: 2098-04-03 — AP plan ↔ Gym" in output
+    assert "Unklar: 2098-04-03 — Maybe AP plan ↔ Evening session" in output
 
 
 @pytest.fixture
@@ -300,12 +527,15 @@ def test_dry_run_counts_without_writing_rows(ap_import_database):
 
     assert (report.workouts_created, report.workouts_skipped) == (1, 0)
     assert report.exercises_created == 1
+    assert [(item.date.isoformat(), item.title) for item in report.new_workouts] == [
+        ("2098-04-04", title),
+    ]
     assert db.query_one("SELECT id FROM workouts WHERE title=%s", (title,)) is None
     assert db.query_one("SELECT id FROM exercises WHERE name=%s", (name,)) is None
 
 
 @pytest.mark.db
-def test_import_skips_existing_workout_with_same_local_start_time(ap_import_database):
+def test_import_marks_similar_time_workout_without_matching_sets_unclear(ap_import_database):
     token = uuid4().hex
     title = f"Synthetic AP duplicate {token}"
     existing_title = f"Synthetic earlier workout {token}"
@@ -321,7 +551,100 @@ def test_import_skips_existing_workout_with_same_local_start_time(ap_import_data
     )
     try:
         report = import_workouts(parse_export(text))
-        assert (report.workouts_created, report.workouts_skipped) == (0, 1)
+        assert (report.workouts_created, report.workouts_skipped) == (0, 0)
+        assert [(item.title, item.existing_title) for item in report.unclear_workouts] == [
+            (title, existing_title),
+        ]
         assert db.query_one("SELECT id FROM workouts WHERE title=%s", (title,)) is None
     finally:
         db.execute("DELETE FROM workouts WHERE id=%s", (workout_id,))
+
+
+@pytest.mark.db
+def test_import_duplicate_check_skips_same_sets_within_ninety_minutes(ap_import_database):
+    token = uuid4().hex
+    title = f"Synthetic AP duplicate check {token}"
+    existing_title = "Gym"
+    exercise_name = f"Synthetic {token} Incline Press"
+    workout_date = datetime(2098, 4, 5, 17, 22, tzinfo=ZoneInfo("Europe/Berlin"))
+    exercise_id = db.insert_returning(
+        """INSERT INTO exercises (name,category,unit,equipment,load_mode)
+           VALUES (%s,'strength','reps',NULL,'external') RETURNING id""",
+        (exercise_name,),
+    )
+    workout_id = db.insert_returning(
+        """INSERT INTO workouts (date,title,type,created_at)
+           VALUES (%s,%s,'strength',%s) RETURNING id""",
+        (workout_date.date(), existing_title, workout_date),
+    )
+    for set_index in (1, 2):
+        db.execute(
+            """INSERT INTO workout_sets (workout_id,exercise_id,set_index,reps,weight_kg)
+               VALUES (%s,%s,%s,8,60)""",
+            (workout_id, exercise_id, set_index),
+        )
+    ap_workout = APWorkout(
+        title,
+        datetime(2098, 4, 5, 17, 20, tzinfo=ZoneInfo("Europe/Berlin")),
+        45,
+        (APExercise(exercise_name, None, "reps", (
+            APSet(1, 60, 8), APSet(2, 60, 8),
+        )),),
+    )
+
+    try:
+        report = import_workouts([ap_workout])
+
+        assert (report.workouts_created, report.workouts_skipped) == (0, 1)
+        assert [(item.title, item.existing_title) for item in report.skipped_workouts] == [
+            (title, existing_title),
+        ]
+        assert report.unclear_workouts == ()
+        assert db.query_one("SELECT id FROM workouts WHERE title=%s", (title,)) is None
+    finally:
+        db.execute("DELETE FROM workouts WHERE id=%s", (workout_id,))
+        db.execute("DELETE FROM exercises WHERE id=%s", (exercise_id,))
+
+
+@pytest.mark.db
+def test_import_marks_less_than_half_matching_sets_unclear(ap_import_database):
+    token = uuid4().hex
+    title = f"Synthetic AP partial overlap {token}"
+    existing_title = "Gym"
+    exercise_name = f"Synthetic {token} Bench Press"
+    workout_date = datetime(2098, 4, 6, 17, 22, tzinfo=ZoneInfo("Europe/Berlin"))
+    exercise_id = db.insert_returning(
+        """INSERT INTO exercises (name,category,unit,equipment,load_mode)
+           VALUES (%s,'strength','reps',NULL,'external') RETURNING id""",
+        (exercise_name,),
+    )
+    workout_id = db.insert_returning(
+        """INSERT INTO workouts (date,title,type,created_at)
+           VALUES (%s,%s,'strength',%s) RETURNING id""",
+        (workout_date.date(), existing_title, workout_date),
+    )
+    db.execute(
+        """INSERT INTO workout_sets (workout_id,exercise_id,set_index,reps,weight_kg)
+           VALUES (%s,%s,1,8,60)""",
+        (workout_id, exercise_id),
+    )
+    ap_workout = APWorkout(
+        title,
+        datetime(2098, 4, 6, 17, 20, tzinfo=ZoneInfo("Europe/Berlin")),
+        45,
+        (APExercise(exercise_name, None, "reps", (
+            APSet(1, 60, 8), APSet(2, 62, 7), APSet(3, 64, 6),
+        )),),
+    )
+
+    try:
+        report = import_workouts([ap_workout], dry_run=True)
+
+        assert (report.workouts_created, report.workouts_skipped) == (0, 0)
+        assert [(item.title, item.existing_title) for item in report.unclear_workouts] == [
+            (title, existing_title),
+        ]
+        assert db.query_one("SELECT id FROM workouts WHERE title=%s", (title,)) is None
+    finally:
+        db.execute("DELETE FROM workouts WHERE id=%s", (workout_id,))
+        db.execute("DELETE FROM exercises WHERE id=%s", (exercise_id,))

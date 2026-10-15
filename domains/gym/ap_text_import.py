@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from io import StringIO
@@ -110,6 +111,28 @@ class ImportReport:
     exercises_created: int
     sets_created: int
     dry_run: bool = False
+    new_workouts: tuple["WorkoutReportEntry", ...] = ()
+    skipped_workouts: tuple["WorkoutReportEntry", ...] = ()
+    unclear_workouts: tuple["WorkoutReportEntry", ...] = ()
+
+
+@dataclass(frozen=True)
+class WorkoutReportEntry:
+    """Ein einzelnes Workout im Importbericht."""
+
+    date: date
+    title: str
+    existing_title: str | None = None
+
+
+SetSignature = tuple[str, float | None, int | None]
+
+
+@dataclass
+class _ExistingWorkout:
+    title: str | None
+    created_at: datetime | None
+    sets: Counter[SetSignature]
 
 
 def _cells(line: str, line_number: int) -> list[str]:
@@ -284,7 +307,8 @@ def parse_export(text: str) -> list[APWorkout]:
             if start_match:
                 finish_workout()
                 day = date.fromisoformat(start_match.group(1))
-                clock = time.fromisoformat(start_match.group(2))
+                hour, minute = map(int, start_match.group(2).split(":"))
+                clock = time(hour, minute)
                 current_workout = {
                     "title": cells[0],
                     "started_at": datetime.combine(day, clock, tzinfo=_BERLIN),
@@ -407,11 +431,19 @@ def _canonical_exercise(
     equipment = _equipment_code(exercise.equipment) or _equipment_code(embedded_equipment)
     raw_legacy = legacy_exercise_for_alias(raw_base)
     raw_canonical = raw_legacy.name if raw_legacy else raw_base
-    resolved, ambiguous, _fuzzy = resolve_alias(raw_base, aliases, allow_typo=False)
+    source_alias = _source_alias(exercise)
+    resolved, ambiguous, _fuzzy = resolve_alias(
+        source_alias, aliases, allow_typo=False,
+    )
+    if not resolved and not ambiguous:
+        resolved, ambiguous, _fuzzy = resolve_alias(
+            raw_base, aliases, allow_typo=False,
+        )
     candidates = [resolved] if resolved else list(ambiguous)
-    options = [(raw_canonical, equipment or (
+    raw_option = (raw_canonical, equipment or (
         _equipment_code(raw_legacy.equipment) if raw_legacy else None
-    ))]
+    ))
+    alias_options = []
     for candidate in candidates:
         candidate_base, candidate_embedded = split_equipment_variant(candidate)
         legacy = legacy_exercise_for_alias(candidate_base)
@@ -420,7 +452,11 @@ def _canonical_exercise(
         target_equipment = equipment or candidate_equipment
         if target_equipment is None and legacy:
             target_equipment = _equipment_code(legacy.equipment)
-        options.append((canonical, target_equipment, candidate_equipment))
+        alias_options.append((canonical, target_equipment, candidate_equipment))
+    options = (
+        [*alias_options, raw_option]
+        if source_alias != exercise.name else [raw_option, *alias_options]
+    )
 
     # Eine schon vorhandene, explizite Variante für das importierte Gerät hat Vorrang.
     exact_matches = []
@@ -520,12 +556,116 @@ def _workout_notes(workout: APWorkout) -> str | None:
     return "\n".join(notes) or None
 
 
+def _berlin_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=_BERLIN)
+    return value.astimezone(_BERLIN)
+
+
+def _set_signature(
+    exercise_key: str, weight_kg: float | None, reps: int | None,
+) -> SetSignature | None:
+    if weight_kg is None and reps is None:
+        return None
+    weight = round(float(weight_kg), 3) if weight_kg is not None else None
+    return exercise_key, weight, int(reps) if reps is not None else None
+
+
+def _existing_workouts(rows: list[dict]) -> list[_ExistingWorkout]:
+    by_id: dict[int, _ExistingWorkout] = {}
+    for row in rows:
+        workout_id = row["workout_id"]
+        workout = by_id.setdefault(workout_id, _ExistingWorkout(
+            title=row.get("title"), created_at=row.get("created_at"), sets=Counter(),
+        ))
+        exercise_id = row.get("exercise_id")
+        if exercise_id is None:
+            continue
+        signature = _set_signature(
+            f"id:{exercise_id}", row.get("weight_kg"), row.get("reps"),
+        )
+        if signature is not None:
+            workout.sets[signature] += 1
+    return list(by_id.values())
+
+
+def _workout_set_signatures(
+    workout: APWorkout, aliases: dict[str, list[str]], exercise_rows: list[dict],
+) -> Counter[SetSignature]:
+    signatures: Counter[SetSignature] = Counter()
+    for item in workout.exercises:
+        if not item.sets:
+            continue
+        canonical, equipment, exercise_row = _canonical_exercise(
+            item, aliases, exercise_rows,
+        )
+        if exercise_row is not None and exercise_row.get("id") is not None:
+            exercise_key = f"id:{exercise_row['id']}"
+        else:
+            storage_name = _variant_name(canonical, equipment, exercise_rows)
+            exercise_key = f"name:{normalize_alias(storage_name)}"
+        for set_item in item.sets:
+            signature = _set_signature(
+                exercise_key, set_item.weight_kg, set_item.reps,
+            )
+            if signature is not None:
+                signatures[signature] += 1
+    return signatures
+
+
+def _duplicate_status(
+    workout: APWorkout, existing: list[_ExistingWorkout],
+    ap_sets: Counter[SetSignature],
+) -> tuple[str, str | None, list[str | None]]:
+    exact_title = next(
+        (item for item in existing if item.title == workout.title), None,
+    )
+    if exact_title is not None:
+        return "skipped", exact_title.title, []
+
+    ap_started_at = _berlin_datetime(workout.started_at)
+    nearby: list[tuple[float, _ExistingWorkout]] = []
+    for item in existing:
+        if item.created_at is None:
+            continue
+        existing_started_at = _berlin_datetime(item.created_at)
+        if existing_started_at.date() != ap_started_at.date():
+            continue
+        difference = abs((existing_started_at - ap_started_at).total_seconds())
+        if difference <= 90 * 60:
+            nearby.append((difference, item))
+
+    ap_set_count = sum(ap_sets.values())
+    if ap_set_count:
+        matching = []
+        for difference, item in nearby:
+            overlap = sum((ap_sets & item.sets).values())
+            if overlap * 2 >= ap_set_count:
+                matching.append((overlap / ap_set_count, difference, item.title))
+        if matching:
+            _ratio, _difference, title = max(
+                matching, key=lambda item: (item[0], -item[1]),
+            )
+            return "skipped", title, []
+
+    if nearby:
+        titles = [item.title for _difference, item in sorted(
+            nearby, key=lambda item: item[0],
+        )]
+        return "unclear", None, titles
+    return "new", None, []
+
+
 def import_workouts(
     workouts: list[APWorkout] | tuple[APWorkout, ...], *, dry_run: bool = False,
 ) -> ImportReport:
     """Importiert bereits geparste Workouts atomar und idempotent."""
     alias_map = load_aliases()
     workouts_created = workouts_skipped = exercises_created = sets_created = 0
+    new_workouts: list[WorkoutReportEntry] = []
+    skipped_workouts: list[WorkoutReportEntry] = []
+    unclear_workouts: list[WorkoutReportEntry] = []
+    planned_by_date: dict[date, list[_ExistingWorkout]] = {}
 
     with db.cursor() as cur:
         # Serialisiert parallele AP-Imports; Duplikatprüfung und Inserts bleiben atomar.
@@ -534,31 +674,48 @@ def import_workouts(
         exercise_rows = [dict(row) for row in cur.fetchall()]
 
         for workout in workouts:
-            workout_date = workout.started_at.date()
-            workout_time = workout.started_at.astimezone(_BERLIN).time().replace(tzinfo=None)
+            started_at = _berlin_datetime(workout.started_at)
+            workout_date = started_at.date()
             cur.execute(
-                """SELECT id FROM workouts
-                   WHERE (date=%s AND title=%s)
-                      OR (date=%s AND date_trunc(
-                            'minute', created_at AT TIME ZONE 'Europe/Berlin'
-                         )::time=%s)
-                   LIMIT 1""",
-                (workout_date, workout.title, workout_date, workout_time),
+                """SELECT w.id AS workout_id,w.title,w.created_at,
+                          ws.exercise_id,ws.weight_kg,ws.reps
+                   FROM workouts w
+                   LEFT JOIN workout_sets ws ON ws.workout_id=w.id
+                   WHERE w.date=%s
+                   ORDER BY w.id,ws.id""",
+                (workout_date,),
             )
-            if cur.fetchone():
+            existing = _existing_workouts(cur.fetchall())
+            if dry_run:
+                existing.extend(planned_by_date.get(workout_date, ()))
+            ap_sets = _workout_set_signatures(workout, alias_map, exercise_rows)
+            status, matched_title, unclear_titles = _duplicate_status(
+                workout, existing, ap_sets,
+            )
+            if status == "skipped":
                 workouts_skipped += 1
+                skipped_workouts.append(WorkoutReportEntry(
+                    workout_date, workout.title, matched_title,
+                ))
+                continue
+            if status == "unclear":
+                unclear_workouts.extend(
+                    WorkoutReportEntry(workout_date, workout.title, title)
+                    for title in unclear_titles
+                )
                 continue
 
             workouts_created += 1
+            new_workouts.append(WorkoutReportEntry(workout_date, workout.title))
             notes = _workout_notes(workout)
-            completed_at = workout.started_at + timedelta(minutes=workout.duration_min or 0)
+            completed_at = started_at + timedelta(minutes=workout.duration_min or 0)
             if not dry_run:
                 cur.execute(
                     """INSERT INTO workouts
                          (date,title,type,duration_min,notes,created_at,last_activity_at,ended_at)
                        VALUES (%s,%s,'strength',%s,%s,%s,%s,%s) RETURNING id""",
                     (workout_date, workout.title, workout.duration_min, notes,
-                     workout.started_at, completed_at, completed_at),
+                     started_at, completed_at, completed_at),
                 )
                 workout_id = cur.fetchone()["id"]
             else:
@@ -610,6 +767,18 @@ def import_workouts(
                         )
                 sets_created += len(item.sets)
 
+            if dry_run:
+                planned_by_date.setdefault(workout_date, []).append(_ExistingWorkout(
+                    title=workout.title, created_at=started_at, sets=ap_sets,
+                ))
+
     return ImportReport(
-        workouts_created, workouts_skipped, exercises_created, sets_created, dry_run,
+        workouts_created=workouts_created,
+        workouts_skipped=workouts_skipped,
+        exercises_created=exercises_created,
+        sets_created=sets_created,
+        dry_run=dry_run,
+        new_workouts=tuple(new_workouts),
+        skipped_workouts=tuple(skipped_workouts),
+        unclear_workouts=tuple(unclear_workouts),
     )

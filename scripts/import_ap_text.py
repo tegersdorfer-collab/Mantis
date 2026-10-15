@@ -29,9 +29,24 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"{mode}: {report.workouts_created} neue Workouts, "
         f"{report.workouts_skipped} übersprungen, "
+        f"{len(report.unclear_workouts)} unklar, "
         f"{report.exercises_created} neue Übungen, "
         f"{report.sets_created} Sätze."
     )
+    for item in report.new_workouts:
+        print(f"  Neu: {item.date.isoformat()} — {item.title}")
+    for item in report.skipped_workouts:
+        existing_title = item.existing_title or "(ohne Titel)"
+        print(
+            f"  Übersprungen: {item.date.isoformat()} — {item.title} "
+            f"↔ {existing_title}"
+        )
+    for item in report.unclear_workouts:
+        existing_title = item.existing_title or "(ohne Titel)"
+        print(
+            f"  Unklar: {item.date.isoformat()} — {item.title} "
+            f"↔ {existing_title}"
+        )
     return 0
 
 
