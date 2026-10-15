@@ -60,6 +60,26 @@ _cartesia_pause_warned = False
 _lock = asyncio.Lock()
 
 
+async def _await_native_worker(awaitable):
+    """Hält den TTS-Modell-Lock bis ein nicht abbrechbarer Thread fertig ist."""
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            task.result()
+        except BaseException:
+            pass
+        raise
+
+
 def _engine() -> str:
     return getattr(config, "TTS_ENGINE", "cartesia")
 
@@ -671,9 +691,9 @@ async def _try_cartesia_ogg(text: str) -> bytes | None:
 async def _synthesize_local(text: str, speed: float) -> bytes:
     """Lokaler Fallback: Kokoro lazy laden, bei dessen Nichtverfügbarkeit Piper nutzen."""
     if _engine() in {"kokoro", "cartesia"} and not _kokoro_unavailable:
-        if await asyncio.to_thread(_load_kokoro) is not None:
-            return await asyncio.to_thread(_synth_kokoro, text, speed)
-    return await asyncio.to_thread(_synth, text, speed)
+        if await _await_native_worker(asyncio.to_thread(_load_kokoro)) is not None:
+            return await _await_native_worker(asyncio.to_thread(_synth_kokoro, text, speed))
+    return await _await_native_worker(asyncio.to_thread(_synth, text, speed))
 
 
 async def _synthesize_unlocked(text: str, speed: float) -> bytes:

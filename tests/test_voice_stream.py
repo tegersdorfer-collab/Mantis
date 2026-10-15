@@ -44,6 +44,15 @@ def wakeword_frame(byte_value: int = 0) -> bytes:
 
 
 
+def test_voice_bargein_settings_default_and_validate():
+    from settings import MantisSettings
+
+    settings = MantisSettings(_env_file=None)
+    assert settings.VOICE_BARGEIN is True
+    assert settings.VOICE_BARGEIN_MIN_SPEECH_MS == 300
+    assert settings.VOICE_BARGEIN_MIN_RMS == 800
+
+
 class TestVoiceStreamSession:
     def test_ignores_muted_chunks(self):
         session = make_session(segment_events=[], wake_hits=[])
@@ -173,14 +182,6 @@ class TestVoiceStreamSession:
 
         assert bool(interruptions) is should_interrupt
 
-
-def test_voice_bargein_settings_default_and_validate():
-    from settings import MantisSettings
-
-    settings = MantisSettings(_env_file=None)
-    assert settings.VOICE_BARGEIN is True
-    assert settings.VOICE_BARGEIN_MIN_SPEECH_MS == 300
-    assert settings.VOICE_BARGEIN_MIN_RMS == 800
 
     def test_no_result_while_segment_incomplete(self):
         session = make_session(segment_events=[None], wake_hits=[False])

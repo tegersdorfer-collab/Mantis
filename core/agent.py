@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Callable
 
 from core import tools as toolreg
 from core import voice_timing
@@ -158,6 +159,7 @@ class Agent:
         think: bool = False,
         dry_run_tools: bool = False,
         tool_selection_task: asyncio.Future | None = None,
+        interrupt_check: Callable[[], bool] | None = None,
     ) -> tuple[str, list[dict]]:
         """
         Führt den ReAct-Loop aus.
@@ -212,6 +214,8 @@ class Agent:
             return True
 
         for step in range(self._max_steps):
+            if interrupt_check is not None and interrupt_check():
+                raise asyncio.CancelledError
             await resolve_tool_selection(wait=False)
             is_first = step == 0
             force = force_tools and is_first and bool(schemas)
@@ -292,6 +296,8 @@ class Agent:
             })
 
             for tc in tool_calls:
+                if interrupt_check is not None and interrupt_check():
+                    raise asyncio.CancelledError
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
                 args = fn.get("arguments", {})
@@ -310,6 +316,8 @@ class Agent:
                         await stream_cb(StreamEvent(
                             "tool_start", attempt_id or "", tool_name=name,
                         ))
+                    if interrupt_check is not None and interrupt_check():
+                        raise asyncio.CancelledError
                     with voice_timing.phase("tool_exec_ms"):
                         result = await toolreg.execute(name, args)
                 trace.append({"tool": name, "args": args, "result": result[:500]})

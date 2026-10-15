@@ -474,7 +474,6 @@ def test_voice_route_persists_both_roles_with_voice_channel(monkeypatch):
     orchestrator, inserted, idle_loop = _make_orchestrator(monkeypatch)
     monkeypatch.setattr(voice, "transcribe_audio", AsyncMock(return_value="Wie wird mein Tag?"))
     monkeypatch.setattr(voice, "is_addressed_to_mantis", AsyncMock(return_value=True))
-    monkeypatch.setattr(voice, "mark_conversation_active", lambda: None)
     monkeypatch.setattr(voice, "synthesize", AsyncMock(return_value=b"audio"))
     app = FastAPI()
     app.include_router(voice.build_router(orchestrator))

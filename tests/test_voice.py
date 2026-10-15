@@ -10,17 +10,12 @@ import core.voice as voice
 
 
 @pytest.fixture(autouse=True)
-def _reset_conversation_window():
-    """Verhindert Test-Verschmutzung über den globalen 'Konversation aktiv'-Status hinweg,
-    z.B. wenn test_voice_router.py vorher lief und mark_conversation_active() real aufgerufen hat.
-
-    Setzt außerdem den STT-Lock zurück: sobald ein Test echte Konkurrenz erzeugt, bindet
+def _reset_stt_lock():
+    """Setzt den STT-Lock zurück: sobald ein Test echte Konkurrenz erzeugt, bindet
     sich asyncio.Lock an dessen Event-Loop, und der nächste asyncio.run() würde daran
     scheitern. In Mantis läuft alles in EINEM Loop — das ist reine Test-Hygiene."""
-    voice._conversation_active_until = 0.0
     voice._whisper_lock = asyncio.Lock()
     yield
-    voice._conversation_active_until = 0.0
 
 
 @pytest.fixture
@@ -715,37 +710,58 @@ class TestIsAddressedToMantis:
 
 
 class TestConversationFollowup:
-    """Nach einer Mantis-Antwort gilt ein kurzes Zeitfenster, in dem Folge-Sprache
-    automatisch als adressiert gilt — sonst ignoriert Mantis kurze Antworten wie
-    'ja', 'zeig mir das' oder 'und morgen?', die keinen Namen/klaren Befehl enthalten."""
+    """Das Folgefenster ist Sitzungszustand und liefert Kontext an den Adress-Check."""
 
-    def setup_method(self):
-        voice._conversation_active_until = 0.0
+    def test_gespraechsfenster_sind_pro_session_getrennt(self):
+        first = voice.VoiceConversationWindow()
+        second = voice.VoiceConversationWindow()
 
-    def test_folge_antwort_innerhalb_des_fensters_gilt_als_adressiert(self):
-        voice.mark_conversation_active()
-        with patch("core.fast.yes_no", new=AsyncMock()) as mock_yes_no:
-            result = asyncio.run(voice.is_addressed_to_mantis("ja genau das meinte ich"))
-        assert result is True
-        mock_yes_no.assert_not_called()
+        first.mark_active("Ich habe das Licht eingeschaltet.")
 
-    def test_ausserhalb_des_fensters_normaler_check(self):
-        voice._conversation_active_until = 0.0  # Fenster abgelaufen/nie aktiv
-        with patch("core.fast.yes_no", new=AsyncMock(return_value=False)) as mock_yes_no:
-            result = asyncio.run(voice.is_addressed_to_mantis("ja genau das meinte ich"))
+        assert first.is_active() is True
+        assert first.address_context() == "Ich habe das Licht eingeschaltet."
+        assert second.is_active() is False
+        assert second.address_context() is None
+
+    def test_folgeaussage_wird_mit_letzter_mantis_antwort_geprueft(self):
+        context = "Die Lampe ist eingeschaltet."
+        jev = AsyncMock(return_value=None)
+        cloud = AsyncMock(return_value=False)
+        with patch("core.decisions.voice_address", new=jev), \
+             patch("core.fast.yes_no", new=cloud):
+            result = asyncio.run(voice.is_addressed_to_mantis(
+                "Licht aus", conversation_context=context,
+            ))
+
         assert result is False
-        mock_yes_no.assert_called_once()
+        jev.assert_awaited_once_with("Licht aus", conversation_context=context)
+        cloud.assert_awaited_once()
+        assert context in cloud.await_args.args[0]
 
-    def test_leerer_text_bleibt_false_auch_im_fenster(self):
-        voice.mark_conversation_active()
-        result = asyncio.run(voice.is_addressed_to_mantis(""))
+    def test_folgeaussage_wird_im_fenster_nicht_automatisch_angenommen(self):
+        jev = AsyncMock(return_value=None)
+        cloud = AsyncMock(return_value=False)
+        with patch("core.decisions.voice_address", new=jev), \
+             patch("core.fast.yes_no", new=cloud):
+            result = asyncio.run(voice.is_addressed_to_mantis(
+                "Ich rede mit jemand anderem",
+                conversation_context="Mantis hat gerade eine Antwort gesprochen.",
+            ))
+
+        assert result is False
+        jev.assert_awaited_once()
+        cloud.assert_awaited_once()
+
+    def test_leerer_text_bleibt_false_auch_mit_gespraechskontext(self):
+        result = asyncio.run(voice.is_addressed_to_mantis(
+            "", conversation_context="Letzte Mantis-Antwort.",
+        ))
         assert result is False
 
 
 def test_address_check_uses_fast_cloud_variant_directly():
     from unittest.mock import AsyncMock, patch
     from core import voice
-    voice._conversation_active_until = 0.0
     with patch("core.decisions.addressed", new=AsyncMock(return_value=True)) as jev, \
          patch("core.voice.fast.yes_no", new=AsyncMock(return_value=False)) as fast:
         assert asyncio.run(voice.is_addressed_to_mantis("mach das Licht an")) is False

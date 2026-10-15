@@ -688,7 +688,7 @@ class MessageHandler:
     async def dashboard_respond(
         self, text: str, stream_cb=None, agent=None, channel_name: str = "web",
         resume_idle_cb=None, prework: VoiceTurnPrework | None = None,
-        defer_finish: bool = False,
+        defer_finish: bool = False, interrupt_check=None,
     ) -> tuple[str, list]:
         self._begin_user_turn()
         self._start_turn()
@@ -701,7 +701,8 @@ class MessageHandler:
 
             response, trace = await self._agent_turn(text, channel_name=channel_name,
                                                      stream_cb=stream_cb, agent=agent,
-                                                     prework=prework)
+                                                     prework=prework,
+                                                     interrupt_check=interrupt_check)
             if not defer_finish:
                 self._finish_turn(text, response, trace, channel_name=channel_name, agent=agent)
             return response, trace
@@ -725,7 +726,8 @@ class MessageHandler:
     async def _agent_turn(self, text: str, channel_name: str,
                           stream_cb=None, agent=None,
                           inbox_context: InboxTurnContext | None = None,
-                          prework: VoiceTurnPrework | None = None) -> tuple[str, list]:
+                          prework: VoiceTurnPrework | None = None,
+                          interrupt_check=None) -> tuple[str, list]:
         """Prompt bauen, Tools wählen, Agent laufen lassen — mit Fehler-Fallback."""
         voice_turn = channel_name == "voice" and agent is not None
         agent = agent or self.agent
@@ -756,14 +758,22 @@ class MessageHandler:
                 messages = self.kzg.recent_messages(max_tokens=3000)
                 if voice_turn:
                     messages = _messages_with_voice_reminder(messages, text)
+                if voice_turn and interrupt_check is not None and interrupt_check():
+                    raise asyncio.CancelledError
+                run_kwargs = dict(
+                    messages=messages,
+                    system=system,
+                    stream_cb=stream_cb,
+                    allowed_tools=[tool_name],
+                    force_tools=True,
+                    temperature=0.75,
+                    max_tokens=max_tokens,
+                )
+                if voice_turn and interrupt_check is not None:
+                    run_kwargs["interrupt_check"] = interrupt_check
                 token = INBOX_TURN_CONTEXT.set(inbox_context)
                 try:
-                    return await agent.run(
-                        messages=messages,
-                        system=system, stream_cb=stream_cb,
-                        allowed_tools=[tool_name], force_tools=True,
-                        temperature=0.75, max_tokens=max_tokens,
-                    )
+                    return await agent.run(**run_kwargs)
                 finally:
                     INBOX_TURN_CONTEXT.reset(token)
             except Exception as e:
@@ -783,6 +793,8 @@ class MessageHandler:
                     "tool": fast.tool, "args": {}, "result": result[:500], "reflex": True,
                 }]
             try:
+                if voice_turn and interrupt_check is not None and interrupt_check():
+                    raise asyncio.CancelledError
                 result = await skills.T.execute(fast.tool, fast.args)
             except Exception as e:
                 result = f"❌ {fast.tool} fehlgeschlagen: {e}"
@@ -799,6 +811,8 @@ class MessageHandler:
         skill_req = skill_request.match(text)
         if skill_req is not None:
             try:
+                if voice_turn and interrupt_check is not None and interrupt_check():
+                    raise asyncio.CancelledError
                 result = await skill_request.erzeuge(skill_req, self.bg_llm)
             except Exception as e:
                 log.error(f"Skill-Fast-Path fehlgeschlagen: {e}")
@@ -862,6 +876,10 @@ class MessageHandler:
                 allowed_tools=allowed, force_tools=force_tools,
                 temperature=0.75, max_tokens=max_tokens,
             )
+            if voice_turn and interrupt_check is not None:
+                run_kwargs["interrupt_check"] = interrupt_check
+            if voice_turn and interrupt_check is not None and interrupt_check():
+                raise asyncio.CancelledError
             if tool_selection_task is not None:
                 run_kwargs["tool_selection_task"] = tool_selection_task
             try:

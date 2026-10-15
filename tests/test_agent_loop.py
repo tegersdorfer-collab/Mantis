@@ -87,6 +87,27 @@ def test_tool_call_then_answer(echo_tool):
     assert "tool" in roles
 
 
+def test_interrupt_flag_prevents_agent_tool_dispatch(echo_tool, monkeypatch):
+    calls = []
+
+    async def execute_echo(text=""):
+        calls.append(text)
+        return f"ECHO:{text}"
+
+    monkeypatch.setattr(toolreg.REGISTRY["echo"], "handler", execute_echo)
+    backend = FakeBackend([("", [_tc("echo", {"text": "must not run"})])])
+
+    async def run():
+        with pytest.raises(asyncio.CancelledError):
+            await Agent(backend).run(
+                [{"role": "user", "content": "Licht aus"}], system="s",
+                interrupt_check=lambda: True,
+            )
+
+    asyncio.run(run())
+    assert calls == []
+
+
 def test_stream_events_mark_tool_rounds_as_nonfinal(echo_tool, monkeypatch):
     class StreamingBackend(FakeBackend):
         def __init__(self):

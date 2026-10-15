@@ -55,7 +55,27 @@ _INITIAL_WORD_RE = re.compile(r"^(?P<prefix>\s*(?:hey\b[\s,!?-]*)?)(?P<word>[^\W
 # weil jede Äußerung isoliert bewertet wird statt als Teil eines laufenden Gesprächs.
 CONVERSATION_FOLLOWUP_WINDOW_S = 15
 VOICE_ADDRESS_TIMEOUT_S = 3.0
-_conversation_active_until = 0.0
+
+
+class VoiceConversationWindow:
+    """Kurzlebiger Gesprächskontext, der genau einer Voice-Session gehört."""
+
+    def __init__(self) -> None:
+        self._active_until = 0.0
+        self._last_response = ""
+
+    def mark_active(self, response: str | None = None) -> None:
+        self._active_until = time.monotonic() + CONVERSATION_FOLLOWUP_WINDOW_S
+        if response and response.strip():
+            self._last_response = response.strip()
+
+    def is_active(self) -> bool:
+        return time.monotonic() < self._active_until
+
+    def address_context(self) -> str | None:
+        if self.is_active() and self._last_response:
+            return self._last_response
+        return None
 
 
 def _audio_duration_seconds(audio_path: str) -> float:
@@ -102,14 +122,17 @@ async def _await_worker_completion(awaitable):
         raise
 
 
-def mark_conversation_active() -> None:
-    """Vom Voice-Router nach jeder erfolgreichen Mantis-Antwort aufzurufen."""
-    global _conversation_active_until
-    _conversation_active_until = time.monotonic() + CONVERSATION_FOLLOWUP_WINDOW_S
+def mark_conversation_active(
+    conversation: VoiceConversationWindow | None = None,
+    response: str | None = None,
+) -> None:
+    """Öffnet das Folgefenster nur für den übergebenen Voice-Kontext."""
+    if conversation is not None:
+        conversation.mark_active(response)
 
 
-def _conversation_active() -> bool:
-    return time.monotonic() < _conversation_active_until
+def _conversation_active(conversation: VoiceConversationWindow | None = None) -> bool:
+    return conversation.is_active() if conversation is not None else False
 
 
 async def transcribe_audio(audio_path: str) -> str:
@@ -343,32 +366,42 @@ async def _transcribe_whisper_locked(audio_path: str) -> str:
         return ""
 
 
-async def is_addressed_to_mantis(text: str) -> bool:
+async def is_addressed_to_mantis(
+    text: str, *, conversation_context: str | None = None,
+) -> bool:
     """Schneller Ja/Nein-Check: ist dieser transkribierte Text ein an Mantis
     gerichteter Befehl/Anfrage? Leerer Text spart den LLM-Call.
 
-    Drei Layer: (1) Keyword-Vorfilter — wird "Mantis" explizit genannt, sofort JA
-    ohne LLM-Call (Latenz ~0). (2) Konversations-Fortsetzung — läuft gerade ein
-    Gespräch (siehe mark_conversation_active()), gilt jede Folge-Äußerung als
-    adressiert. (3) Sonst fragt der Check zuerst Jev und bei Unsicherheit die
-    kurze Fast-Variante der Cloud-Kette; Fehler entscheiden konservativ mit NEIN."""
+    Explizite Wakewords liefern sofort JA. Sonst entscheidet derselbe Adress-Check
+    wie beim ersten Segment; eine letzte Mantis-Antwort kann kurze Folgeäußerungen
+    einordnen, nimmt sie aber nicht automatisch an."""
     stripped = text.strip()
     if not stripped:
         return False
     if fast_commands.has_voice_wakeword(stripped) or "mantis" in stripped.lower():
         return True
-    if time.monotonic() < _conversation_active_until:
-        return True
-
+    context = str(conversation_context or "").strip()[-1000:]
     prompt = (
         f"Ist dieser Satz eine Anfrage oder ein Befehl an einen persönlichen KI-Assistenten "
         f"namens Mantis (nicht nur Small Talk mit jemand anderem im Raum), auch wenn der Name "
         f"'Mantis' nicht genannt wird?\n\n\"{stripped}\""
     )
+    if context:
+        prompt = (
+            "Prüfe nur, ob die neue Spracheingabe an Mantis gerichtet ist. Die letzte Antwort "
+            "von Mantis dient als Gesprächskontext und macht Raumgespräche nicht automatisch "
+            f"zu Befehlen.\n\nLetzte Mantis-Antwort: \"{context}\"\n"
+            f"Neue Spracheingabe: \"{stripped}\""
+        )
     try:
         async with asyncio.timeout(VOICE_ADDRESS_TIMEOUT_S):
             try:
-                jev_answer = await decisions.voice_address(stripped)
+                if context:
+                    jev_answer = await decisions.voice_address(
+                        stripped, conversation_context=context,
+                    )
+                else:
+                    jev_answer = await decisions.voice_address(stripped)
             except Exception as e:
                 log.debug("Jev-Voice-Adresscheck fehlgeschlagen: %s", e)
                 jev_answer = None

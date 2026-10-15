@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import asyncio
 import json
 import logging
+import threading
 from unittest.mock import MagicMock
 
 import httpx
@@ -20,6 +21,7 @@ def _reset_engine_state(monkeypatch):
     monkeypatch.setattr(tts, "_kokoro", None)
     monkeypatch.setattr(tts, "_kokoro_unavailable", False)
     monkeypatch.setattr(tts, "_voice", None)
+    monkeypatch.setattr(tts, "_lock", asyncio.Lock())
     monkeypatch.setattr(tts, "_cartesia_paused_until", 0.0, raising=False)
     monkeypatch.setattr(tts, "_cartesia_pause_warned", False, raising=False)
     yield
@@ -168,6 +170,43 @@ class TestSynthesize:
         long_text = ("Ein Satz. " * 300) + "Ende."
         asyncio.run(tts.synthesize(long_text, max_chars=50))
         assert len(captured["text"]) <= 50
+
+    def test_cancelled_native_synthesis_keeps_model_lock_until_worker_finishes(
+        self, monkeypatch, piper_engine,
+    ):
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def native_synthesis(text, _speed):
+            calls.append(text)
+            if text == "Erster Aufruf":
+                started.set()
+                release.wait(2)
+            return text.encode()
+
+        monkeypatch.setattr(tts, "_synth", native_synthesis)
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OGG:" + wav)
+
+        async def run():
+            first = asyncio.create_task(tts.synthesize("Erster Aufruf"))
+            second = None
+            try:
+                assert await asyncio.to_thread(started.wait, 1)
+                first.cancel()
+                second = asyncio.create_task(tts.synthesize("Zweiter Aufruf"))
+                await asyncio.sleep(0.02)
+                assert calls == ["Erster Aufruf"]
+            finally:
+                release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert second is not None
+            assert await second == b"OGG:Zweiter Aufruf"
+            assert calls == ["Erster Aufruf", "Zweiter Aufruf"]
+
+        asyncio.run(run())
 
 
 class TestStreamingSplit:

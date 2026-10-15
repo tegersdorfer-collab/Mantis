@@ -9,12 +9,14 @@ sie direkt abspielen kann.
 """
 import base64
 import asyncio
+import inspect
 import json
 import logging
 import math
 import re
 import tempfile
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +26,7 @@ from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 
 import config
 from core import db, voice_fillers, voice_timing
-from core.voice import transcribe_audio, is_addressed_to_mantis, mark_conversation_active, _conversation_active
+from core.voice import VoiceConversationWindow, transcribe_audio, is_addressed_to_mantis
 from core.voice_prework import VoicePreworkCache
 from core.voice_stream import VoiceStreamSession
 from core.stream_events import StreamEvent
@@ -42,6 +44,7 @@ class _PlaybackBlock:
     played_ms: float = 0.0
     finished: bool = False
     skipped: bool = False
+    sent_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -61,6 +64,9 @@ class _PlaybackTurn:
         self.audio_end_count: int | None = None
         self.interrupted = False
         self.bargein_ms: float | None = None
+        self.progress_reported = False
+        self.timed_out = False
+        self._first_block_sent_at: float | None = None
         self.changed = asyncio.Event()
         self.stop_ack = asyncio.Event()
 
@@ -87,6 +93,58 @@ class _PlaybackTurn:
             sentence.complete = True
             self.changed.set()
 
+    def mark_block_sent(self, block_id: str, *, sent_at: float | None = None) -> bool:
+        block = self.blocks.get(str(block_id))
+        if block is None:
+            return False
+        timestamp = time.monotonic() if sent_at is None else float(sent_at)
+        block.sent_at = timestamp
+        if self._first_block_sent_at is None:
+            self._first_block_sent_at = timestamp
+        self.changed.set()
+        return True
+
+    @staticmethod
+    def _duration_for(block: _PlaybackBlock) -> float:
+        if block.duration_ms is not None and block.duration_ms > 0:
+            return block.duration_ms
+        return max(350.0, len((block.text or "").split()) * 350.0)
+
+    def _completion_timeout_s(self) -> float:
+        total_ms = sum(
+            self._duration_for(block)
+            for block in self.blocks.values()
+            if block.sent_at is not None
+        )
+        return total_ms / 1000.0 + 2.0
+
+    @property
+    def assistant_text(self) -> str:
+        return " ".join(
+            sentence.text
+            for sentence in self.sentences.values()
+            if any(self.blocks[block_id].sent_at is not None for block_id in sentence.block_ids)
+        ).strip()
+
+    def estimate_progress(self, *, now: float | None = None) -> None:
+        """Schätzt ohne Clientmeldungen, wie viele gesendete Blöcke bereits liefen."""
+        if self._first_block_sent_at is None:
+            return
+        current = time.monotonic() if now is None else float(now)
+        elapsed_ms = max(0.0, (current - self._first_block_sent_at) * 1000.0)
+        offset_ms = 0.0
+        for block in self.blocks.values():
+            if block.sent_at is None:
+                continue
+            duration_ms = self._duration_for(block)
+            played_ms = min(duration_ms, max(0.0, elapsed_ms - offset_ms))
+            block.played_ms = max(block.played_ms, played_ms)
+            if played_ms >= max(0.0, duration_ms - 35.0):
+                block.finished = True
+                block.played_ms = duration_ms
+            offset_ms += duration_ms
+        self.changed.set()
+
     def record_progress(
         self, block_id: str, played_ms: float, *, finished: bool = False,
         skipped: bool = False,
@@ -100,6 +158,7 @@ class _PlaybackTurn:
             return False
         if not math.isfinite(played):
             return False
+        self.progress_reported = True
         if block.duration_ms is not None:
             played = min(played, block.duration_ms)
         block.played_ms = max(block.played_ms, played)
@@ -132,11 +191,19 @@ class _PlaybackTurn:
         return all(block.finished for block in self.blocks.values())
 
     async def wait_until_complete(self) -> None:
-        while not self.complete:
-            self.changed.clear()
+        try:
+            async with asyncio.timeout(self._completion_timeout_s()):
+                while not self.complete:
+                    self.changed.clear()
+                    if self.complete:
+                        return
+                    await self.changed.wait()
+        except TimeoutError:
+            self.estimate_progress()
             if self.complete:
                 return
-            await self.changed.wait()
+            self.timed_out = True
+            raise
 
     def spoken_text(self) -> str:
         parts: list[str] = []
@@ -287,6 +354,28 @@ def _normalized_speech(text: str) -> str:
     return " ".join(text.split())
 
 
+_VOICE_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _is_recent_tts_echo(
+    text: str, sent_blocks, *, now: float | None = None,
+) -> bool:
+    """Erkennt ein Transkript mit mindestens 60 % Token-Treffern in 5 s altem TTS."""
+    transcript_tokens = set(_VOICE_TOKEN_RE.findall(str(text).casefold()))
+    if not transcript_tokens:
+        return False
+    current = time.monotonic() if now is None else float(now)
+    for sent_at, spoken_text in sent_blocks:
+        age = current - float(sent_at)
+        if not 0.0 <= age <= 5.0:
+            continue
+        spoken_tokens = set(_VOICE_TOKEN_RE.findall(str(spoken_text).casefold()))
+        overlap = len(transcript_tokens & spoken_tokens) / len(transcript_tokens)
+        if overlap >= 0.6:
+            return True
+    return False
+
+
 async def sende_streaming_antwort(
     websocket,
     text: str,
@@ -301,6 +390,9 @@ async def sende_streaming_antwort(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     playback: _PlaybackTurn | None = None,
     defer_history: bool = False,
+    wait_for_playback: bool = False,
+    interrupt_check: Callable[[], bool] | None = None,
+    on_tts_text_sent: Callable[[str, float], None] | None = None,
 ) -> str | None:
     """Leitet fertige Antwortsätze parallel zur laufenden Cloud-Antwort an TTS."""
     if started_at is None:
@@ -365,6 +457,10 @@ async def sende_streaming_antwort(
             "block_id": block_id,
             "b64": base64.b64encode(audio).decode("ascii"),
         })
+        sent_at = time.monotonic()
+        playback.mark_block_sent(block_id, sent_at=sent_at)
+        if answer and sentence and on_tts_text_sent is not None:
+            on_tts_text_sent(sentence, sent_at)
         sequence += 1
 
     async def send_ack_after_delay() -> None:
@@ -399,6 +495,8 @@ async def sende_streaming_antwort(
         if not isinstance(event, StreamEvent):
             return
         if event.kind == "tool_start":
+            if interrupt_check is not None and interrupt_check():
+                raise asyncio.CancelledError
             request_filler("tool")
             return
         if event.kind == "attempt_start":
@@ -449,6 +547,17 @@ async def sende_streaming_antwort(
                 respond_kwargs["prework"] = prework
             if defer_history:
                 respond_kwargs["defer_finish"] = True
+            if interrupt_check is not None:
+                try:
+                    parameters = inspect.signature(orch.voice_respond).parameters.values()
+                except (TypeError, ValueError):
+                    parameters = ()
+                if any(
+                    parameter.name == "interrupt_check"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                ):
+                    respond_kwargs["interrupt_check"] = interrupt_check
             reply, trace = await orch.voice_respond(text, **respond_kwargs)
             _mark_reflex(trace)
             reply = reply or ""
@@ -592,6 +701,19 @@ async def sende_streaming_antwort(
     reply = None
     trace = []
     client_disconnected = False
+    cancelled_during_playback_wait = False
+
+    async def record_interrupted_turn() -> None:
+        try:
+            await asyncio.wait_for(playback.stop_ack.wait(), timeout=0.25)
+        except asyncio.TimeoutError:
+            pass
+        if not playback.progress_reported:
+            playback.estimate_progress()
+        recorder = getattr(orch, "record_interrupted_voice_turn", None)
+        if callable(recorder):
+            recorder(playback.spoken_text())
+
     try:
         tasks = (responder, synthesizer, sender, ack_task)
         await asyncio.gather(*(task for task in tasks if task is not None))
@@ -623,17 +745,28 @@ async def sende_streaming_antwort(
             return_exceptions=True,
         )
         try:
-            if playback.interrupted and defer_history:
-                try:
-                    await asyncio.wait_for(playback.stop_ack.wait(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    pass
-                recorder = getattr(orch, "record_interrupted_voice_turn", None)
-                if callable(recorder):
-                    recorder(playback.spoken_text())
+            if playback.interrupted:
+                await record_interrupted_turn()
             elif not client_disconnected:
                 await websocket.send_json({"type": "audio_end", "count": sequence})
                 playback.mark_audio_end(sequence)
+                if wait_for_playback or defer_history:
+                    try:
+                        await playback.wait_until_complete()
+                    except TimeoutError:
+                        log.warning("Voice-Playback meldete keinen Fortschritt rechtzeitig")
+                    except asyncio.CancelledError:
+                        cancelled_during_playback_wait = True
+                        client_disconnected = not playback.interrupted
+                    if playback.interrupted:
+                        await record_interrupted_turn()
+                    elif (
+                        defer_history and not playback.timed_out
+                        and response_error is None
+                    ):
+                        finish = getattr(orch, "finish_voice_turn", None)
+                        if callable(finish) and reply:
+                            finish(text, reply, trace)
         finally:
             try:
                 _record_voice_latency(
@@ -649,11 +782,8 @@ async def sende_streaming_antwort(
                 )
             finally:
                 voice_timing.reset(timing_token)
-    if defer_history and not client_disconnected and response_error is None:
-        await playback.wait_until_complete()
-        finish = getattr(orch, "finish_voice_turn", None)
-        if callable(finish) and reply:
-            finish(text, reply, trace)
+    if cancelled_during_playback_wait:
+        raise asyncio.CancelledError
     if response_error is not None:
         raise response_error
     return reply
@@ -692,7 +822,6 @@ def build_router(orch=None) -> APIRouter:
                 timing_token = voice_timing.start()
                 reply, trace = await orch.voice_respond(text)
                 _mark_reflex(trace)
-                mark_conversation_active()
                 try:
                     ogg = await synthesize(reply)
                 except Exception as e:
@@ -750,6 +879,10 @@ def build_router(orch=None) -> APIRouter:
         supports_playback_progress = False
         active_playback: _PlaybackTurn | None = None
         active_response_task: asyncio.Task | None = None
+        background_response_tasks: set[asyncio.Task] = set()
+        playback_turns: dict[str, _PlaybackTurn] = {}
+        recent_tts_blocks: deque[tuple[float, str]] = deque()
+        conversation_window = VoiceConversationWindow()
         send_lock = asyncio.Lock()
 
         class SerializedWebSocket:
@@ -759,8 +892,32 @@ def build_router(orch=None) -> APIRouter:
 
         send_socket = SerializedWebSocket()
 
-        async def stop_for_bargein(detected_at: float) -> None:
+        def _response_task_done(task: asyncio.Task) -> None:
+            background_response_tasks.discard(task)
+            if not task.cancelled():
+                try:
+                    task.exception()
+                except BaseException:
+                    pass
+
+        def _detach_active_response() -> None:
             nonlocal active_response_task
+            task = active_response_task
+            active_response_task = None
+            if task is None or task.done():
+                return
+            task.cancel()
+            background_response_tasks.add(task)
+            task.add_done_callback(_response_task_done)
+
+        def _remember_tts_text(text: str, sent_at: float) -> None:
+            cutoff = sent_at - 5.0
+            while recent_tts_blocks and recent_tts_blocks[0][0] < cutoff:
+                recent_tts_blocks.popleft()
+            recent_tts_blocks.append((sent_at, text))
+            conversation_window.mark_active(text)
+
+        async def stop_for_bargein(detected_at: float) -> None:
             playback = active_playback
             if (
                 playback is None or not playback.playback_active
@@ -768,18 +925,19 @@ def build_router(orch=None) -> APIRouter:
             ):
                 return
             playback.interrupted = True
-            mark_conversation_active()
-            await send_socket.send_json({
-                "type": "stop_playback", "turn_id": playback.turn_id,
-            })
+            conversation_window.mark_active(
+                playback.assistant_text or conversation_window.address_context(),
+            )
             playback.bargein_ms = round(
                 max(0.0, (time.monotonic() - detected_at) * 1000), 1,
             )
-            if active_response_task is not None and not active_response_task.done():
-                active_response_task.cancel()
+            _detach_active_response()
+            await send_socket.send_json({
+                "type": "stop_playback", "turn_id": playback.turn_id,
+            })
 
         def conversation_active() -> bool:
-            return active_playback is not None or _conversation_active()
+            return active_playback is not None or conversation_window.is_active()
 
         session = VoiceStreamSession(
             vad_segmenter=segmenter,
@@ -797,16 +955,24 @@ def build_router(orch=None) -> APIRouter:
         ) -> None:
             nonlocal active_response_task, active_playback
             try:
-                await sende_streaming_antwort(
+                reply = await sende_streaming_antwort(
                     send_socket, text, orch,
                     stt_ms=result.get("stt_ms"),
+                    address_check_ms=result.get("address_check_ms"),
                     started_at=result.get("turn_started_at"),
                     prework=prework,
                     partial_runs=result.get("partial_runs", 0),
                     partial_as_final=result.get("partial_as_final", False),
                     playback=playback,
-                    defer_history=supports_playback_progress,
+                    defer_history=callable(getattr(orch, "finish_voice_turn", None)),
+                    wait_for_playback=(
+                        supports_playback_progress
+                        or callable(getattr(orch, "finish_voice_turn", None))
+                    ),
+                    interrupt_check=lambda: playback.interrupted,
+                    on_tts_text_sent=_remember_tts_text,
                 )
+                conversation_window.mark_active(reply or playback.assistant_text)
             except asyncio.CancelledError:
                 raise
             except (WebSocketDisconnect, RuntimeError) as e:
@@ -815,10 +981,15 @@ def build_router(orch=None) -> APIRouter:
                 log.error("Voice-Antworttask fehlgeschlagen: %s", e)
             finally:
                 if active_playback is playback and (
-                    playback.interrupted or playback.complete
+                    playback.interrupted or playback.complete or playback.timed_out
                     or not supports_playback_progress
                 ):
                     active_playback = None
+                if (
+                    playback.interrupted or playback.complete or playback.timed_out
+                    or not supports_playback_progress
+                ):
+                    playback_turns.pop(playback.turn_id, None)
                 if active_response_task is asyncio.current_task():
                     active_response_task = None
 
@@ -839,7 +1010,9 @@ def build_router(orch=None) -> APIRouter:
                             control.get("playback_progress", False),
                         )
                     elif control.get("type") == "playback_progress":
-                        playback = active_playback
+                        block_id = str(control.get("block_id", ""))
+                        turn_id = block_id.rsplit(":", 1)[0] if ":" in block_id else ""
+                        playback = playback_turns.get(turn_id)
                         if playback is not None:
                             playback.record_progress(
                                 control.get("block_id", ""),
@@ -847,11 +1020,10 @@ def build_router(orch=None) -> APIRouter:
                                 finished=bool(control.get("finished", False)),
                                 skipped=bool(control.get("skipped", False)),
                             )
-                            mark_conversation_active()
-                            if playback.complete:
+                            if playback.complete and active_playback is playback:
                                 active_playback = None
                     elif control.get("type") == "playback_stopped":
-                        playback = active_playback
+                        playback = playback_turns.get(str(control.get("turn_id", "")))
                         if (
                             playback is not None
                             and control.get("turn_id") == playback.turn_id
@@ -864,12 +1036,33 @@ def build_router(orch=None) -> APIRouter:
                 if result is None:
                     continue
 
-                text = result["text"]
-                mark_conversation_active()
-                if active_response_task is not None:
-                    if not active_response_task.done():
-                        await asyncio.gather(active_response_task, return_exceptions=True)
-                    active_response_task = None
+                text = str(result.get("text") or "").strip()
+                if _is_recent_tts_echo(
+                    text, recent_tts_blocks, now=time.monotonic(),
+                ):
+                    log.debug("Voice-Transkript als Echo der letzten TTS-Blöcke verworfen")
+                    if prework_cache is not None:
+                        prework_cache.clear()
+                    continue
+                address_started = time.perf_counter()
+                conversation_context = conversation_window.address_context()
+                if conversation_context:
+                    addressed = await is_addressed_to_mantis(
+                        text, conversation_context=conversation_context,
+                    )
+                else:
+                    addressed = await is_addressed_to_mantis(text)
+                result["address_check_ms"] = round(
+                    (time.perf_counter() - address_started) * 1000, 1,
+                )
+                if not addressed:
+                    if prework_cache is not None:
+                        prework_cache.clear()
+                    continue
+
+                if active_playback is not None and active_playback.playback_active:
+                    await stop_for_bargein(time.monotonic())
+                _detach_active_response()
                 active_playback = None
                 prework = prework_cache.take_for(text) if prework_cache is not None else None
                 if prework_cache is not None:
@@ -877,6 +1070,7 @@ def build_router(orch=None) -> APIRouter:
                 if audio_streaming and orch is not None:
                     playback = _PlaybackTurn()
                     active_playback = playback
+                    playback_turns[playback.turn_id] = playback
                     active_response_task = asyncio.create_task(
                         run_streaming_response(result, text, prework, playback),
                         name="voice-response-turn",
@@ -899,7 +1093,7 @@ def build_router(orch=None) -> APIRouter:
                         else:
                             reply, trace = await orch.voice_respond(text, prework=prework)
                         _mark_reflex(trace)
-                        mark_conversation_active()
+                        conversation_window.mark_active(reply)
                     first_answer_audio_ms = await sende_antwort(
                         websocket, text, reply, audio_streaming, started_at=started_at,
                     )
@@ -929,10 +1123,14 @@ def build_router(orch=None) -> APIRouter:
             log.error(f"Voice-WebSocket-Handler abgebrochen: {e}")
         finally:
             try:
-                if active_response_task is not None and not active_response_task.done():
-                    active_response_task.cancel()
+                tasks_to_finish = set(background_response_tasks)
                 if active_response_task is not None:
-                    await asyncio.gather(active_response_task, return_exceptions=True)
+                    tasks_to_finish.add(active_response_task)
+                for task in tasks_to_finish:
+                    if not task.done():
+                        task.cancel()
+                if tasks_to_finish:
+                    await asyncio.gather(*tasks_to_finish, return_exceptions=True)
                 await session.close()
             finally:
                 if prework_cache is not None:
