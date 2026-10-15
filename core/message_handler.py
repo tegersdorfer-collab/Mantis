@@ -126,6 +126,29 @@ def _same_normalized_transcript(left: str, right: str) -> bool:
     )
 
 
+def _tool_selection_query(kzg, text: str) -> str:
+    """Ergänzt kurze Voice-Fortsetzungen um die letzte Nutzeranfrage."""
+    recent_messages = getattr(kzg, "recent_messages", None)
+    if not callable(recent_messages):
+        return text
+    try:
+        messages = recent_messages(max_tokens=3000)
+    except Exception:
+        return text
+    previous_user_text = ""
+    for message in reversed(messages):
+        if isinstance(message, dict):
+            role = message.get("role")
+            content = message.get("content")
+        else:
+            role = getattr(message, "role", None)
+            content = getattr(message, "content", None)
+        if role == "user" and isinstance(content, str) and content.strip():
+            previous_user_text = content.strip()
+            break
+    return f"{previous_user_text}\n{text}" if previous_user_text else text
+
+
 @dataclass(frozen=True)
 class PendingInboxDeletion:
     item_id: int
@@ -687,7 +710,9 @@ class MessageHandler:
     async def prepare_voice_turn(self, text: str) -> VoiceTurnPrework:
         """Baut Voice-Kontext und lokale Tool-Vorauswahl ohne Cloud-Klassifikation."""
         started = time.perf_counter()
-        keyword_tools, force_tools = _keyword_tool_selection(text)
+        keyword_tools, force_tools = _keyword_tool_selection(
+            _tool_selection_query(getattr(self, "kzg", None), text),
+        )
         system = await self.prompt_builder.build(text, speculative=True)
         return VoiceTurnPrework(
             text=text,
@@ -819,6 +844,10 @@ class MessageHandler:
             voice_turn and prework is not None
             and partial_text_matches_final(prework.text, text)
         )
+        selection_text = (
+            _tool_selection_query(self.kzg, text)
+            if voice_turn and transient_user_message else text
+        )
 
         async def build_context():
             if execution_gate is not None:
@@ -941,12 +970,12 @@ class MessageHandler:
             # Tool-Freigaben für geänderte Teiltexte werden immer aus dem finalen
             # Transkript neu berechnet. Die asynchrone Klassifikation darunter
             # erhält ebenfalls ausschließlich den finalen Text.
-            return _keyword_tool_selection(text)
+            return _keyword_tool_selection(selection_text)
 
         async def _timed_select():
             with voice_timing.phase("tool_select_ms"):
                 try:
-                    return await skills.T.select_tools_async(text)
+                    return await skills.T.select_tools_async(selection_text)
                 except Exception as exc:
                     log.warning(
                         "Tool-Auswahl fehlgeschlagen (%s) — nutze Keyword-Auswahl",

@@ -205,6 +205,67 @@ def test_agent_turn_reuses_matching_context_but_selects_tools_from_final_text(mo
     ]
 
 
+def test_speculative_followup_selects_tools_from_previous_user_context(monkeypatch):
+    from core import message_handler
+    from llm.base import Message
+
+    handler = object.__new__(message_handler.MessageHandler)
+    handler.kzg = type("KZG", (), {
+        "recent_messages": lambda _self, **_kwargs: [
+            Message(role="user", content="Wie wird das Wetter morgen?"),
+        ],
+    })()
+    handler.prompt_builder = type("PromptBuilder", (), {
+        "build": lambda _self, text, **_kwargs: asyncio.sleep(0, result=f"Kontext: {text}"),
+    })()
+    selections = []
+
+    def keyword_selection(text):
+        selections.append(("keyword", text))
+        return (["get_weather"], False) if "Wetter" in text else ([], False)
+
+    async def async_selection(text):
+        selections.append(("async", text))
+        return (["get_weather"], False) if "Wetter" in text else ([], False)
+
+    class Agent:
+        backend = type("Backend", (), {"sends_full_tool_catalog": True})()
+
+        async def run(self, **kwargs):
+            self.selected, _force = await kwargs["tool_selection_task"]
+            self.approved = await kwargs["execution_gate"]()
+            return "Die Wettervorhersage.", [{"tool": "get_weather"}]
+
+    agent = Agent()
+    monkeypatch.setattr(message_handler, "_keyword_tool_selection", keyword_selection)
+    monkeypatch.setattr(message_handler.skills.T, "select_tools_async", async_selection)
+    monkeypatch.setattr(message_handler.fast_commands, "match_voice", lambda _text: None)
+    monkeypatch.setattr(message_handler.skill_request, "match", lambda _text: None)
+
+    async def approve():
+        return True
+
+    async def run():
+        return await handler._agent_turn(
+            "Und nächste Woche?",
+            channel_name="voice",
+            agent=agent,
+            transient_user_message=True,
+            execution_gate=approve,
+        )
+
+    reply, trace = asyncio.run(run())
+
+    assert reply == "Die Wettervorhersage."
+    assert trace == [{"tool": "get_weather"}]
+    assert agent.selected == ["get_weather"]
+    assert agent.approved is True
+    assert selections == [
+        ("keyword", "Wie wird das Wetter morgen?\nUnd nächste Woche?"),
+        ("async", "Wie wird das Wetter morgen?\nUnd nächste Woche?"),
+    ]
+
+
 def test_agent_turn_discards_prework_for_distant_final_text(monkeypatch):
     from core import message_handler
 

@@ -35,6 +35,7 @@ log = logging.getLogger(__name__)
 _whisper_model = None
 _parakeet_model = None
 _parakeet_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parakeet-mlx")
+_parakeet_last_activity_at: float | None = None
 # Beide Engines teilen sich EINEN Lock: whisper.cpp/ggml crasht bei parallelen
 # transcribe()-Aufrufen (s.u.), und zwei gleichzeitig geladene STT-Modelle wären auf
 # dem 16-GB-Mac ohnehin verschwenderisch.
@@ -258,9 +259,9 @@ def _load_parakeet_model(model_id: str):
 
 def _warmup_parakeet(model) -> None:
     """Kompiliert den ersten MLX-Transkriptionspfad mit einer Sekunde Stille."""
+    global _parakeet_last_activity_at
     wav_path = None
     warmup_pcm = b"\0\0" * 16_000
-    warmup_seconds = len(warmup_pcm) / (2 * 16_000)
     try:
         with tempfile.NamedTemporaryFile(prefix="mantis-stt-warmup-", suffix=".wav", delete=False) as wav_file:
             wav_path = wav_file.name
@@ -269,13 +270,10 @@ def _warmup_parakeet(model) -> None:
             wav_file.setsampwidth(2)
             wav_file.setframerate(16_000)
             wav_file.writeframes(warmup_pcm)
-        started_at = time.perf_counter()
         model.transcribe(wav_path)
-        stt_runtime.record_stt_runtime(
-            warmup_seconds,
-            max(0.0, (time.perf_counter() - started_at) * 1000),
-            replace_samples=True,
-        )
+        # Der Kompilier-/Aufwachlauf ist keine brauchbare Laufzeitschätzung für
+        # normale Segmente. Er hält nur den MLX-Pfad warm.
+        _parakeet_last_activity_at = time.monotonic()
     finally:
         if wav_path is not None:
             Path(wav_path).unlink(missing_ok=True)
@@ -311,6 +309,76 @@ async def preload_parakeet() -> None:
             log.warning("Parakeet-Vorladen fehlgeschlagen (%s)", type(exc).__name__)
 
 
+async def keepwarm_parakeet_once() -> bool:
+    """Wärmt Parakeet nur auf, wenn der gemeinsame STT-Pfad gerade frei ist."""
+    interval_s = max(0, int(getattr(config, "VOICE_STT_KEEPWARM_S", 240)))
+    if (
+        interval_s <= 0
+        or getattr(config, "STT_ENGINE", "parakeet") != "parakeet"
+        or _parakeet_model is None
+        or _parakeet_unavailable
+    ):
+        return False
+    if (
+        _parakeet_last_activity_at is not None
+        and time.monotonic() - _parakeet_last_activity_at < interval_s
+    ):
+        return False
+    if _whisper_lock.locked():
+        return False
+
+    await _whisper_lock.acquire()
+    try:
+        if _parakeet_model is None or _parakeet_unavailable:
+            return False
+        loop = asyncio.get_running_loop()
+        await _await_worker_completion(loop.run_in_executor(
+            _parakeet_executor, _warmup_parakeet, _parakeet_model,
+        ))
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning("Parakeet-Keepwarm fehlgeschlagen (%s)", type(exc).__name__)
+        return False
+    finally:
+        _whisper_lock.release()
+
+
+async def _parakeet_keepwarm_loop(preload_task: asyncio.Task | None = None) -> None:
+    if preload_task is not None:
+        await asyncio.gather(preload_task, return_exceptions=True)
+    interval_s = int(getattr(config, "VOICE_STT_KEEPWARM_S", 240))
+    if interval_s <= 0:
+        return
+    while True:
+        last_activity_at = _parakeet_last_activity_at
+        next_warm_at = (
+            time.monotonic() if last_activity_at is None else last_activity_at
+        ) + interval_s
+        delay_s = max(0.0, next_warm_at - time.monotonic())
+        if delay_s <= 0:
+            # The executor may still be occupied (for example by a native STT
+            # call); back off instead of spinning when a warmup cannot start.
+            delay_s = min(15.0, float(interval_s))
+        await asyncio.sleep(delay_s)
+        await keepwarm_parakeet_once()
+
+
+def schedule_parakeet_keepwarm(
+    preload_task: asyncio.Task | None = None,
+) -> asyncio.Task | None:
+    """Startet den periodischen Keepwarm-Task, wenn Parakeet aktiv ist."""
+    if (
+        int(getattr(config, "VOICE_STT_KEEPWARM_S", 240)) <= 0
+        or getattr(config, "STT_ENGINE", "parakeet") != "parakeet"
+    ):
+        return None
+    return asyncio.create_task(
+        _parakeet_keepwarm_loop(preload_task), name="parakeet-stt-keepwarm",
+    )
+
+
 def schedule_parakeet_preload() -> asyncio.Task | None:
     """Plant das Modell-Laden als Hintergrund-Task ein, sofern es aktiviert ist."""
     if (
@@ -324,7 +392,7 @@ def schedule_parakeet_preload() -> asyncio.Task | None:
 async def _transcribe_parakeet(audio_path: str) -> str:
     """Parakeet-TDT über MLX. Setzt bei fehlendem Paket/Modell _parakeet_unavailable,
     damit der Aufrufer einmalig auf whisper umschaltet. Nur unter _whisper_lock aufrufen."""
-    global _parakeet_model, _parakeet_unavailable
+    global _parakeet_model, _parakeet_unavailable, _parakeet_last_activity_at
     if _parakeet_model is None:
         model_id = getattr(config, "STT_PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
         log.info(f"🔊 Lade Parakeet-Modell '{model_id}' …")
@@ -346,10 +414,20 @@ async def _transcribe_parakeet(audio_path: str) -> str:
     try:
         loop = asyncio.get_running_loop()
         started_at = time.perf_counter()
+        keepwarm_interval_s = int(getattr(config, "VOICE_STT_KEEPWARM_S", 240))
+        cold_after_s = max(240, keepwarm_interval_s)
+        was_cold = (
+            _parakeet_last_activity_at is None
+            or time.monotonic() - _parakeet_last_activity_at > cold_after_s
+        )
         result = await _await_worker_completion(
             loop.run_in_executor(_parakeet_executor, _parakeet_model.transcribe, audio_path)
         )
-        _record_stt_runtime(audio_path, started_at)
+        if not was_cold:
+            _record_stt_runtime(audio_path, started_at)
+        else:
+            log.info("Parakeet nach Leerlauf aufgewacht; Laufzeit nicht fürs Partial-Budget gelernt")
+        _parakeet_last_activity_at = time.monotonic()
         return (result.text or "").strip()
     except Exception as e:
         # Laufzeitfehler (kaputte Datei o.ä.) — kein Grund, die Engine zu wechseln.

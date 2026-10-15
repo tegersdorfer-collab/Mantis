@@ -26,6 +26,10 @@ SAMPLE_RATE = 16000
 # independently per detector before dispatching full-size frames.
 VAD_FRAME_BYTES = 512 * 2  # 1024 bytes
 WAKEWORD_FRAME_BYTES = 1280 * 2  # 2560 bytes
+_DEFAULT_PARTIAL = object()
+PARTIAL_SKIP_REASONS = (
+    "busy", "budget", "interval", "no_speech", "disabled", "not_wired",
+)
 log = logging.getLogger(__name__)
 
 
@@ -70,9 +74,10 @@ class VoiceStreamSession:
         *,
         partial_transcriber: Callable[
             [bytes], Awaitable[str | tuple[str, bool] | None]
-        ] | None = None,
-        partial_executor_available: Callable[[], bool] | None = None,
+        ] | None | object = _DEFAULT_PARTIAL,
+        partial_executor_available: Callable[[], bool] | None | object = _DEFAULT_PARTIAL,
         on_partial: Callable[[str], None] | None = None,
+        on_speech_started: Callable[[float], None] | None = None,
         partial_interval_ms: float | None = None,
         clock: Callable[[], float] | None = None,
         bargein_active_fn: Callable[[], bool] | None = None,
@@ -92,9 +97,20 @@ class VoiceStreamSession:
         # fed through on a shared per-call cadence.
         self._vad_buffer = bytearray()
         self._wakeword_buffer = bytearray()
-        self._partial_transcriber = partial_transcriber or transcribe_pcm_partial
-        self._partial_executor_available = partial_executor_available or partial_stt_executor_available
+        self._partial_transcriber = (
+            transcribe_pcm_partial if partial_transcriber is _DEFAULT_PARTIAL
+            else partial_transcriber
+        )
+        self._partial_executor_available = (
+            partial_stt_executor_available
+            if partial_executor_available is _DEFAULT_PARTIAL
+            else partial_executor_available
+        )
+        self._partial_wired = callable(self._partial_transcriber) and callable(
+            self._partial_executor_available
+        )
         self._on_partial = on_partial
+        self._on_speech_started = on_speech_started
         self._partial_interval_ms = float(
             config.VOICE_PARTIAL_STT_MS if partial_interval_ms is None else partial_interval_ms
         )
@@ -102,10 +118,12 @@ class VoiceStreamSession:
         self._bargein_active_fn = bargein_active_fn or (lambda: False)
         self._on_bargein = on_bargein
         self._bargein_notified = False
+        self._speech_onset_notified = False
         self._speech_started_at: float | None = None
         self._last_partial_at: float | None = None
         self._partial_task: asyncio.Task | None = None
         self._partial_runs = 0
+        self._partial_skip_reasons = {reason: 0 for reason in PARTIAL_SKIP_REASONS}
         self._partial_text = ""
         self._partial_wakeword_hint = False
         self._partial_audio_end_sample_index: int | None = None
@@ -117,9 +135,11 @@ class VoiceStreamSession:
     def _reset_segment_state(self) -> None:
         self._segment_generation += 1
         self._bargein_notified = False
+        self._speech_onset_notified = False
         self._speech_started_at = None
         self._last_partial_at = None
         self._partial_runs = 0
+        self._partial_skip_reasons = {reason: 0 for reason in PARTIAL_SKIP_REASONS}
         self._partial_text = ""
         self._partial_wakeword_hint = False
         self._partial_audio_end_sample_index = None
@@ -177,6 +197,7 @@ class VoiceStreamSession:
                 continue
 
             partial_runs = self._partial_runs
+            partial_skip_reasons = dict(self._partial_skip_reasons)
             turn_started_at = time.perf_counter()
             stt_started = turn_started_at
             partial_text = self._partial_text
@@ -234,7 +255,9 @@ class VoiceStreamSession:
                 "wakeword_hint": bool(wakeword_hint),
                 "stt_ms": stt_ms,
                 "turn_started_at": turn_started_at,
+                "segment_ended_at": time.monotonic(),
                 "partial_runs": partial_runs,
+                "partial_skip_reasons": partial_skip_reasons,
                 "partial_text": partial_text,
                 "partial_as_final": partial_as_final,
             }
@@ -284,9 +307,25 @@ class VoiceStreamSession:
     def _maybe_start_partial(self) -> None:
         if self._closed:
             return
-        if getattr(self._segmenter, "is_speaking", None) is not True:
+        speaking = getattr(self._segmenter, "is_speaking", None) is True
+        current_chunk_is_speech = (
+            getattr(self._segmenter, "current_chunk_is_speech", None) is True
+        )
+        if not speaking or not current_chunk_is_speech:
+            self._partial_skip_reasons["no_speech"] += 1
             return
-        if getattr(self._segmenter, "current_chunk_is_speech", None) is not True:
+        if not self._speech_onset_notified:
+            self._speech_onset_notified = True
+            if self._on_speech_started is not None:
+                try:
+                    self._on_speech_started(self._clock())
+                except Exception as exc:
+                    log.debug("Voice-Speechstart-Callback fehlgeschlagen (%s)", type(exc).__name__)
+        if self._partial_interval_ms <= 0:
+            self._partial_skip_reasons["disabled"] += 1
+            return
+        if not self._partial_wired:
+            self._partial_skip_reasons["not_wired"] += 1
             return
         now = self._clock()
         if self._speech_started_at is None:
@@ -299,8 +338,10 @@ class VoiceStreamSession:
             self._segment_generation += 1
 
         if now - self._last_partial_at < self._partial_interval_ms / 1000:
+            self._partial_skip_reasons["interval"] += 1
             return
         if self._partial_task is not None and not self._partial_task.done():
+            self._partial_skip_reasons["busy"] += 1
             return
         self._last_partial_at = now
         if self._partial_task is not None:
@@ -311,17 +352,21 @@ class VoiceStreamSession:
             self._partial_task = None
         try:
             if not self._partial_executor_available():
+                self._partial_skip_reasons["busy"] += 1
                 return
         except Exception as exc:
             log.debug("STT-Executor-Status nicht verfügbar (%s)", type(exc).__name__)
+            self._partial_skip_reasons["not_wired"] += 1
             return
 
         current_audio = getattr(self._segmenter, "current_audio", None)
         if not isinstance(current_audio, (bytes, bytearray)) or not current_audio:
+            self._partial_skip_reasons["no_speech"] += 1
             return
         audio_seconds = len(current_audio) / (2 * SAMPLE_RATE)
         predicted_ms = stt_runtime.estimate_stt_runtime_ms(audio_seconds)
         if predicted_ms > float(getattr(config, "VOICE_PARTIAL_MAX_MS", 600)):
+            self._partial_skip_reasons["budget"] += 1
             return
         generation = self._segment_generation
         audio = bytes(current_audio)

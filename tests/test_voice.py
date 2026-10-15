@@ -387,7 +387,7 @@ def test_voice_settings_default_to_short_answers_and_stt_preload(monkeypatch):
     assert settings.VOICE_WAKE_PREROLL_MS == 1500
 
 
-def test_stt_runtime_estimate_learns_from_warmup_and_final_runs(monkeypatch, tmp_path):
+def test_stt_runtime_estimate_uses_final_runs_but_not_warmup(monkeypatch, tmp_path):
     import time
     import wave
     from collections import deque
@@ -410,8 +410,7 @@ def test_stt_runtime_estimate_learns_from_warmup_and_final_runs(monkeypatch, tmp
 
     voice._warmup_parakeet(model)
 
-    assert len(stt_runtime._samples) == 1
-    assert stt_runtime.estimate_stt_runtime_ms(1.0) < 550
+    assert len(stt_runtime._samples) == 0
 
     audio_path = tmp_path / "one-second.wav"
     with wave.open(str(audio_path), "wb") as audio_file:
@@ -422,11 +421,73 @@ def test_stt_runtime_estimate_learns_from_warmup_and_final_runs(monkeypatch, tmp
 
     assert asyncio.run(voice.transcribe_audio(str(audio_path))) == "Okay Mantis"
 
-    assert len(stt_runtime._samples) == 2
+    assert len(stt_runtime._samples) == 1
     assert stt_runtime.estimate_stt_runtime_ms(1.0) < 550
 
 
-def test_parakeet_warmup_replaces_old_runtime_average_using_its_audio_duration(monkeypatch):
+def test_idle_parakeet_keepwarm_runs_only_when_stt_executor_is_idle(monkeypatch):
+    import time
+    from types import SimpleNamespace
+
+    calls = []
+    model = SimpleNamespace(transcribe=lambda _path: calls.append("warm"))
+    monkeypatch.setattr(voice, "_parakeet_model", model)
+    monkeypatch.setattr(voice, "_parakeet_unavailable", False)
+    monkeypatch.setattr(voice, "_whisper_lock", asyncio.Lock())
+    monkeypatch.setattr(voice, "_parakeet_last_activity_at", time.monotonic() - 241)
+
+    async def run():
+        assert await voice.keepwarm_parakeet_once() is True
+        await voice._whisper_lock.acquire()
+        try:
+            assert await voice.keepwarm_parakeet_once() is False
+        finally:
+            voice._whisper_lock.release()
+
+    asyncio.run(run())
+    assert calls == ["warm"]
+
+
+def test_idle_parakeet_keepwarm_skips_recent_stt_activity(monkeypatch):
+    import time
+    from types import SimpleNamespace
+
+    calls = []
+    model = SimpleNamespace(transcribe=lambda _path: calls.append("warm"))
+    monkeypatch.setattr(voice, "_parakeet_model", model)
+    monkeypatch.setattr(voice, "_parakeet_unavailable", False)
+    monkeypatch.setattr(voice, "_whisper_lock", asyncio.Lock())
+    monkeypatch.setattr(voice, "_parakeet_last_activity_at", time.monotonic() - 30)
+    monkeypatch.setattr(voice.config, "VOICE_STT_KEEPWARM_S", 240, raising=False)
+
+    assert asyncio.run(voice.keepwarm_parakeet_once()) is False
+    assert calls == []
+
+
+def test_cold_parakeet_inference_does_not_poison_partial_runtime_budget(monkeypatch):
+    import time
+    from types import SimpleNamespace
+
+    calls = []
+    model = SimpleNamespace(transcribe=lambda _path: SimpleNamespace(text="Mantis"))
+    monkeypatch.setattr(voice, "_parakeet_model", model)
+    monkeypatch.setattr(voice, "_parakeet_unavailable", False)
+    monkeypatch.setattr(voice, "_parakeet_last_activity_at", 0.0, raising=False)
+    monkeypatch.setattr(
+        voice, "_record_stt_runtime", lambda path, started: calls.append((path, started)),
+    )
+
+    async def run():
+        assert await voice._transcribe_parakeet("cold.wav") == "Mantis"
+        assert calls == []
+        voice._parakeet_last_activity_at = time.monotonic() - 1
+        assert await voice._transcribe_parakeet("warm.wav") == "Mantis"
+
+    asyncio.run(run())
+    assert calls and calls[0][0] == "warm.wav"
+
+
+def test_parakeet_warmup_does_not_replace_final_stt_runtime_samples(monkeypatch):
     from collections import deque
     from types import SimpleNamespace
 
@@ -435,13 +496,10 @@ def test_parakeet_warmup_replaces_old_runtime_average_using_its_audio_duration(m
     monkeypatch.setattr(
         stt_runtime, "_samples", deque([400.0, 300.0], maxlen=stt_runtime._SAMPLE_WINDOW),
     )
-    elapsed = iter((10.0, 10.12))
-    monkeypatch.setattr(voice.time, "perf_counter", lambda: next(elapsed))
-
     voice._warmup_parakeet(SimpleNamespace(transcribe=lambda _path: None))
 
-    assert list(stt_runtime._samples) == pytest.approx([120.0])
-    assert stt_runtime.estimate_stt_runtime_ms(2.0) == pytest.approx(340.0)
+    assert list(stt_runtime._samples) == pytest.approx([400.0, 300.0])
+    assert stt_runtime.estimate_stt_runtime_ms(2.0) == pytest.approx(800.0)
 
 
 def test_failed_parakeet_inference_does_not_record_stt_runtime(monkeypatch):

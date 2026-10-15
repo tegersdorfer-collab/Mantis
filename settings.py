@@ -100,8 +100,9 @@ class MantisSettings(BaseSettings):
     VOICE_SILENCE_MS: int = 800
     VOICE_ADAPTIVE_SILENCE: bool = True
     VOICE_SILENCE_FAST_MS: int = Field(default=450, gt=0)
-    VOICE_SILENCE_SLOW_MS: int = Field(default=1200, gt=0)
-    VOICE_PARTIAL_STT_MS: int = Field(default=700, gt=0)
+    VOICE_SILENCE_SLOW_MS: int = Field(default=2000, gt=0)
+    VOICE_CONTINUATION_MS: int = Field(default=3000, gt=0)
+    VOICE_PARTIAL_STT_MS: int = Field(default=700, ge=0)
     VOICE_PARTIAL_STALE_MS: int = Field(default=400, gt=0)
     VOICE_PARTIAL_MAX_MS: int = Field(default=900, gt=0)
     VOICE_WAKE_PREROLL_MS: int = Field(default=1500, ge=0)
@@ -162,6 +163,7 @@ class MantisSettings(BaseSettings):
     STT_ENGINE: str = "parakeet"
     STT_PARAKEET_MODEL: str = "mlx-community/parakeet-tdt-0.6b-v3"
     STT_PRELOAD: bool = True
+    VOICE_STT_KEEPWARM_S: int = Field(default=240, ge=0)
     ANTHROPIC_API_KEY: str = ""
     ANTHROPIC_ALLOWED_MODELS: list[str] = Field(
         default_factory=lambda: ["claude-haiku-5-5"],

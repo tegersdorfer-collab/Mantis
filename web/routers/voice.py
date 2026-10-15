@@ -33,7 +33,9 @@ from core.voice import (
 )
 from core import fast_commands
 from core.voice_prework import VoicePreworkCache
-from core.voice_stream import VoiceStreamSession
+from core.voice_stream import (
+    VoiceStreamSession, partial_stt_executor_available, transcribe_pcm_partial,
+)
 from core.stream_events import StreamEvent
 from core.tts import _first_early_stream_boundary, synthesize, synthesize_stream
 
@@ -359,6 +361,8 @@ def _record_voice_latency(
     address_check_ms: float | None = None,
     address_check_mode: str | None = None,
     held_ms: float | None = None,
+    partial_runs: int | None = None,
+    partial_skip_reasons: dict | None = None,
     first_token_ms: float | None = None,
     first_tts_block_ms: float | None = None,
     first_answer_audio_ms: float | None = None,
@@ -368,6 +372,13 @@ def _record_voice_latency(
     bargein_ms: float | None = None,
 ) -> dict:
     model, stage = _voice_backend_details(orch)
+    timing_detail = voice_timing.snapshot()
+    if partial_runs is not None:
+        timing_detail["partial_runs"] = max(0, int(partial_runs))
+    if partial_skip_reasons is not None:
+        timing_detail["partial_skip_reasons"] = voice_timing.partial_skip_snapshot(
+            partial_skip_reasons,
+        )
     detail = {
         "stt_ms": stt_ms,
         "address_check_ms": address_check_ms,
@@ -383,7 +394,7 @@ def _record_voice_latency(
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
         "model": model,
         "stage": stage,
-        **voice_timing.snapshot(),
+        **timing_detail,
     }
     log.info("voice_latency %s", detail)
     db.log_event("voice_latency", "Voice-Turn", detail)
@@ -510,6 +521,7 @@ async def sende_streaming_antwort(
     started_at: float | None = None,
     prework=None,
     partial_runs: int = 0,
+    partial_skip_reasons: dict | None = None,
     partial_as_final: bool = False,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     playback: _PlaybackTurn | None = None,
@@ -858,6 +870,7 @@ async def sende_streaming_antwort(
     turn_state, turn_token = tts._start_tts_turn()
     timing = voice_timing.current()
     timing.partial_runs = max(0, int(partial_runs))
+    voice_timing.set_partial_skip_reasons(partial_skip_reasons)
     timing.partial_as_final = bool(partial_as_final)
     if getattr(config, "VOICE_FILLERS_ENABLED", True):
         ack_task = asyncio.create_task(send_ack_after_delay(), name="voice-filler-ack-delay")
@@ -1045,7 +1058,7 @@ def build_router(orch=None) -> APIRouter:
     async def voice_stream(websocket: WebSocket):
         await websocket.accept()
 
-        from core.vad import SileroVAD, VadSegmenter
+        from core.vad import SileroVAD, VadSegmenter, UtteranceStatus, classify_utterance
 
         vad_model = SileroVAD(Path(__file__).parent.parent.parent / "data" / "vad" / "silero_vad.onnx")
         # VoiceStreamSession buffers raw incoming chunks into fixed 512-sample
@@ -1077,6 +1090,13 @@ def build_router(orch=None) -> APIRouter:
         recent_tts_turns: deque[_PlaybackTurn] = deque()
         conversation_window = VoiceConversationWindow()
         send_lock = asyncio.Lock()
+        turn_results: asyncio.Queue[dict] = asyncio.Queue()
+        pending_incomplete_result: dict | None = None
+        pending_incomplete_end_at = 0.0
+        pending_incomplete_deadline = 0.0
+        pending_continuation_started = False
+        pending_incomplete_task: asyncio.Task | None = None
+        latest_speech_started_at: float | None = None
 
         class SerializedWebSocket:
             async def send_json(self, data):
@@ -1162,6 +1182,19 @@ def build_router(orch=None) -> APIRouter:
                 "type": "stop_playback", "turn_id": playback.turn_id,
             })
 
+        def on_voice_speech_started(started_at: float | None = None) -> None:
+            nonlocal latest_speech_started_at, pending_continuation_started
+            onset_at = time.monotonic() if started_at is None else float(started_at)
+            latest_speech_started_at = onset_at
+            if (
+                pending_incomplete_result is not None
+                and pending_incomplete_end_at < onset_at <= pending_incomplete_deadline
+            ):
+                pending_continuation_started = True
+                task = pending_incomplete_task
+                if task is not None and not task.done():
+                    task.cancel()
+
         def conversation_active() -> bool:
             return active_playback is not None or conversation_window.is_active()
 
@@ -1169,7 +1202,11 @@ def build_router(orch=None) -> APIRouter:
             vad_segmenter=segmenter,
             wakeword_detector=wakeword_detector,
             conversation_active_fn=conversation_active,
+            partial_transcriber=transcribe_pcm_partial,
+            partial_executor_available=partial_stt_executor_available,
+            partial_interval_ms=config.VOICE_PARTIAL_STT_MS,
             on_partial=prework_cache.offer if prework_cache is not None else None,
+            on_speech_started=on_voice_speech_started,
             bargein_active_fn=lambda: (
                 active_playback is not None and active_playback.playback_active
             ),
@@ -1192,6 +1229,7 @@ def build_router(orch=None) -> APIRouter:
                     started_at=result.get("turn_started_at"),
                     prework=prework,
                     partial_runs=result.get("partial_runs", 0),
+                    partial_skip_reasons=result.get("partial_skip_reasons"),
                     partial_as_final=result.get("partial_as_final", False),
                     playback=playback,
                     execution_gate=execution_gate,
@@ -1414,6 +1452,8 @@ def build_router(orch=None) -> APIRouter:
                         orch, started_at, stt_ms=result.get("stt_ms"),
                         address_check_ms=result.get("address_check_ms"),
                         address_check_mode=address_mode, held_ms=output_gate.held_ms,
+                        partial_runs=result.get("partial_runs", 0),
+                        partial_skip_reasons=result.get("partial_skip_reasons"),
                     )
 
                 address_task = asyncio.create_task(
@@ -1434,6 +1474,9 @@ def build_router(orch=None) -> APIRouter:
                 timing_token = voice_timing.start()
                 timing = voice_timing.current()
                 timing.partial_runs = max(0, int(result.get("partial_runs", 0)))
+                voice_timing.set_partial_skip_reasons(
+                    result.get("partial_skip_reasons"),
+                )
                 timing.partial_as_final = bool(result.get("partial_as_final", False))
                 response_task = asyncio.create_task(
                     call_voice_response(), name="voice-speculative-response",
@@ -1525,6 +1568,9 @@ def build_router(orch=None) -> APIRouter:
                     timing_token = voice_timing.start()
                     timing = voice_timing.current()
                     timing.partial_runs = max(0, int(result.get("partial_runs", 0)))
+                    voice_timing.set_partial_skip_reasons(
+                        result.get("partial_skip_reasons"),
+                    )
                     timing.partial_as_final = bool(result.get("partial_as_final", False))
                     reply, trace = await call_voice_response()
                     _mark_reflex(trace)
@@ -1552,13 +1598,166 @@ def build_router(orch=None) -> APIRouter:
                     if timing_token is not None:
                         voice_timing.reset(timing_token)
 
-        turn_results: asyncio.Queue[dict] = asyncio.Queue()
+        async def clear_pending_incomplete() -> dict | None:
+            nonlocal pending_incomplete_result, pending_incomplete_task
+            nonlocal pending_continuation_started
+            result = pending_incomplete_result
+            pending_incomplete_result = None
+            pending_continuation_started = False
+            task = pending_incomplete_task
+            pending_incomplete_task = None
+            if task is not None and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            return result
+
+        async def flush_incomplete_after_window(result: dict, deadline: float) -> None:
+            try:
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(deadline - time.monotonic())
+            except asyncio.CancelledError:
+                return
+            if (
+                pending_incomplete_result is result
+                and not pending_continuation_started
+            ):
+                # The turn processor serializes this marker with incoming audio
+                # results, so a late continuation cannot race a duplicate turn.
+                turn_results.put_nowait({"_voice_incomplete_flush": result})
+
+        async def queue_or_merge_voice_result(result: dict) -> None:
+            nonlocal pending_incomplete_result, pending_incomplete_end_at
+            nonlocal pending_incomplete_deadline, pending_continuation_started
+            nonlocal pending_incomplete_task
+
+            if pending_incomplete_result is not None:
+                if (
+                    not pending_continuation_started
+                    and latest_speech_started_at is not None
+                    and pending_incomplete_end_at < latest_speech_started_at
+                    <= pending_incomplete_deadline
+                ):
+                    pending_continuation_started = True
+
+                continuation_started = pending_continuation_started
+                first = await clear_pending_incomplete()
+                if first is not None:
+                    if continuation_started:
+                        merged = dict(result)
+                        first_text = str(first.get("text") or "").strip()
+                        next_text = str(result.get("text") or "").strip()
+                        merged["text"] = " ".join(
+                            part for part in (first_text, next_text) if part
+                        )
+                        merged["turn_started_at"] = first.get(
+                            "turn_started_at", result.get("turn_started_at"),
+                        )
+                        first_stt_ms = first.get("stt_ms")
+                        next_stt_ms = result.get("stt_ms")
+                        if first_stt_ms is not None or next_stt_ms is not None:
+                            merged["stt_ms"] = sum(
+                                float(value or 0.0)
+                                for value in (first_stt_ms, next_stt_ms)
+                            )
+                        merged["wakeword_triggered"] = bool(
+                            first.get("wakeword_triggered")
+                            or result.get("wakeword_triggered")
+                        )
+                        merged["wakeword_hint"] = bool(
+                            first.get("wakeword_hint") or result.get("wakeword_hint")
+                        )
+                        merged["partial_runs"] = (
+                            max(0, int(first.get("partial_runs", 0) or 0))
+                            + max(0, int(result.get("partial_runs", 0) or 0))
+                        )
+                        first_reasons = voice_timing.partial_skip_snapshot(
+                            first.get("partial_skip_reasons"),
+                        )
+                        next_reasons = voice_timing.partial_skip_snapshot(
+                            result.get("partial_skip_reasons"),
+                        )
+                        merged["partial_skip_reasons"] = {
+                            reason: first_reasons[reason] + next_reasons[reason]
+                            for reason in first_reasons
+                        }
+                        merged["partial_text"] = ""
+                        merged["partial_as_final"] = False
+
+                        def echo_values(value):
+                            if isinstance(value, str):
+                                return [value]
+                            return list(value or ())
+
+                        merged["_echo_texts"] = [
+                            *echo_values(first.get("_echo_texts")),
+                            *echo_values(result.get("_echo_texts")),
+                        ]
+                        await process_voice_result(merged)
+                        return
+                    await process_voice_result(first)
+
+            text = str(result.get("text") or "").strip()
+            classifier_text = re.sub(
+                r"^\s*Mantis\b[\s,;:.!?—-]*", "", text, flags=re.IGNORECASE,
+            )
+            explicitly_addressed = bool(
+                result.get("wakeword_triggered")
+                or result.get("wakeword_hint")
+                or has_voice_wakeword_hint(text)
+                or re.match(r"^\s*Mantis\b", text, flags=re.IGNORECASE)
+            )
+            should_defer_incomplete = (
+                classify_utterance(classifier_text) is UtteranceStatus.INCOMPLETE
+                and (not conversation_window.is_active() or explicitly_addressed)
+            )
+            if not should_defer_incomplete:
+                await process_voice_result(result)
+                return
+
+            ended_at = float(
+                result.get("segment_ended_at")
+                or result.get("turn_started_at")
+                or time.monotonic()
+            )
+            deadline = ended_at + max(
+                1, int(getattr(config, "VOICE_CONTINUATION_MS", 3000)),
+            ) / 1000
+            if deadline <= time.monotonic():
+                await process_voice_result(result)
+                return
+
+            pending_incomplete_result = result
+            pending_incomplete_end_at = ended_at
+            pending_incomplete_deadline = deadline
+            pending_continuation_started = bool(
+                latest_speech_started_at is not None
+                and ended_at < latest_speech_started_at <= deadline
+            )
+            pending_incomplete_task = asyncio.create_task(
+                flush_incomplete_after_window(result, deadline),
+                name="voice-incomplete-continuation-window",
+            )
+
+        async def process_incomplete_flush_marker(result: dict) -> None:
+            if (
+                pending_incomplete_result is result
+                and not pending_continuation_started
+                and time.monotonic() >= pending_incomplete_deadline
+            ):
+                pending = await clear_pending_incomplete()
+                if pending is not None:
+                    await process_voice_result(pending)
 
         async def process_turn_results() -> None:
             while True:
                 result = await turn_results.get()
                 try:
-                    await process_voice_result(result)
+                    if "_voice_incomplete_flush" in result:
+                        await process_incomplete_flush_marker(
+                            result["_voice_incomplete_flush"],
+                        )
+                    else:
+                        await queue_or_merge_voice_result(result)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -1626,6 +1825,8 @@ def build_router(orch=None) -> APIRouter:
                 tasks_to_finish.update(background_address_tasks)
                 if active_response_task is not None:
                     tasks_to_finish.add(active_response_task)
+                if pending_incomplete_task is not None:
+                    tasks_to_finish.add(pending_incomplete_task)
                 tasks_to_finish.add(turn_processor)
                 for task in tasks_to_finish:
                     if not task.done():

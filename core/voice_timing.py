@@ -11,6 +11,20 @@ from contextlib import contextmanager
 _current: contextvars.ContextVar["TurnTiming | None"] = contextvars.ContextVar(
     "voice_turn_timing", default=None,
 )
+_PARTIAL_SKIP_REASONS = (
+    "busy", "budget", "interval", "no_speech", "disabled", "not_wired",
+)
+
+
+def partial_skip_snapshot(reasons: dict | None = None) -> dict[str, int]:
+    values = reasons or {}
+    result = {}
+    for name in _PARTIAL_SKIP_REASONS:
+        try:
+            result[name] = max(0, int(values.get(name, 0)))
+        except (TypeError, ValueError):
+            result[name] = 0
+    return result
 
 
 class TurnTiming:
@@ -22,6 +36,7 @@ class TurnTiming:
         self.pending_tokens: int | None = None
         self.reflex = False
         self.partial_runs = 0
+        self.partial_skip_reasons = partial_skip_snapshot()
         self.partial_as_final = False
         self.partial_reused = False
         self.saved_ms = 0.0
@@ -34,6 +49,7 @@ class TurnTiming:
             "tool_exec_ms": round(self.tool_exec_ms, 1),
             "reflex": self.reflex,
             "partial_runs": self.partial_runs,
+            "partial_skip_reasons": dict(self.partial_skip_reasons),
             "partial_as_final": self.partial_as_final,
             "partial_reused": self.partial_reused,
             "saved_ms": round(self.saved_ms, 1),
@@ -69,6 +85,12 @@ def mark_partial_reused(saved_ms: float) -> None:
     if timing is not None and not timing.reflex:
         timing.partial_reused = True
         timing.saved_ms = max(0.0, float(saved_ms))
+
+
+def set_partial_skip_reasons(reasons: dict | None) -> None:
+    timing = _current.get()
+    if timing is not None:
+        timing.partial_skip_reasons = partial_skip_snapshot(reasons)
 
 
 def snapshot() -> dict:

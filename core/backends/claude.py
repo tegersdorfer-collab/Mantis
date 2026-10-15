@@ -6,6 +6,7 @@ import json
 import logging
 
 import anthropic
+import httpx
 
 from core.backends.base import AgentBackend, StreamCb
 from core.voice_text import last_complete_sentence
@@ -15,6 +16,9 @@ import config
 log = logging.getLogger(__name__)
 
 _FAST_PURPOSES = ("voice", "fast")
+_ANTHROPIC_HTTP_KEEPALIVE_S = 7200
+_ANTHROPIC_HTTP_MAX_CONNECTIONS = 20
+_ANTHROPIC_HTTP_MAX_KEEPALIVE_CONNECTIONS = 10
 _TEMPERATURE_UNSUPPORTED_MODEL_PREFIXES = ("claude-haiku-5-5",)
 
 
@@ -219,7 +223,17 @@ class ClaudeBackend(AgentBackend):
         self._model = model or config.CLAUDE_CHAT_MODEL
         ensure_anthropic_model_allowed(self._model)
         self._purpose = purpose
-        self._client = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+        self._http_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=_ANTHROPIC_HTTP_MAX_CONNECTIONS,
+                max_keepalive_connections=_ANTHROPIC_HTTP_MAX_KEEPALIVE_CONNECTIONS,
+                keepalive_expiry=_ANTHROPIC_HTTP_KEEPALIVE_S,
+            ),
+        )
+        self._client = anthropic.AsyncAnthropic(
+            api_key=config.ANTHROPIC_API_KEY,
+            http_client=self._http_client,
+        )
 
     @property
     def model_name(self) -> str:
