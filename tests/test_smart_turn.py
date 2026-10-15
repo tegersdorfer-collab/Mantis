@@ -94,7 +94,7 @@ def test_smart_turn_uses_one_eight_second_whisper_window_and_runtime_names(tmp_p
 
 
 def test_smart_turn_features_match_real_whisper_pipecat_reference(tmp_path):
-    from transformers import WhisperFeatureExtractor
+    WhisperFeatureExtractor = pytest.importorskip("transformers").WhisperFeatureExtractor
     from core.smart_turn import SmartTurnAnalyzer, WINDOW_SAMPLES
 
     class CapturingSession(_Session):
