@@ -217,12 +217,32 @@ _TIMER_STOP_RE = re.compile(
     r"(?:stopp(?:e|en)?|stop(?:pe|pen)?|beende|abbrechen)\s+(?:den\s+)?timer)$",
     re.IGNORECASE,
 )
+_WAKEWORD_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:hey|okay)\s*,?\s+)?"
+    r"(?P<wake>mantis|mäntis|mann\s*,?\s*das|man\s*tis|mentis|manthis)"
+    r"(?:[\s,.:!-]+|$)",
+    re.IGNORECASE,
+)
 
 
 def _voice_text(text: str) -> str:
     value = text.strip().lower()
-    value = re.sub(r"^(?:hey\s+)?mantis[\s,.:!-]+", "", value)
     return re.sub(r"[\s?!.;,]+$", "", value).strip()
+
+
+def _is_ambiguous_wakeword(wake: str) -> bool:
+    return re.sub(r"[\s,]+", "", wake).casefold() == "manndas"
+
+
+def has_voice_wakeword(text: str) -> bool:
+    """Prüft ein führendes Weckwort ohne mehrdeutige Alltagssätze abzufangen."""
+    wakeword = _WAKEWORD_PREFIX_RE.match(text)
+    if wakeword is None:
+        return False
+    if not _is_ambiguous_wakeword(wakeword.group("wake")):
+        return True
+    command = match_voice(text[wakeword.end():])
+    return command is not None and command.tool == "voice_reflex"
 
 
 def _as_voice_reflex(response: str, label: str) -> FastCommand:
@@ -250,13 +270,26 @@ def match_voice(text: str, *, now: datetime | None = None) -> FastCommand | None
     """
     if not text or not text.strip():
         return None
-    phrase = _voice_text(text)
-    if not phrase:
-        return None
     if now is None:
         now = datetime.now(ZoneInfo(config.OWNER_TIMEZONE))
     elif now.tzinfo is None:
         now = now.replace(tzinfo=ZoneInfo(config.OWNER_TIMEZONE))
+
+    wakeword = _WAKEWORD_PREFIX_RE.match(text)
+    if wakeword is not None:
+        remainder = text[wakeword.end():]
+        if _is_ambiguous_wakeword(wakeword.group("wake")):
+            # "Mann, das ..." ist auch gewöhnliche Sprache. Nur als Weckwort werten,
+            # wenn der Rest für sich bereits einen eng begrenzten Voice-Reflex trifft.
+            command = match_voice(remainder, now=now)
+            if command is not None and command.tool == "voice_reflex":
+                return command
+        else:
+            text = remainder
+
+    phrase = _voice_text(text)
+    if not phrase:
+        return None
 
     if phrase in {"wie spät ist es", "wie spät ist's", "wie viel uhr ist es", "uhrzeit"}:
         return _as_voice_reflex(f"Es ist {now:%H:%M} Uhr.", "uhrzeit")
