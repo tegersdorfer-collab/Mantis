@@ -139,6 +139,9 @@ class MantisSettings(BaseSettings):
     TTS_KLON_PYTHON: str = str(_TTS_KLON_REPO_ROOT / ".venv-tts" / "bin" / "python")
     TTS_KLON_REF_DIR: str = str(_TTS_KLON_REPO_ROOT / "data" / "voice_clone")
     TTS_KLON_IDLE_S: float = Field(default=600.0, gt=0)
+    TTS_KLON_START_TIMEOUT_S: float = Field(default=20.0, gt=0)
+    TTS_KLON_FIRST_CHUNK_TIMEOUT_S: float = Field(default=3.0, gt=0)
+    TTS_KLON_CHUNK_TIMEOUT_S: float = Field(default=3.0, gt=0)
     TTS_KLON_PRONUNCIATIONS: dict[str, str] = Field(
         default_factory=lambda: dict(_DEFAULT_TTS_KLON_PRONUNCIATIONS),
     )

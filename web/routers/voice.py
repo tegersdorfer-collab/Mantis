@@ -125,11 +125,7 @@ class _PlaybackTurn:
 
     @property
     def assistant_text(self) -> str:
-        return " ".join(
-            sentence.text
-            for sentence in self.sentences.values()
-            if any(self.blocks[block_id].sent_at is not None for block_id in sentence.block_ids)
-        ).strip()
+        return self.spoken_text()
 
     def estimate_progress(self, *, now: float | None = None) -> None:
         """Schätzt ohne Clientmeldungen, wie viele gesendete Blöcke bereits liefen."""
@@ -1016,6 +1012,8 @@ def build_router(orch=None) -> APIRouter:
             ):
                 return
             playback.interrupted = True
+            if not playback.progress_reported:
+                playback.estimate_progress()
             conversation_window.mark_active(
                 playback.assistant_text or conversation_window.address_context(),
             )

@@ -65,6 +65,10 @@ async def _probe_sentence(process, request_id: str, text: str) -> tuple[float, f
         if not line:
             raise RuntimeError(f"Worker endete unerwartet (Exit {process.returncode})")
         result = json.loads(line)
+        if "ready" in result and "id" not in result:
+            if not result["ready"]:
+                raise RuntimeError(result.get("error") or "Worker nicht bereit")
+            continue
         if result.get("id") != request_id:
             raise RuntimeError("Worker lieferte eine falsche Anfrage-ID")
         if "error" in result:

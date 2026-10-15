@@ -53,6 +53,9 @@ _DEFAULT_ENGINE_CHAIN = ("cartesia", "klon", "elevenlabs", "google", "local")
 _LEGACY_DEFAULT_ENGINE_CHAIN = ("cartesia", "elevenlabs", "google", "local")
 _ERROR_COOLDOWN_S = 60.0
 _BOUND_ENGINE_RETRY_TIMEOUT_S = 1.5
+_KLON_START_TIMEOUT_DEFAULT_S = 20.0
+_KLON_FIRST_CHUNK_TIMEOUT_DEFAULT_S = 3.0
+_KLON_CHUNK_TIMEOUT_DEFAULT_S = 3.0
 _QUOTA_HINTS = ("quota", "credit", "payment_required")
 _KLON_MODEL = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"
 _KLON_WORKER_PATH = Path(__file__).parent.parent / "services" / "tts_klon" / "worker.py"
@@ -88,6 +91,7 @@ _lock = asyncio.Lock()
 _klon_process: asyncio.subprocess.Process | None = None
 _klon_process_lock = asyncio.Lock()
 _klon_idle_task: asyncio.Task | None = None
+_klon_prewarm_task: asyncio.Task | None = None
 _klon_last_used = 0.0
 _klon_request_seq = 0
 
@@ -126,12 +130,37 @@ async def _discard_klon_worker(process: asyncio.subprocess.Process) -> None:
         _klon_process = None
         _cancel_klon_idle_task()
     if process.returncode is None:
-        process.kill()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
     try:
         await asyncio.wait_for(process.wait(), timeout=2.0)
     except TimeoutError:
-        process.kill()
-        await process.wait()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+        except TimeoutError:
+            log.error("Klon-TTS-Worker ließ sich nicht rechtzeitig reap'en")
+
+
+def _klon_timeout(config_name: str, default: float) -> float:
+    try:
+        return max(0.01, float(getattr(config, config_name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _klon_worker_environment() -> dict[str, str]:
+    allowed = {"PATH", "HOME", "HF_HOME", "HF_HUB_CACHE", "TMPDIR", "LANG"}
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name in allowed or name.startswith("LC_")
+    }
 
 
 async def _expire_klon_worker(
@@ -172,7 +201,7 @@ async def _ensure_klon_worker() -> asyncio.subprocess.Process:
     python = _klon_python_path()
     if python is None:
         raise RuntimeError("TTS_KLON_PYTHON ist nicht verfügbar")
-    _klon_process = await asyncio.create_subprocess_exec(
+    process = await asyncio.create_subprocess_exec(
         str(python),
         str(_KLON_WORKER_PATH),
         "--ref-dir",
@@ -180,13 +209,42 @@ async def _ensure_klon_worker() -> asyncio.subprocess.Process:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
+        env=_klon_worker_environment(),
     )
-    _touch_klon_worker(_klon_process)
+    _klon_process = process
+    try:
+        if process.stdout is None:
+            raise RuntimeError("Klon-TTS-Worker ohne Standardausgabe gestartet")
+        line = await asyncio.wait_for(
+            process.stdout.readline(),
+            timeout=_klon_timeout("TTS_KLON_START_TIMEOUT_S", _KLON_START_TIMEOUT_DEFAULT_S),
+        )
+        if not line:
+            raise RuntimeError("Klon-TTS-Worker endete vor dem Modell-Start")
+        try:
+            message = json.loads(line)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("Klon-TTS-Worker meldete einen ungültigen Startstatus") from exc
+        if not isinstance(message, dict) or message.get("ready") is not True:
+            detail = message.get("error") if isinstance(message, dict) else None
+            raise RuntimeError(str(detail or "Klon-TTS-Worker meldete keinen erfolgreichen Start"))
+    except BaseException:
+        await _discard_klon_worker(process)
+        raise
+    _touch_klon_worker(process)
     log.info("Klon-TTS-Worker gestartet")
-    return _klon_process
+    return process
 
 
 async def _stop_klon_worker() -> None:
+    global _klon_prewarm_task
+    prewarm_task = _klon_prewarm_task
+    if prewarm_task is not None and prewarm_task is not asyncio.current_task():
+        if not prewarm_task.done():
+            prewarm_task.cancel()
+            await asyncio.gather(prewarm_task, return_exceptions=True)
+        if _klon_prewarm_task is prewarm_task:
+            _klon_prewarm_task = None
     async with _klon_process_lock:
         process = _klon_process
         if process is not None:
@@ -205,12 +263,19 @@ async def _prewarm_klon() -> None:
 
 
 def _schedule_klon_prewarm() -> None:
+    global _klon_prewarm_task
+    if _klon_prewarm_task is not None and not _klon_prewarm_task.done():
+        return
     try:
         task = asyncio.create_task(_prewarm_klon(), name="mantis-tts-klon-prewarm")
     except RuntimeError:
         return
+    _klon_prewarm_task = task
 
     def report_failure(done_task: asyncio.Task) -> None:
+        global _klon_prewarm_task
+        if _klon_prewarm_task is done_task:
+            _klon_prewarm_task = None
         if done_task.cancelled():
             return
         error = done_task.exception()
@@ -236,15 +301,35 @@ async def _klon_pcm_stream(text: str):
         sample_rate = None
         got_chunk = False
         completed = False
+        first_chunk_deadline = (
+            asyncio.get_running_loop().time()
+            + _klon_timeout(
+                "TTS_KLON_FIRST_CHUNK_TIMEOUT_S",
+                _KLON_FIRST_CHUNK_TIMEOUT_DEFAULT_S,
+            )
+        )
         try:
             process.stdin.write(
                 (
                     json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n"
                 ).encode("utf-8")
             )
-            await process.stdin.drain()
+            await asyncio.wait_for(
+                process.stdin.drain(),
+                timeout=max(0.0, first_chunk_deadline - asyncio.get_running_loop().time()),
+            )
             while True:
-                line = await process.stdout.readline()
+                if got_chunk:
+                    timeout = _klon_timeout(
+                        "TTS_KLON_CHUNK_TIMEOUT_S",
+                        _KLON_CHUNK_TIMEOUT_DEFAULT_S,
+                    )
+                else:
+                    timeout = max(
+                        0.0,
+                        first_chunk_deadline - asyncio.get_running_loop().time(),
+                    )
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=timeout)
                 if not line:
                     raise RuntimeError("Klon-TTS-Worker wurde unerwartet beendet")
                 try:
@@ -1671,6 +1756,25 @@ def _split_for_streaming(text: str) -> list[str]:
     return stuecke
 
 
+async def _iterate_async_until(iterator, deadline: float):
+    """Liefert Stücke bis zu einem Gesamtzeitlimit und schließt den Quellstream."""
+    try:
+        loop = asyncio.get_running_loop()
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+            try:
+                item = await asyncio.wait_for(anext(iterator), timeout=remaining)
+            except StopAsyncIteration:
+                return
+            yield item
+    finally:
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            await close()
+
+
 async def _synthesize_unlocked_stream(
     text: str,
     speed: float,
@@ -1687,29 +1791,52 @@ async def _synthesize_unlocked_stream(
                 if retry_bound_engine:
                     state.chain_position = position + 1
                 continue
-            emitted = False
-            try:
-                async for ogg in _klon_ogg_stream(text):
-                    if not ogg:
-                        continue
-                    emitted = True
-                    previous_engine = state.engine
-                    if state.audio_emitted and previous_engine and previous_engine != engine:
+            attempts = 2 if retry_bound_engine else 1
+            for attempt in range(attempts):
+                emitted = False
+                try:
+                    source = _klon_ogg_stream(text).__aiter__()
+                    if attempt:
+                        deadline = (
+                            asyncio.get_running_loop().time()
+                            + max(0.01, float(_BOUND_ENGINE_RETRY_TIMEOUT_S))
+                        )
+                        chunks = _iterate_async_until(source, deadline)
+                    else:
+                        chunks = source
+                    async for ogg in chunks:
+                        if not ogg:
+                            continue
+                        emitted = True
+                        previous_engine = state.engine
+                        if state.audio_emitted and previous_engine and previous_engine != engine:
+                            log.warning(
+                                "Stimmwechsel im laufenden Turn: %s → %s",
+                                _engine_label(previous_engine),
+                                _engine_label(engine),
+                            )
+                        state.engine = engine
+                        state.chain_position = position
+                        state.audio_emitted = True
+                        yield ogg
+                    if emitted:
+                        return
+                except Exception as exc:
+                    log.warning(
+                        "Klon-TTS-Stream fehlgeschlagen (%s)", redact_error_text(exc),
+                    )
+                    if emitted:
+                        state.chain_position = position + 1
+                        raise
+                    if attempt and isinstance(exc, TimeoutError):
+                        _pause_engine(engine, "RetryTimeout", quota=False)
                         log.warning(
-                            "Stimmwechsel im laufenden Turn: %s → %s",
-                            _engine_label(previous_engine),
+                            "%s TTS-Retry nach bereits ausgegebenem Audio lief ins Timeout",
                             _engine_label(engine),
                         )
-                    state.engine = engine
-                    state.chain_position = position
-                    state.audio_emitted = True
-                    yield ogg
-                if emitted:
-                    return
-            except Exception as exc:
-                log.warning("Klon-TTS-Stream fehlgeschlagen (%s)", redact_error_text(exc))
-                if emitted:
-                    return
+                    if attempt == 0 and retry_bound_engine:
+                        continue
+                    break
             if retry_bound_engine:
                 state.chain_position = position + 1
             continue
@@ -1787,10 +1914,12 @@ async def synthesize_stream(
     turn_state = _active_tts_turn.get() or TTSTurnState()
     async with _lock:
         for i, stueck in enumerate(stuecke):
+            emitted_in_piece = False
             try:
                 async for ogg in _synthesize_unlocked_stream(stueck, speed, turn_state):
                     if not ogg:
                         continue
+                    emitted_in_piece = True
                     log.info(
                         "🔊 TTS-Stück %s/%s: %s Zeichen → %sKB OGG",
                         i + 1,
@@ -1802,6 +1931,8 @@ async def synthesize_stream(
             except Exception as e:
                 # Ein kaputtes Stück darf die restliche Antwort nicht verschlucken.
                 log.error("TTS-Stück %s fehlgeschlagen: %s", i, redact_error_text(e))
+                if emitted_in_piece:
+                    raise
 
 
 async def list_voices() -> list[str]:

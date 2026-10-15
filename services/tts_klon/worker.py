@@ -5,7 +5,11 @@ import argparse
 from contextlib import redirect_stdout
 import base64
 import json
+import os
+import queue
 import sys
+import threading
+import time
 from pathlib import Path
 
 
@@ -16,6 +20,45 @@ _PROTOCOL_OUT = sys.stdout
 def _emit(message: dict) -> None:
     _PROTOCOL_OUT.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
     _PROTOCOL_OUT.flush()
+
+
+def _watch_parent(parent_pid: int) -> None:
+    """Beendet den Modellprozess kurz nach dem Verschwinden seines Elternprozesses."""
+    while True:
+        time.sleep(2)
+        current_parent = os.getppid()
+        if current_parent != parent_pid or current_parent <= 1:
+            os._exit(0)
+
+
+def _start_parent_watchdog() -> None:
+    parent_pid = os.getppid()
+    thread = threading.Thread(
+        target=_watch_parent,
+        args=(parent_pid,),
+        name="tts-klon-parent-watchdog",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _read_stdin(requests: queue.Queue[str | None]) -> None:
+    """Leitet JSONL-Anfragen weiter und beendet sich direkt bei stdin-EOF."""
+    for line in sys.stdin:
+        requests.put(line)
+    os._exit(0)
+
+
+def _start_stdin_reader() -> queue.Queue[str | None]:
+    requests: queue.Queue[str | None] = queue.Queue()
+    thread = threading.Thread(
+        target=_read_stdin,
+        args=(requests,),
+        name="tts-klon-stdin-reader",
+        daemon=True,
+    )
+    thread.start()
+    return requests
 
 
 def _load_runtime(ref_dir: Path):
@@ -45,6 +88,8 @@ def _pcm16le(audio, np) -> bytes:
 
 
 def main() -> int:
+    _start_parent_watchdog()
+    requests = _start_stdin_reader()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ref-dir",
@@ -55,13 +100,17 @@ def main() -> int:
 
     try:
         np, model, ref_audio, ref_text = _load_runtime(args.ref_dir)
-        startup_error = None
     except Exception as exc:
-        np = model = ref_audio = ref_text = None
         startup_error = f"{type(exc).__name__}: {exc}"
         print(f"Klon-TTS-Worker konnte nicht starten: {startup_error}", file=sys.stderr, flush=True)
+        _emit({"ready": False, "error": startup_error})
+        return 1
+    _emit({"ready": True})
 
-    for line in sys.stdin:
+    while True:
+        line = requests.get()
+        if line is None:
+            return 0
         request_id = None
         try:
             request = json.loads(line)
@@ -71,9 +120,6 @@ def main() -> int:
                 raise ValueError("id muss ein String oder Integer sein")
             if not text:
                 raise ValueError("text darf nicht leer sein")
-            if startup_error is not None:
-                raise RuntimeError(startup_error)
-
             sequence = 0
             with redirect_stdout(sys.stderr):
                 chunks = model.generate(
@@ -99,8 +145,6 @@ def main() -> int:
             _emit({"id": request_id, "done": True})
         except Exception as exc:
             _emit({"id": request_id, "error": f"{type(exc).__name__}: {exc}"})
-            if startup_error is not None:
-                return 1
 
     return 0
 

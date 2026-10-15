@@ -51,9 +51,21 @@ async def _stop_components(components) -> None:
     """Stoppt Komponenten einzeln, damit ein Fehler den Rest nicht blockiert."""
     for name, component in components:
         try:
-            await component.stop()
+            stop = component if callable(component) else component.stop
+            await stop()
         except Exception as exc:
             log.warning("%s konnte nicht sauber beendet werden (%s)", name, type(exc).__name__)
+
+
+async def _shutdown_services(components, stop_tts_worker, stop_gym_server, stop_event) -> None:
+    """Beendet App-Dienste, den isolierten TTS-Worker und den Gym-Server."""
+    try:
+        await _stop_components((*components, ("Klon-TTS", stop_tts_worker)))
+    finally:
+        try:
+            await stop_gym_server()
+        finally:
+            stop_event.set()
 
 
 async def main():
@@ -167,13 +179,14 @@ async def main():
 
     async def shutdown():
         log.info("Fährt herunter...")
-        try:
-            await _stop_components((("Orchestrator", orchestrator), ("Telegram-Kanal", channel)))
-        finally:
-            try:
-                await stop_gym_server()
-            finally:
-                stop_event.set()
+        from core.tts import _stop_klon_worker
+
+        await _shutdown_services(
+            (("Orchestrator", orchestrator), ("Telegram-Kanal", channel)),
+            _stop_klon_worker,
+            stop_gym_server,
+            stop_event,
+        )
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))

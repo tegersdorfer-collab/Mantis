@@ -30,6 +30,7 @@ def _configure_klon(monkeypatch, tmp_path, worker_source):
     monkeypatch.setattr(tts, "_klon_process", None)
     monkeypatch.setattr(tts, "_klon_process_lock", asyncio.Lock())
     monkeypatch.setattr(tts, "_klon_idle_task", None)
+    monkeypatch.setattr(tts, "_klon_prewarm_task", None, raising=False)
     monkeypatch.setattr(tts, "_klon_last_used", 0.0)
     monkeypatch.setattr(tts, "_klon_request_seq", 0)
     monkeypatch.setattr(tts.config, "TTS_KLON_PYTHON", sys.executable, raising=False)
@@ -96,6 +97,7 @@ def test_klon_synthesize_collects_pcm_and_records_zero_cost_usage(
     requests_file = tmp_path / "requests.jsonl"
     worker_source = f'''import base64, json, sys
 requests_path = {str(requests_file)!r}
+print(json.dumps({{"ready": True}}), flush=True)
 for line in sys.stdin:
     request = json.loads(line)
     with open(requests_path, "a", encoding="utf-8") as log:
@@ -139,6 +141,7 @@ def test_klon_stream_yields_before_worker_finishes_generation(monkeypatch, tmp_p
     continue_file = tmp_path / "continue"
     worker_source = f'''import base64, json, sys, time
 continue_path = {str(continue_file)!r}
+print(json.dumps({{"ready": True}}), flush=True)
 for line in sys.stdin:
     request = json.loads(line)
     print(json.dumps({{"id": request["id"], "seq": 0,
@@ -173,6 +176,7 @@ def test_klon_worker_crash_is_restarted_for_the_next_request(monkeypatch, tmp_pa
     counter_file = tmp_path / "starts"
     worker_source = f'''import base64, json, os, sys
 counter_path = {str(counter_file)!r}
+print(json.dumps({{"ready": True}}), flush=True)
 for line in sys.stdin:
     request = json.loads(line)
     try:
@@ -202,8 +206,286 @@ for line in sys.stdin:
     assert counter_file.read_text(encoding="utf-8") == "2"
 
 
+def test_klon_startup_timeout_kills_worker_and_continues_to_next_engine(
+    monkeypatch, tmp_path,
+):
+    worker_source = "import time\ntime.sleep(10)\n"
+    _configure_klon(monkeypatch, tmp_path, worker_source)
+    created_processes = []
+    create_process = asyncio.create_subprocess_exec
+
+    async def track_process(*args, **kwargs):
+        process = await create_process(*args, **kwargs)
+        created_processes.append(process)
+        return process
+
+    monkeypatch.setattr(tts.asyncio, "create_subprocess_exec", track_process)
+    monkeypatch.setattr(tts.config, "TTS_KLON_START_TIMEOUT_S", 0.03, raising=False)
+    monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN", ["klon", "google"], raising=False)
+    monkeypatch.setattr(tts.config, "GOOGLE_TTS_API_KEY", "google-key", raising=False)
+    monkeypatch.setattr(tts, "_record_google_tts_usage", lambda _text: None)
+
+    async def google(_text):
+        return _fake_ogg(), False
+
+    monkeypatch.setattr(tts, "_google_tts_synthesize", google)
+
+    async def run():
+        try:
+            return await asyncio.wait_for(tts.synthesize("Fallback nach Starttimeout."), 0.7)
+        finally:
+            await _async_worker_cleanup()
+
+    assert asyncio.run(run()) == _fake_ogg()
+    assert len(created_processes) == 1
+    assert created_processes[0].returncode is not None
+    assert tts._klon_process is None
+    assert not tts._klon_process_lock.locked()
+
+
+def test_klon_first_chunk_timeout_is_reported_and_releases_worker(monkeypatch, tmp_path):
+    worker_source = '''import json, sys, time
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    time.sleep(10)
+'''
+    _configure_klon(monkeypatch, tmp_path, worker_source)
+    monkeypatch.setattr(tts.config, "TTS_KLON_FIRST_CHUNK_TIMEOUT_S", 0.03, raising=False)
+
+    async def collect():
+        with pytest.raises(TimeoutError):
+            async for _chunk in tts._klon_pcm_stream("Erster Ton"):
+                pytest.fail("Der Worker darf vor seinem ersten Chunk nicht antworten")
+
+    asyncio.run(asyncio.wait_for(collect(), 0.7))
+    assert tts._klon_process is None
+    assert not tts._klon_process_lock.locked()
+
+
+def test_klon_chunk_gap_timeout_keeps_first_chunk_then_kills_worker(
+    monkeypatch, tmp_path,
+):
+    worker_source = f'''import json, sys, time
+print(json.dumps({{"ready": True}}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({{"id": request["id"], "seq": 0,
+        "pcm_b64": {_pcm_payload()!r}, "sample_rate": 24000}}), flush=True)
+    time.sleep(10)
+'''
+    _configure_klon(monkeypatch, tmp_path, worker_source)
+    monkeypatch.setattr(tts.config, "TTS_KLON_FIRST_CHUNK_TIMEOUT_S", 0.2, raising=False)
+    monkeypatch.setattr(tts.config, "TTS_KLON_CHUNK_TIMEOUT_S", 0.03, raising=False)
+
+    async def collect():
+        chunks = []
+        with pytest.raises(TimeoutError):
+            async for chunk in tts._klon_pcm_stream("Abstand"):
+                chunks.append(chunk)
+        return chunks
+
+    assert asyncio.run(asyncio.wait_for(collect(), 0.7)) == [
+        (base64.b64decode(_pcm_payload()), 24000),
+    ]
+    assert tts._klon_process is None
+    assert not tts._klon_process_lock.locked()
+
+
+def test_klon_stalled_stdin_drain_is_bounded_and_uses_next_engine(monkeypatch, tmp_path):
+    class _StalledStdin:
+        def write(self, _data):
+            return None
+
+        async def drain(self):
+            await asyncio.Event().wait()
+
+    class _FakeProcess:
+        def __init__(self):
+            self.stdin = _StalledStdin()
+            self.stdout = object()
+            self.returncode = None
+            self.killed = False
+            self.reaped = False
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.reaped = True
+            return self.returncode
+
+    process = _FakeProcess()
+    monkeypatch.setattr(tts, "_klon_process", process)
+    monkeypatch.setattr(tts, "_klon_process_lock", asyncio.Lock())
+    monkeypatch.setattr(tts, "_klon_is_configured", lambda: True)
+    monkeypatch.setattr(
+        tts, "_ensure_klon_worker", lambda: asyncio.sleep(0, result=process),
+    )
+    monkeypatch.setattr(tts.config, "TTS_KLON_FIRST_CHUNK_TIMEOUT_S", 0.03, raising=False)
+    monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN", ["klon", "google"], raising=False)
+    monkeypatch.setattr(tts.config, "GOOGLE_TTS_API_KEY", "google-key", raising=False)
+    monkeypatch.setattr(tts, "is_available", lambda: True)
+    monkeypatch.setattr(tts, "_record_google_tts_usage", lambda _text: None)
+
+    async def google(_text):
+        return _fake_ogg(), False
+
+    monkeypatch.setattr(tts, "_google_tts_synthesize", google)
+
+    async def run():
+        return await asyncio.wait_for(tts.synthesize("Drain-Fallback."), 0.3)
+
+    assert asyncio.run(run()) == _fake_ogg()
+    assert process.killed is True
+    assert process.reaped is True
+    assert tts._klon_process is None
+    assert not tts._klon_process_lock.locked()
+
+
+def test_streaming_retries_bound_klon_once_after_pre_chunk_failure(monkeypatch, tmp_path):
+    counter_file = tmp_path / "klon-attempts"
+    worker_source = f'''import base64, json, os, sys
+counter_path = {str(counter_file)!r}
+try:
+    count = int(open(counter_path, encoding="utf-8").read()) + 1
+except FileNotFoundError:
+    count = 1
+open(counter_path, "w", encoding="utf-8").write(str(count))
+print(json.dumps({{"ready": True}}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    if count == 1:
+        print(json.dumps({{"id": request["id"], "error": "kurzer Fehler"}}), flush=True)
+        continue
+    print(json.dumps({{"id": request["id"], "seq": 0,
+        "pcm_b64": {_pcm_payload()!r}, "sample_rate": 24000}}), flush=True)
+    print(json.dumps({{"id": request["id"], "done": True}}), flush=True)
+'''
+    _configure_klon(monkeypatch, tmp_path, worker_source)
+    monkeypatch.setattr(tts, "_BOUND_ENGINE_RETRY_TIMEOUT_S", 0.5, raising=False)
+    monkeypatch.setattr(tts, "_wav_to_ogg", lambda _wav: _fake_ogg())
+    monkeypatch.setattr(tts, "_record_klon_usage", lambda _text: None, raising=False)
+    state = tts.TTSTurnState(engine="klon", chain_position=0, audio_emitted=True)
+
+    async def run():
+        try:
+            return [
+                chunk async for chunk in tts._synthesize_unlocked_stream(
+                    "Retry.", 1.0, state,
+                )
+            ]
+        finally:
+            await _async_worker_cleanup()
+
+    assert asyncio.run(run()) == [_fake_ogg()]
+    assert counter_file.read_text(encoding="utf-8") == "2"
+
+
+def test_streaming_klon_error_after_audio_propagates_incomplete_sentence(
+    monkeypatch, tmp_path,
+):
+    worker_source = f'''import json, sys
+print(json.dumps({{"ready": True}}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({{"id": request["id"], "seq": 0,
+        "pcm_b64": {_pcm_payload()!r}, "sample_rate": 24000}}), flush=True)
+    print(json.dumps({{"id": request["id"], "error": "Abbruch nach Chunk"}}), flush=True)
+'''
+    _configure_klon(monkeypatch, tmp_path, worker_source)
+    monkeypatch.setattr(tts, "_wav_to_ogg", lambda _wav: _fake_ogg())
+    monkeypatch.setattr(tts, "_record_klon_usage", lambda _text: None, raising=False)
+    monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN", ["klon", "google"], raising=False)
+    state = tts.TTSTurnState(engine="klon", chain_position=0, audio_emitted=True)
+
+    async def collect():
+        chunks = []
+        stream = tts.synthesize_stream("Der Satz ist noch unvollständig.")
+        token = tts._active_tts_turn.set(state)
+        try:
+            with pytest.raises(RuntimeError, match="Abbruch nach Chunk"):
+                async for chunk in stream:
+                    chunks.append(chunk)
+            return chunks
+        finally:
+            tts._active_tts_turn.reset(token)
+            await stream.aclose()
+            await _async_worker_cleanup()
+
+    assert asyncio.run(collect()) == [_fake_ogg()]
+    assert state.chain_position == 1
+
+
+def test_worker_environment_contains_only_runtime_allowlist(monkeypatch, tmp_path):
+    environment_file = tmp_path / "worker-environment.json"
+    worker_source = f'''import json, os, sys
+with open({str(environment_file)!r}, "w", encoding="utf-8") as output:
+    json.dump(dict(os.environ), output)
+print(json.dumps({{"ready": True}}), flush=True)
+for _line in sys.stdin:
+    pass
+'''
+    _configure_klon(monkeypatch, tmp_path, worker_source)
+    safe_values = {
+        "PATH": "/usr/bin",
+        "HOME": str(tmp_path),
+        "HF_HOME": str(tmp_path / "hf-home"),
+        "HF_HUB_CACHE": str(tmp_path / "hf-cache"),
+        "TMPDIR": str(tmp_path),
+        "LANG": "de_DE.UTF-8",
+        "LC_CTYPE": "de_DE.UTF-8",
+    }
+    for name, value in safe_values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("CARTESIA_API_KEY", "must-not-leak")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+
+    async def run():
+        try:
+            await tts._prewarm_klon()
+            await asyncio.sleep(0.05)
+        finally:
+            await _async_worker_cleanup()
+
+    asyncio.run(run())
+    worker_environment = json.loads(environment_file.read_text(encoding="utf-8"))
+    allowed = {"PATH", "HOME", "HF_HOME", "HF_HUB_CACHE", "TMPDIR", "LANG"}
+    expected = {
+        name: value for name, value in os.environ.items()
+        if name in allowed or name.startswith("LC_")
+    }
+    assert {name: worker_environment[name] for name in expected} == expected
+    assert set(worker_environment) <= set(expected) | {"__CF_USER_TEXT_ENCODING"}
+
+
+def test_shutdown_cancels_in_progress_klon_prewarm(monkeypatch):
+    started = asyncio.Event()
+    cancelled = []
+    monkeypatch.setattr(tts, "_klon_is_configured", lambda: True)
+
+    async def prewarm():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    monkeypatch.setattr(tts, "_prewarm_klon", prewarm)
+
+    async def run():
+        tts._schedule_klon_prewarm()
+        await started.wait()
+        await tts._stop_klon_worker()
+        return list(cancelled)
+
+    assert asyncio.run(run()) == [True]
+
+
 def test_klon_worker_stops_after_configured_idle_period(monkeypatch, tmp_path):
     worker_source = f'''import base64, json, sys
+print(json.dumps({{"ready": True}}), flush=True)
 for line in sys.stdin:
     request = json.loads(line)
     print(json.dumps({{"id": request["id"], "seq": 0,
@@ -240,6 +522,7 @@ def test_unavailable_klon_continues_to_the_next_provider(monkeypatch, tmp_path):
 
 def test_klon_empty_audio_is_rejected_before_falling_back(monkeypatch, tmp_path):
     worker_source = '''import json, sys
+print(json.dumps({"ready": True}), flush=True)
 for line in sys.stdin:
     request = json.loads(line)
     print(json.dumps({"id": request["id"], "done": True}), flush=True)

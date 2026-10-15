@@ -131,7 +131,9 @@ Der Klon-Fallback läuft in einem eigenen Worker mit `TTS_KLON_PYTHON` (standard
 `.venv-tts/bin/python`) und lädt mlx-audio nicht in Mantis’ Python-Umgebung. Die
 Sprecherreferenz liegt standardmäßig in `data/voice_clone`; `TTS_KLON_REF_DIR` kann den
 Pfad ändern. Der Prozess bleibt bis zu 600 Sekunden warm und beendet sich dann, um seinen
-Modellspeicher freizugeben.
+Modellspeicher freizugeben. Modellstart und Audio-Streaming sind begrenzt durch
+`TTS_KLON_START_TIMEOUT_S` (20 s), `TTS_KLON_FIRST_CHUNK_TIMEOUT_S` (3 s) und
+`TTS_KLON_CHUNK_TIMEOUT_S` (3 s); bei Überschreitung wird der Worker beendet.
 
 Werkzeugauswahl, Sprecher-Adressierung und Memory-Prüfungen laufen über die gemeinsame Cloud-Kette. Das optionale Forge-Vorgate bleibt über `JEV_FORGE_GATE_ENABLED` und `JEV_ENABLED` abschaltbar und nutzt dieselbe schnelle Cloud-Variante. Die Fragen und Schwellenwerte stehen in `core/decisions.py`; `JEV_LOG_PATH` behält das bisherige JevKit-Logformat für Auswertungen bei.
 

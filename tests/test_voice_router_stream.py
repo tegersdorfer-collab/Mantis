@@ -137,6 +137,18 @@ class TestSendeAntwort:
         assert ws.gesendet == [{"text": "nicht adressiert", "addressed": True,
                                 "reply": None, "audio_b64": None}]
 
+    def test_bargein_history_uses_played_words_of_incomplete_sentence(self):
+        from web.routers.voice import _PlaybackTurn
+
+        playback = _PlaybackTurn()
+        block_id = playback.register_block(
+            0, b"audio", text="Das ist ein unvollständiger Satz.", sentence_id=0,
+        )
+        playback.mark_block_sent(block_id, sent_at=100.0)
+        playback.record_progress(block_id, 700.0, now=100.7)
+
+        assert playback.assistant_text == "Das ist"
+
 
 def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkeypatch):
     timeline = []
