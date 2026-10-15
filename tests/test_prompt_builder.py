@@ -107,3 +107,41 @@ def test_prompt_builder_skips_long_term_memory_embedding_for_bare_acknowledgemen
 
     assert embed.await_count == 0
     assert searches == []
+
+
+def test_speculative_prompt_build_stages_recall_without_mutating_memory_state(monkeypatch):
+    recalled = []
+    memory = SimpleNamespace(id=17)
+    builder = PromptBuilder(
+        embed_llm=SimpleNamespace(embed=AsyncMock(return_value=[0.1, 0.2])),
+        lzg=SimpleNamespace(
+            search_hybrid=lambda *_args, **_kwargs: [memory],
+            format_for_context=lambda memories: ", ".join(str(item.id) for item in memories),
+        ),
+        kzg=SimpleNamespace(get_recent_turns=lambda **_kwargs: []),
+        kg=SimpleNamespace(
+            format_for_context=lambda: "",
+            format_directives=lambda: "",
+            warm_profile=lambda: "",
+        ),
+        reflection=SimpleNamespace(behavior_notes=lambda: ""),
+        dashboard=SimpleNamespace(format_for_context=lambda: ""),
+        forgetting=SimpleNamespace(bump_recall=recalled.append),
+        identity="IDENTITY",
+    )
+    builder._last_mem_ids = [99]
+    builder._task_ctx = lambda: ""
+    monkeypatch.setattr("core.prompt_builder.skill_md.build_skill_context", lambda _text: "")
+    monkeypatch.setattr("core.situation.prompt_context", lambda: "")
+
+    prompt = asyncio.run(builder.build("spekulative Frage", speculative=True))
+
+    assert "17" in prompt
+    assert prompt.recall_ids == (17,)
+    assert recalled == []
+    assert builder._last_mem_ids == [99]
+
+    builder.book_recall(prompt.recall_ids)
+
+    assert recalled == [17]
+    assert builder._last_mem_ids == [17]

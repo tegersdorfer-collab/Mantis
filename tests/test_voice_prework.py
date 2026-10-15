@@ -1,4 +1,5 @@
 import asyncio
+import pytest
 
 from core.voice_prework import VoicePreworkCache, VoiceTurnPrework, partial_text_matches_final
 
@@ -106,7 +107,7 @@ def test_partial_prework_uses_local_selection_and_context_without_cloud_or_agent
 
     handler = object.__new__(message_handler.MessageHandler)
     handler.prompt_builder = type("PromptBuilder", (), {
-        "build": lambda _self, text: asyncio.sleep(0, result=f"Kontext: {text}"),
+        "build": lambda _self, text, **_kwargs: asyncio.sleep(0, result=f"Kontext: {text}"),
     })()
     cloud_calls = []
 
@@ -272,3 +273,44 @@ def test_reflex_fast_path_checks_interrupt_before_executing_tool(monkeypatch):
     result, trace = asyncio.run(run(False))
     assert executed == [command.tool]
     assert trace[0]["reflex"] is True
+
+
+@pytest.mark.parametrize(
+    "text", ["Okay", "Schalte das Licht aus"],
+    ids=["voice-reflex", "direct-tool"],
+)
+def test_voice_fast_paths_wait_for_address_gate_before_return_or_execution(
+    monkeypatch, text,
+):
+    import pytest
+    from core import message_handler
+
+    handler = object.__new__(message_handler.MessageHandler)
+    executed = []
+    gate_started = asyncio.Event()
+    release_gate = asyncio.Event()
+
+    async def execute(tool, args):
+        executed.append((tool, args))
+        return "ok"
+
+    async def execution_gate():
+        gate_started.set()
+        await release_gate.wait()
+        return False
+
+    monkeypatch.setattr(message_handler.skills.T, "execute", execute)
+
+    async def run():
+        task = asyncio.create_task(handler._agent_turn(
+            text, channel_name="voice", agent=object(),
+            execution_gate=execution_gate,
+        ))
+        await asyncio.wait_for(gate_started.wait(), timeout=0.5)
+        assert executed == []
+        release_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert executed == []

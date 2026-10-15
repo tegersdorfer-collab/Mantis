@@ -259,6 +259,8 @@ def _load_parakeet_model(model_id: str):
 def _warmup_parakeet(model) -> None:
     """Kompiliert den ersten MLX-Transkriptionspfad mit einer Sekunde Stille."""
     wav_path = None
+    warmup_pcm = b"\0\0" * 16_000
+    warmup_seconds = len(warmup_pcm) / (2 * 16_000)
     try:
         with tempfile.NamedTemporaryFile(prefix="mantis-stt-warmup-", suffix=".wav", delete=False) as wav_file:
             wav_path = wav_file.name
@@ -266,11 +268,13 @@ def _warmup_parakeet(model) -> None:
             wav_file.setnchannels(1)
             wav_file.setsampwidth(2)
             wav_file.setframerate(16_000)
-            wav_file.writeframes(b"\0\0" * 16_000)
+            wav_file.writeframes(warmup_pcm)
         started_at = time.perf_counter()
         model.transcribe(wav_path)
         stt_runtime.record_stt_runtime(
-            1.0, max(0.0, (time.perf_counter() - started_at) * 1000),
+            warmup_seconds,
+            max(0.0, (time.perf_counter() - started_at) * 1000),
+            replace_samples=True,
         )
     finally:
         if wav_path is not None:

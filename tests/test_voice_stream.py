@@ -202,18 +202,286 @@ class TestVoiceStreamSession:
         # VAD frames along the way; queue enough segment/wake side effects to
         # cover every process_chunk/check call triggered.
         session = make_session(
-            segment_events=[None, segment],
+            segment_events=[None, None, segment],
             wake_hits=[True],
             conversation_active=False,
         )
         monkeypatch.setattr(vs, "transcribe_pcm", AsyncMock(return_value="hallo mantis"))
 
-        result = asyncio.run(session.handle_chunk(wakeword_frame(), muted=False))
+        result = asyncio.run(
+            session.handle_chunk(wakeword_frame() + vad_frame(), muted=False),
+        )
 
         assert result["text"] == "hallo mantis" and result["addressed"] is True
         assert result["wakeword_triggered"] is True
         assert isinstance(result["stt_ms"], float) and result["stt_ms"] >= 0
         assert isinstance(result["turn_started_at"], float)
+
+    def test_wakeword_from_discarded_160ms_segment_cannot_authorize_later_command(
+        self, monkeypatch,
+    ):
+        import config
+        import core.voice_stream as vs
+        from core.vad import VadSegmenter
+
+        class FakeVAD:
+            def speech_probability(self, frame):
+                return 1.0 if frame != b"\0" * len(frame) else 0.0
+
+        class OneWakeHit:
+            def __init__(self):
+                self.calls = 0
+
+            def check(self, _frame):
+                self.calls += 1
+                return self.calls == 1
+
+        final_calls = []
+
+        async def final_stt(audio):
+            final_calls.append(audio)
+            return "Mach das Licht an", False
+
+        async def run():
+            session = VoiceStreamSession(
+                vad_segmenter=VadSegmenter(FakeVAD(), chunk_ms=32),
+                wakeword_detector=OneWakeHit(),
+                conversation_active_fn=lambda: False,
+                partial_executor_available=lambda: False,
+            )
+            short_speech = b"\xe8\x03" * (160 * 16)
+            one_second_silence = b"\0\0" * 16_000
+            command_speech = b"\xe8\x03" * (3 * 16_000)
+
+            await session.handle_chunk(short_speech, muted=False)
+            for _ in range(120):
+                await session.handle_chunk(one_second_silence, muted=False)
+            await session.handle_chunk(command_speech, muted=False)
+            result = await session.handle_chunk(one_second_silence, muted=False)
+            await session.close()
+            return result
+
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800, raising=False)
+        monkeypatch.setattr(vs, "transcribe_pcm", final_stt)
+
+        result = asyncio.run(run())
+
+        assert result is None
+        assert final_calls == []
+
+    @pytest.mark.parametrize(
+        ("silence_before_speech_ms", "expected_wakeword"),
+        [(1000, True), (2000, False)],
+        ids=["within-1500ms-preroll", "outside-1500ms-preroll"],
+    )
+    def test_wakeword_is_bound_to_segment_start_and_configured_preroll(
+        self, monkeypatch, silence_before_speech_ms, expected_wakeword,
+    ):
+        import config
+        import core.voice_stream as vs
+        from core.vad import VadSegmenter
+
+        class FakeVAD:
+            def speech_probability(self, frame):
+                return 1.0 if frame != b"\0" * len(frame) else 0.0
+
+        class OneWakeHit:
+            def __init__(self):
+                self.calls = 0
+
+            def check(self, _frame):
+                self.calls += 1
+                return self.calls == 1
+
+        async def final_stt(_audio):
+            return "Erzähl mir etwas", False
+
+        async def run():
+            session = VoiceStreamSession(
+                vad_segmenter=VadSegmenter(FakeVAD(), chunk_ms=32),
+                wakeword_detector=OneWakeHit(),
+                conversation_active_fn=lambda: False,
+                partial_executor_available=lambda: False,
+            )
+            silence = b"\0\0" * 16_000
+            for _ in range(silence_before_speech_ms // 1000):
+                await session.handle_chunk(silence, muted=False)
+            await session.handle_chunk(b"\xe8\x03" * (3 * 16_000), muted=False)
+            result = await session.handle_chunk(silence, muted=False)
+            await session.close()
+            return result
+
+        monkeypatch.setattr(config, "VOICE_WAKE_PREROLL_MS", 1500, raising=False)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800, raising=False)
+        monkeypatch.setattr(vs, "transcribe_pcm", final_stt)
+
+        result = asyncio.run(run())
+
+        if expected_wakeword:
+            assert result is not None
+            assert result["wakeword_triggered"] is True
+        else:
+            assert result is None
+
+    @pytest.mark.parametrize(
+        ("wake_after_ms", "speech_frames", "minimum_runs"),
+        [
+            (400, 375, 2), (800, 375, 2),
+            (400, 563, 2), (800, 563, 2),
+            (400, 750, 3), (800, 750, 3),
+        ],
+        ids=[
+            "wake-400ms-speech-3s", "wake-800ms-speech-3s",
+            "wake-400ms-speech-4_5s", "wake-800ms-speech-4_5s",
+            "wake-400ms-speech-6s", "wake-800ms-speech-6s",
+        ],
+    )
+    def test_partial_stt_runs_from_speech_start_with_real_8ms_frames(
+        self, monkeypatch, wake_after_ms, speech_frames, minimum_runs,
+    ):
+        import config
+        import core.voice_stream as vs
+        from core import stt_runtime
+        from core.vad import VadSegmenter
+
+        class FakeClock:
+            now = 0.0
+
+            def __call__(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        class FakeVAD:
+            def speech_probability(self, frame):
+                return 1.0 if frame != b"\0" * len(frame) else 0.0
+
+        class WakeAfterSpeechOffset:
+            def __init__(self):
+                self.samples_seen = 0
+                self.hit = False
+                self.speech_start_sample = 384 * 16
+
+            def check(self, frame):
+                self.samples_seen += len(frame) // 2
+                target = self.speech_start_sample + wake_after_ms * 16
+                if not self.hit and self.samples_seen >= target:
+                    self.hit = True
+                    return True
+                return False
+
+        async def run():
+            clock = FakeClock()
+            partial_audio_seconds = []
+
+            async def partial_stt(audio):
+                partial_audio_seconds.append(len(audio) / (2 * 16_000))
+                return "Teiltext", False
+
+            segmenter = VadSegmenter(FakeVAD(), chunk_ms=32)
+            wakeword = WakeAfterSpeechOffset()
+            session = VoiceStreamSession(
+                vad_segmenter=segmenter,
+                wakeword_detector=wakeword,
+                conversation_active_fn=lambda: False,
+                partial_transcriber=partial_stt,
+                partial_executor_available=lambda: True,
+                partial_interval_ms=700,
+                clock=clock,
+            )
+            raw_frame = lambda speech: (
+                b"\xe8\x03" if speech else b"\0\0"
+            ) * 128
+
+            async def feed(frames, speech):
+                for _ in range(frames):
+                    await session.handle_chunk(raw_frame(speech), muted=False)
+                    clock.advance(0.008)
+                    await asyncio.sleep(0)
+
+            # Twelve 32ms VAD frames are the segmenter's real 384ms preroll.
+            await feed(48, False)
+            await feed(speech_frames, True)
+            # Three trailing 8ms frames may complete the preceding speech VAD
+            # frame, so feed 832ms to guarantee 800ms of actual silence frames.
+            result = await session.handle_chunk(b"\0\0" * (128 * 104), muted=False)
+            await session.close()
+            return result, partial_audio_seconds
+
+        monkeypatch.setattr(config, "VOICE_PARTIAL_MAX_MS", 900, raising=False)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800, raising=False)
+        monkeypatch.setattr(stt_runtime, "_samples", deque([120.0], maxlen=10))
+        monkeypatch.setattr(vs, "transcribe_pcm", AsyncMock(return_value=("Final", False)))
+
+        result, partial_audio_seconds = asyncio.run(run())
+
+        assert result is not None and result["wakeword_triggered"] is True
+        assert result["partial_runs"] >= minimum_runs
+        # At an 800ms wakeword delay the first 700ms interval must already have
+        # launched from speech onset, before the detector reports the wakeword.
+        if wake_after_ms > 700:
+            assert partial_audio_seconds[0] < 0.384 + wake_after_ms / 1000
+
+    def test_over_budget_partial_is_retried_after_the_next_interval(self, monkeypatch):
+        import config
+        import core.voice_stream as vs
+        estimates = iter((1000.0, 200.0))
+
+        class FakeClock:
+            now = 0.0
+
+            def __call__(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        class SpeechSegmenter:
+            is_speaking = True
+            current_chunk_is_speech = True
+            current_audio = b"\0\0" * 16_000
+
+            def process_chunk(self, _frame):
+                return None
+
+        async def run():
+            clock = FakeClock()
+            partial_calls = []
+
+            async def partial_stt(_audio):
+                partial_calls.append(clock.now)
+                return "Teiltext"
+
+            session = VoiceStreamSession(
+                vad_segmenter=SpeechSegmenter(),
+                wakeword_detector=MagicMock(),
+                conversation_active_fn=lambda: False,
+                partial_transcriber=partial_stt,
+                partial_executor_available=lambda: True,
+                partial_interval_ms=700,
+                clock=clock,
+            )
+            await session.handle_chunk(vad_frame(), muted=False)
+            clock.advance(0.7)
+            await session.handle_chunk(vad_frame(), muted=False)
+            await session.handle_chunk(vad_frame(), muted=False)
+            assert partial_calls == []
+            assert session._partial_runs == 0
+            clock.advance(0.7)
+            await session.handle_chunk(vad_frame(), muted=False)
+            await asyncio.sleep(0)
+            return partial_calls
+
+        monkeypatch.setattr(config, "VOICE_PARTIAL_MAX_MS", 600, raising=False)
+        monkeypatch.setattr(
+            vs.stt_runtime, "estimate_stt_runtime_ms", lambda _seconds: next(estimates),
+        )
+
+        partial_calls = asyncio.run(run())
+
+        assert len(partial_calls) == 1
+        assert partial_calls[0] == pytest.approx(1.4)
 
     def test_segment_during_active_conversation_triggers_even_without_wakeword(self, monkeypatch):
         import core.voice_stream as vs
@@ -611,14 +879,14 @@ class TestVoiceStreamSession:
 
         assert recorded == []
 
-    def test_initial_runtime_estimate_skips_first_run_over_configured_budget(
+    def test_initial_runtime_estimate_allows_first_run_within_configured_budget(
         self, monkeypatch,
     ):
         import config
         import core.voice_stream as vs
         from core import stt_runtime
 
-        assert stt_runtime.estimate_stt_runtime_ms(1.25) == 650.0
+        assert stt_runtime.estimate_stt_runtime_ms(1.25) == 287.5
 
         class FakeClock:
             now = 0.0
@@ -668,8 +936,8 @@ class TestVoiceStreamSession:
 
         partial_calls, partial_runs = asyncio.run(run())
 
-        assert partial_calls == []
-        assert partial_runs == 0
+        assert len(partial_calls) == 1
+        assert partial_runs == 1
 
     def test_partial_runtime_estimate_is_shared_with_new_sessions(self, monkeypatch):
         import config

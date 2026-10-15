@@ -278,6 +278,8 @@ def test_router_bypasses_real_wakeword_and_speculates_with_tool_and_audio_gates(
 
     llm_started = asyncio.Event()
     llm_streamed = asyncio.Event()
+    release_generation = asyncio.Event()
+    response_cancelled = asyncio.Event()
     address_started = asyncio.Event()
     release_address = asyncio.Event()
     latency_logged = asyncio.Event()
@@ -332,8 +334,14 @@ def test_router_bypasses_real_wakeword_and_speculates_with_tool_and_audio_gates(
             await stream_cb(delta("answer", "Antwort."))
             await stream_cb(attempt_end("answer", final=True))
             llm_streamed.set()
-            if execution_gate is not None and not await execution_gate():
-                raise asyncio.CancelledError
+            if execution_gate is not None:
+                try:
+                    await release_generation.wait()
+                    if not await execution_gate():
+                        raise asyncio.CancelledError
+                except asyncio.CancelledError:
+                    response_cancelled.set()
+                    raise
             tool_runs.append("read-only-tool")
             return "Antwort.", [{"tool": "read-only-tool"}]
 
@@ -384,6 +392,8 @@ def test_router_bypasses_real_wakeword_and_speculates_with_tool_and_audio_gates(
             assert tool_runs == []
             assert tts_calls == []
             assert not any(item.get("type") == "audio_chunk" for item in websocket.sent)
+            if authorized:
+                release_generation.set()
             release_address.set()
         await asyncio.wait_for(latency_logged.wait(), timeout=1)
         detail = next(item[2] for item in logged if item[0] == "voice_latency")
@@ -400,6 +410,7 @@ def test_router_bypasses_real_wakeword_and_speculates_with_tool_and_audio_gates(
         else:
             assert detail["address_check_ms"] is not None
             assert tool_runs == []
+            assert response_cancelled.is_set()
             assert tts_calls == []
             assert not any(item.get("type") == "audio_chunk" for item in websocket.sent)
             assert detail["held_ms"] > 0

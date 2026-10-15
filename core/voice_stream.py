@@ -8,6 +8,7 @@ import tempfile
 import time
 import wave
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 
 import config
@@ -80,7 +81,10 @@ class VoiceStreamSession:
         self._segmenter = vad_segmenter
         self._wakeword = wakeword_detector
         self._conversation_active_fn = conversation_active_fn
-        self._wake_fired_in_segment = False
+        self._wakeword_hits: deque[int] = deque()
+        self._wakeword_detected = False
+        self._wakeword_samples_processed = 0
+        self._vad_samples_processed = 0
         # Independent byte-accumulation buffers: the two detectors require
         # different frame sizes (see VAD_FRAME_BYTES / WAKEWORD_FRAME_BYTES
         # above), so incoming raw chunks (arbitrary size, e.g. 8ms from the
@@ -134,22 +138,39 @@ class VoiceStreamSession:
         while len(self._wakeword_buffer) >= WAKEWORD_FRAME_BYTES:
             frame = bytes(self._wakeword_buffer[:WAKEWORD_FRAME_BYTES])
             del self._wakeword_buffer[:WAKEWORD_FRAME_BYTES]
-            if self._wakeword.check(frame):
-                self._wake_fired_in_segment = True
+            self._wakeword_samples_processed += len(frame) // 2
+            detected = bool(self._wakeword.check(frame))
+            if detected and not self._wakeword_detected:
+                self._wakeword_hits.append(self._wakeword_samples_processed)
+            self._wakeword_detected = detected
 
         result = None
         while len(self._vad_buffer) >= VAD_FRAME_BYTES:
             frame = bytes(self._vad_buffer[:VAD_FRAME_BYTES])
             del self._vad_buffer[:VAD_FRAME_BYTES]
 
+            was_speaking = getattr(self._segmenter, "is_speaking", None) is True
             segment = self._segmenter.process_chunk(frame)
+            self._vad_samples_processed += len(frame) // 2
             await self._maybe_trigger_bargein()
             if segment is None:
-                self._maybe_start_partial()
+                if (
+                    was_speaking
+                    and getattr(self._segmenter, "is_speaking", None) is not True
+                ):
+                    self._discard_wakeword_hits_through(self._vad_samples_processed)
+                    self._reset_segment_state()
+                else:
+                    self._maybe_start_partial()
                 continue
 
-            wake_fired = self._wake_fired_in_segment
-            self._wake_fired_in_segment = False
+            segment_end_sample = self._vad_samples_processed
+            segment_start_sample = max(
+                0, segment_end_sample - len(segment.audio) // 2,
+            )
+            wake_fired = self._wakeword_fired_for_segment(
+                segment_start_sample, segment_end_sample,
+            )
 
             if not wake_fired and not self._conversation_active_fn():
                 self._reset_segment_state()
@@ -220,6 +241,26 @@ class VoiceStreamSession:
 
         return result
 
+    def _discard_wakeword_hits_through(self, sample_index: int) -> None:
+        while self._wakeword_hits and self._wakeword_hits[0] <= sample_index:
+            self._wakeword_hits.popleft()
+        self._wakeword_detected = False
+
+    def _wakeword_fired_for_segment(self, start_sample: int, end_sample: int) -> bool:
+        preroll_samples = int(
+            max(0, float(getattr(config, "VOICE_WAKE_PREROLL_MS", 1500)))
+            * SAMPLE_RATE / 1000
+        )
+        earliest_sample = max(0, start_sample - preroll_samples)
+        while self._wakeword_hits and self._wakeword_hits[0] < earliest_sample:
+            self._wakeword_hits.popleft()
+        fired = any(
+            earliest_sample <= hit <= end_sample
+            for hit in self._wakeword_hits
+        )
+        self._discard_wakeword_hits_through(end_sample)
+        return fired
+
     async def _maybe_trigger_bargein(self) -> None:
         if (
             self._bargein_notified
@@ -247,9 +288,6 @@ class VoiceStreamSession:
             return
         if getattr(self._segmenter, "current_chunk_is_speech", None) is not True:
             return
-        if not (self._wake_fired_in_segment or self._conversation_active_fn()):
-            return
-
         now = self._clock()
         if self._speech_started_at is None:
             self._speech_started_at = now
@@ -264,6 +302,7 @@ class VoiceStreamSession:
             return
         if self._partial_task is not None and not self._partial_task.done():
             return
+        self._last_partial_at = now
         if self._partial_task is not None:
             try:
                 self._partial_task.result()
@@ -289,7 +328,6 @@ class VoiceStreamSession:
         audio_end_sample_index = len(audio) // 2
         self._partial_audio_end_sample_index = audio_end_sample_index
         self._partial_run_generation = generation
-        self._last_partial_at = now
         self._partial_task = asyncio.create_task(
             self._run_partial(audio, generation, audio_end_sample_index),
             name="voice-partial-stt",
@@ -352,6 +390,8 @@ class VoiceStreamSession:
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
         self._partial_task = None
+        self._wakeword_hits.clear()
+        self._wakeword_detected = False
         self._partial_text = ""
         self._partial_audio_end_sample_index = None
         self._partial_run_generation = None

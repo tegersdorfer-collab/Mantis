@@ -377,12 +377,14 @@ class TestTranscribeParakeet:
 def test_voice_settings_default_to_short_answers_and_stt_preload(monkeypatch):
     monkeypatch.delenv("VOICE_MAX_TOKENS", raising=False)
     monkeypatch.delenv("STT_PRELOAD", raising=False)
+    monkeypatch.delenv("VOICE_WAKE_PREROLL_MS", raising=False)
     from settings import MantisSettings
 
     settings = MantisSettings(_env_file=None)
 
     assert settings.VOICE_MAX_TOKENS == 500
     assert settings.STT_PRELOAD is True
+    assert settings.VOICE_WAKE_PREROLL_MS == 1500
 
 
 def test_stt_runtime_estimate_learns_from_warmup_and_final_runs(monkeypatch, tmp_path):
@@ -422,6 +424,24 @@ def test_stt_runtime_estimate_learns_from_warmup_and_final_runs(monkeypatch, tmp
 
     assert len(stt_runtime._samples) == 2
     assert stt_runtime.estimate_stt_runtime_ms(1.0) < 550
+
+
+def test_parakeet_warmup_replaces_old_runtime_average_using_its_audio_duration(monkeypatch):
+    from collections import deque
+    from types import SimpleNamespace
+
+    from core import stt_runtime
+
+    monkeypatch.setattr(
+        stt_runtime, "_samples", deque([400.0, 300.0], maxlen=stt_runtime._SAMPLE_WINDOW),
+    )
+    elapsed = iter((10.0, 10.12))
+    monkeypatch.setattr(voice.time, "perf_counter", lambda: next(elapsed))
+
+    voice._warmup_parakeet(SimpleNamespace(transcribe=lambda _path: None))
+
+    assert list(stt_runtime._samples) == pytest.approx([120.0])
+    assert stt_runtime.estimate_stt_runtime_ms(2.0) == pytest.approx(340.0)
 
 
 def test_failed_parakeet_inference_does_not_record_stt_runtime(monkeypatch):
