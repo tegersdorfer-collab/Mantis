@@ -74,6 +74,7 @@ class ParsedSet:
     weight_kg: float | None
     reps: int
     is_warmup: bool = False
+    duration_s: int | None = None  # Zeitübung: Sekunden statt Wiederholungen
 
 
 @dataclass(frozen=True)

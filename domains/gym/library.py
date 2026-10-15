@@ -108,13 +108,17 @@ def exercise_detail(exercise_id: int) -> dict:
     ids = plans._exercise_ids(exercise_id)
     rows = db.query(
         """SELECT w.id AS workout_id,w.date,w.title,w.created_at,
-                  ws.id AS set_id,ws.set_index,ws.weight_kg,ws.reps
+                  ws.id AS set_id,ws.set_index,ws.weight_kg,ws.reps,ws.duration_s
            FROM workouts w JOIN workout_sets ws ON ws.workout_id=w.id
            WHERE w.type IN ('gym','strength') AND ws.exercise_id=ANY(%s)
              AND COALESCE(ws.is_warmup,FALSE)=FALSE
            ORDER BY w.date,w.created_at,w.id,ws.set_index,ws.id""",
         (ids,),
     ) if ids else []
+    timed_exercise = (
+        str(exercise.get("unit") or "").casefold() == "min"
+        or any(progression.is_timed_set(row) for row in rows)
+    )
     by_workout: dict[int, dict] = {}
     ordered = []
     for row in rows:
@@ -130,10 +134,15 @@ def exercise_detail(exercise_id: int) -> dict:
             }
             ordered.append(by_workout[workout_id])
         weight = float(row["weight_kg"]) if row.get("weight_kg") is not None else None
-        reps = int(row["reps"])
-        item = {"id": int(row["set_id"]), "set_index": int(row["set_index"]), "weight_kg": weight, "reps": reps}
+        timed = progression.is_timed_set(row)
+        reps = progression.set_amount(row)
+        item = {
+            "id": int(row["set_id"]), "set_index": int(row["set_index"]),
+            "weight_kg": weight, "reps": reps,
+            "unit": "seconds" if timed else "reps",
+        }
         by_workout[workout_id]["sets"].append(item)
-        estimate = progression.estimate_1rm(weight, reps)
+        estimate = None if timed_exercise else progression.estimate_1rm(weight, reps)
         if estimate is not None and (by_workout[workout_id]["e1rm_kg"] is None
                                      or estimate > by_workout[workout_id]["e1rm_kg"]):
             by_workout[workout_id]["e1rm_kg"] = round(estimate, 2)
@@ -189,7 +198,7 @@ def workout_detail(workout_id: int) -> dict:
         raise TrackerError(404, "Training nicht gefunden")
     rows = db.query(
         """SELECT ws.id,ws.exercise_id,e.name AS exercise,e.muscle,e.equipment,
-                  e.dumbbell_pair,e.load_mode,ws.set_index,ws.weight_kg,ws.reps,
+                  e.dumbbell_pair,e.load_mode,ws.set_index,ws.weight_kg,ws.reps,ws.duration_s,
                   COALESCE(ws.is_warmup,FALSE) AS is_warmup
            FROM workout_sets ws JOIN exercises e ON e.id=ws.exercise_id
            WHERE ws.workout_id=%s ORDER BY ws.set_index,ws.id""",
@@ -199,9 +208,10 @@ def workout_detail(workout_id: int) -> dict:
     volume = 0.0
     for row in rows:
         weight = float(row["weight_kg"]) if row.get("weight_kg") is not None else None
-        reps = int(row["reps"])
+        timed = progression.is_timed_set(row)
+        reps = progression.set_amount(row)
         is_warmup = bool(row["is_warmup"])
-        if not is_warmup and weight and weight > 0 and reps > 0:
+        if not is_warmup and not timed and weight and weight > 0 and reps > 0:
             multiplier = 1
             if row.get("equipment") == "dumbbell" and row.get("dumbbell_pair") is not False:
                 multiplier = 2
@@ -215,6 +225,7 @@ def workout_detail(workout_id: int) -> dict:
             "set_index": int(row["set_index"]),
             "weight_kg": weight,
             "reps": reps,
+            "unit": "seconds" if timed else "reps",
             "is_warmup": is_warmup,
         })
     workout.update({
@@ -233,10 +244,9 @@ def update_history_set(workout_id: int, set_id: int, weight_kg: float | None = N
     if weight_kg is None and reps is None:
         raise TrackerError(400, "Keine Änderung angegeben")
     weight = _weight(weight_kg) if weight_kg is not None else None
-    count = _reps(reps) if reps is not None else None
     with db.cursor() as cur:
         cur.execute(
-            """SELECT ws.id,ws.weight_kg,ws.reps,w.ended_at FROM workout_sets ws
+            """SELECT ws.id,ws.weight_kg,ws.reps,ws.duration_s,w.ended_at FROM workout_sets ws
                JOIN workouts w ON w.id=ws.workout_id WHERE ws.id=%s AND w.id=%s
                AND w.type IN ('gym','strength') FOR UPDATE OF ws,w""",
             (set_id, workout_id),
@@ -246,9 +256,14 @@ def update_history_set(workout_id: int, set_id: int, weight_kg: float | None = N
             raise TrackerError(404, "Satz nicht gefunden")
         if row["ended_at"] is None:
             raise TrackerError(409, "Offene Sätze werden im Training bearbeitet")
+        timed = progression.is_timed_set(row)
+        count = _reps(reps, timed) if reps is not None else None
         new_weight = weight if weight is not None else row["weight_kg"]
-        new_reps = count if count is not None else row["reps"]
-        cur.execute("UPDATE workout_sets SET weight_kg=%s,reps=%s WHERE id=%s", (new_weight, new_reps, set_id))
+        new_reps = count if count is not None else progression.set_amount(row)
+        cur.execute(
+            "UPDATE workout_sets SET weight_kg=%s,reps=%s,duration_s=%s WHERE id=%s",
+            (new_weight, None if timed else new_reps, new_reps if timed else None, set_id),
+        )
     return {"id": set_id, "workout_id": workout_id, "weight_kg": new_weight, "reps": new_reps}
 
 

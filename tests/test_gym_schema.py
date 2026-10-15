@@ -30,4 +30,11 @@ def test_gym_v2_plan_tables_are_idempotent_and_stay_separate_from_legacy_columns
         assert f"create table if not exists {table}" in sql
     assert "create unique index if not exists gym_one_active_plan_idx" in sql
     gym_migrations = [statement for statement in statements if "gym_plan" in statement or "gym_workout_exercises" in statement]
-    assert all("alter table" not in statement and "drop table" not in statement for statement in gym_migrations)
+    assert all("drop table" not in statement and "drop column" not in statement for statement in gym_migrations)
+    # Einzige erlaubte Änderung bestehender Gym-Tabellen: idempotentes target_unit.
+    altering = [statement for statement in gym_migrations if "alter table" in statement]
+    assert altering
+    assert all(
+        "add column if not exists target_unit" in statement and "drop" not in statement
+        for statement in altering
+    )

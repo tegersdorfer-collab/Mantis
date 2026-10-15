@@ -18,7 +18,7 @@ from domains.gym.aliases import (
 )
 from domains.gym.legacy import legacy_exercise, legacy_exercise_for_alias
 from domains.gym.parser import ParsedLog, ParsedSet, has_non_exercise_start, parse_set_message
-from domains.gym.progression import estimate_1rm
+from domains.gym.progression import estimate_1rm, is_timed_set, set_amount
 
 
 @dataclass(frozen=True)
@@ -138,7 +138,7 @@ def _format_reps(values: list[int] | tuple[int, ...]) -> str:
 
 
 def _history_target(sets: list[dict]) -> str:
-    values = [int(row.get("reps") or 0) for row in sets]
+    values = [set_amount(row) for row in sets]
     return _format_reps(values)
 
 
@@ -582,7 +582,7 @@ class GymCoach:
     def _log_reply(result: dict) -> str:
         current = result["sets"]
         weights = [row.get("weight_kg") for row in current]
-        reps = [int(row["reps"]) for row in current]
+        reps = [set_amount(row) for row in current]
         metadata = result.get("metadata") or {}
         weight_unit = (
             " je Hantel"
@@ -594,7 +594,7 @@ class GymCoach:
             summary = f"{_format_weight(weights[0])}{weight_unit} · {_format_reps(reps)}"
         else:
             summary = " · ".join(
-                f"{_format_weight(row.get('weight_kg'))}{weight_unit} × {row['reps']}"
+                f"{_format_weight(row.get('weight_kg'))}{weight_unit} × {set_amount(row)}"
                 for row in current
             )
         text = f"✅ {result['exercise']} {summary}"
@@ -708,8 +708,9 @@ class GymCoach:
                     except (TypeError, ValueError):
                         pass
                 weight = _format_weight(weight_value)
-                rendered.append(f"{weight}×{item.get('reps')}")
-                estimate = None if item.get("load_mode") in {"added", "bodyweight"} else estimate_1rm(
+                timed = is_timed_set(item)
+                rendered.append(f"{weight}×{set_amount(item)}{' s' if timed else ''}")
+                estimate = None if timed or item.get("load_mode") in {"added", "bodyweight"} else estimate_1rm(
                     item.get("weight_kg"), item.get("reps")
                 )
                 if estimate is not None:
@@ -890,7 +891,7 @@ class GymCoach:
             name = str(item["name"])
             last = latest.get(normalize_alias(name))
             weight = last.get("weight_kg") if last and last.get("weight_kg") is not None else item.get("weight")
-            target = item.get("reps") or (last.get("reps") if last else 8)
+            target = item.get("reps") or (set_amount(last) if last else 8)
             if weight is not None:
                 suggestions.append(f"{name} {_format_weight(weight)}, Ziel {target}")
         detail = " · " + "; ".join(suggestions[:3]) if suggestions else ""
@@ -940,7 +941,10 @@ class GymCoach:
             seen.add(row.get("exercise"))
             if row.get("weight_kg") is not None:
                 low, high = (8, 12) if any(word in normalize_alias(row.get("exercise")) for word in ("curl", "heben", "fly")) else (6, 10)
-                target = min(high, int(row.get("reps") or low) + 1)
+                if is_timed_set(row):
+                    target = f"{set_amount(row) + 5} s"
+                else:
+                    target = min(high, (set_amount(row) or low) + 1)
                 suggestions.append(f"{row['exercise']} {_format_weight(row['weight_kg'])}, Ziel {target}")
             if len(suggestions) == 3:
                 break

@@ -90,6 +90,7 @@ class APExercise:
     sets: tuple[APSet, ...]
     note: str | None = None
     load_mode: str = "external"
+    target_reps: int | None = None
 
 
 @dataclass(frozen=True)
@@ -185,7 +186,9 @@ def _parse_seconds(value: str, unit: str, line_number: int) -> int:
     return round(seconds)
 
 
-def _exercise_line(cells: list[str], line_number: int) -> tuple[str, str | None, str | None] | None:
+def _exercise_line(
+    cells: list[str], line_number: int,
+) -> tuple[str, str | None, str | None, int | None] | None:
     if not cells:
         return None
     match = _EXERCISE_START.fullmatch(cells[0])
@@ -196,13 +199,17 @@ def _exercise_line(cells: list[str], line_number: int) -> tuple[str, str | None,
         raise ValueError(f"Zeile {line_number}: Übungsname fehlt")
     name = parts[0]
     equipment = None
+    target_reps = None
     for part in parts[1:]:
-        if _EXERCISE_REPS.fullmatch(part) or _SUPERSET.match(part):
+        if _EXERCISE_REPS.fullmatch(part):
+            target_reps = int(re.match(r"\d+", part).group()) or None
+            continue
+        if _SUPERSET.match(part):
             continue
         if equipment is None:
             equipment = part
     note = ";".join(cells[1:]).strip() or None
-    return name, equipment, note
+    return name, equipment, note, target_reps
 
 
 def _set_from_row(
@@ -282,6 +289,7 @@ def parse_export(text: str) -> list[APWorkout]:
                 sets=tuple(set_rows),
                 note=current_exercise["note"],
                 load_mode=_load_mode(columns or (), set_rows),
+                target_reps=current_exercise["target_reps"],
             ))
         current_exercise = None
         columns = None
@@ -323,10 +331,10 @@ def parse_export(text: str) -> list[APWorkout]:
             finish_exercise()
             parsed = _exercise_line(cells, line_number)
             assert parsed is not None
-            name, equipment, note = parsed
+            name, equipment, note, target_reps = parsed
             current_exercise = {
                 "name": name, "equipment": equipment, "note": note,
-                "unit": "reps", "sets": [],
+                "unit": "reps", "sets": [], "target_reps": target_reps,
             }
             continue
 
@@ -500,6 +508,19 @@ def _canonical_exercise(
         target_equipment = equipment or _equipment_code(raw_legacy.equipment)
         return raw_legacy.name, target_equipment, None
     return raw_base, equipment, None
+
+
+def resolve_exercise_row(
+    exercise: APExercise, aliases: dict[str, list[str]], rows: list[dict],
+) -> dict | None:
+    """Liefert die vorhandene Übungszeile zu einer Exportübung (None, wenn unbekannt)."""
+    canonical, equipment, row = _canonical_exercise(exercise, aliases, rows)
+    if row is not None:
+        return row
+    name = _variant_name(canonical, equipment, rows)
+    return next(
+        (r for r in rows if normalize_alias(r["name"]) == normalize_alias(name)), None,
+    )
 
 
 def _variant_name(canonical_name: str, equipment: str | None, rows: list[dict]) -> str:

@@ -7,8 +7,51 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from core import db
-from domains.gym import plans, session
+from domains.gym import ap_text_import, plans, session
 from domains.gym.aliases import normalize_alias
+
+
+class _SyntheticSeedCursor:
+    def __init__(self, plan_name, workouts, exercises, aliases, sets):
+        self.plan_name = plan_name.casefold()
+        self.workouts = workouts
+        self.exercises = exercises
+        self.aliases = aliases
+        self.sets = sets
+        self.rows = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=()):
+        statement = " ".join(sql.split()).casefold()
+        if "from workouts" in statement:
+            self.rows = [
+                row.copy() for row in self.workouts
+                if self.plan_name in str(row.get("title") or "").casefold()
+            ]
+        elif "from exercises e" in statement:
+            self.rows = [row.copy() for row in self.exercises]
+        elif "from exercise_aliases" in statement:
+            self.rows = [row.copy() for row in self.aliases]
+        elif "from workout_sets ws" in statement:
+            workout_ids = set(params[0])
+            self.rows = [
+                row.copy() for row in self.sets if row["workout_id"] in workout_ids
+            ]
+        else:
+            raise AssertionError(f"unexpected seed query: {sql}")
+
+    def fetchall(self):
+        return [row.copy() for row in self.rows]
+
+
+def _use_synthetic_seed_rows(monkeypatch, *, name, workouts, exercises, aliases, sets):
+    cursor = _SyntheticSeedCursor(name, workouts, exercises, aliases, sets)
+    monkeypatch.setattr(plans.db, "cursor", lambda: cursor)
 
 
 def test_plan_start_uses_week_one_after_the_last_gap_over_21_days():
@@ -251,3 +294,276 @@ def test_plan_session_snapshots_day_and_reorders_session_exercises(plan_database
 
     reordered = plans.session_exercises(started["id"], started["title"])
     assert [item["exercise_id"] for item in reordered] == [alias_id, canonical_id]
+
+
+def _export_text(name, rows):
+    """Baut einen synthetischen AP-Export; rows = (Tag, Datum, [(Übung, Ziel)])."""
+    lines = []
+    for index, (day, day_date, exercises) in enumerate(rows):
+        number = plans.PLAN_DAY_ORDER.index(day) + 1
+        lines.append(f'"{day} · Day {number} · Week {7 - index} · {name}";"{day_date} 19:37 h";"1 hr"')
+        for position, (label, target) in enumerate(exercises, 1):
+            suffix = f" · {target} reps" if target else ""
+            lines.extend([f'"{position}. {label}{suffix}"', "#;KG;REPS", "1;50;8"])
+        lines.append("")
+    return "\n".join(lines)
+
+
+@pytest.mark.db
+def test_seed_takes_rep_targets_from_latest_ap_export_workout_of_same_day(plan_database):
+    name = plan_database["name"]
+    export = _export_text(name, [
+        ("Lower A", "2026-10-05", [(f"{name} Canonical", 5)]),
+        ("Upper B", "2026-10-08", [(f"{name} Alias", 7)]),
+        ("Upper B", "2026-10-02", [(f"{name} Alias", 9)]),
+    ])
+    workouts = ap_text_import.parse_export(export)
+
+    preview = plans.preview_seed(name, ap_workouts=workouts)
+    seeded = plans.seed_plan(name, ap_workouts=workouts)
+
+    lower_a = preview["days"][0]["exercises"][0]
+    upper_b = preview["days"][3]["exercises"][0]
+    assert (lower_a["rep_min"], lower_a["rep_max"]) == (5, 5)
+    assert (upper_b["rep_min"], upper_b["rep_max"]) == (7, 7)
+    stored = seeded["days"][3]["exercises"][0]
+    assert (stored["rep_min"], stored["rep_max"], stored["target_unit"]) == (7, 7, "reps")
+
+
+@pytest.mark.db
+def test_seed_without_ap_export_keeps_exercise_defaults(plan_database):
+    seeded = plans.seed_plan(plan_database["name"])
+
+    assert all(
+        item["target_unit"] == "reps"
+        for day in seeded["days"] for item in day["exercises"]
+    )
+    first = seeded["days"][0]["exercises"][0]
+    assert (first["rep_min"], first["rep_max"]) == (8, 12)
+
+
+@pytest.mark.db
+def test_seed_includes_time_based_exercises_with_seconds_target(plan_database):
+    name = plan_database["name"]
+    hang_id = db.insert_returning(
+        """INSERT INTO exercises (name,category,unit,rep_min,rep_max,load_mode)
+           VALUES (%s,'strength','min',6,10,'added') RETURNING id""",
+        (f"{name} Hang",),
+    )
+    started = None
+    try:
+        upper_b = db.query_one(
+            "SELECT id FROM workouts WHERE title LIKE %s ORDER BY date DESC LIMIT 1", (f"Upper B%{name}",)
+        )["id"]
+        for index, seconds in ((5, 34), (6, 27)):
+            db.execute(
+                """INSERT INTO workout_sets
+                     (workout_id,exercise_id,set_index,reps,weight_kg,duration_s,is_warmup)
+                   VALUES (%s,%s,%s,NULL,20,%s,FALSE)""",
+                (upper_b, hang_id, index, seconds),
+            )
+
+        seeded = plans.seed_plan(name)
+        items = seeded["days"][3]["exercises"]
+        hang = next(item for item in items if item["exercise_id"] == hang_id)
+
+        assert hang["target_unit"] == "seconds"
+        assert hang["target_sets"] == 2
+        assert (hang["rep_min"], hang["rep_max"]) == (30, 40)
+        assert [item["target_unit"] for item in items if item is not hang] == ["reps"]
+
+        started = plans.start_plan_session(
+            seeded["days"][3]["id"], datetime(2026, 10, 15, 10, 0, tzinfo=ZoneInfo("Europe/Berlin"))
+        )
+        plan_database["workouts"].append(started["id"])
+        state = plans.session_exercises(started["id"], started["title"])
+        entry = next(item for item in state if item["exercise_id"] == hang_id)
+        assert entry["target_unit"] == "seconds"
+        assert entry["prefill"] == [{"weight_kg": 20.0, "reps": 34}, {"weight_kg": 20.0, "reps": 27}]
+    finally:
+        if started:
+            db.execute("DELETE FROM workouts WHERE id=%s", (started["id"],))
+        db.execute("DELETE FROM gym_plans WHERE name=%s", (name,))
+        db.execute("DELETE FROM workout_sets WHERE exercise_id=%s", (hang_id,))
+        db.execute("DELETE FROM exercises WHERE id=%s", (hang_id,))
+
+
+def test_seed_uses_canonical_unit_or_set_duration_and_reports_conflicts(monkeypatch):
+    name = "Synthetic Plan"
+    reps_name = f"{name} Reps Canonical"
+    reps_alias_name = f"{name} Reps Alias"
+    time_name = f"{name} Time Canonical"
+    time_alias_name = f"{name} Time Alias"
+    reps_id, reps_alias_id, time_id, time_alias_id = (1, 2, 3, 4)
+    workouts = [
+        {"id": 1, "date": date(2026, 8, 19), "title": f"Lower A · Day 1 · Week 1 · {name}"},
+        {"id": 2, "date": date(2026, 8, 21), "title": f"Upper B · Day 4 · Week 1 · {name}"},
+    ]
+    exercises = [
+        {"id": reps_id, "name": reps_name, "category": "strength", "unit": "reps", "rep_min": 6, "rep_max": 10},
+        {"id": reps_alias_id, "name": reps_alias_name, "category": "strength", "unit": "min", "rep_min": 30, "rep_max": 40},
+        {"id": time_id, "name": time_name, "category": "strength", "unit": "min", "rep_min": 30, "rep_max": 60},
+        {"id": time_alias_id, "name": time_alias_name, "category": "strength", "unit": "reps", "rep_min": 6, "rep_max": 10},
+    ]
+    aliases = [
+        {"normalized_alias": normalize_alias(reps_alias_name), "exercise_id": reps_id},
+        {"normalized_alias": normalize_alias(time_alias_name), "exercise_id": time_id},
+    ]
+    sets = [
+        {"workout_id": 2, "exercise_id": reps_alias_id, "set_index": 20,
+         "duration_s": None, "distance_km": None, "is_warmup": False, "reps": 10},
+        {"workout_id": 2, "exercise_id": time_alias_id, "set_index": 21,
+         "duration_s": 45, "distance_km": None, "is_warmup": False, "reps": None},
+    ]
+    _use_synthetic_seed_rows(
+        monkeypatch, name=name, workouts=workouts, exercises=exercises,
+        aliases=aliases, sets=sets,
+    )
+
+    preview = plans.preview_seed(name)
+    entries = {item["exercise_id"]: item for day in preview["days"] for item in day["exercises"]}
+
+    assert entries[reps_id]["target_unit"] == "reps"
+    assert entries[time_id]["target_unit"] == "seconds"
+    assert len(preview["warnings"]) == 2
+
+
+def test_seed_filters_workouts_by_exact_plan_suffix_before_dates_and_medians(monkeypatch):
+    name = "Synthetic Plan"
+    canonical_id = 1
+    workouts = [
+        {"id": 1, "date": date(2026, 8, 19), "title": f"Lower A · Day 1 · Week 1 · {name}"},
+        {"id": 2, "date": date(2026, 8, 22), "title": f"Lower A · Day 1 · Week 2 · {name}"},
+        {"id": 3, "date": date(2026, 10, 1), "title": f"Lower A · Day 1 · Week 6 · {name}"},
+        {"id": 4, "date": date(2026, 9, 20), "title": f"Lower A · Day 1 · Week 1 · {name} · archived"},
+        {"id": 5, "date": date(2026, 10, 20), "title": f"Lower A · Day 1 · Week 9 · {name} · archived"},
+    ]
+    exercises = [{
+        "id": canonical_id, "name": f"{name} Canonical", "category": "strength",
+        "unit": "reps", "rep_min": 8, "rep_max": 12,
+    }]
+    sets = [
+        {"workout_id": 2, "exercise_id": canonical_id, "set_index": index,
+         "duration_s": None, "distance_km": None, "is_warmup": False, "reps": 8}
+        for index in (1, 2)
+    ] + [
+        {"workout_id": 3, "exercise_id": canonical_id, "set_index": index,
+         "duration_s": None, "distance_km": None, "is_warmup": False, "reps": 8}
+        for index in (1, 2, 3)
+    ] + [{
+        "workout_id": 5, "exercise_id": canonical_id, "set_index": 1,
+        "duration_s": None, "distance_km": None, "is_warmup": False, "reps": 8,
+    }]
+    _use_synthetic_seed_rows(
+        monkeypatch, name=name, workouts=workouts, exercises=exercises, aliases=[], sets=sets,
+    )
+
+    preview = plans.preview_seed(name)
+
+    assert preview["start_date"] == date(2026, 8, 19)
+    lower_a_entry = preview["days"][0]["exercises"][0]
+    assert lower_a_entry["target_sets"] == 3
+
+
+def test_seed_caps_time_range_at_600_seconds(monkeypatch):
+    name = "Synthetic Plan"
+    workouts = [
+        {"id": 1, "date": date(2026, 8, 19), "title": f"Lower A · Day 1 · Week 1 · {name}"},
+    ]
+    exercises = [{
+        "id": 1, "name": f"{name} Hold", "category": "strength",
+        "unit": "min", "rep_min": 30, "rep_max": 60,
+    }]
+    sets = [{
+        "workout_id": 1, "exercise_id": 1, "set_index": 1,
+        "duration_s": 600, "distance_km": None, "is_warmup": False, "reps": None,
+    }]
+    _use_synthetic_seed_rows(
+        monkeypatch, name=name, workouts=workouts, exercises=exercises, aliases=[], sets=sets,
+    )
+
+    preview = plans.preview_seed(name)
+    entry = preview["days"][0]["exercises"][0]
+
+    assert entry["target_unit"] == "seconds"
+    assert entry["rep_max"] == 600
+
+
+@pytest.mark.db
+def test_seed_resolves_equipment_variants_to_the_same_ids_as_the_import(plan_database, monkeypatch):
+    name = plan_database["name"]
+    base = f"{name} Zugvariante"
+    created = []
+    try:
+        barbell_id = db.insert_returning(
+            """INSERT INTO exercises (name,category,unit,equipment,load_mode,rep_min,rep_max)
+               VALUES (%s,'strength','reps','machine','external',6,10) RETURNING id""",
+            (base,),
+        )
+        dumbbell_id = db.insert_returning(
+            """INSERT INTO exercises (name,category,unit,equipment,load_mode,rep_min,rep_max)
+               VALUES (%s,'strength','reps','dumbbell','external',6,10) RETURNING id""",
+            (f"{base} (Dumbbell)",),
+        )
+        created.extend([barbell_id, dumbbell_id])
+        upper_b = db.query_one(
+            "SELECT id FROM workouts WHERE title LIKE %s ORDER BY date DESC LIMIT 1", (f"Upper B%{name}",)
+        )["id"]
+        for exercise_id, first_index in ((barbell_id, 10), (dumbbell_id, 20)):
+            for offset in range(2):
+                db.execute(
+                    """INSERT INTO workout_sets (workout_id,exercise_id,set_index,reps,weight_kg,is_warmup)
+                       VALUES (%s,%s,%s,8,20,FALSE)""",
+                    (upper_b, exercise_id, first_index + offset),
+                )
+        export = _export_text(name, [
+            ("Upper B", "2026-10-08", [(f"{base} · Dumbbell", 11), (f"{base} · Machine", 5)]),
+        ])
+        workouts = ap_text_import.parse_export(export)
+        rows = [dict(r) for r in db.query("SELECT id,name,equipment,unit,load_mode FROM exercises")]
+        from domains.gym.aliases import load_aliases
+        aliases = load_aliases()
+        import_ids = {
+            item.equipment: int(ap_text_import.resolve_exercise_row(item, aliases, rows)["id"])
+            for item in workouts[0].exercises
+        }
+        assert import_ids == {"Dumbbell": dumbbell_id, "Machine": barbell_id}
+
+        seen_rows = []
+        real_resolve = plans.resolve_exercise_row
+
+        def spy(item, alias_map, candidate_rows):
+            seen_rows.append({int(r["id"]): r for r in candidate_rows})
+            return real_resolve(item, alias_map, candidate_rows)
+
+        monkeypatch.setattr(plans, "resolve_exercise_row", spy)
+
+        preview = plans.preview_seed(name, ap_workouts=workouts)
+
+        for candidates in seen_rows:
+            assert candidates[dumbbell_id]["equipment"] == "dumbbell"
+            assert candidates[barbell_id]["equipment"] == "machine"
+            assert candidates[barbell_id]["load_mode"] == "external"
+        assert seen_rows
+        by_id = {item["exercise_id"]: item for item in preview["days"][3]["exercises"]}
+        assert (by_id[dumbbell_id]["rep_min"], by_id[dumbbell_id]["rep_max"]) == (11, 11)
+        assert (by_id[barbell_id]["rep_min"], by_id[barbell_id]["rep_max"]) == (5, 5)
+    finally:
+        db.execute("DELETE FROM workout_sets WHERE exercise_id=ANY(%s)", (created,))
+        db.execute("DELETE FROM exercises WHERE id=ANY(%s)", (created,))
+
+
+def test_ap_rep_targets_match_plan_name_by_title_suffix_only():
+    rows = {1: {"id": 1, "name": "Synthetic Curl", "equipment": None, "unit": "reps", "load_mode": "external"}}
+    export = (
+        '"Upper A · Day 2 · Week 7 · Plan 2";"2026-10-08 19:37 h";"1 hr"\n'
+        '"1. Synthetic Curl · 12 reps"\n#;KG;REPS\n1;50;8\n\n'
+        '"Upper A · Day 2 · Week 6 · Plan";"2026-10-01 19:37 h";"1 hr"\n'
+        '"1. Synthetic Curl · 6 reps"\n#;KG;REPS\n1;50;8\n'
+    )
+    workouts = ap_text_import.parse_export(export)
+    assert len(workouts) == 2
+
+    targets = plans._ap_rep_targets(None, workouts, "Plan", rows, {1: 1})
+
+    assert targets == {("Upper A", 1): 6}

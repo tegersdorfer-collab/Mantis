@@ -813,3 +813,16 @@ def test_import_marks_less_than_half_matching_sets_unclear(ap_import_database):
     finally:
         db.execute("DELETE FROM workouts WHERE id=%s", (workout_id,))
         db.execute("DELETE FROM exercises WHERE id=%s", (exercise_id,))
+
+
+def test_parse_export_keeps_rep_target_of_exercise_line():
+    text = (
+        '"Upper A · Day 2 · Week 7 · New plan";"2026-10-05 13:26 h";"1 hr"\n'
+        '"1. Bench Press · Barbell · 4 reps"\n#;KG;REPS\n1;80;4\n'
+        '"2. Pull-Ups · Bodyweight"\n#;KG;REPS\n1;+0;6\n'
+        '"3. Weighted Deadhang · Bodyweight"\n#;KG;SECS\n1;+20;34\n'
+    )
+
+    exercises = parse_export(text)[0].exercises
+
+    assert [item.target_reps for item in exercises] == [4, None, None]

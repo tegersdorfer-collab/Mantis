@@ -334,7 +334,7 @@ def _exercise_rows(cur, exercise_id: int) -> list[dict]:
     exercise_ids = duplicate_ids or [exercise_id]
     return _fetchall(
         cur,
-        """SELECT w.id AS workout_id, w.created_at, ws.set_index, ws.reps,
+        """SELECT w.id AS workout_id, w.created_at, ws.set_index, ws.reps, ws.duration_s,
                   ws.weight_kg, COALESCE(ws.is_warmup,FALSE) AS is_warmup
            FROM workout_sets ws JOIN workouts w ON w.id=ws.workout_id
            WHERE ws.exercise_id = ANY(%s) AND w.type IN ('strength','gym')
@@ -399,6 +399,22 @@ def legacy_equipment_variants(exercise_name: str, equipment: str) -> list[str]:
     return list(dict.fromkeys(variants))
 
 
+def _seconds_bounds(cur, workout_id: int, exercise_id: int) -> dict:
+    """Sekundenziele der Plan-Übung dieser Session (leer bei Wiederholungs-Übungen)."""
+    row = _fetchone(
+        cur,
+        """SELECT rep_min, rep_max FROM gym_workout_exercises
+           WHERE workout_id=%s AND exercise_id=%s AND target_unit='seconds'""",
+        (workout_id, exercise_id),
+    )
+    if not row or row.get("rep_min") is None or row.get("rep_max") is None:
+        return {}
+    return {
+        "rep_min": row["rep_min"], "rep_max": row["rep_max"],
+        "target_unit": "seconds",
+    }
+
+
 def _exercise_state(cur, workout_id: int, exercise_id: int) -> dict:
     groups = _group_history(_exercise_rows(cur, exercise_id))
     position = next(
@@ -429,6 +445,7 @@ def _exercise_state(cur, workout_id: int, exercise_id: int) -> dict:
         )
     }
     prior_rows = [row for group in groups if group and group[0]["workout_id"] != workout_id for row in group]
+    metadata.update(_seconds_bounds(cur, workout_id, exercise_id))
     count = progression_set_count(
         len(current), _planned_set_count(cur, exercise.get("name", "")),
         previous_count=len(previous),
@@ -483,15 +500,18 @@ def add_sets(
             next_index += 1
             cur.execute(
                 """INSERT INTO workout_sets
-                     (workout_id, exercise_id, set_index, reps, weight_kg, client_id, is_warmup)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                     (workout_id, exercise_id, set_index, reps, duration_s, weight_kg, client_id, is_warmup)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (
-                    workout["id"], exercise["id"], next_index, item.reps,
+                    workout["id"], exercise["id"], next_index,
+                    None if item.duration_s is not None else item.reps, item.duration_s,
                     item.weight_kg, client_id, item.is_warmup,
                 ),
             )
             inserted_sets.append({
-                "set_index": next_index, "reps": item.reps,
+                "set_index": next_index,
+                "reps": None if item.duration_s is not None else item.reps,
+                "duration_s": item.duration_s,
                 "weight_kg": item.weight_kg, "is_warmup": item.is_warmup,
             })
         cur.execute("UPDATE workouts SET last_activity_at=%s WHERE id=%s", (moment, workout["id"]))
@@ -512,6 +532,7 @@ def add_sets(
             "exercise_type", "equipment", "rep_min", "rep_max", "rep_start",
             "load_mode", "weight_increment_kg", "dumbbell_pair",
         )}
+        metadata.update(_seconds_bounds(cur, workout["id"], exercise["id"]))
         if parsed.load_mode in {"added", "bodyweight"}:
             metadata["load_mode"] = (
                 "added" if is_pullup_name(exercise["name"])
@@ -597,7 +618,7 @@ def finish(now: datetime | None = None) -> dict | None:
         sets = _fetchall(
             cur,
             """SELECT e.id AS exercise_id, e.name AS exercise, e.equipment, e.load_mode, e.dumbbell_pair,
-                      ws.weight_kg, ws.reps, COALESCE(ws.is_warmup,FALSE) AS is_warmup
+                      ws.weight_kg, ws.reps, ws.duration_s, COALESCE(ws.is_warmup,FALSE) AS is_warmup
                FROM workout_sets ws JOIN exercises e ON e.id=ws.exercise_id
                WHERE ws.workout_id=%s ORDER BY ws.id""",
             (workout["id"],),
@@ -635,15 +656,21 @@ def correct_last_reps(
             return None
         row = _fetchone(
             cur,
-            """SELECT id, exercise_id, set_index, reps FROM workout_sets
+            """SELECT id, exercise_id, set_index, reps, duration_s FROM workout_sets
                WHERE workout_id=%s ORDER BY id DESC LIMIT 1""",
             (workout["id"],),
         )
         if not row:
             return None
-        if expected_reps is not None and row.get("reps") != expected_reps:
-            return {"conflict": True, "reps": row.get("reps"), "expected_reps": expected_reps}
-        cur.execute("UPDATE workout_sets SET reps=%s WHERE id=%s", (reps, row["id"]))
+        timed = row.get("duration_s") is not None and row.get("reps") is None
+        current_amount = row.get("duration_s") if timed else row.get("reps")
+        if expected_reps is not None and current_amount != expected_reps:
+            return {"conflict": True, "reps": current_amount, "expected_reps": expected_reps}
+        cur.execute(
+            "UPDATE workout_sets SET duration_s=%s WHERE id=%s" if timed
+            else "UPDATE workout_sets SET reps=%s WHERE id=%s",
+            (reps, row["id"]),
+        )
         cur.execute("UPDATE workouts SET last_activity_at=%s WHERE id=%s", (moment, workout["id"]))
         state = _exercise_state(cur, workout["id"], row["exercise_id"])
         return {**row, "reps": reps, "workout_id": workout["id"], **state}
@@ -705,7 +732,7 @@ def correct_last_load(exercise_name: str, weight_kg: float, now: datetime | None
         return {**row, "weight_kg": weight_kg, "workout_id": workout["id"], **state}
 
 
-_HISTORY_SELECT = """SELECT w.id AS workout_id, w.date, w.created_at, ws.set_index, ws.reps,
+_HISTORY_SELECT = """SELECT w.id AS workout_id, w.date, w.created_at, ws.set_index, ws.reps, ws.duration_s,
                   ws.weight_kg, COALESCE(ws.is_warmup,FALSE) AS is_warmup,
                   e.name AS exercise, e.load_mode
            FROM workout_sets ws JOIN workouts w ON w.id=ws.workout_id
@@ -769,7 +796,7 @@ def exercise_history(exercise_name: str, limit: int = 5) -> list[dict]:
 def workout_exercise_history(limit: int = 12) -> list[dict]:
     return db.query(
         """SELECT w.id AS workout_id, w.date, w.created_at, e.name AS exercise,
-                  e.muscle, ws.set_index, ws.reps, ws.weight_kg,
+                  e.muscle, ws.set_index, ws.reps, ws.duration_s, ws.weight_kg,
                   COALESCE(ws.is_warmup,FALSE) AS is_warmup
            FROM workouts w JOIN workout_sets ws ON ws.workout_id=w.id
            JOIN exercises e ON e.id=ws.exercise_id
