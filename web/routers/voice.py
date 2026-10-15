@@ -20,7 +20,7 @@ from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 
 import config
-from core import db, voice_fillers, voice_timing
+from core import db, tts, voice_fillers, voice_timing
 from core.voice import transcribe_audio, is_addressed_to_mantis, mark_conversation_active, _conversation_active
 from core.voice_stream import VoiceStreamSession
 from core.stream_events import StreamEvent
@@ -158,6 +158,8 @@ async def sende_streaming_antwort(
     spoken_sentences: list[str] = []
     response: list[tuple[str | None, Exception | None]] = []
     ack_task: asyncio.Task | None = None
+    turn_state: tts.TTSTurnState | None = None
+    turn_token = None
 
     def request_filler(kind: str) -> None:
         nonlocal filler_kind, pending_filler
@@ -168,6 +170,8 @@ async def sende_streaming_antwort(
             or response_audio_ready
             or (timing is not None and timing.reflex)
         ):
+            return
+        if turn_state is None or not tts._tts_turn_can_use_filler(turn_state):
             return
         selected = voice_fillers.choose_cached_filler(kind)
         if selected is None:
@@ -385,6 +389,7 @@ async def sende_streaming_antwort(
                 await asyncio.gather(*wait_tasks, return_exceptions=True)
 
     timing_token = voice_timing.start()
+    turn_state, turn_token = tts._start_tts_turn()
     if getattr(config, "VOICE_FILLERS_ENABLED", True):
         ack_task = asyncio.create_task(send_ack_after_delay(), name="voice-filler-ack-delay")
     responder = asyncio.create_task(produce_response())
@@ -437,7 +442,11 @@ async def sende_streaming_antwort(
                     filler_ms=filler_ms,
                 )
             finally:
-                voice_timing.reset(timing_token)
+                try:
+                    if turn_token is not None:
+                        tts._end_tts_turn(turn_token)
+                finally:
+                    voice_timing.reset(timing_token)
     if response_error is not None:
         raise response_error
     return reply

@@ -122,7 +122,7 @@ Drei fokussierte Apps gegen dieselbe FastAPI (`:7779`), erreichbar über Tailsca
 | Backend | FastAPI + uvicorn |
 | Frontend | Vanilla JS PWA (Chart.js, vis.js, marked.js, globe.gl, Leaflet) |
 | iOS-Apps | 3 × SwiftUI — BodyOS / BrainOS / FlowOS |
-| Kommunikation | python-telegram-bot · Voice (Parakeet lokal + Cartesia Sonic 3.6, Kokoro/Piper-Fallback) · Cloud-Bildanalyse |
+| Kommunikation | python-telegram-bot · Voice (Parakeet lokal + TTS-Kette Cartesia/ElevenLabs/Google/Kokoro/Piper) · Cloud-Bildanalyse |
 | Health-Import | Swift-App → HealthKit Background Delivery → HTTP Push |
 | Prozess-Management | launchd + KeepAlive (Auto-Restart nach Crash) |
 | CI | GitHub Actions (ruff lint + pytest, Python 3.14) |

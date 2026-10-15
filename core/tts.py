@@ -1,13 +1,14 @@
-"""Cartesia Sonic 3.6 als TTS mit lokalem Kokoro/Piper-Fallback.
+"""Cloud-TTS mit konfigurierbarer Ersatzkette und lokalem Kokoro/Piper-Fallback.
 
-Alle öffentlichen Funktionen liefern Telegram-kompatible OGG/Opus-Bytes. Cartesia
-liefert WAV, das über dieselbe ffmpeg-Konvertierung wie der lokale Pfad umgewandelt
-wird. Lokale Modelle werden erst geladen, wenn Cartesia nicht verfügbar ist.
+Alle öffentlichen Funktionen liefern Telegram-kompatible OGG/Opus-Bytes. Cloud-
+Provider-Audio wird bei Bedarf über dieselbe ffmpeg-Konvertierung wie der lokale
+Pfad umgewandelt. Lokale Modelle werden erst geladen, wenn Cloud-Provider ausfallen.
 """
 from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextvars
 import io
 import logging
 import re
@@ -16,6 +17,7 @@ import tempfile
 import time
 import wave
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import config
@@ -37,14 +39,16 @@ _ESPEAK_DATA = "/opt/homebrew/share/espeak-ng-data"
 _CARTESIA_URL = "https://api.cartesia.ai/tts/bytes"
 _CARTESIA_VERSION = "2025-04-16"
 _CARTESIA_TIMEOUT_S = 5.0
-_CARTESIA_PAUSE_S = 30 * 60
-_CARTESIA_PAUSE_STATUSES = {401, 402, 403, 429}
+_ELEVENLABS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
+_ELEVENLABS_TIMEOUT_S = 5.0
+_ELEVENLABS_OUTPUT_FORMAT = "mp3_44100_128"
 _GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 _GOOGLE_TTS_TIMEOUT_S = 5.0
 _GOOGLE_TTS_MODEL = "chirp3-hd"
 _GOOGLE_TTS_USD_PER_MILLION_CHARS = 30.0
-_GOOGLE_TTS_PAUSE_S = 30 * 60
-_GOOGLE_TTS_PAUSE_STATUSES = {401, 403, 429}
+_DEFAULT_ENGINE_CHAIN = ("cartesia", "elevenlabs", "google", "local")
+_ERROR_COOLDOWN_S = 60.0
+_QUOTA_HINTS = ("quota", "credit", "payment_required")
 
 VOICE_MODELS: dict[str, str] = {
     "thorsten-high": "de_DE-thorsten-high",
@@ -65,29 +69,113 @@ _kokoro: object | None = None
 _kokoro_unavailable = False
 _cartesia_paused_until = 0.0
 _cartesia_pause_warned = False
+_elevenlabs_paused_until = 0.0
+_elevenlabs_pause_warned = False
 _google_tts_paused_until = 0.0
 _google_tts_pause_warned = False
+_engine_paused_until: dict[str, float] = {}
+_engine_pause_warned: set[str] = set()
 _lock = asyncio.Lock()
+
+
+@dataclass(slots=True)
+class TTSTurnState:
+    """Providerbindung für alle Satzblöcke eines Voice-Turns."""
+
+    engine: str | None = None
+    chain_position: int | None = None
+
+
+_active_tts_turn: contextvars.ContextVar[TTSTurnState | None] = contextvars.ContextVar(
+    "active_tts_turn",
+    default=None,
+)
 
 
 def _engine() -> str:
     return getattr(config, "TTS_ENGINE", "cartesia")
 
 
+def _engine_chain() -> list[str]:
+    """Liefert die konfigurierte Kette und berücksichtigt alte TTS_ENGINE-Werte."""
+    configured = list(getattr(config, "TTS_ENGINE_CHAIN", _DEFAULT_ENGINE_CHAIN))
+    explicit = bool(getattr(config, "TTS_ENGINE_CHAIN_EXPLICIT", False))
+    if not explicit and tuple(configured) == _DEFAULT_ENGINE_CHAIN:
+        primary = str(_engine() or "cartesia").strip().lower()
+        if primary in {"kokoro", "piper"}:
+            return [primary]
+        configured = [primary, *(name for name in _DEFAULT_ENGINE_CHAIN if name != primary)]
+
+    chain: list[str] = []
+    for value in configured:
+        name = str(value).strip().lower()
+        if name and name not in chain:
+            chain.append(name)
+    return chain
+
+
 def _cartesia_key() -> str:
     return str(getattr(config, "CARTESIA_API_KEY", "") or "").strip()
+
+
+def _elevenlabs_key() -> str:
+    return str(getattr(config, "ELEVENLABS_API_KEY", "") or "").strip()
 
 
 def _google_tts_key() -> str:
     return str(getattr(config, "GOOGLE_TTS_API_KEY", "") or "").strip()
 
 
+def _pause_until_compat_name(engine: str) -> str:
+    return {
+        "cartesia": "_cartesia_paused_until",
+        "elevenlabs": "_elevenlabs_paused_until",
+        "google": "_google_tts_paused_until",
+    }.get(engine, "")
+
+
+def _engine_label(engine: str) -> str:
+    return {
+        "cartesia": "Cartesia",
+        "elevenlabs": "ElevenLabs",
+        "google": "Google Cloud",
+        "local": "Lokales",
+        "kokoro": "Kokoro",
+        "piper": "Piper",
+    }.get(engine, engine)
+
+
+def _engine_is_paused(engine: str) -> bool:
+    compat_name = _pause_until_compat_name(engine)
+    legacy_deadline = globals().get(compat_name, 0.0) if compat_name else 0.0
+    return time.monotonic() < max(_engine_paused_until.get(engine, 0.0), legacy_deadline)
+
+
 def _cartesia_is_paused() -> bool:
-    return time.monotonic() < _cartesia_paused_until
+    return _engine_is_paused("cartesia")
+
+
+def _elevenlabs_is_paused() -> bool:
+    return _engine_is_paused("elevenlabs")
 
 
 def _google_tts_is_paused() -> bool:
-    return time.monotonic() < _google_tts_paused_until
+    return _engine_is_paused("google")
+
+
+def _start_tts_turn() -> tuple[TTSTurnState, contextvars.Token]:
+    state = TTSTurnState()
+    return state, _active_tts_turn.set(state)
+
+
+def _end_tts_turn(token: contextvars.Token) -> None:
+    _active_tts_turn.reset(token)
+
+
+def _tts_turn_can_use_filler(state: TTSTurnState) -> bool:
+    """Füller gibt es erst, wenn im aktuellen Turn die Hauptstimme feststeht."""
+    chain = _engine_chain()
+    return bool(chain and state.engine == chain[0])
 
 
 def _kokoro_paths() -> tuple[Path, Path]:
@@ -151,20 +239,29 @@ def _active_voice_name() -> str:
 
 
 def is_available() -> bool:
-    """True, wenn IRGENDEINE Engine sprechen kann — Kokoro oder Piper."""
-    if _engine() == "cartesia" and _cartesia_key() and not _cartesia_is_paused():
-        return True
-    if _engine() == "google" and _google_tts_key() and not _google_tts_is_paused():
-        return True
-    if _engine() in {"kokoro", "cartesia", "google"} and not _kokoro_unavailable:
+    """True, wenn mindestens ein Provider der Ersatzkette einsatzbereit ist."""
+    for engine in _engine_chain():
+        if engine == "cartesia" and _cartesia_key() and not _cartesia_is_paused():
+            return True
+        if engine == "elevenlabs" and _elevenlabs_key() and not _elevenlabs_is_paused():
+            return True
+        if engine == "google" and _google_tts_key() and not _google_tts_is_paused():
+            return True
+        if engine in {"local", "kokoro", "piper"} and _local_engine_available(engine):
+            return True
+    return False
+
+
+def _local_engine_available(engine: str) -> bool:
+    if engine in {"local", "kokoro"} and not _kokoro_unavailable:
         onnx, voices = _kokoro_paths()
         if onnx.exists() and voices.exists():
             return True
     try:
-        onnx, cfg = resolve_voice_paths(_active_voice_name())
+        onnx, voice_config = resolve_voice_paths(_active_voice_name())
     except KeyError:
         return False
-    return onnx.exists() and cfg.exists()
+    return onnx.exists() and voice_config.exists()
 
 
 def _load_voice():
@@ -571,6 +668,36 @@ def _wav_to_ogg(wav_bytes: bytes) -> bytes:
         Path(ogg_path).unlink(missing_ok=True)
 
 
+def _mp3_to_ogg(mp3_bytes: bytes) -> bytes:
+    """MP3 → OGG/Opus via ffmpeg (Telegram-kompatibles Format)."""
+    if not mp3_bytes:
+        raise ValueError("ElevenLabs lieferte leeres MP3-Audio")
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+        tmp_mp3.write(mp3_bytes)
+        mp3_path = tmp_mp3.name
+
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_ogg:
+        ogg_path = tmp_ogg.name
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", mp3_path,
+                "-c:a", "libopus",
+                "-b:a", "64k",
+                "-ar", "48000",
+                ogg_path,
+            ],
+            capture_output=True,
+            check=True,
+        )
+        return Path(ogg_path).read_bytes()
+    finally:
+        Path(mp3_path).unlink(missing_ok=True)
+        Path(ogg_path).unlink(missing_ok=True)
+
+
 def _apply_cartesia_pronunciations(text: str) -> str:
     """Ersetzt Wörter, die die deutsche Cartesia-Stimme falsch ausspricht, durch eine Lautschreibung.
 
@@ -601,6 +728,29 @@ async def _cartesia_synthesize(text: str) -> bytes:
     }
     async with httpx.AsyncClient(timeout=_CARTESIA_TIMEOUT_S) as client:
         response = await client.post(_CARTESIA_URL, headers=headers, json=payload)
+    response.raise_for_status()
+    return response.content
+
+
+async def _elevenlabs_synthesize(text: str) -> bytes:
+    """Ruft ElevenLabs auf und liefert MP3-Audio für die Opus-Konvertierung."""
+    voice_id = config.TTS_ELEVENLABS_VOICE
+    payload = {
+        "text": _apply_cartesia_pronunciations(_numbers_to_german_words(text)),
+        "model_id": config.TTS_ELEVENLABS_MODEL,
+        "language_code": "de",
+    }
+    headers = {
+        "xi-api-key": _elevenlabs_key(),
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=_ELEVENLABS_TIMEOUT_S) as client:
+        response = await client.post(
+            f"{_ELEVENLABS_URL}/{voice_id}",
+            headers=headers,
+            params={"output_format": _ELEVENLABS_OUTPUT_FORMAT},
+            json=payload,
+        )
     response.raise_for_status()
     return response.content
 
@@ -675,6 +825,24 @@ def _record_cartesia_usage(text: str) -> None:
         log.debug("Cartesia-Usage konnte nicht erfasst werden: %s", redact_error_text(exc))
 
 
+def _record_elevenlabs_usage(text: str) -> None:
+    chars = len(text)
+    estimated_cost = chars * float(config.TTS_ELEVENLABS_USD_PER_MILLION_CHARS) / 1_000_000
+    try:
+        from core import llm_usage
+
+        llm_usage.record(
+            "elevenlabs",
+            config.TTS_ELEVENLABS_MODEL,
+            chars,
+            0,
+            purpose="tts",
+            actual_cost=estimated_cost,
+        )
+    except Exception as exc:
+        log.debug("ElevenLabs-Usage konnte nicht erfasst werden: %s", redact_error_text(exc))
+
+
 def _record_google_tts_usage(text: str) -> None:
     chars = len(text)
     estimated_cost = chars * _GOOGLE_TTS_USD_PER_MILLION_CHARS / 1_000_000
@@ -693,77 +861,112 @@ def _record_google_tts_usage(text: str) -> None:
         log.debug("Google-TTS-Usage konnte nicht erfasst werden: %s", redact_error_text(exc))
 
 
-def _pause_cartesia(status: int) -> None:
-    global _cartesia_paused_until, _cartesia_pause_warned
-    _cartesia_paused_until = time.monotonic() + _CARTESIA_PAUSE_S
-    if not _cartesia_pause_warned:
+def _is_quota_error(engine: str, exc: httpx.HTTPStatusError) -> bool:
+    status = exc.response.status_code
+    try:
+        body = exc.response.text.lower()
+    except Exception:
+        body = ""
+    has_quota_hint = any(hint in body for hint in _QUOTA_HINTS)
+    return status == 402 or (status == 429 and has_quota_hint) or (
+        engine in {"cartesia", "elevenlabs"} and has_quota_hint
+    )
+
+
+def _pause_engine(engine: str, status: int | str, *, quota: bool) -> None:
+    duration = (
+        max(0.0, float(getattr(config, "TTS_QUOTA_COOLDOWN_S", 3600.0)))
+        if quota
+        else _ERROR_COOLDOWN_S
+    )
+    deadline = time.monotonic() + duration
+    _engine_paused_until[engine] = deadline
+    compat_name = _pause_until_compat_name(engine)
+    if compat_name:
+        globals()[compat_name] = deadline
+    if engine not in _engine_pause_warned:
         log.warning(
-            "Cartesia TTS pausiert nach HTTP %s für 30 Minuten; nutze lokales TTS",
-            status,
+            "%s TTS pausiert nach %s für %s s; probiere den nächsten Provider",
+            _engine_label(engine),
+            f"HTTP {status}" if isinstance(status, int) else status,
+            int(duration),
         )
-        _cartesia_pause_warned = True
+        _engine_pause_warned.add(engine)
+        compat_warn_name = {
+            "cartesia": "_cartesia_pause_warned",
+            "elevenlabs": "_elevenlabs_pause_warned",
+            "google": "_google_tts_pause_warned",
+        }.get(engine)
+        if compat_warn_name:
+            globals()[compat_warn_name] = True
 
 
-def _pause_google_tts(status: int) -> None:
-    global _google_tts_paused_until, _google_tts_pause_warned
-    _google_tts_paused_until = time.monotonic() + _GOOGLE_TTS_PAUSE_S
-    if not _google_tts_pause_warned:
-        log.warning(
-            "Google Cloud TTS pausiert nach HTTP %s für 30 Minuten; nutze lokales TTS",
-            status,
-        )
-        _google_tts_pause_warned = True
+def _has_provider_key(engine: str) -> bool:
+    return {
+        "cartesia": _cartesia_key,
+        "elevenlabs": _elevenlabs_key,
+        "google": _google_tts_key,
+    }.get(engine, lambda: True)() != ""
 
 
-async def _try_cartesia(text: str) -> bytes | None:
-    """Gibt Cartesia-Audio oder None zurück, wenn der lokale Fallback übernehmen soll."""
-    if not _cartesia_key() or _cartesia_is_paused():
-        return None
-    try:
-        wav = await _cartesia_synthesize(text)
-    except httpx.HTTPStatusError as exc:
-        status = exc.response.status_code
-        if status in _CARTESIA_PAUSE_STATUSES:
-            _pause_cartesia(status)
+async def _synthesize_provider(engine: str, text: str, speed: float) -> bytes | None:
+    if engine in {"cartesia", "elevenlabs", "google"}:
+        if not _has_provider_key(engine) or _engine_is_paused(engine):
+            return None
+        try:
+            if engine == "cartesia":
+                source_audio = await _cartesia_synthesize(text)
+            elif engine == "elevenlabs":
+                source_audio = await _elevenlabs_synthesize(text)
+            else:
+                source_audio, is_wav = await _google_tts_synthesize(text)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            _pause_engine(engine, status, quota=_is_quota_error(engine, exc))
+            log.warning("%s TTS HTTP %s; probiere den nächsten Provider", _engine_label(engine), status)
+            return None
+        except Exception as exc:
+            _pause_engine(engine, type(exc).__name__, quota=False)
+            log.warning("%s TTS fehlgeschlagen (%s); probiere den nächsten Provider", _engine_label(engine), type(exc).__name__)
+            return None
+
+        try:
+            if engine == "cartesia":
+                ogg = await asyncio.to_thread(_cartesia_wav_to_ogg, source_audio)
+            elif engine == "elevenlabs":
+                ogg = await asyncio.to_thread(_mp3_to_ogg, source_audio)
+            else:
+                ogg = await asyncio.to_thread(_wav_to_ogg, source_audio) if is_wav else source_audio
+                if not is_wav and not ogg.startswith(b"OggS"):
+                    raise ValueError("Google TTS lieferte kein gültiges OGG")
+            if not ogg:
+                raise ValueError("TTS lieferte leeres Audio")
+        except Exception as exc:
+            _pause_engine(engine, type(exc).__name__, quota=False)
+            log.warning("%s-TTS-Audio nicht nutzbar (%s); probiere den nächsten Provider", _engine_label(engine), type(exc).__name__)
+            return None
+
+        if engine == "cartesia":
+            _record_cartesia_usage(text)
+        elif engine == "elevenlabs":
+            _record_elevenlabs_usage(text)
         else:
-            log.warning("Cartesia TTS HTTP %s; nutze lokales TTS", status)
-        return None
-    except Exception as exc:
-        # Ausnahme-Texte von HTTP-Clients können Request-Details enthalten.
-        log.warning("Cartesia TTS fehlgeschlagen (%s); nutze lokales TTS", type(exc).__name__)
-        return None
+            _record_google_tts_usage(text)
+        return ogg
 
-    _record_cartesia_usage(text)
-    return wav
-
-
-async def _try_google_tts_ogg(text: str) -> bytes | None:
-    """Gibt Google-Audio als OGG/Opus oder None für den lokalen Fallback zurück."""
-    if not _google_tts_key() or _google_tts_is_paused():
-        return None
-    try:
-        audio, is_wav = await _google_tts_synthesize(text)
-    except httpx.HTTPStatusError as exc:
-        status = exc.response.status_code
-        if status in _GOOGLE_TTS_PAUSE_STATUSES:
-            _pause_google_tts(status)
-        else:
-            log.warning("Google Cloud TTS HTTP %s; nutze lokales TTS", status)
-        return None
-    except Exception as exc:
-        # HTTP-Fehlertexte und Requests können vertrauliche Header enthalten.
-        log.warning("Google Cloud TTS fehlgeschlagen (%s); nutze lokales TTS", type(exc).__name__)
-        return None
-
-    _record_google_tts_usage(text)
-    try:
-        ogg = await asyncio.to_thread(_wav_to_ogg, audio) if is_wav else audio
-        if not ogg or (not is_wav and not ogg.startswith(b"OggS")):
-            raise ValueError("Google TTS lieferte kein gültiges OGG")
-    except Exception as exc:
-        log.warning("Google-TTS-Audio nicht nutzbar (%s); nutze lokales TTS", type(exc).__name__)
-        return None
-    return ogg
+    if engine in {"local", "kokoro", "piper"}:
+        try:
+            if engine == "piper" and _engine() != "piper":
+                wav = await asyncio.to_thread(_synth, text, speed)
+            else:
+                wav = await _synthesize_local(text, speed)
+            ogg = await asyncio.to_thread(_wav_to_ogg, wav)
+            return ogg or None
+        except Exception as exc:
+            log.warning("Lokales TTS fehlgeschlagen (%s)", type(exc).__name__)
+    else:
+        log.warning("Unbekannte TTS-Engine '%s' wird übersprungen", engine)
+    return None
 
 
 def _wav_nframes(wav: bytes) -> int:
@@ -778,50 +981,34 @@ def _cartesia_wav_to_ogg(wav: bytes) -> bytes:
     return _wav_to_ogg(wav)
 
 
-async def _try_cartesia_ogg(text: str) -> bytes | None:
-    """Cartesia-Audio als OGG oder None (Ausfall ODER nicht konvertierbares Audio).
-
-    Kaputtes/leeres WAV bei HTTP 200 ist kein Auth-/Kontingentproblem: kein Pausieren,
-    nur Warnung und lokaler Fallback für genau dieses Stück.
-    """
-    wav = await _try_cartesia(text)
-    if wav is None:
-        return None
-    try:
-        ogg = await asyncio.to_thread(_cartesia_wav_to_ogg, wav)
-    except Exception as exc:
-        log.warning("Cartesia-Audio nicht konvertierbar (%s); nutze lokales TTS", type(exc).__name__)
-        return None
-    if not ogg:
-        log.warning("Cartesia-Audio ergab leeres OGG; nutze lokales TTS")
-        return None
-    return ogg
-
-
 async def _synthesize_local(text: str, speed: float) -> bytes:
     """Lokaler Fallback: Kokoro lazy laden, bei dessen Nichtverfügbarkeit Piper nutzen."""
-    if _engine() in {"kokoro", "cartesia", "google"} and not _kokoro_unavailable:
+    if _engine() in {"kokoro", "cartesia", "elevenlabs", "google", "local"} and not _kokoro_unavailable:
         if await asyncio.to_thread(_load_kokoro) is not None:
             return await asyncio.to_thread(_synth_kokoro, text, speed)
     return await asyncio.to_thread(_synth, text, speed)
 
 
-async def _synthesize_unlocked(text: str, speed: float) -> bytes:
-    """Erzeugt ein vollständiges Audio, ohne den Stream-Lock selbst zu verwalten."""
-    try:
-        engine = _engine()
-        if engine == "google":
-            ogg = await _try_google_tts_ogg(text)
-        else:
-            ogg = await _try_cartesia_ogg(text) if engine == "cartesia" else None
-        if ogg is None:
-            wav = await _synthesize_local(text, speed)
-            ogg = await asyncio.to_thread(_wav_to_ogg, wav)
-        log.info(f"🔊 TTS: {len(text)} Zeichen → {len(ogg)//1024}KB OGG")
-        return ogg
-    except Exception as e:
-        log.error("TTS fehlgeschlagen: %s", redact_error_text(e))
-        return b""
+async def _synthesize_unlocked(
+    text: str,
+    speed: float,
+    *,
+    state: TTSTurnState | None = None,
+    engines: list[str] | None = None,
+) -> bytes:
+    """Synthesisiert mit der Ersatzkette und merkt sich den Provider im Turn."""
+    state = state or _active_tts_turn.get() or TTSTurnState()
+    chain = list(engines if engines is not None else _engine_chain())
+    start_position = state.chain_position or 0
+    chain = chain[start_position:]
+    for offset, engine in enumerate(chain, start=start_position):
+        audio = await _synthesize_provider(engine, text, speed)
+        if audio:
+            state.engine = engine
+            state.chain_position = offset
+            log.info("🔊 TTS: %s · %s Zeichen → %sKB OGG", engine, len(text), len(audio) // 1024)
+            return audio
+    return b""
 
 
 async def synthesize(
@@ -869,7 +1056,17 @@ async def synthesize_filler(text: str, max_chars: int = 2000) -> bytes:
     if not text.strip():
         return b""
 
-    return await _synthesize_unlocked(text, DEFAULT_SPEED)
+    chain = _engine_chain()
+    if not chain:
+        return b""
+    # Der Cache gehört zur Hauptstimme. Wenn sie ausfällt, wird kein Audio einer
+    # Ersatzstimme unter ihrer Cache-Identität abgelegt.
+    return await _synthesize_unlocked(
+        text,
+        DEFAULT_SPEED,
+        state=TTSTurnState(),
+        engines=chain[:1],
+    )
 
 
 # Schnittgrößen fürs Streaming. Der erste Block ist bewusst klein: er bestimmt,
@@ -969,20 +1166,16 @@ async def synthesize_stream(
         return
 
     stuecke = _split_for_streaming(text)
+    turn_state = _active_tts_turn.get() or TTSTurnState()
     async with _lock:
         for i, stueck in enumerate(stuecke):
             try:
-                engine = _engine()
-                if engine == "google":
-                    ogg = await _try_google_tts_ogg(stueck)
-                else:
-                    ogg = await _try_cartesia_ogg(stueck) if engine == "cartesia" else None
-                if ogg is None:
-                    wav = await _synthesize_local(stueck, speed)
-                    ogg = await asyncio.to_thread(_wav_to_ogg, wav)
+                ogg = await _synthesize_unlocked(stueck, speed, state=turn_state)
             except Exception as e:
                 # Ein kaputtes Stück darf die restliche Antwort nicht verschlucken.
                 log.error("TTS-Stück %s fehlgeschlagen: %s", i, redact_error_text(e))
+                continue
+            if not ogg:
                 continue
             log.info(f"🔊 TTS-Stück {i + 1}/{len(stuecke)}: {len(stueck)} Zeichen → {len(ogg) // 1024}KB")
             yield ogg
@@ -992,10 +1185,13 @@ async def list_voices() -> list[str]:
     """Gibt die verfügbaren Stimmen zurück."""
     if not is_available():
         return []
-    if _engine() == "cartesia":
+    engine = (_engine_chain() or [_engine()])[0]
+    if engine == "cartesia":
         return [config.TTS_CARTESIA_VOICE]
-    if _engine() == "google":
+    if engine == "elevenlabs":
+        return [config.TTS_ELEVENLABS_VOICE]
+    if engine == "google":
         return [config.TTS_GOOGLE_VOICE]
-    if _engine() == "kokoro" and not _kokoro_unavailable:
+    if engine in {"local", "kokoro"} and not _kokoro_unavailable:
         return [config.TTS_KOKORO_VOICE]
     return [DEFAULT_VOICE]
