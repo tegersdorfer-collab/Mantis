@@ -1318,7 +1318,7 @@ class TestElevenLabs:
         )
         monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN_EXPLICIT", False, raising=False)
 
-        assert tts._engine_chain() == ["google", "cartesia", "elevenlabs", "local"]
+        assert tts._engine_chain() == ["google", "cartesia", "klon", "elevenlabs", "local"]
 
     def test_filler_synthesis_never_uses_a_fallback_voice(self, elevenlabs_engine, monkeypatch):
         monkeypatch.setattr(tts.config, "GOOGLE_TTS_API_KEY", "google-key", raising=False)
