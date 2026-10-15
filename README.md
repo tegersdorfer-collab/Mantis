@@ -137,6 +137,19 @@ Modellspeicher freizugeben. Modellstart und Audio-Streaming sind begrenzt durch
 
 Werkzeugauswahl, Sprecher-Adressierung und Memory-Prüfungen laufen über die gemeinsame Cloud-Kette. Das optionale Forge-Vorgate bleibt über `JEV_FORGE_GATE_ENABLED` und `JEV_ENABLED` abschaltbar und nutzt dieselbe schnelle Cloud-Variante. Die Fragen und Schwellenwerte stehen in `core/decisions.py`; `JEV_LOG_PATH` behält das bisherige JevKit-Logformat für Auswertungen bei.
 
+### Lokale Voice-Satzendeerkennung
+
+Smart Turn v3.2 bewertet lokale Voice-Segmente nach 250 ms Stille. Das ONNX-Modell liegt
+standardmäßig unter `data/turn/smart-turn-v3.2-cpu.onnx`; `VOICE_SMART_TURN_MODEL` kann
+einen anderen lokalen Pfad setzen. Fehlt das Modell oder schlägt die Inferenz fehl, bleibt
+die bisherige Stille-Heuristik aktiv. `VOICE_SMART_TURN=false` schaltet Smart Turn ab.
+
+Optionale Aufnahmen schaltest du mit `VOICE_RECORD_SEGMENTS=true` ein. Mantis speichert
+WAV/JSON-Paare lokal unter `data/voice_segments/YYYY-MM-DD`; `VOICE_RECORD_MAX_FILES`
+begrenzt die tatsächliche Zahl der WAV- und JSON-Dateien (Standard 300). Die Auswertung
+läuft offline mit `python3.14 scripts/eval_turn_detection.py`; für einen anderen
+Mitschnitt- oder Modellpfad gibt es `--captures` und `--model`.
+
 ---
 
 ## Setup

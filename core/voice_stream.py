@@ -13,9 +13,12 @@ from collections.abc import Awaitable, Callable
 
 import config
 from core import stt_runtime
-from core.vad import VadSegmenter
+from core.vad import VadSegmenter, classify_utterance
+from core.voice_segments import record_voice_segment
+from core.voice_text import normalize_wakeword_transcript
 
 SAMPLE_RATE = 16000
+WAKEWORD_SAFETY_MARGIN_MS = 100
 
 # Silero VAD's ONNX export requires exactly 512 samples (32ms @ 16kHz) per
 # speech_probability() call. openWakeWord's documented standard chunk size is
@@ -43,7 +46,7 @@ async def transcribe_pcm(pcm_audio: bytes) -> tuple[str, bool]:
             wav_file.setsampwidth(2)
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(pcm_audio)
-        return await transcribe_audio_with_hint(tmp.name)
+        return await transcribe_audio_with_hint(tmp.name, normalize_wakeword=False)
 
 
 async def transcribe_pcm_partial(pcm_audio: bytes) -> tuple[str, bool] | None:
@@ -56,7 +59,25 @@ async def transcribe_pcm_partial(pcm_audio: bytes) -> tuple[str, bool] | None:
             wav_file.setsampwidth(2)
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(pcm_audio)
-        return await transcribe_audio_partial_with_hint(tmp.name)
+        return await transcribe_audio_partial_with_hint(
+            tmp.name, normalize_wakeword=False,
+        )
+
+
+def crop_wakeword_audio(
+    pcm_audio: bytes,
+    *,
+    segment_start_sample: int,
+    wakeword_hit_sample: int | None,
+) -> tuple[bytes, int]:
+    """Schneidet ab 100 ms vor dem Treffer; ohne Treffer bleibt Audio unverändert."""
+    segment_start = max(0, int(segment_start_sample))
+    if wakeword_hit_sample is None:
+        return bytes(pcm_audio), segment_start
+    safety_samples = int(SAMPLE_RATE * WAKEWORD_SAFETY_MARGIN_MS / 1000)
+    crop_start = max(segment_start, int(wakeword_hit_sample) - safety_samples)
+    offset_samples = crop_start - segment_start
+    return bytes(pcm_audio[offset_samples * 2:]), crop_start
 
 
 def partial_stt_executor_available() -> bool:
@@ -81,6 +102,7 @@ class VoiceStreamSession:
         clock: Callable[[], float] | None = None,
         bargein_active_fn: Callable[[], bool] | None = None,
         on_bargein: Callable[[float], Awaitable[None]] | None = None,
+        smart_turn_analyzer=None,
     ):
         self._segmenter = vad_segmenter
         self._wakeword = wakeword_detector
@@ -122,23 +144,58 @@ class VoiceStreamSession:
         self._partial_runs = 0
         self._partial_skip_reasons = {reason: 0 for reason in PARTIAL_SKIP_REASONS}
         self._partial_text = ""
+        self._partial_heuristic_text = ""
         self._partial_wakeword_hint = False
+        self._partial_transcripts: list[dict] = []
         self._partial_audio_end_sample_index: int | None = None
+        self._partial_audio_start_sample_index: int | None = None
+        self._partial_wakeword_fired = False
         self._partial_run_generation: int | None = None
         self._finalizing = False
         self._closed = False
         self._segment_generation = 0
+        self._smart_turn_enabled = bool(getattr(config, "VOICE_SMART_TURN", True))
+        if smart_turn_analyzer is None and self._smart_turn_enabled:
+            from core.smart_turn import get_smart_turn_analyzer
+
+            smart_turn_analyzer = get_smart_turn_analyzer()
+        self._smart_turn = smart_turn_analyzer
+        self._smart_turn_task: asyncio.Task | None = None
+        self._smart_turn_warmup_task: asyncio.Task | None = None
+        self._smart_turn_warmup_started = False
+        self._smart_turn_task_generation: int | None = None
+        self._smart_turn_check_silence_ms: float | None = None
+        self._next_smart_turn_check_ms: float | None = None
+        self._turn_model_p: float | None = None
+        self._turn_model_ms = 0.0
+        self._smart_turn_failed = False
+        self._turn_decision = "heuristic" if not self._smart_turn_enabled else None
 
     def _reset_segment_state(self) -> None:
         self._segment_generation += 1
+        self._cancel_smart_turn_task()
+        self._smart_turn_check_silence_ms = None
+        self._next_smart_turn_check_ms = None
+        self._turn_model_p = None
+        self._turn_model_ms = 0.0
+        self._turn_decision = (
+            "fallback" if self._smart_turn_failed
+            else "heuristic" if not self._smart_turn_enabled else None
+        )
+        if self._smart_turn_failed:
+            self._set_smart_turn_mode("fallback")
         self._bargein_notified = False
         self._speech_started_at = None
         self._last_partial_at = None
         self._partial_runs = 0
         self._partial_skip_reasons = {reason: 0 for reason in PARTIAL_SKIP_REASONS}
         self._partial_text = ""
+        self._partial_heuristic_text = ""
         self._partial_wakeword_hint = False
+        self._partial_transcripts = []
         self._partial_audio_end_sample_index = None
+        self._partial_audio_start_sample_index = None
+        self._partial_wakeword_fired = False
         self._partial_run_generation = None
         setter = getattr(self._segmenter, "set_partial_transcript", None)
         if callable(setter):
@@ -165,6 +222,7 @@ class VoiceStreamSession:
             frame = bytes(self._vad_buffer[:VAD_FRAME_BYTES])
             del self._vad_buffer[:VAD_FRAME_BYTES]
 
+            self._collect_smart_turn_result()
             was_speaking = getattr(self._segmenter, "is_speaking", None) is True
             segment = self._segmenter.process_chunk(frame)
             self._vad_samples_processed += len(frame) // 2
@@ -176,19 +234,72 @@ class VoiceStreamSession:
                 ):
                     self._discard_wakeword_hits_through(self._vad_samples_processed)
                     self._reset_segment_state()
+                elif getattr(self._segmenter, "current_chunk_is_speech", None) is True:
+                    self._reset_smart_turn_for_resumed_speech()
+                    self._maybe_start_smart_turn_warmup()
+                    self._maybe_start_partial()
                 else:
+                    self._maybe_start_smart_turn()
                     self._maybe_start_partial()
                 continue
+
+            self._collect_smart_turn_result()
 
             segment_end_sample = self._vad_samples_processed
             segment_start_sample = max(
                 0, segment_end_sample - len(segment.audio) // 2,
             )
-            wake_fired = self._wakeword_fired_for_segment(
+            wakeword_hit_sample = self._wakeword_hit_for_range(
                 segment_start_sample, segment_end_sample,
+                consume=True,
+            )
+            wake_fired = wakeword_hit_sample is not None
+            stt_audio, crop_start_sample = crop_wakeword_audio(
+                segment.audio,
+                segment_start_sample=segment_start_sample,
+                wakeword_hit_sample=wakeword_hit_sample,
+            )
+
+            turn_model_p = self._turn_model_p
+            turn_model_ms = round(self._turn_model_ms, 1)
+            turn_decision = self._turn_decision or "fallback"
+            silence_used_ms = float(
+                getattr(segment, "silence_ms", 0.0)
+                or getattr(self._segmenter, "current_silence_ms", 0.0)
+                or 0.0
+            )
+            heuristic_class = classify_utterance(
+                self._partial_heuristic_text or self._partial_text,
+            ).value
+            last_speech_sample_index = getattr(segment, "last_speech_sample_index", None)
+            if last_speech_sample_index is None:
+                last_speech_sample_index = len(segment.audio) // 2
+            last_speech_absolute_sample_index = (
+                segment_start_sample + int(last_speech_sample_index)
+            )
+            wakeword_position_samples = (
+                max(0, wakeword_hit_sample - segment_start_sample)
+                if wakeword_hit_sample is not None else None
+            )
+            wakeword_position_ms = (
+                wakeword_position_samples * 1000 / SAMPLE_RATE
+                if wakeword_position_samples is not None else None
             )
 
             if not wake_fired and not self._conversation_active_fn():
+                await self._record_segment(
+                    segment.audio,
+                    transcript=None,
+                    partial_transcripts=list(self._partial_transcripts),
+                    wakeword_position_samples=wakeword_position_samples,
+                    wakeword_position_ms=wakeword_position_ms,
+                    silence_used_ms=silence_used_ms,
+                    turn_model_p=turn_model_p,
+                    turn_model_ms=turn_model_ms,
+                    turn_decision=turn_decision,
+                    heuristic_class=heuristic_class,
+                    last_speech_sample_index=last_speech_sample_index,
+                )
                 self._reset_segment_state()
                 continue
 
@@ -197,15 +308,17 @@ class VoiceStreamSession:
             turn_started_at = time.perf_counter()
             stt_started = turn_started_at
             partial_text = self._partial_text
-            last_speech_sample_index = getattr(segment, "last_speech_sample_index", None)
-            if last_speech_sample_index is None:
-                last_speech_sample_index = len(segment.audio) // 2
             task = self._partial_task
             partial_covers_speech = (
                 task is not None
                 and self._partial_run_generation == self._segment_generation
                 and self._partial_audio_end_sample_index is not None
-                and self._partial_audio_end_sample_index >= last_speech_sample_index
+                and self._partial_audio_end_sample_index >= last_speech_absolute_sample_index
+                and (
+                    not wake_fired
+                    or self._partial_audio_start_sample_index is not None
+                    and self._partial_audio_start_sample_index >= crop_start_sample
+                )
             )
             text = None
             partial_as_final = False
@@ -226,14 +339,17 @@ class VoiceStreamSession:
 
             wakeword_hint = False
             if not text:
-                transcript = await transcribe_pcm(segment.audio)
+                transcript = await transcribe_pcm(stt_audio)
                 if isinstance(transcript, tuple) and len(transcript) == 2:
-                    text, wakeword_hint = transcript
+                    raw_text, wakeword_hint = transcript
                 else:
-                    text = transcript
+                    raw_text = transcript
                     from core.voice import has_voice_wakeword_hint
 
-                    wakeword_hint = has_voice_wakeword_hint(str(text or ""))
+                    wakeword_hint = has_voice_wakeword_hint(str(raw_text or ""))
+                text = normalize_wakeword_transcript(
+                    str(raw_text or ""), wakeword_triggered=wake_fired,
+                )
             elif partial_as_final:
                 from core.voice import has_voice_wakeword_hint
 
@@ -241,9 +357,12 @@ class VoiceStreamSession:
                     self._partial_wakeword_hint
                     or has_voice_wakeword_hint(str(text or ""))
                 )
+                text = normalize_wakeword_transcript(
+                    str(text or ""), wakeword_triggered=wake_fired,
+                )
             partial_text = self._partial_text or partial_text
             stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
-            self._reset_segment_state()
+            partial_transcripts = list(self._partial_transcripts)
             result = {
                 "text": text,
                 "addressed": True,
@@ -255,9 +374,176 @@ class VoiceStreamSession:
                 "partial_skip_reasons": partial_skip_reasons,
                 "partial_text": partial_text,
                 "partial_as_final": partial_as_final,
+                "turn_model_p": turn_model_p,
+                "turn_model_ms": turn_model_ms,
+                "turn_decision": turn_decision,
+                "silence_used_ms": silence_used_ms,
+                "heuristic_class": heuristic_class,
+                "wakeword_position_ms": wakeword_position_ms,
+                "wakeword_position_samples": wakeword_position_samples,
+                "partial_transcripts": partial_transcripts,
             }
+            await self._record_segment(
+                segment.audio,
+                transcript=text,
+                partial_transcripts=partial_transcripts,
+                wakeword_position_samples=wakeword_position_samples,
+                wakeword_position_ms=wakeword_position_ms,
+                silence_used_ms=silence_used_ms,
+                turn_model_p=turn_model_p,
+                turn_model_ms=turn_model_ms,
+                turn_decision=turn_decision,
+                heuristic_class=heuristic_class,
+                last_speech_sample_index=last_speech_sample_index,
+            )
+            self._reset_segment_state()
 
         return result
+
+    async def _record_segment(self, audio: bytes, **metadata) -> None:
+        if not getattr(config, "VOICE_RECORD_SEGMENTS", False):
+            return
+        try:
+            await asyncio.to_thread(record_voice_segment, bytes(audio), metadata)
+        except Exception as exc:
+            log.debug("Voice-Segment konnte nicht gespeichert werden (%s)", type(exc).__name__)
+
+    def _set_smart_turn_mode(self, mode: str | None) -> None:
+        setter = getattr(self._segmenter, "set_smart_turn_mode", None)
+        if callable(setter):
+            setter(mode)
+
+    def _cancel_smart_turn_task(self) -> None:
+        task = self._smart_turn_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._smart_turn_task = None
+        self._smart_turn_task_generation = None
+
+    def _reset_smart_turn_for_resumed_speech(self) -> None:
+        self._cancel_smart_turn_task()
+        self._smart_turn_check_silence_ms = None
+        self._next_smart_turn_check_ms = None
+        self._turn_model_p = None
+        self._turn_decision = (
+            "fallback" if self._smart_turn_failed
+            else "heuristic" if not self._smart_turn_enabled else None
+        )
+        self._set_smart_turn_mode("fallback" if self._smart_turn_failed else None)
+
+    def _maybe_start_smart_turn_warmup(self) -> None:
+        if (
+            not self._smart_turn_enabled
+            or self._smart_turn is None
+            or self._smart_turn_failed
+            or self._smart_turn_warmup_started
+            or not callable(getattr(self._smart_turn, "warmup", None))
+        ):
+            return
+        self._smart_turn_warmup_started = True
+        self._smart_turn_warmup_task = asyncio.create_task(
+            self._warm_smart_turn(), name="voice-smart-turn-warmup",
+        )
+
+    async def _warm_smart_turn(self) -> None:
+        try:
+            await self._smart_turn.warmup()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._closed:
+                return
+            self._smart_turn_failed = True
+            self._turn_decision = "fallback"
+            self._set_smart_turn_mode("fallback")
+            from core.smart_turn import warn_unavailable_once
+
+            warn_unavailable_once(exc)
+
+    def _collect_smart_turn_result(self) -> None:
+        task = self._smart_turn_task
+        if task is None or not task.done():
+            return
+        generation = self._smart_turn_task_generation
+        self._smart_turn_task = None
+        self._smart_turn_task_generation = None
+        if task.cancelled() or generation != self._segment_generation:
+            return
+        try:
+            prediction = task.result()
+            if hasattr(prediction, "probability"):
+                probability = float(prediction.probability)
+                elapsed_ms = float(getattr(prediction, "elapsed_ms", 0.0))
+            else:
+                probability = float(prediction)
+                elapsed_ms = 0.0
+            if not 0 <= probability <= 1:
+                raise ValueError("Smart-Turn-Ausgabe liegt außerhalb [0, 1]")
+        except Exception as exc:
+            self._smart_turn_failed = True
+            self._turn_decision = "fallback"
+            self._set_smart_turn_mode("fallback")
+            from core.smart_turn import warn_unavailable_once
+
+            warn_unavailable_once(exc)
+            return
+
+        self._turn_model_p = probability
+        self._turn_model_ms += max(0.0, elapsed_ms)
+        complete_at = float(getattr(config, "VOICE_SMART_TURN_COMPLETE", 0.6))
+        incomplete_below = float(getattr(config, "VOICE_SMART_TURN_INCOMPLETE", 0.3))
+        if probability >= complete_at:
+            self._turn_decision = "model_complete"
+            self._next_smart_turn_check_ms = None
+            self._set_smart_turn_mode("model_complete")
+        elif probability < incomplete_below:
+            self._turn_decision = "model_incomplete"
+            self._next_smart_turn_check_ms = (
+                float(self._smart_turn_check_silence_ms or 0.0) + 300.0
+            )
+            self._set_smart_turn_mode("model_incomplete")
+        else:
+            self._turn_decision = "heuristic"
+            self._next_smart_turn_check_ms = None
+            self._set_smart_turn_mode("heuristic")
+
+    def _maybe_start_smart_turn(self) -> None:
+        if (
+            not self._smart_turn_enabled
+            or self._smart_turn is None
+            or self._smart_turn_failed
+            or self._closed
+            or getattr(self._segmenter, "is_speaking", None) is not True
+            or getattr(self._segmenter, "current_chunk_is_speech", None) is True
+        ):
+            return
+        try:
+            silence_ms = float(getattr(self._segmenter, "current_silence_ms", 0.0))
+        except (TypeError, ValueError):
+            return
+        trigger_ms = float(getattr(config, "VOICE_SMART_TURN_TRIGGER_MS", 250))
+        if silence_ms < trigger_ms:
+            return
+        if self._smart_turn_task is not None and not self._smart_turn_task.done():
+            return
+        if self._turn_decision in {"model_complete", "heuristic", "fallback"}:
+            return
+        if (
+            self._turn_decision == "model_incomplete"
+            and self._next_smart_turn_check_ms is not None
+            and silence_ms < self._next_smart_turn_check_ms
+        ):
+            return
+        audio = getattr(self._segmenter, "current_audio", b"")
+        if not isinstance(audio, (bytes, bytearray)) or not audio:
+            return
+        self._smart_turn_check_silence_ms = silence_ms
+        self._set_smart_turn_mode("model_pending")
+        self._smart_turn_task_generation = self._segment_generation
+        self._smart_turn_task = asyncio.create_task(
+            self._smart_turn.predict(bytes(audio)),
+            name="voice-smart-turn",
+        )
 
     def _discard_wakeword_hits_through(self, sample_index: int) -> None:
         while self._wakeword_hits and self._wakeword_hits[0] <= sample_index:
@@ -265,6 +551,13 @@ class VoiceStreamSession:
         # _wakeword_detected bleibt: Ein anhaltendes Detektorsignal ist keine neue Flanke.
 
     def _wakeword_fired_for_segment(self, start_sample: int, end_sample: int) -> bool:
+        return self._wakeword_hit_for_range(
+            start_sample, end_sample, consume=True,
+        ) is not None
+
+    def _wakeword_hit_for_range(
+        self, start_sample: int, end_sample: int, *, consume: bool,
+    ) -> int | None:
         preroll_samples = int(
             max(0, float(getattr(config, "VOICE_WAKE_PREROLL_MS", 1500)))
             * SAMPLE_RATE / 1000
@@ -272,12 +565,27 @@ class VoiceStreamSession:
         earliest_sample = max(0, start_sample - preroll_samples)
         while self._wakeword_hits and self._wakeword_hits[0] < earliest_sample:
             self._wakeword_hits.popleft()
-        fired = any(
-            earliest_sample <= hit <= end_sample
-            for hit in self._wakeword_hits
+        hit = next((
+            value for value in self._wakeword_hits
+            if earliest_sample <= value <= end_sample
+        ), None)
+        if consume:
+            self._discard_wakeword_hits_through(end_sample)
+        return hit
+
+    def _wakeword_fired_for_partial_audio(
+        self, audio: bytes, audio_end_sample_index: int,
+    ) -> tuple[bytes, int, bool]:
+        segment_start = max(0, audio_end_sample_index - len(audio) // 2)
+        hit = self._wakeword_hit_for_range(
+            segment_start, audio_end_sample_index, consume=False,
         )
-        self._discard_wakeword_hits_through(end_sample)
-        return fired
+        cropped, crop_start = crop_wakeword_audio(
+            audio,
+            segment_start_sample=segment_start,
+            wakeword_hit_sample=hit,
+        )
+        return cropped, crop_start, hit is not None
 
     async def _maybe_trigger_bargein(self) -> None:
         if (
@@ -351,24 +659,38 @@ class VoiceStreamSession:
         if not isinstance(current_audio, (bytes, bytearray)) or not current_audio:
             self._partial_skip_reasons["no_speech"] += 1
             return
-        audio_seconds = len(current_audio) / (2 * SAMPLE_RATE)
+        audio_end_sample_index = self._vad_samples_processed
+        audio, audio_start_sample_index, wakeword_fired = self._wakeword_fired_for_partial_audio(
+            bytes(current_audio), audio_end_sample_index,
+        )
+        audio_seconds = len(audio) / (2 * SAMPLE_RATE)
         predicted_ms = stt_runtime.estimate_stt_runtime_ms(audio_seconds)
         if predicted_ms > float(getattr(config, "VOICE_PARTIAL_MAX_MS", 600)):
             self._partial_skip_reasons["budget"] += 1
             return
         generation = self._segment_generation
-        audio = bytes(current_audio)
-        audio_end_sample_index = len(audio) // 2
-        self._partial_audio_end_sample_index = audio_end_sample_index
+        self._partial_audio_end_sample_index = self._vad_samples_processed
+        self._partial_audio_start_sample_index = audio_start_sample_index
+        self._partial_wakeword_fired = wakeword_fired
         self._partial_run_generation = generation
         self._partial_task = asyncio.create_task(
-            self._run_partial(audio, generation, audio_end_sample_index),
+            self._run_partial(
+                audio, generation, len(current_audio) // 2,
+                wakeword_triggered=wakeword_fired,
+                segment_offset_ms=(len(current_audio) // 2) * 1000 / SAMPLE_RATE,
+            ),
             name="voice-partial-stt",
         )
         self._partial_runs += 1
 
     async def _run_partial(
-        self, audio: bytes, generation: int, audio_end_sample_index: int,
+        self,
+        audio: bytes,
+        generation: int,
+        audio_end_sample_index: int,
+        *,
+        wakeword_triggered: bool = False,
+        segment_offset_ms: float | None = None,
     ) -> str | None:
         try:
             transcript = await self._partial_transcriber(audio)
@@ -389,20 +711,32 @@ class VoiceStreamSession:
             wakeword_hint = has_voice_wakeword_hint(str(text or ""))
         if text is None:
             return None
-        text = str(text).strip()
-        if not text:
+        raw_text = str(text).strip()
+        if not raw_text:
             return None
+        text = normalize_wakeword_transcript(
+            raw_text, wakeword_triggered=wakeword_triggered,
+        )
         if generation == self._segment_generation and not self._closed and (
             getattr(self._segmenter, "is_speaking", None) is True or self._finalizing
         ):
             self._partial_text = text
+            self._partial_heuristic_text = raw_text
             self._partial_wakeword_hint = bool(wakeword_hint)
+            self._partial_transcripts.append({
+                "offset_ms": round(
+                    audio_end_sample_index * 1000 / SAMPLE_RATE
+                    if segment_offset_ms is None else segment_offset_ms,
+                    1,
+                ),
+                "text": text,
+            })
             setter = getattr(self._segmenter, "set_partial_transcript", None)
             if callable(setter):
                 try:
-                    setter(text, audio_end_sample_index=audio_end_sample_index)
+                    setter(raw_text, audio_end_sample_index=audio_end_sample_index)
                 except TypeError:
-                    setter(text)
+                    setter(raw_text)
             if self._on_partial is not None:
                 try:
                     self._on_partial(text)
@@ -417,6 +751,12 @@ class VoiceStreamSession:
         self._closed = True
         self._on_partial = None
         self._segment_generation += 1
+        warmup_task = self._smart_turn_warmup_task
+        if warmup_task is not None and not warmup_task.done():
+            warmup_task.cancel()
+        if warmup_task is not None:
+            await asyncio.gather(warmup_task, return_exceptions=True)
+        self._smart_turn_warmup_task = None
         task = self._partial_task
         if task is not None and not task.done():
             task.cancel()

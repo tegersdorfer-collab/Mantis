@@ -2084,6 +2084,35 @@ def test_voice_latency_event_contains_phase_timings(monkeypatch):
     assert detail["llm_calls"][0]["output_tokens"] == 9
 
 
+def test_voice_latency_event_includes_smart_turn_decision_fields(monkeypatch):
+    logged = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            return "Hallo.", []
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+    asyncio.run(sende_streaming_antwort(
+        FakeWebSocket(), "Hi", FakeOrchestrator(),
+        address_metrics={
+            "turn_model_p": 0.91,
+            "turn_model_ms": 13.4,
+            "turn_decision": "model_complete",
+            "silence_used_ms": 288,
+        },
+    ))
+
+    detail = logged[0][2]
+    assert detail["turn_model_p"] == 0.91
+    assert detail["turn_model_ms"] == 13.4
+    assert detail["turn_decision"] == "model_complete"
+    assert detail["silence_used_ms"] == 288
+
+
 def test_voice_latency_records_partial_reuse_and_saved_context_time(monkeypatch):
     from core.voice_prework import VoiceTurnPrework
 
@@ -2465,7 +2494,8 @@ def test_incomplete_voice_segment_is_processed_without_continuation_timer(monkey
     import web.routers.voice as voice_router
 
     text = "Mantis erinnere mich an"
-    responses = {text: ("Worauf soll ich dich erinnern?", [])}
+    addressed_text = "Mantis, erinnere mich an"
+    responses = {addressed_text: ("Worauf soll ich dich erinnern?", [])}
     orchestrator, handler, agent, persisted = _make_real_voice_orchestrator(
         monkeypatch, responses,
     )
@@ -2505,14 +2535,14 @@ def test_incomplete_voice_segment_is_processed_without_continuation_timer(monkey
 
     audio_responses = [item for item in websocket.sent if "audio_b64" in item]
     assert len(audio_responses) == 1
-    assert audio_responses[0]["text"] == text
+    assert audio_responses[0]["text"] == addressed_text
     assert audio_responses[0]["audio_b64"] == base64.b64encode(b"voice-test-audio").decode()
-    assert [call["text"] for call in agent.calls] == [text]
+    assert [call["text"] for call in agent.calls] == [addressed_text]
     assert [(turn.role, turn.content) for turn in handler.kzg.get_turns()] == [
-        ("user", text), ("assistant", "Worauf soll ich dich erinnern?"),
+        ("user", addressed_text), ("assistant", "Worauf soll ich dich erinnern?"),
     ]
     assert [(role, content) for role, content, _channel, _meta in persisted] == [
-        ("user", text), ("assistant", "Worauf soll ich dich erinnern?"),
+        ("user", addressed_text), ("assistant", "Worauf soll ich dich erinnern?"),
     ]
 
 
@@ -2524,7 +2554,8 @@ def test_incomplete_voice_phrase_spans_1800ms_pause_in_one_real_segment(monkeypa
 
     incomplete = "Mantis erinnere mich an"
     complete = "Mantis erinnere mich an den Müll morgen früh"
-    responses = {complete: ("Ich erinnere dich morgen früh.", [{"tool": "set_reminder"}])}
+    addressed_complete = "Mantis, erinnere mich an den Müll morgen früh"
+    responses = {addressed_complete: ("Ich erinnere dich morgen früh.", [{"tool": "set_reminder"}])}
     orchestrator, handler, agent, persisted = _make_real_voice_orchestrator(
         monkeypatch, responses,
     )
@@ -2582,17 +2613,17 @@ def test_incomplete_voice_phrase_spans_1800ms_pause_in_one_real_segment(monkeypa
     audio_responses = [item for item in websocket.sent if "audio_b64" in item]
     assert len(final_segments) == 1
     assert len(agent.calls) == 1
-    assert agent.calls[0]["text"] == complete
+    assert agent.calls[0]["text"] == addressed_complete
     assert "set_reminder" in agent.calls[0]["tools"]
     assert agent.calls[0]["force"] is True
     assert len(audio_responses) == 1
-    assert audio_responses[0]["text"] == complete
+    assert audio_responses[0]["text"] == addressed_complete
     assert audio_responses[0]["audio_b64"] == base64.b64encode(b"voice-test-audio").decode()
     assert [(turn.role, turn.content) for turn in handler.kzg.get_turns()] == [
-        ("user", complete), ("assistant", "Ich erinnere dich morgen früh."),
+        ("user", addressed_complete), ("assistant", "Ich erinnere dich morgen früh."),
     ]
     assert [(role, content) for role, content, _channel, _meta in persisted] == [
-        ("user", complete), ("assistant", "Ich erinnere dich morgen früh."),
+        ("user", addressed_complete), ("assistant", "Ich erinnere dich morgen früh."),
     ]
 
 

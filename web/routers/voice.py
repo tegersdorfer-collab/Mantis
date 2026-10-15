@@ -368,6 +368,10 @@ def _record_voice_latency(
     first_answer_audio_ms: float | None = None,
     filler: str | None = None,
     filler_ms: float | None = None,
+    turn_model_p: float | None = None,
+    turn_model_ms: float | None = None,
+    turn_decision: str | None = None,
+    silence_used_ms: float | None = None,
     bargein: bool = False,
     bargein_ms: float | None = None,
 ) -> dict:
@@ -389,6 +393,10 @@ def _record_voice_latency(
         "first_answer_audio_ms": first_answer_audio_ms,
         "filler": filler,
         "filler_ms": filler_ms,
+        "turn_model_p": turn_model_p,
+        "turn_model_ms": turn_model_ms,
+        "turn_decision": turn_decision,
+        "silence_used_ms": silence_used_ms,
         "bargein": bool(bargein),
         "bargein_ms": bargein_ms,
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
@@ -972,6 +980,22 @@ async def sende_streaming_antwort(
                     first_answer_audio_ms=first_answer_audio_ms,
                     filler=filler_kind,
                     filler_ms=filler_ms,
+                    turn_model_p=(
+                        address_metrics.get("turn_model_p")
+                        if address_metrics is not None else None
+                    ),
+                    turn_model_ms=(
+                        address_metrics.get("turn_model_ms")
+                        if address_metrics is not None else None
+                    ),
+                    turn_decision=(
+                        address_metrics.get("turn_decision")
+                        if address_metrics is not None else None
+                    ),
+                    silence_used_ms=(
+                        address_metrics.get("silence_used_ms")
+                        if address_metrics is not None else None
+                    ),
                     bargein=playback.interrupted,
                     bargein_ms=playback.bargein_ms,
                 )
@@ -1434,6 +1458,10 @@ def build_router(orch=None) -> APIRouter:
                         address_check_mode=address_mode, held_ms=output_gate.held_ms,
                         partial_runs=result.get("partial_runs", 0),
                         partial_skip_reasons=result.get("partial_skip_reasons"),
+                        turn_model_p=result.get("turn_model_p"),
+                        turn_model_ms=result.get("turn_model_ms"),
+                        turn_decision=result.get("turn_decision"),
+                        silence_used_ms=result.get("silence_used_ms"),
                     )
 
                 address_task = asyncio.create_task(
@@ -1520,6 +1548,10 @@ def build_router(orch=None) -> APIRouter:
                             held_ms=output_gate.held_ms,
                             first_tts_block_ms=local_first_tts_block_ms,
                             first_answer_audio_ms=local_first_audio_ms,
+                            turn_model_p=result.get("turn_model_p"),
+                            turn_model_ms=result.get("turn_model_ms"),
+                            turn_decision=result.get("turn_decision"),
+                            silence_used_ms=result.get("silence_used_ms"),
                         )
 
                 async def resolve_nonstream_address_safely() -> None:
@@ -1573,6 +1605,10 @@ def build_router(orch=None) -> APIRouter:
                         held_ms=output_gate.held_ms,
                         first_tts_block_ms=first_tts_block_ms,
                         first_answer_audio_ms=first_answer_audio_ms,
+                        turn_model_p=result.get("turn_model_p"),
+                        turn_model_ms=result.get("turn_model_ms"),
+                        turn_decision=result.get("turn_decision"),
+                        silence_used_ms=result.get("silence_used_ms"),
                     )
                 finally:
                     if timing_token is not None:
