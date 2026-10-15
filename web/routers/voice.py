@@ -23,7 +23,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect,
+)
 
 import config
 from core import db, tts, voice_fillers, voice_timing
@@ -417,6 +419,9 @@ def _record_voice_latency(
     bargein_ms: float | None = None,
     duck_ms: float | None = None,
     bargein_decision: str | None = None,
+    speaker_score: float | None = None,
+    speaker_ms: float | None = None,
+    speaker_decision: str | None = None,
     address_rejected: bool = False,
 ) -> dict:
     model, stage = _voice_backend_details(orch)
@@ -451,6 +456,9 @@ def _record_voice_latency(
         "bargein_ms": bargein_ms,
         "duck_ms": duck_ms,
         "bargein_decision": bargein_decision,
+        "speaker_score": speaker_score,
+        "speaker_ms": speaker_ms,
+        "speaker_decision": speaker_decision,
         "address_rejected": bool(address_rejected),
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
         "model": model,
@@ -1069,6 +1077,18 @@ async def sende_streaming_antwort(
                     bargein_ms=playback.bargein_ms,
                     duck_ms=playback.current_duck_ms(),
                     bargein_decision=playback.bargein_decision,
+                    speaker_score=(
+                        address_metrics.get("speaker_score")
+                        if address_metrics is not None else None
+                    ),
+                    speaker_ms=(
+                        address_metrics.get("speaker_ms")
+                        if address_metrics is not None else None
+                    ),
+                    speaker_decision=(
+                        address_metrics.get("speaker_decision")
+                        if address_metrics is not None else None
+                    ),
                     address_rejected=bool(
                         address_metrics.get("address_rejected", False)
                         if address_metrics is not None else False
@@ -1089,6 +1109,49 @@ async def sende_streaming_antwort(
 
 def build_router(orch=None) -> APIRouter:
     router = APIRouter()
+
+    @router.get("/api/voice/speaker")
+    async def speaker_status():
+        from core.speaker import get_speaker_verifier
+
+        try:
+            return await get_speaker_verifier().status()
+        except Exception as exc:
+            log.exception("Sprecherprofilstatus konnte nicht geladen werden")
+            raise HTTPException(
+                status_code=503, detail="Sprecherprofil ist nicht verfügbar",
+            ) from exc
+
+    @router.post("/api/voice/speaker/enroll")
+    async def speaker_enroll(audio: list[UploadFile] = File(...)):
+        from core.speaker import get_speaker_verifier
+
+        payloads = [await item.read() for item in audio]
+        try:
+            return await get_speaker_verifier().enroll_wavs(payloads)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            log.exception("Sprecherprofil konnte nicht eingelernt werden")
+            raise HTTPException(
+                status_code=503, detail="Sprecherprofil konnte nicht eingelernt werden",
+            ) from exc
+        finally:
+            for item in audio:
+                await item.close()
+
+    @router.delete("/api/voice/speaker")
+    async def speaker_reset():
+        from core.speaker import get_speaker_verifier
+
+        try:
+            await get_speaker_verifier().reset()
+        except Exception as exc:
+            log.exception("Sprecherprofil konnte nicht zurückgesetzt werden")
+            raise HTTPException(
+                status_code=503, detail="Sprecherprofil konnte nicht zurückgesetzt werden",
+            ) from exc
+        return {"enrolled": False}
 
     @router.post("/api/voice/segment")
     async def voice_segment(audio: UploadFile = File(...)):
@@ -1158,6 +1221,52 @@ def build_router(orch=None) -> APIRouter:
     @router.websocket("/ws/voice/stream")
     async def voice_stream(websocket: WebSocket):
         await websocket.accept()
+
+        speaker_verifier = None
+        speaker_profile_active = False
+        speaker_profile_lookup_task: asyncio.Task | None = None
+        speaker_last_profile_check = 0.0
+        speaker_verify_enabled = bool(getattr(config, "VOICE_SPEAKER_VERIFY", True))
+        if speaker_verify_enabled:
+            try:
+                from core.speaker import get_speaker_verifier
+
+                speaker_verifier = get_speaker_verifier()
+                speaker_profile_active = await speaker_verifier.has_profile()
+                speaker_last_profile_check = time.monotonic()
+            except Exception as exc:
+                log.warning(
+                    "Sprecherprofil konnte für Voice-WS nicht geladen werden (%s)",
+                    type(exc).__name__,
+                )
+                speaker_profile_active = True
+        speaker_progress_contexts: dict[int, dict] = {}
+
+        async def refresh_speaker_profile() -> None:
+            nonlocal speaker_profile_active, speaker_last_profile_check
+            if not speaker_verify_enabled or speaker_verifier is None:
+                return
+            speaker_last_profile_check = time.monotonic()
+            try:
+                speaker_profile_active = await speaker_verifier.has_profile()
+            except Exception as exc:
+                log.debug("Sprecherprofil-Refresh fehlgeschlagen (%s)", type(exc).__name__)
+                speaker_profile_active = True
+
+        def schedule_speaker_profile_refresh() -> None:
+            nonlocal speaker_profile_lookup_task, speaker_last_profile_check
+            if (
+                not speaker_verify_enabled or speaker_verifier is None
+                or speaker_profile_active
+                or time.monotonic() - speaker_last_profile_check < 1.0
+            ):
+                return
+            if speaker_profile_lookup_task is not None and not speaker_profile_lookup_task.done():
+                return
+            speaker_last_profile_check = time.monotonic()
+            speaker_profile_lookup_task = asyncio.get_running_loop().create_task(
+                refresh_speaker_profile(), name="voice-speaker-profile-refresh",
+            )
 
         from core.vad import SileroVAD, VadSegmenter
 
@@ -1280,11 +1389,13 @@ def build_router(orch=None) -> APIRouter:
 
         async def stop_for_bargein(
             detected_at: float, *, decision: str | None = None,
+            playback: _PlaybackTurn | None = None,
         ) -> None:
             nonlocal ducked_playback
-            playback = active_playback
+            playback = playback or active_playback
             if (
-                playback is None or not playback.playback_active
+                playback is None or playback is not active_playback
+                or not playback.playback_active
                 or playback.interrupted
             ):
                 return
@@ -1305,11 +1416,91 @@ def build_router(orch=None) -> APIRouter:
                 "type": "stop_playback", "turn_id": playback.turn_id,
             })
 
+        async def _score_bargein_prefix(
+            audio: bytes, playback: _PlaybackTurn, context: dict, *, final: bool,
+        ) -> None:
+            try:
+                score_result = await speaker_verifier.score_pcm(audio)
+                score = score_result.score
+                context["score"] = score
+                context["speaker_ms"] = round(
+                    float(context.get("speaker_ms", 0.0)) + score_result.elapsed_ms,
+                    1,
+                )
+                threshold = float(getattr(config, "VOICE_SPEAKER_THRESHOLD", 0.35))
+                accepted = score is not None and score >= threshold
+                if final:
+                    context["decision"] = (
+                        "early_accept" if accepted and context.get("decision") == "early_accept"
+                        else "accepted" if accepted else "rejected"
+                    )
+                    if accepted:
+                        await stop_for_bargein(
+                            time.monotonic(), decision="speaker_accepted",
+                            playback=playback,
+                        )
+                    else:
+                        if active_playback is playback:
+                            await unduck_playback(
+                                decision="speaker_rejected", playback=playback,
+                            )
+                elif accepted:
+                    context["decision"] = "early_accept"
+                    await stop_for_bargein(
+                        time.monotonic(), decision="speaker_early_accept",
+                        playback=playback,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Barge-in-Sprecherprüfung fehlgeschlagen (%s)", type(exc).__name__)
+                if final:
+                    context["decision"] = "rejected"
+                    if active_playback is playback:
+                        await unduck_playback(
+                            decision="speaker_rejected", playback=playback,
+                        )
+
+        def handle_speech_progress(audio: bytes, speech_ms: float, generation: int) -> None:
+            if not speaker_verify_enabled or speaker_verifier is None:
+                return
+            if not speaker_profile_active:
+                schedule_speaker_profile_refresh()
+                return
+            playback = active_playback
+            if playback is None or not playback.playback_active:
+                return
+            context = speaker_progress_contexts.setdefault(
+                generation,
+                {"tasks": [], "score": None, "speaker_ms": 0.0, "decision": None},
+            )
+            context["playback"] = playback
+            if speech_ms >= 600 and not context.get("early_started"):
+                prefix = bytes(audio[:int(0.6 * 16_000 * 2)])
+                if len(prefix) >= 16_000:
+                    context["early_started"] = True
+                    task = asyncio.get_running_loop().create_task(
+                        _score_bargein_prefix(prefix, playback, context, final=False),
+                        name="voice-speaker-bargein-early",
+                    )
+                    context["tasks"].append(task)
+            if speech_ms >= 1_000 and not context.get("final_started"):
+                prefix = bytes(audio[:16_000 * 2])
+                if len(prefix) >= 16_000:
+                    context["final_started"] = True
+                    task = asyncio.get_running_loop().create_task(
+                        _score_bargein_prefix(prefix, playback, context, final=True),
+                        name="voice-speaker-bargein-final",
+                    )
+                    context["tasks"].append(task)
+
         def handle_voice_partial(partial: str) -> None:
-            if prework_cache is not None:
+            if prework_cache is not None and not speaker_profile_active:
                 prework_cache.offer(partial)
             playback = active_playback
             if (
+                not speaker_profile_active
+                and
                 playback is not None and playback.playback_active
                 and _is_stop_reflex(partial)
             ):
@@ -1333,6 +1524,7 @@ def build_router(orch=None) -> APIRouter:
                 active_playback is not None and active_playback.playback_active
             ),
             on_bargein=duck_for_bargein,
+            on_speech_progress=handle_speech_progress,
         )
 
         async def run_streaming_response(
@@ -1386,8 +1578,96 @@ def build_router(orch=None) -> APIRouter:
                     active_response_task = None
 
         async def process_voice_result(result: dict) -> None:
-            nonlocal active_playback, active_response_task
+            nonlocal active_playback, active_response_task, speaker_profile_active
+            await refresh_speaker_profile()
             raw_text = str(result.get("raw_text") or result.get("text") or "").strip()
+            generation = result.pop("segment_generation", None)
+            speaker_context = speaker_progress_contexts.pop(generation, {})
+            tasks = tuple(speaker_context.get("tasks", ()))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            pcm_audio = result.pop("pcm_audio", b"")
+            speaker_pcm_audio = result.pop("speech_pcm_audio", b"") or pcm_audio
+            result["speaker_score"] = None
+            result["speaker_ms"] = round(
+                float(speaker_context.get("speaker_ms", 0.0)), 1,
+            )
+            result["speaker_decision"] = "no_profile"
+            if speaker_profile_active:
+                verification = None
+                if speaker_verifier is None:
+                    result["speaker_decision"] = "rejected"
+                else:
+                    try:
+                        verification = await speaker_verifier.verify_pcm(speaker_pcm_audio)
+                        result["speaker_score"] = verification.score
+                        result["speaker_ms"] = round(
+                            verification.elapsed_ms
+                            + float(speaker_context.get("speaker_ms", 0.0)),
+                            1,
+                        )
+                        result["speaker_decision"] = (
+                            "early_accept"
+                            if verification.decision == "accepted"
+                            and speaker_context.get("decision") == "early_accept"
+                            else verification.decision
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "Finale Sprecherprüfung fehlgeschlagen (%s)", type(exc).__name__,
+                        )
+                        result["speaker_decision"] = "rejected"
+
+                if result["speaker_decision"] == "rejected":
+                    await _cancel_pending_address_tasks()
+                    rejected_playback = speaker_context.get("playback")
+                    if rejected_playback is None and result.get("bargein"):
+                        rejected_playback = ducked_playback
+                    if rejected_playback is not None:
+                        await unduck_playback(
+                            decision="speaker_rejected", playback=rejected_playback,
+                        )
+                    if prework_cache is not None:
+                        prework_cache.clear()
+                    _record_voice_latency(
+                        orch,
+                        result.get("turn_started_at", time.perf_counter()),
+                        stt_ms=result.get("stt_ms"),
+                        partial_runs=result.get("partial_runs", 0),
+                        partial_skip_reasons=result.get("partial_skip_reasons"),
+                        turn_model_p=result.get("turn_model_p"),
+                        turn_model_ms=result.get("turn_model_ms"),
+                        turn_decision=result.get("turn_decision"),
+                        silence_used_ms=result.get("silence_used_ms"),
+                        speaker_score=result.get("speaker_score"),
+                        speaker_ms=result.get("speaker_ms"),
+                        speaker_decision="rejected",
+                    )
+                    return
+
+                if (
+                    speaker_verifier is not None
+                    and result.get("speaker_score") is not None
+                    and result["speaker_score"] >= float(
+                        getattr(config, "VOICE_SPEAKER_LEARN_MIN", 0.6),
+                    )
+                ):
+                    try:
+                        await speaker_verifier.maybe_learn(
+                            speaker_pcm_audio,
+                            result["speaker_score"],
+                            acoustic_wakeword=bool(result.get("wakeword_triggered")),
+                            bargein=bool(result.get("bargein")),
+                            overlapping=bool(result.get("overlapping")),
+                            embedding=verification.embedding,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "Sprecher-Mitlernen fehlgeschlagen (%s)", type(exc).__name__,
+                        )
+            # Raw PCM is held only through verification/optional embedding learning.
+            del pcm_audio
+            del speaker_pcm_audio
             # Echo-Texte stammen vom Empfangszeitpunkt (Einreihen), nicht von der
             # Abarbeitung: langsame Adress-Checks davor dürfen das Fenster nicht schließen.
             echo_texts = list(result.pop("_echo_texts", ()))
@@ -1397,6 +1677,21 @@ def build_router(orch=None) -> APIRouter:
                 await unduck_playback(decision="ignored")
                 if prework_cache is not None:
                     prework_cache.clear()
+                _record_voice_latency(
+                    orch,
+                    result.get("turn_started_at", time.perf_counter()),
+                    stt_ms=result.get("stt_ms"),
+                    address_check_mode="tts_echo",
+                    partial_runs=result.get("partial_runs", 0),
+                    partial_skip_reasons=result.get("partial_skip_reasons"),
+                    turn_model_p=result.get("turn_model_p"),
+                    turn_model_ms=result.get("turn_model_ms"),
+                    turn_decision=result.get("turn_decision"),
+                    silence_used_ms=result.get("silence_used_ms"),
+                    speaker_score=result.get("speaker_score"),
+                    speaker_ms=result.get("speaker_ms"),
+                    speaker_decision=result.get("speaker_decision"),
+                )
                 return
 
             # Eine neuere Äußerung ersetzt einen noch ungeklärten spekulativen Turn.
@@ -1605,6 +1900,9 @@ def build_router(orch=None) -> APIRouter:
                         turn_model_ms=result.get("turn_model_ms"),
                         turn_decision=result.get("turn_decision"),
                         silence_used_ms=result.get("silence_used_ms"),
+                        speaker_score=result.get("speaker_score"),
+                        speaker_ms=result.get("speaker_ms"),
+                        speaker_decision=result.get("speaker_decision"),
                     )
 
                 address_task = asyncio.create_task(
@@ -1701,6 +1999,9 @@ def build_router(orch=None) -> APIRouter:
                             turn_model_ms=result.get("turn_model_ms"),
                             turn_decision=result.get("turn_decision"),
                             silence_used_ms=result.get("silence_used_ms"),
+                            speaker_score=result.get("speaker_score"),
+                            speaker_ms=result.get("speaker_ms"),
+                            speaker_decision=result.get("speaker_decision"),
                         )
 
                 async def resolve_nonstream_address_safely() -> None:
@@ -1758,6 +2059,9 @@ def build_router(orch=None) -> APIRouter:
                         turn_model_ms=result.get("turn_model_ms"),
                         turn_decision=result.get("turn_decision"),
                         silence_used_ms=result.get("silence_used_ms"),
+                        speaker_score=result.get("speaker_score"),
+                        speaker_ms=result.get("speaker_ms"),
+                        speaker_decision=result.get("speaker_decision"),
                     )
                 finally:
                     if timing_token is not None:
@@ -1838,6 +2142,10 @@ def build_router(orch=None) -> APIRouter:
                     turn_processor.cancel()
                 tasks_to_finish = set(background_response_tasks)
                 tasks_to_finish.update(background_address_tasks)
+                for context in speaker_progress_contexts.values():
+                    tasks_to_finish.update(context.get("tasks", ()))
+                if speaker_profile_lookup_task is not None:
+                    tasks_to_finish.add(speaker_profile_lookup_task)
                 if active_response_task is not None:
                     tasks_to_finish.add(active_response_task)
                 tasks_to_finish.add(turn_processor)

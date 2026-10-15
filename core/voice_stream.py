@@ -107,6 +107,7 @@ class VoiceStreamSession:
         clock: Callable[[], float] | None = None,
         bargein_active_fn: Callable[[], bool] | None = None,
         on_bargein: Callable[[float], Awaitable[None]] | None = None,
+        on_speech_progress: Callable[[bytes, float, int], None] | None = None,
         smart_turn_analyzer=None,
     ):
         self._segmenter = vad_segmenter
@@ -142,7 +143,11 @@ class VoiceStreamSession:
         self._clock = clock or time.monotonic
         self._bargein_active_fn = bargein_active_fn or (lambda: False)
         self._on_bargein = on_bargein
+        self._on_speech_progress = on_speech_progress
         self._bargein_notified = False
+        self._segment_overlapped = False
+        self._speaker_early_progress_sent = False
+        self._speaker_final_progress_sent = False
         self._speech_started_at: float | None = None
         self._last_partial_at: float | None = None
         self._partial_task: asyncio.Task | None = None
@@ -191,6 +196,9 @@ class VoiceStreamSession:
         if self._smart_turn_failed:
             self._set_smart_turn_mode("fallback")
         self._bargein_notified = False
+        self._segment_overlapped = False
+        self._speaker_early_progress_sent = False
+        self._speaker_final_progress_sent = False
         self._speech_started_at = None
         self._last_partial_at = None
         self._partial_runs = 0
@@ -243,6 +251,37 @@ class VoiceStreamSession:
             segment = self._segmenter.process_chunk(frame)
             self._vad_samples_processed += len(frame) // 2
             await self._maybe_trigger_bargein()
+            if (
+                callable(self._on_speech_progress)
+                and self._bargein_active_fn()
+                and getattr(self._segmenter, "is_speaking", None) is True
+                and getattr(self._segmenter, "current_chunk_is_speech", None) is True
+            ):
+                self._segment_overlapped = True
+                speech_ms = float(
+                    getattr(self._segmenter, "current_speech_ms", 0.0) or 0.0,
+                )
+                early_due = speech_ms >= 600 and not self._speaker_early_progress_sent
+                final_due = speech_ms >= 1_000 and not self._speaker_final_progress_sent
+                if early_due:
+                    self._speaker_early_progress_sent = True
+                if final_due:
+                    self._speaker_final_progress_sent = True
+                if (
+                    bool(getattr(config, "VOICE_BARGEIN", True))
+                    and (early_due or final_due)
+                ):
+                    current_audio = getattr(
+                        self._segmenter,
+                        "current_speech_audio",
+                        getattr(self._segmenter, "current_audio", b""),
+                    )
+                    if not isinstance(current_audio, (bytes, bytearray)):
+                        current_audio = getattr(self._segmenter, "current_audio", b"")
+                    if isinstance(current_audio, (bytes, bytearray)) and current_audio:
+                        self._on_speech_progress(
+                            bytes(current_audio), speech_ms, self._segment_generation,
+                        )
             if segment is None:
                 if (
                     was_speaking
@@ -385,6 +424,8 @@ class VoiceStreamSession:
             result = {
                 "text": text,
                 "raw_text": raw_text,
+                "pcm_audio": bytes(segment.audio),
+                "speech_pcm_audio": bytes(getattr(segment, "speech_audio", b"")),
                 "addressed": True,
                 "wakeword_triggered": wake_fired,
                 "wakeword_hint": bool(wakeword_hint),
@@ -402,6 +443,9 @@ class VoiceStreamSession:
                 "wakeword_position_ms": wakeword_position_ms,
                 "wakeword_position_samples": wakeword_position_samples,
                 "partial_transcripts": partial_transcripts,
+                "bargein": self._bargein_notified,
+                "overlapping": self._segment_overlapped,
+                "segment_generation": self._segment_generation,
             }
             await self._record_segment(
                 segment.audio,

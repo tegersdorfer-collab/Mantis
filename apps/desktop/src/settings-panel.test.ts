@@ -27,6 +27,17 @@ describe('settings-panel', () => {
     expect(input.value).toBe('http://100.1.2.3:7779');
   });
 
+  it('öffnet die Stimmeneinlernung aus den Einstellungen', () => {
+    initSettingsPanel();
+    const opened = vi.fn();
+    document.addEventListener('open-speaker-enrollment', opened, { once: true });
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: ',', metaKey: true }));
+    document.querySelector<HTMLButtonElement>('#settings-speaker-enrollment')!.click();
+
+    expect(opened).toHaveBeenCalledOnce();
+    expect(document.getElementById('settings-panel')!.classList.contains('visible')).toBe(false);
+  });
+
   it('speichert die neue Basis-URL bei Submit und schließt das Panel', () => {
     initSettingsPanel();
     document.dispatchEvent(new KeyboardEvent('keydown', { key: ',', metaKey: true }));

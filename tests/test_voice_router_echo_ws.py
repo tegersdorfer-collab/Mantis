@@ -105,6 +105,7 @@ def _run_scenario(monkeypatch, scenario):
     monkeypatch.setattr(vad, "VadSegmenter", lambda *a, **k: object())
     monkeypatch.setattr(wakeword, "WakeWordDetector", lambda p: object())
     monkeypatch.setattr(config, "VOICE_FILLERS_ENABLED", False)
+    monkeypatch.setattr(config, "VOICE_SPEAKER_VERIFY", False)
     endpoint = next(
         r.endpoint for r in vr.build_router(Orch()).routes
         if r.path == "/ws/voice/stream"

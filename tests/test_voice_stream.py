@@ -164,6 +164,35 @@ def test_middle_smart_turn_score_keeps_the_partial_text_heuristic(monkeypatch):
     assert len(analyzer.audios) == 1
 
 
+def test_speech_progress_callback_receives_live_audio_and_segment_generation():
+    segmenter = MagicMock()
+    segmenter.is_speaking = True
+    segmenter.current_chunk_is_speech = True
+    segmenter.current_speech_ms = 640
+    segmenter.current_audio = b"\x01\x00" * 8_000
+    segmenter.process_chunk.return_value = None
+    callbacks = []
+    session = VoiceStreamSession(
+        vad_segmenter=segmenter,
+        wakeword_detector=MagicMock(),
+        conversation_active_fn=lambda: True,
+        partial_interval_ms=0,
+        partial_executor_available=lambda: False,
+        bargein_active_fn=lambda: True,
+        on_speech_progress=lambda audio, speech_ms, generation: callbacks.append(
+            (audio, speech_ms, generation),
+        ),
+    )
+
+    async def run():
+        await session.handle_chunk(vad_frame(), muted=False)
+        await session.close()
+
+    asyncio.run(run())
+
+    assert callbacks == [(segmenter.current_audio, 640, 0)]
+
+
 def test_exact_incomplete_threshold_uses_heuristic_fallback(monkeypatch):
     analyzer = _FakeTurnAnalyzer([0.3])
     session, _segmenter = _smart_turn_session(analyzer, monkeypatch)
