@@ -48,6 +48,7 @@ _GOOGLE_TTS_MODEL = "chirp3-hd"
 _GOOGLE_TTS_USD_PER_MILLION_CHARS = 30.0
 _DEFAULT_ENGINE_CHAIN = ("cartesia", "elevenlabs", "google", "local")
 _ERROR_COOLDOWN_S = 60.0
+_BOUND_ENGINE_RETRY_TIMEOUT_S = 1.5
 _QUOTA_HINTS = ("quota", "credit", "payment_required")
 
 VOICE_MODELS: dict[str, str] = {
@@ -84,6 +85,7 @@ class TTSTurnState:
 
     engine: str | None = None
     chain_position: int | None = None
+    audio_emitted: bool = False
 
 
 _active_tts_turn: contextvars.ContextVar[TTSTurnState | None] = contextvars.ContextVar(
@@ -165,6 +167,7 @@ def _google_tts_is_paused() -> bool:
 
 def _start_tts_turn() -> tuple[TTSTurnState, contextvars.Token]:
     state = TTSTurnState()
+    state.engine, state.chain_position = _first_available_engine()
     return state, _active_tts_turn.set(state)
 
 
@@ -175,7 +178,12 @@ def _end_tts_turn(token: contextvars.Token) -> None:
 def _tts_turn_can_use_filler(state: TTSTurnState) -> bool:
     """Füller gibt es erst, wenn im aktuellen Turn die Hauptstimme feststeht."""
     chain = _engine_chain()
-    return bool(chain and state.engine == chain[0])
+    return bool(
+        chain
+        and state.engine == chain[0]
+        and state.chain_position == 0
+        and _turn_engine_available(chain[0])
+    )
 
 
 def _kokoro_paths() -> tuple[Path, Path]:
@@ -240,16 +248,7 @@ def _active_voice_name() -> str:
 
 def is_available() -> bool:
     """True, wenn mindestens ein Provider der Ersatzkette einsatzbereit ist."""
-    for engine in _engine_chain():
-        if engine == "cartesia" and _cartesia_key() and not _cartesia_is_paused():
-            return True
-        if engine == "elevenlabs" and _elevenlabs_key() and not _elevenlabs_is_paused():
-            return True
-        if engine == "google" and _google_tts_key() and not _google_tts_is_paused():
-            return True
-        if engine in {"local", "kokoro", "piper"} and _local_engine_available(engine):
-            return True
-    return False
+    return any(_engine_available(engine) for engine in _engine_chain())
 
 
 def _local_engine_available(engine: str) -> bool:
@@ -708,12 +707,17 @@ def _apply_cartesia_pronunciations(text: str) -> str:
     return text
 
 
+def _normalized_provider_text(text: str) -> str:
+    """Text in derselben normalisierten Form, die Cloud-TTS tatsächlich sendet."""
+    return _apply_cartesia_pronunciations(_numbers_to_german_words(text))
+
+
 async def _cartesia_synthesize(text: str) -> bytes:
     """Ruft Cartesia auf und liefert WAV-Bytes für die vorhandene OGG-Konvertierung."""
     api_key = _cartesia_key()
     payload = {
         "model_id": config.TTS_CARTESIA_MODEL,
-        "transcript": _apply_cartesia_pronunciations(_numbers_to_german_words(text)),
+        "transcript": _normalized_provider_text(text),
         "voice": {"mode": "id", "id": config.TTS_CARTESIA_VOICE},
         "language": config.TTS_CARTESIA_LANGUAGE,
         "output_format": {
@@ -736,7 +740,7 @@ async def _elevenlabs_synthesize(text: str) -> bytes:
     """Ruft ElevenLabs auf und liefert MP3-Audio für die Opus-Konvertierung."""
     voice_id = config.TTS_ELEVENLABS_VOICE
     payload = {
-        "text": _apply_cartesia_pronunciations(_numbers_to_german_words(text)),
+        "text": _normalized_provider_text(text),
         "model_id": config.TTS_ELEVENLABS_MODEL,
         "language_code": "de",
     }
@@ -759,7 +763,7 @@ async def _google_tts_request(text: str, audio_encoding: str) -> bytes:
     """Ruft Google Cloud TTS auf und dekodiert das Base64-Audio."""
     payload = {
         "input": {
-            "text": _apply_cartesia_pronunciations(_numbers_to_german_words(text)),
+            "text": _normalized_provider_text(text),
         },
         "voice": {
             "languageCode": "de-DE",
@@ -868,7 +872,8 @@ def _is_quota_error(engine: str, exc: httpx.HTTPStatusError) -> bool:
     except Exception:
         body = ""
     has_quota_hint = any(hint in body for hint in _QUOTA_HINTS)
-    return status == 402 or (status == 429 and has_quota_hint) or (
+    google_quota_exhausted = engine == "google" and "resource_exhausted" in body
+    return status in {402, 429} or google_quota_exhausted or (
         engine in {"cartesia", "elevenlabs"} and has_quota_hint
     )
 
@@ -879,9 +884,13 @@ def _pause_engine(engine: str, status: int | str, *, quota: bool) -> None:
         if quota
         else _ERROR_COOLDOWN_S
     )
-    deadline = time.monotonic() + duration
-    _engine_paused_until[engine] = deadline
     compat_name = _pause_until_compat_name(engine)
+    previous_deadline = max(
+        _engine_paused_until.get(engine, 0.0),
+        globals().get(compat_name, 0.0) if compat_name else 0.0,
+    )
+    deadline = max(previous_deadline, time.monotonic() + duration)
+    _engine_paused_until[engine] = deadline
     if compat_name:
         globals()[compat_name] = deadline
     if engine not in _engine_pause_warned:
@@ -909,9 +918,52 @@ def _has_provider_key(engine: str) -> bool:
     }.get(engine, lambda: True)() != ""
 
 
-async def _synthesize_provider(engine: str, text: str, speed: float) -> bytes | None:
+def _engine_available(engine: str) -> bool:
     if engine in {"cartesia", "elevenlabs", "google"}:
-        if not _has_provider_key(engine) or _engine_is_paused(engine):
+        return _has_provider_key(engine) and not _engine_is_paused(engine)
+    if engine in {"local", "kokoro", "piper"}:
+        return _local_engine_available(engine)
+    return False
+
+
+def _turn_engine_available(engine: str) -> bool:
+    """Prüft Füller-Preselection ohne synchronen Datenbankzugriff."""
+    if engine in {"cartesia", "elevenlabs", "google"}:
+        return _engine_available(engine)
+    if engine in {"local", "kokoro"} and not _kokoro_unavailable:
+        onnx, voices = _kokoro_paths()
+        if onnx.exists() and voices.exists():
+            return True
+    if engine in {"local", "kokoro", "piper"}:
+        voice_names = set(VOICE_MODELS)
+        if _loaded_voice_name:
+            voice_names.add(_loaded_voice_name)
+        for voice_name in voice_names:
+            try:
+                onnx, voice_config = resolve_voice_paths(voice_name)
+            except KeyError:
+                continue
+            if onnx.exists() and voice_config.exists():
+                return True
+    return False
+
+
+def _first_available_engine() -> tuple[str | None, int | None]:
+    for position, engine in enumerate(_engine_chain()):
+        if _turn_engine_available(engine):
+            return engine, position
+    return None, None
+
+
+async def _synthesize_provider(
+    engine: str,
+    text: str,
+    speed: float,
+    *,
+    ignore_paused: bool = False,
+) -> bytes | None:
+    if engine in {"cartesia", "elevenlabs", "google"}:
+        if not _has_provider_key(engine) or (_engine_is_paused(engine) and not ignore_paused):
             return None
         try:
             if engine == "cartesia":
@@ -935,10 +987,14 @@ async def _synthesize_provider(engine: str, text: str, speed: float) -> bytes | 
                 ogg = await asyncio.to_thread(_cartesia_wav_to_ogg, source_audio)
             elif engine == "elevenlabs":
                 ogg = await asyncio.to_thread(_mp3_to_ogg, source_audio)
+                if _ogg_opus_sample_count(ogg) <= 0:
+                    raise ValueError("ElevenLabs lieferte OGG ohne Samples")
             else:
                 ogg = await asyncio.to_thread(_wav_to_ogg, source_audio) if is_wav else source_audio
                 if not is_wav and not ogg.startswith(b"OggS"):
                     raise ValueError("Google TTS lieferte kein gültiges OGG")
+                if _ogg_opus_sample_count(ogg) <= 0:
+                    raise ValueError("Google TTS lieferte Audio ohne Samples")
             if not ogg:
                 raise ValueError("TTS lieferte leeres Audio")
         except Exception as exc:
@@ -947,11 +1003,11 @@ async def _synthesize_provider(engine: str, text: str, speed: float) -> bytes | 
             return None
 
         if engine == "cartesia":
-            _record_cartesia_usage(text)
+            _record_cartesia_usage(_normalized_provider_text(text))
         elif engine == "elevenlabs":
-            _record_elevenlabs_usage(text)
+            _record_elevenlabs_usage(_normalized_provider_text(text))
         else:
-            _record_google_tts_usage(text)
+            _record_google_tts_usage(_normalized_provider_text(text))
         return ogg
 
     if engine in {"local", "kokoro", "piper"}:
@@ -972,6 +1028,35 @@ async def _synthesize_provider(engine: str, text: str, speed: float) -> bytes | 
 def _wav_nframes(wav: bytes) -> int:
     with wave.open(io.BytesIO(wav), "rb") as wav_file:
         return wav_file.getnframes()
+
+
+def _ogg_opus_sample_count(audio: bytes) -> int:
+    """Ermittelt die decodierbare Dauer eines OGG/Opus-Streams in Samples."""
+    offset = 0
+    pre_skip = None
+    final_granule = None
+    while offset + 27 <= len(audio):
+        if audio[offset:offset + 4] != b"OggS":
+            return 0
+        segment_count = audio[offset + 26]
+        table_start = offset + 27
+        body_start = table_start + segment_count
+        if body_start > len(audio):
+            return 0
+        body_size = sum(audio[table_start:body_start])
+        page_end = body_start + body_size
+        if page_end > len(audio):
+            return 0
+        granule = int.from_bytes(audio[offset + 6:offset + 14], "little")
+        if granule != 0xFFFFFFFFFFFFFFFF:
+            final_granule = granule
+        head = audio[body_start:page_end].find(b"OpusHead")
+        if head >= 0 and body_start + head + 12 <= page_end:
+            pre_skip = int.from_bytes(audio[body_start + head + 10:body_start + head + 12], "little")
+        offset = page_end
+    if pre_skip is None or final_granule is None:
+        return 0
+    return max(0, final_granule - pre_skip)
 
 
 def _cartesia_wav_to_ogg(wav: bytes) -> bytes:
@@ -1002,10 +1087,38 @@ async def _synthesize_unlocked(
     start_position = state.chain_position or 0
     chain = chain[start_position:]
     for offset, engine in enumerate(chain, start=start_position):
-        audio = await _synthesize_provider(engine, text, speed)
+        retry_bound_engine = state.audio_emitted and state.engine == engine
+        audio = await _synthesize_provider(
+            engine,
+            text,
+            speed,
+            ignore_paused=retry_bound_engine,
+        )
+        if not audio and retry_bound_engine:
+            try:
+                audio = await asyncio.wait_for(
+                    _synthesize_provider(engine, text, speed, ignore_paused=True),
+                    timeout=max(0.01, float(_BOUND_ENGINE_RETRY_TIMEOUT_S)),
+                )
+            except TimeoutError:
+                _pause_engine(engine, "RetryTimeout", quota=False)
+                log.warning(
+                    "%s TTS-Retry nach bereits ausgegebenem Audio lief ins Timeout",
+                    _engine_label(engine),
+                )
+            if not audio:
+                state.chain_position = offset + 1
         if audio:
+            previous_engine = state.engine
+            if state.audio_emitted and previous_engine and previous_engine != engine:
+                log.warning(
+                    "Stimmwechsel im laufenden Turn: %s → %s",
+                    _engine_label(previous_engine),
+                    _engine_label(engine),
+                )
             state.engine = engine
             state.chain_position = offset
+            state.audio_emitted = True
             log.info("🔊 TTS: %s · %s Zeichen → %sKB OGG", engine, len(text), len(audio) // 1024)
             return audio
     return b""

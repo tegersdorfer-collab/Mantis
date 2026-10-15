@@ -380,6 +380,14 @@ def _fake_local_synthesis(monkeypatch):
     monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OGG:" + wav)
 
 
+def _fake_ogg_opus(samples: int = 4800) -> bytes:
+    pre_skip = 312
+    body = b"OpusHead" + bytes((1, 1)) + pre_skip.to_bytes(2, "little") + b"\0" * 7
+    granule = pre_skip + samples
+    header = b"OggS\0\0" + granule.to_bytes(8, "little") + b"\0" * 12 + bytes((1,))
+    return header + bytes((len(body),)) + body
+
+
 class TestCartesia:
     def test_schreibt_live_zahlenbeispiele_vor_cartesia_aus(
         self, cartesia_engine, monkeypatch
@@ -419,7 +427,7 @@ class TestCartesia:
         from core import llm_usage
         monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: usage.append((args, kwargs)))
 
-        result = asyncio.run(tts.synthesize("**Hallo** [Timo](https://example.com)!"))
+        result = asyncio.run(tts.synthesize("**Mantis** hat 2 Termine."))
 
         assert result == b"OggSCARTESIA_WAV"
         assert len(requests) == 1
@@ -430,7 +438,7 @@ class TestCartesia:
         assert timeouts == [5.0]
         assert json.loads(request.content) == {
             "model_id": "sonic-3.6",
-            "transcript": "Hallo Timo!",
+            "transcript": "Mäntis hat zwei Termine.",
             "voice": {"mode": "id", "id": "afa425cf-5489-4a09-8a3f-d3cb1f82150d"},
             "language": "de",
             "output_format": {
@@ -441,9 +449,9 @@ class TestCartesia:
         }
         assert len(usage) == 1
         args, kwargs = usage[0]
-        assert args[:4] == ("cartesia", "sonic-3.6", len("Hallo Timo!"), 0)
+        assert args[:4] == ("cartesia", "sonic-3.6", len("Mäntis hat zwei Termine."), 0)
         assert kwargs["purpose"] == "tts"
-        assert kwargs["actual_cost"] == pytest.approx(len("Hallo Timo!") * 65 / 1_000_000)
+        assert kwargs["actual_cost"] == pytest.approx(len("Mäntis hat zwei Termine.") * 65 / 1_000_000)
         assert tts._kokoro is None
 
     def test_cartesia_key_macht_tts_ohne_lokale_modelle_verfuegbar(
@@ -511,7 +519,7 @@ class TestCartesia:
             assert asyncio.run(tts.synthesize("Hallo")) == b"OGG:KOKORO_WAV:Hallo"
 
         assert len(requests) == 1
-        expected_cooldown = 3600.0 if status == 402 else 60.0
+        expected_cooldown = 3600.0 if status in {402, 429} else 60.0
         assert tts._cartesia_paused_until == 1000.0 + expected_cooldown
         warnings = [record for record in caplog.records if "Cartesia TTS pausiert" in record.message]
         assert len(warnings) == 1
@@ -660,10 +668,57 @@ class TestCartesiaKonvertierung:
 
 
 class TestGoogle:
+    def test_google_ogg_ohne_opus_samples_nutzt_naechste_engine(self, google_engine, monkeypatch):
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN", ["google", "local"], raising=False)
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        monkeypatch.setattr(tts, "_record_google_tts_usage", lambda _text: None)
+        fallback = []
+        expected_audio = _fake_ogg_opus()
+
+        async def empty_google(_text):
+            return _fake_ogg_opus(0), False
+
+        async def local(text, _speed):
+            fallback.append(text)
+            return b"LOCAL_WAV"
+
+        monkeypatch.setattr(tts, "_google_tts_synthesize", empty_google)
+        monkeypatch.setattr(tts, "_synthesize_local", local)
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda _wav: expected_audio)
+
+        assert asyncio.run(tts.synthesize("Hallo.")) == expected_audio
+        assert fallback == ["Hallo."]
+
+    def test_google_linear16_ohne_samples_nutzt_naechste_engine(self, google_engine, monkeypatch):
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN", ["google", "local"], raising=False)
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        monkeypatch.setattr(tts, "_record_google_tts_usage", lambda _text: None)
+        fallback = []
+        expected_audio = _fake_ogg_opus()
+
+        async def empty_google(_text):
+            return b"GOOGLE_LINEAR16_WAV", True
+
+        async def local(text, _speed):
+            fallback.append(text)
+            return b"LOCAL_WAV"
+
+        def convert(wav):
+            return _fake_ogg_opus(0) if wav == b"GOOGLE_LINEAR16_WAV" else expected_audio
+
+        monkeypatch.setattr(tts, "_google_tts_synthesize", empty_google)
+        monkeypatch.setattr(tts, "_synthesize_local", local)
+        monkeypatch.setattr(tts, "_wav_to_ogg", convert)
+
+        assert asyncio.run(tts.synthesize("Hallo.")) == expected_audio
+        assert fallback == ["Hallo."]
+
     def test_synthesizes_ogg_mit_header_stimme_normalisierung_und_kosten(
         self, google_engine, monkeypatch
     ):
-        audio = b"OggS-google-audio"
+        audio = _fake_ogg_opus()
         requests = []
         _mock_google(
             monkeypatch,
@@ -695,14 +750,15 @@ class TestGoogle:
         }
         assert len(usage) == 1
         args, kwargs = usage[0]
-        assert args[:4] == ("google", "chirp3-hd", len("Mantis hat 2 Termine."), 0)
+        assert args[:4] == ("google", "chirp3-hd", len("Mäntis hat zwei Termine."), 0)
         assert kwargs["purpose"] == "tts"
-        assert kwargs["actual_cost"] == pytest.approx(len("Mantis hat 2 Termine.") * 30 / 1_000_000)
+        assert kwargs["actual_cost"] == pytest.approx(len("Mäntis hat zwei Termine.") * 30 / 1_000_000)
 
     def test_wechselt_bei_abgelehntem_ogg_zu_linear16_und_konvertiert(
         self, google_engine, monkeypatch
     ):
         requests = []
+        audio = _fake_ogg_opus()
 
         def handler(request):
             requests.append(request)
@@ -723,11 +779,11 @@ class TestGoogle:
             )
 
         _mock_google(monkeypatch, handler)
-        monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OGG:" + wav)
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda _wav: audio)
 
         result = asyncio.run(tts.synthesize("Hallo."))
 
-        assert result == b"OGG:GOOGLE_WAV"
+        assert result == audio
         assert [json.loads(request.content)["audioConfig"] for request in requests] == [
             {"audioEncoding": "OGG_OPUS", "sampleRateHertz": 24000},
             {"audioEncoding": "LINEAR16", "sampleRateHertz": 24000},
@@ -738,13 +794,14 @@ class TestGoogle:
         self, google_engine, monkeypatch
     ):
         requested_texts = []
+        audio = _fake_ogg_opus()
 
         def handler(request):
             payload = json.loads(request.content)
             requested_texts.append(payload["input"]["text"])
             return httpx.Response(
                 200,
-                json={"audioContent": base64.b64encode(b"OggS-block").decode("ascii")},
+                json={"audioContent": base64.b64encode(audio).decode("ascii")},
             )
 
         _mock_google(monkeypatch, handler)
@@ -761,7 +818,7 @@ class TestGoogle:
         chunks = asyncio.run(collect())
 
         assert requested_texts == [tts._numbers_to_german_words(block) for block in expected]
-        assert chunks == [b"OggS-block"] * len(expected)
+        assert chunks == [audio] * len(expected)
 
     def test_api_fehler_faellt_lokal_zurueck_und_loggt_keinen_key(
         self, google_engine, monkeypatch, caplog
@@ -807,14 +864,14 @@ class TestElevenLabs:
             monkeypatch,
             lambda request: requests.append(request) or httpx.Response(200, content=b"MP3_AUDIO"),
         )
-        monkeypatch.setattr(tts, "_mp3_to_ogg", lambda audio: b"OggS:" + audio)
+        monkeypatch.setattr(tts, "_mp3_to_ogg", lambda _audio: _fake_ogg_opus())
         usage = []
         from core import llm_usage
         monkeypatch.setattr(llm_usage, "record", lambda *args, **kwargs: usage.append((args, kwargs)))
 
         result = asyncio.run(tts.synthesize("**Mantis** hat 2 Termine."))
 
-        assert result.startswith(b"OggS:")
+        assert result == _fake_ogg_opus()
         assert len(requests) == 1
         request = requests[0]
         assert request.method == "POST"
@@ -829,9 +886,33 @@ class TestElevenLabs:
             "model_id": "eleven_v4_turbo",
             "language_code": "de",
         }
-        assert usage[0][0][:4] == ("elevenlabs", "eleven_v4_turbo", len("Mantis hat 2 Termine."), 0)
+        assert usage[0][0][:4] == ("elevenlabs", "eleven_v4_turbo", len("Mäntis hat zwei Termine."), 0)
         assert usage[0][1]["purpose"] == "tts"
         assert usage[0][1]["actual_cost"] == 0
+
+    def test_mp3_konvertierung_ohne_opus_samples_nutzt_naechste_engine(
+        self, elevenlabs_engine, monkeypatch
+    ):
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN", ["elevenlabs", "local"], raising=False)
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+        monkeypatch.setattr(tts, "_record_elevenlabs_usage", lambda _text: None)
+        fallback = []
+        expected_audio = _fake_ogg_opus()
+
+        async def mp3(_text):
+            return b"MP3_AUDIO"
+
+        async def local(text, _speed):
+            fallback.append(text)
+            return b"LOCAL_WAV"
+
+        monkeypatch.setattr(tts, "_elevenlabs_synthesize", mp3)
+        monkeypatch.setattr(tts, "_mp3_to_ogg", lambda _audio: _fake_ogg_opus(0))
+        monkeypatch.setattr(tts, "_synthesize_local", local)
+        monkeypatch.setattr(tts, "_wav_to_ogg", lambda _wav: expected_audio)
+
+        assert asyncio.run(tts.synthesize("Hallo.")) == expected_audio
+        assert fallback == ["Hallo."]
 
     def test_skips_quota_exhausted_engine_without_retrying_every_sentence(
         self, elevenlabs_engine, monkeypatch
@@ -842,6 +923,7 @@ class TestElevenLabs:
         monkeypatch.setattr(tts.config, "TTS_QUOTA_COOLDOWN_S", 123.0, raising=False)
         monkeypatch.setattr(tts.time, "monotonic", lambda: 1000.0)
         requests = []
+        expected_audio = _fake_ogg_opus()
 
         def handler(request):
             requests.append(str(request.url))
@@ -849,20 +931,20 @@ class TestElevenLabs:
                 return httpx.Response(429, text="quota exceeded")
             return httpx.Response(
                 200,
-                json={"audioContent": base64.b64encode(b"OggS:google").decode("ascii")},
+                json={"audioContent": base64.b64encode(expected_audio).decode("ascii")},
             )
 
         _mock_google(monkeypatch, handler)
         monkeypatch.setattr(tts, "_record_google_tts_usage", lambda _text: None)
 
         for _ in range(2):
-            assert asyncio.run(tts.synthesize("Hallo.")) == b"OggS:google"
+            assert asyncio.run(tts.synthesize("Hallo.")) == expected_audio
 
         assert sum("elevenlabs.io" in url for url in requests) == 1
         assert sum("texttospeech.googleapis.com" in url for url in requests) == 2
         assert tts._elevenlabs_paused_until == 1123.0
 
-    def test_falls_back_to_next_engine_after_timeout_and_pins_stream_voice(self, monkeypatch):
+    def test_retries_bound_engine_once_with_short_timeout_then_switches_voice(self, monkeypatch, caplog):
         monkeypatch.setattr(tts.config, "TTS_ENGINE", "cartesia", raising=False)
         monkeypatch.setattr(tts.config, "CARTESIA_API_KEY", "cartesia-key", raising=False)
         monkeypatch.setattr(tts.config, "GOOGLE_TTS_API_KEY", "google-key", raising=False)
@@ -871,25 +953,89 @@ class TestElevenLabs:
         monkeypatch.setattr(tts, "is_available", lambda: True)
         monkeypatch.setattr(tts, "_record_cartesia_usage", lambda _text: None)
         monkeypatch.setattr(tts, "_record_google_tts_usage", lambda _text: None)
+        monkeypatch.setattr(tts, "_BOUND_ENGINE_RETRY_TIMEOUT_S", 0.01, raising=False)
+        caplog.set_level(logging.INFO, logger=tts.__name__)
         requested = []
         cartesia_calls = 0
+        retry_cancelled = []
+        google_audio = _fake_ogg_opus()
 
         async def cartesia(text):
             nonlocal cartesia_calls
             cartesia_calls += 1
             requested.append("cartesia")
             if cartesia_calls == 1:
-                return b"OggS:cartesia"
-            raise httpx.ReadTimeout("timeout")
+                return b"WAV:cartesia"
+            if cartesia_calls == 2:
+                raise httpx.ReadTimeout("timeout")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                retry_cancelled.append(True)
+                raise
 
         async def google(text):
             requested.append("google")
-            return b"OggS:google", False
+            return google_audio, False
 
         monkeypatch.setattr(tts, "_cartesia_synthesize", cartesia)
         monkeypatch.setattr(tts, "_google_tts_synthesize", google)
         monkeypatch.setattr(tts, "_cartesia_wav_to_ogg", lambda _wav: b"OggS:cartesia")
         monkeypatch.setattr(tts, "_wav_to_ogg", lambda wav: b"OggS:" + wav)
+        async def collect():
+            state, token = tts._start_tts_turn()
+            try:
+                chunks = []
+                for sentence in ("Erster Satz.", "Zweiter Satz.", "Dritter Satz."):
+                    chunks.extend([chunk async for chunk in tts.synthesize_stream(sentence)])
+                return chunks, state.engine
+            finally:
+                tts._end_tts_turn(token)
+
+        async def bounded_collect():
+            return await asyncio.wait_for(collect(), timeout=0.5)
+
+        assert asyncio.run(bounded_collect()) == (
+            [b"OggS:cartesia", google_audio, google_audio],
+            "google",
+        )
+        assert requested == ["cartesia", "cartesia", "cartesia", "google", "google"]
+        assert retry_cancelled == [True]
+        assert "Stimmwechsel im laufenden Turn: Cartesia → Google Cloud" in caplog.text
+
+    def test_erschoepfter_retry_kehrt_im_selben_turn_nicht_zur_hauptengine_zurueck(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(tts.config, "TTS_ENGINE", "cartesia", raising=False)
+        monkeypatch.setattr(tts.config, "CARTESIA_API_KEY", "cartesia-key", raising=False)
+        monkeypatch.setattr(tts.config, "GOOGLE_TTS_API_KEY", "google-key", raising=False)
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN", ["cartesia", "google", "local"], raising=False)
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+        monkeypatch.setattr(tts, "is_available", lambda: True)
+        monkeypatch.setattr(tts, "_record_cartesia_usage", lambda _text: None)
+        cartesia_calls = []
+        google_calls = []
+        local_calls = []
+
+        async def cartesia(_text):
+            cartesia_calls.append(True)
+            if len(cartesia_calls) == 1:
+                return b"WAV:cartesia"
+            raise httpx.ReadTimeout("Cartesia timeout")
+
+        async def google(_text):
+            google_calls.append(True)
+            raise httpx.ReadTimeout("Google timeout")
+
+        async def local(_text, _speed):
+            local_calls.append(True)
+            raise RuntimeError("local unavailable")
+
+        monkeypatch.setattr(tts, "_cartesia_synthesize", cartesia)
+        monkeypatch.setattr(tts, "_google_tts_synthesize", google)
+        monkeypatch.setattr(tts, "_synthesize_local", local)
+        monkeypatch.setattr(tts, "_cartesia_wav_to_ogg", lambda _wav: b"OggS:cartesia")
+
         async def collect():
             _state, token = tts._start_tts_turn()
             try:
@@ -900,8 +1046,43 @@ class TestElevenLabs:
             finally:
                 tts._end_tts_turn(token)
 
-        assert asyncio.run(collect()) == [b"OggS:cartesia", b"OggS:google", b"OggS:google"]
-        assert requested == ["cartesia", "cartesia", "google", "google"]
+        assert asyncio.run(collect()) == [b"OggS:cartesia"]
+        assert len(cartesia_calls) == 3
+        assert len(google_calls) == 1
+        assert len(local_calls) == 2
+
+    def test_spaeterer_kurzer_fehler_verkuerzt_quota_cooldown_nicht(self, monkeypatch):
+        monkeypatch.setattr(tts.config, "TTS_QUOTA_COOLDOWN_S", 3600.0, raising=False)
+        now = [1000.0]
+        monkeypatch.setattr(tts.time, "monotonic", lambda: now[0])
+
+        tts._pause_engine("google", 429, quota=True)
+        now[0] = 1500.0
+        tts._pause_engine("google", "ReadTimeout", quota=False)
+
+        assert tts._engine_paused_until["google"] == 4600.0
+        assert tts._google_tts_paused_until == 4600.0
+
+    @pytest.mark.parametrize(
+        ("engine", "status", "body"),
+        [
+            ("google", 429, ""),
+            ("elevenlabs", 429, "temporarily unavailable"),
+            ("google", 403, '{"error":{"status":"RESOURCE_EXHAUSTED"}}'),
+            ("cartesia", 402, ""),
+        ],
+    )
+    def test_quota_signale_pausieren_engine_eine_stunde(self, monkeypatch, engine, status, body):
+        monkeypatch.setattr(tts.config, "TTS_QUOTA_COOLDOWN_S", 3600.0, raising=False)
+        monkeypatch.setattr(tts.time, "monotonic", lambda: 100.0)
+        request = httpx.Request("POST", "https://tts.test/synthesize")
+        response = httpx.Response(status, request=request, text=body)
+        error = httpx.HTTPStatusError("provider error", request=request, response=response)
+
+        assert tts._is_quota_error(engine, error) is True
+        tts._pause_engine(engine, status, quota=tts._is_quota_error(engine, error))
+
+        assert tts._engine_paused_until[engine] == 3700.0
 
     def test_turn_advances_forward_and_does_not_return_to_an_earlier_provider(self, monkeypatch):
         monkeypatch.setattr(tts.config, "TTS_ENGINE", "cartesia", raising=False)
@@ -912,6 +1093,7 @@ class TestElevenLabs:
         monkeypatch.setattr(tts, "is_available", lambda: True)
         calls = []
         local = []
+        google_audio = _fake_ogg_opus()
 
         async def cartesia(_text):
             calls.append("cartesia")
@@ -920,7 +1102,7 @@ class TestElevenLabs:
         async def google(_text):
             calls.append("google")
             if calls.count("google") == 1:
-                return b"OggS:google", False
+                return google_audio, False
             # Simuliere, dass Cartesias Cooldown später ausläuft, während Google
             # im selben Turn gerade fehlschlägt.
             tts._engine_paused_until["cartesia"] = 0.0
@@ -947,9 +1129,9 @@ class TestElevenLabs:
                 tts._end_tts_turn(token)
 
         assert asyncio.run(collect()) == [
-            b"OggS:google", b"OggS:LOCAL_WAV", b"OggS:LOCAL_WAV",
+            google_audio, b"OggS:LOCAL_WAV", b"OggS:LOCAL_WAV",
         ]
-        assert calls == ["cartesia", "google", "google"]
+        assert calls == ["cartesia", "google", "google", "google"]
         assert len(local) == 2
 
     def test_legacy_engine_overrides_default_chain_when_no_chain_is_configured(self, monkeypatch):
@@ -974,7 +1156,7 @@ class TestElevenLabs:
 
         async def fallback(text):
             requested.append("google")
-            return b"OggS:google", False
+            return _fake_ogg_opus(), False
 
         monkeypatch.setattr(tts, "_elevenlabs_synthesize", fail_primary)
         monkeypatch.setattr(tts, "_google_tts_synthesize", fallback)
