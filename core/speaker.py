@@ -25,6 +25,10 @@ EMBEDDING_DIM = 192
 MAX_EMBEDDINGS = 50
 MAX_CENTROIDS = 4
 AUTO_LEARN_INTERVAL_S = 600
+LEARNED_SCORE_BONUS_MAX = 0.15
+VERIFY_WINDOW_SECONDS = 1.5
+VERIFY_WINDOW_HOP_SECONDS = 0.75
+VERIFY_WINDOW_MIN_SPEECH_SECONDS = 0.2
 DEFAULT_MODEL_PATH = (
     Path(__file__).resolve().parents[1]
     / "data" / "speaker" / "3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx"
@@ -145,6 +149,32 @@ def score_embedding(embedding: np.ndarray, profile: Sequence[np.ndarray]) -> flo
     return float(np.clip(np.max(centers @ target), -1.0, 1.0))
 
 
+def _anchor_rows(rows: Sequence[dict]) -> list[dict]:
+    """Nur explizit eingelernte Zeilen sind unveränderliche Vertrauensanker."""
+    return [row for row in rows if row.get("source") == "enrollment"]
+
+
+def _score_profile(embedding: np.ndarray, rows: Sequence[dict]) -> tuple[float, float]:
+    """Begrenzt den Einfluss gelernter Beispiele auf maximal 0,15 Scorepunkte."""
+    anchors = _anchor_rows(rows)
+    if not anchors:
+        raise ValueError("Sprecherprofil hat keine Enrollment-Anker")
+    anchor_score = score_embedding(
+        embedding, [row["embedding"] for row in anchors],
+    )
+    learned = [row for row in rows if row.get("source") == "wakeword"]
+    if not learned:
+        return anchor_score, anchor_score
+    learned_score = score_embedding(
+        embedding, [row["embedding"] for row in learned],
+    )
+    score = max(
+        anchor_score,
+        min(learned_score, anchor_score + LEARNED_SCORE_BONUS_MAX),
+    )
+    return float(score), anchor_score
+
+
 def most_redundant_index(embeddings: Sequence[np.ndarray]) -> int:
     """Index des Teilprofils mit dem ähnlichsten Nachbarn (also redundantesten)."""
     vectors = np.stack([_unit(vector) for vector in embeddings])
@@ -252,8 +282,16 @@ class SpeakerProfileStore:
                     if (now - last_at).total_seconds() < minimum_interval_s:
                         return False
             if len(rows) >= MAX_EMBEDDINGS:
-                redundant = most_redundant_index([row["embedding"] for row in rows])
-                cur.execute("DELETE FROM speaker_profile WHERE id = %s", (rows[redundant]["id"],))
+                learned_rows = [row for row in rows if row["source"] == "wakeword"]
+                if not learned_rows:
+                    return False
+                redundant = most_redundant_index(
+                    [row["embedding"] for row in learned_rows],
+                )
+                cur.execute(
+                    "DELETE FROM speaker_profile WHERE id = %s",
+                    (learned_rows[redundant]["id"],),
+                )
             cur.execute(
                 """INSERT INTO speaker_profile (embedding, score, source)
                    VALUES (%s, %s, %s)""",
@@ -371,7 +409,7 @@ class SpeakerVerifier:
         rows = await self._rows()
         history = await asyncio.to_thread(self._store.history, 10)
         return {
-            "enrolled": bool(rows),
+            "enrolled": bool(_anchor_rows(rows)),
             "embeddings": len(rows),
             "last_learning": [
                 {
@@ -390,32 +428,61 @@ class SpeakerVerifier:
         rows = await self._rows()
         if not rows:
             return SpeakerScore(None, 0.0, False)
+        if not _anchor_rows(rows):
+            return SpeakerScore(None, 0.0, True)
         started = time.perf_counter()
         embedding = await self.embed_pcm(pcm_audio)
-        score = score_embedding(embedding, [row["embedding"] for row in rows])
+        score, _anchor_score = _score_profile(embedding, rows)
         return SpeakerScore(score, round((time.perf_counter() - started) * 1000, 1), True, embedding)
 
     async def verify_pcm(self, pcm_audio: bytes) -> SpeakerVerification:
         rows = await self._rows()
         if not rows:
             return SpeakerVerification(None, None, 0.0, "no_profile")
+        if not _anchor_rows(rows):
+            return SpeakerVerification(None, None, 0.0, "rejected")
         audio = decode_pcm(pcm_audio)
         started = time.perf_counter()
         full_embedding = await self.embed_waveform(audio, SAMPLE_RATE)
-        full_score = score_embedding(full_embedding, [row["embedding"] for row in rows])
+        full_score, _full_anchor_score = _score_profile(full_embedding, rows)
         first_second = audio[:SAMPLE_RATE]
         if len(audio) <= SAMPLE_RATE:
             first_score = full_score
         else:
             first_embedding = await self.embed_waveform(first_second, SAMPLE_RATE)
-            first_score = score_embedding(first_embedding, [row["embedding"] for row in rows])
+            first_score, _first_anchor_score = _score_profile(first_embedding, rows)
         score = min(full_score, first_score)
         threshold = float(getattr(config, "VOICE_SPEAKER_THRESHOLD", 0.38))
+        window_samples = int(VERIFY_WINDOW_SECONDS * SAMPLE_RATE)
+        hop_samples = int(VERIFY_WINDOW_HOP_SECONDS * SAMPLE_RATE)
+        if len(audio) <= window_samples:
+            window_starts = [0]
+        else:
+            window_starts = list(range(0, len(audio) - window_samples + 1, hop_samples))
+            final_start = len(audio) - window_samples
+            if window_starts[-1] != final_start:
+                window_starts.append(final_start)
+        speech_window_scores = []
+        for start in window_starts:
+            window = audio[start:start + window_samples]
+            if speech_duration(window) < VERIFY_WINDOW_MIN_SPEECH_SECONDS:
+                continue
+            window_embedding = await self.embed_waveform(window, SAMPLE_RATE)
+            window_score, _window_anchor_score = _score_profile(window_embedding, rows)
+            speech_window_scores.append(window_score)
+        windows_accepted = bool(speech_window_scores) and all(
+            window_score >= threshold - 0.08
+            for window_score in speech_window_scores
+        )
         return SpeakerVerification(
             score=score,
             first_second_score=first_score,
             elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
-            decision="accepted" if full_score >= threshold and first_score >= threshold else "rejected",
+            decision=(
+                "accepted"
+                if score >= threshold and windows_accepted
+                else "rejected"
+            ),
             embedding=full_embedding,
         )
 
@@ -431,12 +498,19 @@ class SpeakerVerifier:
     ) -> bool:
         if not acoustic_wakeword or bargein or overlapping:
             return False
-        if score < float(getattr(config, "VOICE_SPEAKER_LEARN_MIN", 0.6)):
+        minimum_score = float(getattr(config, "VOICE_SPEAKER_LEARN_MIN", 0.6))
+        if score < minimum_score:
             return False
         audio = decode_pcm(pcm_audio)
         if speech_duration(audio) < 1.5:
             return False
         vector = embedding if embedding is not None else await self.embed_waveform(audio, SAMPLE_RATE)
+        rows = await self._rows()
+        anchors = _anchor_rows(rows)
+        if not anchors or score_embedding(
+            vector, [row["embedding"] for row in anchors],
+        ) < minimum_score:
+            return False
         return await asyncio.to_thread(
             self._store.add_embedding, vector, score, "wakeword",
             minimum_interval_s=AUTO_LEARN_INTERVAL_S,

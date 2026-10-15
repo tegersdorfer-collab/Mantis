@@ -59,9 +59,12 @@ export function startVoiceCaptureStream(
 
   function startStreamingPlayback(): StreamingAudioPlayer {
     player?.stop();
-    player = new StreamingAudioPlayer(() => {
+    const nextPlayer = new StreamingAudioPlayer(() => {
+      if (player !== nextPlayer) return;
       player = null;
+      playbackDucked = false;
     }, sendProgress);
+    player = nextPlayer;
     if (playbackDucked) player.duck();
     return player;
   }

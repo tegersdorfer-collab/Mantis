@@ -160,6 +160,7 @@ class VoiceStreamSession:
         self._partial_transcripts: list[dict] = []
         self._partial_audio_end_sample_index: int | None = None
         self._partial_audio_start_sample_index: int | None = None
+        self._partial_audio_pcm: bytes | None = None
         self._partial_wakeword_fired = False
         self._partial_run_generation: int | None = None
         self._finalizing = False
@@ -210,6 +211,7 @@ class VoiceStreamSession:
         self._partial_transcripts = []
         self._partial_audio_end_sample_index = None
         self._partial_audio_start_sample_index = None
+        self._partial_audio_pcm = None
         self._partial_wakeword_fired = False
         self._partial_run_generation = None
         setter = getattr(self._segmenter, "set_partial_transcript", None)
@@ -378,6 +380,7 @@ class VoiceStreamSession:
             text = None
             raw_text = ""
             partial_as_final = False
+            stt_audio_for_result = stt_audio
             if partial_covers_speech:
                 self._finalizing = True
                 try:
@@ -392,6 +395,8 @@ class VoiceStreamSession:
                     text = str(text).strip()
                     partial_text = text
                     partial_as_final = bool(text)
+                    if partial_as_final and self._partial_audio_pcm:
+                        stt_audio_for_result = self._partial_audio_pcm
 
             wakeword_hint = False
             if not text:
@@ -425,6 +430,7 @@ class VoiceStreamSession:
                 "text": text,
                 "raw_text": raw_text,
                 "pcm_audio": bytes(segment.audio),
+                "stt_pcm_audio": bytes(stt_audio_for_result),
                 "speech_pcm_audio": bytes(getattr(segment, "speech_audio", b"")),
                 "addressed": True,
                 "wakeword_triggered": wake_fired,
@@ -742,6 +748,7 @@ class VoiceStreamSession:
         generation = self._segment_generation
         self._partial_audio_end_sample_index = self._vad_samples_processed
         self._partial_audio_start_sample_index = audio_start_sample_index
+        self._partial_audio_pcm = bytes(audio)
         self._partial_wakeword_fired = wakeword_fired
         self._partial_run_generation = generation
         self._partial_task = asyncio.create_task(
@@ -840,6 +847,7 @@ class VoiceStreamSession:
         self._wakeword_detected = False
         self._partial_text = ""
         self._partial_audio_end_sample_index = None
+        self._partial_audio_pcm = None
         self._partial_run_generation = None
         self._vad_buffer.clear()
         self._wakeword_buffer.clear()

@@ -17,9 +17,11 @@ import re
 import tempfile
 import time
 import unicodedata
+import wave
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
@@ -43,6 +45,59 @@ from core.stream_events import StreamEvent
 from core.tts import _first_early_stream_boundary, synthesize, synthesize_stream
 
 log = logging.getLogger("mantis.api")
+
+SPEAKER_ENROLL_MAX_FILES = 12
+SPEAKER_ENROLL_MAX_BYTES = 4 * 1024 * 1024
+SPEAKER_ENROLL_MAX_SECONDS = 90.0
+SPEAKER_ENROLL_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _wav_duration_seconds(payload: bytes) -> float:
+    """Liest die WAV-Dauer aus dem Header, ohne PCM-Frames zu dekodieren."""
+    try:
+        with wave.open(BytesIO(payload), "rb") as source:
+            frame_rate = source.getframerate()
+            if frame_rate <= 0:
+                raise ValueError("Ungültige WAV-Datei")
+            return source.getnframes() / frame_rate
+    except (wave.Error, EOFError) as exc:
+        raise ValueError("Ungültige WAV-Datei") from exc
+
+
+async def _read_bounded_uploads(uploads: list[UploadFile]) -> list[bytes]:
+    if len(uploads) > SPEAKER_ENROLL_MAX_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Maximal {SPEAKER_ENROLL_MAX_FILES} Audio-Dateien erlaubt",
+        )
+    total_bytes = 0
+    total_seconds = 0.0
+    payloads = []
+    for upload in uploads:
+        parts = []
+        while True:
+            remaining = SPEAKER_ENROLL_MAX_BYTES - total_bytes
+            chunk = await upload.read(
+                min(SPEAKER_ENROLL_READ_CHUNK_BYTES, remaining + 1),
+            )
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > SPEAKER_ENROLL_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Sprecher-Upload darf insgesamt höchstens 4 MB groß sein",
+                )
+            parts.append(chunk)
+        payload = b"".join(parts)
+        total_seconds += _wav_duration_seconds(payload)
+        if total_seconds > SPEAKER_ENROLL_MAX_SECONDS:
+            raise HTTPException(
+                status_code=413,
+                detail="Sprecher-Upload darf insgesamt höchstens 90 Sekunden Audio enthalten",
+            )
+        payloads.append(payload)
+    return payloads
 
 
 @dataclass(slots=True)
@@ -1126,9 +1181,11 @@ def build_router(orch=None) -> APIRouter:
     async def speaker_enroll(audio: list[UploadFile] = File(...)):
         from core.speaker import get_speaker_verifier
 
-        payloads = [await item.read() for item in audio]
         try:
+            payloads = await _read_bounded_uploads(audio)
             return await get_speaker_verifier().enroll_wavs(payloads)
+        except HTTPException:
+            raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -1164,10 +1221,25 @@ def build_router(orch=None) -> APIRouter:
         reply = None
         audio_b64 = None
         timing_token = None
+        speaker_verifier = None
+        speaker_profile_active = False
+        if bool(getattr(config, "VOICE_SPEAKER_VERIFY", True)):
+            try:
+                from core.speaker import get_speaker_verifier
+
+                speaker_verifier = get_speaker_verifier()
+                speaker_profile_active = await speaker_verifier.has_profile()
+            except Exception as exc:
+                log.warning(
+                    "Sprecherprofil konnte für HTTP-Voice nicht geladen werden (%s)",
+                    type(exc).__name__,
+                )
+                speaker_profile_active = True
         try:
             suffix = Path(audio.filename or "segment.wav").suffix or ".wav"
+            payload = await audio.read()
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-                tmp.write(await audio.read())
+                tmp.write(payload)
                 tmp.flush()
                 stt_started = time.perf_counter()
                 text, wakeword_hint = await transcribe_audio_with_hint(
@@ -1175,7 +1247,27 @@ def build_router(orch=None) -> APIRouter:
                 )
                 stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
 
-            if text:
+            speaker_accepted = True
+            if speaker_profile_active:
+                speaker_accepted = False
+                if speaker_verifier is not None:
+                    try:
+                        import numpy as np
+                        from core.speaker import decode_wav
+
+                        samples, _sample_rate = decode_wav(payload)
+                        pcm_audio = np.clip(
+                            np.rint(samples * 32768.0), -32768, 32767,
+                        ).astype("<i2").tobytes()
+                        verification = await speaker_verifier.verify_pcm(pcm_audio)
+                        speaker_accepted = verification.decision == "accepted"
+                    except Exception as exc:
+                        log.warning(
+                            "HTTP-Voice-Sprecherprüfung fehlgeschlagen (%s)",
+                            type(exc).__name__,
+                        )
+
+            if text and speaker_accepted:
                 address_started = time.perf_counter()
                 addressed = await is_addressed_to_mantis(
                     text, wakeword_hint=wakeword_hint,
@@ -1408,6 +1500,7 @@ def build_router(orch=None) -> APIRouter:
             )
             started_at = playback.bargein_started_at or detected_at
             playback.bargein_ms = round(max(0.0, (stopped_at - started_at) * 1000), 1)
+            was_ducked = playback.ducked
             playback.finish_duck(now=stopped_at, decision=decision)
             if ducked_playback is playback:
                 ducked_playback = None
@@ -1415,18 +1508,24 @@ def build_router(orch=None) -> APIRouter:
             await send_socket.send_json({
                 "type": "stop_playback", "turn_id": playback.turn_id,
             })
+            if was_ducked:
+                await send_socket.send_json({"type": "unduck_playback"})
 
         async def _score_bargein_prefix(
             audio: bytes, playback: _PlaybackTurn, context: dict, *, final: bool,
+            sequence: int,
         ) -> None:
             try:
                 score_result = await speaker_verifier.score_pcm(audio)
                 score = score_result.score
-                context["score"] = score
                 context["speaker_ms"] = round(
                     float(context.get("speaker_ms", 0.0)) + score_result.elapsed_ms,
                     1,
                 )
+                if sequence <= int(context.get("decision_sequence", 0)):
+                    return
+                context["decision_sequence"] = sequence
+                context["score"] = score
                 threshold = float(getattr(config, "VOICE_SPEAKER_THRESHOLD", 0.35))
                 accepted = score is not None and score >= threshold
                 if final:
@@ -1454,7 +1553,8 @@ def build_router(orch=None) -> APIRouter:
                 raise
             except Exception as exc:
                 log.warning("Barge-in-Sprecherprüfung fehlgeschlagen (%s)", type(exc).__name__)
-                if final:
+                if final and sequence > int(context.get("decision_sequence", 0)):
+                    context["decision_sequence"] = sequence
                     context["decision"] = "rejected"
                     if active_playback is playback:
                         await unduck_playback(
@@ -1472,15 +1572,23 @@ def build_router(orch=None) -> APIRouter:
                 return
             context = speaker_progress_contexts.setdefault(
                 generation,
-                {"tasks": [], "score": None, "speaker_ms": 0.0, "decision": None},
+                {
+                    "tasks": [], "score": None, "speaker_ms": 0.0,
+                    "decision": None, "next_sequence": 0, "decision_sequence": 0,
+                },
             )
             context["playback"] = playback
             if speech_ms >= 600 and not context.get("early_started"):
                 prefix = bytes(audio[:int(0.6 * 16_000 * 2)])
                 if len(prefix) >= 16_000:
                     context["early_started"] = True
+                    context["next_sequence"] += 1
+                    sequence = context["next_sequence"]
                     task = asyncio.get_running_loop().create_task(
-                        _score_bargein_prefix(prefix, playback, context, final=False),
+                        _score_bargein_prefix(
+                            prefix, playback, context, final=False,
+                            sequence=sequence,
+                        ),
                         name="voice-speaker-bargein-early",
                     )
                     context["tasks"].append(task)
@@ -1488,8 +1596,13 @@ def build_router(orch=None) -> APIRouter:
                 prefix = bytes(audio[:16_000 * 2])
                 if len(prefix) >= 16_000:
                     context["final_started"] = True
+                    context["next_sequence"] += 1
+                    sequence = context["next_sequence"]
                     task = asyncio.get_running_loop().create_task(
-                        _score_bargein_prefix(prefix, playback, context, final=True),
+                        _score_bargein_prefix(
+                            prefix, playback, context, final=True,
+                            sequence=sequence,
+                        ),
                         name="voice-speaker-bargein-final",
                     )
                     context["tasks"].append(task)
@@ -1564,6 +1677,13 @@ def build_router(orch=None) -> APIRouter:
             except Exception as e:
                 log.error("Voice-Antworttask fehlgeschlagen: %s", e)
             finally:
+                if playback.ducked:
+                    try:
+                        await unduck_playback(
+                            decision="ignored", playback=playback,
+                        )
+                    except (WebSocketDisconnect, RuntimeError):
+                        log.debug("Voice-Playback konnte nicht zurückgesetzt werden")
                 if active_playback is playback and (
                     playback.interrupted or playback.complete or playback.timed_out
                     or not supports_playback_progress
@@ -1587,7 +1707,8 @@ def build_router(orch=None) -> APIRouter:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             pcm_audio = result.pop("pcm_audio", b"")
-            speaker_pcm_audio = result.pop("speech_pcm_audio", b"") or pcm_audio
+            result.pop("speech_pcm_audio", None)
+            speaker_pcm_audio = result.pop("stt_pcm_audio", b"") or pcm_audio
             result["speaker_score"] = None
             result["speaker_ms"] = round(
                 float(speaker_context.get("speaker_ms", 0.0)), 1,

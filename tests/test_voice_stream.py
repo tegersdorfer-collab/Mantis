@@ -563,6 +563,47 @@ def test_debounced_wakeword_crop_uses_first_positive_frame_end(monkeypatch):
     assert result is not None and result["wakeword_triggered"] is True
     assert result["wakeword_position_ms"] == 800
     assert struct.unpack("<h", captured[0][:2])[0] == 10_400
+    assert result["stt_pcm_audio"] == captured[0]
+
+
+def test_final_speaker_audio_matches_partial_stt_audio(monkeypatch):
+    from core.vad import SegmentEvent
+
+    segment_audio = b"\x01\x00" * 16_000
+    partial_audio = b"\x02\x00" * 14_000
+
+    class Segmenter:
+        is_speaking = False
+        current_chunk_is_speech = False
+
+        def process_chunk(self, _frame):
+            return SegmentEvent(
+                audio=segment_audio, duration_ms=1000,
+                last_speech_sample_index=16_000,
+            )
+
+    session = VoiceStreamSession(
+        vad_segmenter=Segmenter(),
+        wakeword_detector=MagicMock(),
+        conversation_active_fn=lambda: True,
+        partial_transcriber=AsyncMock(return_value=("Mantis, sag etwas.", False)),
+        partial_executor_available=lambda: True,
+    )
+    session._partial_audio_start_sample_index = 0
+    session._partial_audio_end_sample_index = 16_000
+    session._partial_audio_pcm = partial_audio
+    session._partial_run_generation = 0
+
+    async def run():
+        session._partial_task = asyncio.create_task(session._run_partial(
+            partial_audio, 0, 16_000,
+        ))
+        return await session.handle_chunk(vad_frame(), muted=False)
+
+    result = asyncio.run(run())
+
+    assert result["partial_as_final"] is True
+    assert result["stt_pcm_audio"] == partial_audio
 
 
 def test_wakeword_audio_crop_keeps_a_conservative_preroll():
@@ -661,18 +702,22 @@ def test_partial_transcription_uses_wakeword_crop_and_safe_prefix(
         clock.now += 0.01
         await session.handle_chunk(vad_frame(), muted=False)
         await session._partial_task
-        result = (session._partial_text, segmenter.partial_text)
+        result = (
+            session._partial_text, segmenter.partial_text, session._partial_audio_pcm,
+        )
         await session.close()
         return result
 
-    partial_text, heuristic_text = asyncio.run(run())
+    partial_text, heuristic_text, partial_stt_audio = asyncio.run(run())
 
     if wakeword_hit:
         assert partial_audio == [segment_audio[3152:]]
+        assert partial_stt_audio == segment_audio[3152:]
         assert partial_text == "Mantis, bitte mach das Licht an"
         assert heuristic_text == "Mentis, bitte mach das Licht an"
     else:
         assert partial_audio == [segment_audio]
+        assert partial_stt_audio == segment_audio
         assert partial_text == "Mentis, bitte mach das Licht an"
         assert heuristic_text == "Mentis, bitte mach das Licht an"
 

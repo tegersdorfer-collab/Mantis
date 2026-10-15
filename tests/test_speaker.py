@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import subprocess
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,8 @@ import numpy as np
 import pytest
 
 from core.speaker import (
+    MAX_EMBEDDINGS,
+    SpeakerProfileStore,
     SpeakerVerifier,
     decode_wav,
     kaldi_fbank,
@@ -117,7 +120,10 @@ def test_verifier_returns_no_profile_without_running_embedder():
 
 def test_final_segments_shorter_than_half_a_second_can_be_verified():
     store = FakeStore()
-    store.rows.append({"embedding": np.array([1.0, 0.0, 0.0])})
+    store.rows.append({
+        "embedding": np.array([1.0, 0.0, 0.0]),
+        "source": "enrollment",
+    })
     service = SpeakerVerifier(
         store=store,
         embedder=lambda *_args: np.array([1.0, 0.0, 0.0]),
@@ -127,6 +133,29 @@ def test_final_segments_shorter_than_half_a_second_can_be_verified():
 
     assert result.decision == "accepted"
     assert result.score == pytest.approx(1.0)
+
+
+def test_learned_only_profile_cannot_authorize_a_speaker():
+    store = FakeStore()
+    store.rows.append({
+        "embedding": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "score": 0.9,
+        "source": "wakeword",
+        "learned_at": datetime.now(timezone.utc),
+    })
+    embedder_calls = []
+    service = SpeakerVerifier(
+        store=store,
+        embedder=lambda *_args: embedder_calls.append(True),
+    )
+
+    has_profile, result, status = asyncio.run(_verify_learned_only(service))
+
+    assert has_profile is True
+    assert result.decision == "rejected"
+    assert result.score is None
+    assert status["enrolled"] is False
+    assert embedder_calls == []
 
 
 def test_enrollment_requires_twenty_seconds_and_keeps_only_embeddings():
@@ -177,6 +206,12 @@ def test_fake_embedder_accepts_matching_profile_and_rejects_other_speaker():
 
 def test_auto_learning_requires_wakeword_confidence_duration_and_non_overlap():
     store = FakeStore()
+    store.rows.append({
+        "embedding": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "score": None,
+        "source": "enrollment",
+        "learned_at": datetime.now(timezone.utc),
+    })
     service = SpeakerVerifier(
         store=store,
         embedder=lambda *_args: (_ for _ in ()).throw(
@@ -217,7 +252,201 @@ def test_auto_learning_requires_wakeword_confidence_duration_and_non_overlap():
     assert learned is True
     assert rejected is short is overlapped is False
     assert store.minimum_intervals == [600]
+    assert len(store.rows) == 2
+
+
+def test_auto_learning_cannot_poison_profile_with_foreign_vector():
+    store = FakeStore()
+    store.rows.append({
+        "embedding": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "score": None,
+        "source": "enrollment",
+        "learned_at": datetime.now(timezone.utc),
+    })
+    foreign = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    service = SpeakerVerifier(store=store, embedder=lambda *_args: foreign)
+
+    learned = asyncio.run(service.maybe_learn(
+        _pcm(1.6), 0.7,
+        acoustic_wakeword=True,
+        bargein=False,
+        overlapping=False,
+        embedding=foreign,
+    ))
+    verification = asyncio.run(service.verify_pcm(_pcm(1.6)))
+
+    assert learned is False
     assert len(store.rows) == 1
+    assert store.rows[0]["source"] == "enrollment"
+    assert verification.decision == "rejected"
+
+
+def test_learned_embeddings_can_raise_score_by_at_most_point_fifteen():
+    store = FakeStore()
+    store.rows.extend([
+        {
+            "embedding": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            "score": None,
+            "source": "enrollment",
+            "learned_at": datetime.now(timezone.utc),
+        },
+        {
+            "embedding": np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            "score": 0.9,
+            "source": "wakeword",
+            "learned_at": datetime.now(timezone.utc),
+        },
+    ])
+    candidate = np.array([0.5, np.sqrt(0.75), 0.0], dtype=np.float32)
+    service = SpeakerVerifier(store=store, embedder=lambda *_args: candidate)
+
+    result = asyncio.run(service.score_pcm(_pcm(1.0)))
+
+    assert result.score == pytest.approx(0.65)
+
+
+def test_auto_learning_requires_reported_score_above_learning_threshold(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "VOICE_SPEAKER_LEARN_MIN", 0.6, raising=False)
+    store = FakeStore()
+    store.rows.append({
+        "embedding": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "score": None,
+        "source": "enrollment",
+        "learned_at": datetime.now(timezone.utc),
+    })
+    matching = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    service = SpeakerVerifier(store=store, embedder=lambda *_args: matching)
+
+    learned = asyncio.run(service.maybe_learn(
+        _pcm(1.6), 0.59,
+        acoustic_wakeword=True,
+        bargein=False,
+        overlapping=False,
+        embedding=matching,
+    ))
+
+    assert learned is False
+    assert len(store.rows) == 1
+
+
+def test_auto_learning_rejects_overlap_even_without_bargein_flag():
+    store = FakeStore()
+    store.rows.append({
+        "embedding": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "score": None,
+        "source": "enrollment",
+        "learned_at": datetime.now(timezone.utc),
+    })
+    service = SpeakerVerifier(
+        store=store,
+        embedder=lambda *_args: np.array([1.0, 0.0, 0.0]),
+    )
+
+    learned = asyncio.run(service.maybe_learn(
+        _pcm(1.6), 0.99,
+        acoustic_wakeword=True,
+        bargein=False,
+        overlapping=True,
+        embedding=np.array([1.0, 0.0, 0.0]),
+    ))
+
+    assert learned is False
+    assert len(store.rows) == 1
+    assert store.rows[0]["source"] == "enrollment"
+
+
+def test_profile_store_replaces_only_learned_rows_at_capacity(monkeypatch):
+    from core import db
+
+    anchor = np.array([1.0, 0.0], dtype=np.float32)
+    learned = np.array([1.0, 0.0], dtype=np.float32)
+    rows = [
+        {"id": 1, "embedding": anchor, "source": "enrollment"},
+        *[
+            {"id": index + 2, "embedding": learned, "source": "wakeword"}
+            for index in range(MAX_EMBEDDINGS - 1)
+        ],
+    ]
+
+    class Cursor:
+        def __init__(self):
+            self.deleted = []
+            self.inserted = []
+
+        def execute(self, query, params=None):
+            if query.startswith("SELECT id, embedding, source, learned_at"):
+                return
+            if query.startswith("DELETE FROM speaker_profile"):
+                self.deleted.append(params[0])
+            elif query.startswith("INSERT INTO speaker_profile"):
+                self.inserted.append(params)
+
+        def fetchall(self):
+            return rows
+
+    cursor = Cursor()
+
+    class CursorContext:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(db, "cursor", CursorContext)
+    added = SpeakerProfileStore().add_embedding(learned, 0.8, "wakeword")
+
+    assert added is True
+    assert cursor.deleted
+    assert cursor.deleted[0] != 1
+    assert len(cursor.inserted) == 1
+
+
+def test_verification_rejects_foreign_first_second_even_when_full_audio_matches():
+    store = FakeStore()
+    store.rows.append({
+        "embedding": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "score": None,
+        "source": "enrollment",
+        "learned_at": datetime.now(timezone.utc),
+    })
+
+    def embedder(samples, _sample_rate):
+        if len(samples) == 16_000:
+            return np.array([0.0, 1.0, 0.0])
+        return np.array([1.0, 0.0, 0.0])
+
+    service = SpeakerVerifier(store=store, embedder=embedder)
+    result = asyncio.run(service.verify_pcm(_pcm(2.0)))
+
+    assert result.first_second_score < 0.35
+    assert result.decision == "rejected"
+
+
+def test_verification_rejects_foreign_speech_in_later_stt_window():
+    store = FakeStore()
+    store.rows.append({
+        "embedding": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "score": None,
+        "source": "enrollment",
+        "learned_at": datetime.now(timezone.utc),
+    })
+
+    def embedder(samples, _sample_rate):
+        if len(samples) == 48_000:
+            return np.array([1.0, 0.0, 0.0])
+        return np.array([1.0, 0.0, 0.0]) if float(samples.mean()) >= 0 else np.array([0.0, 1.0, 0.0])
+
+    service = SpeakerVerifier(store=store, embedder=embedder)
+    timo = np.full(24_000, 1000, dtype="<i2")
+    foreign = np.full(24_000, -1000, dtype="<i2")
+    pcm = np.concatenate((timo, foreign)).tobytes()
+    result = asyncio.run(service.verify_pcm(pcm))
+
+    assert result.score >= 0.35
+    assert result.decision == "rejected"
 
 
 def test_onnx_runtime_uses_session_discovered_names_and_single_thread_options(tmp_path):
@@ -258,6 +487,14 @@ async def _verify_both(service):
     return await service.verify_pcm(_pcm(1.2, 1000)), await service.verify_pcm(_pcm(1.2, -1000))
 
 
+async def _verify_learned_only(service):
+    return (
+        await service.has_profile(),
+        await service.verify_pcm(_pcm(1.2)),
+        await service.status(),
+    )
+
+
 def test_reference_embedding_matches_sherpa_onnx_fixture_when_model_exists():
     from core.speaker import DEFAULT_MODEL_PATH
 
@@ -276,3 +513,17 @@ def test_reference_embedding_matches_sherpa_onnx_fixture_when_model_exists():
     asyncio.run(service.close())
 
     assert cosine >= 0.99
+
+
+def test_synthetic_reference_fixture_is_present_and_not_gitignored():
+    repository = Path(__file__).resolve().parents[1]
+    fixture_path = repository / "tests" / "fixtures" / "speaker_reference_synthetic.npz"
+
+    assert fixture_path.is_file()
+    result = subprocess.run(
+        ["git", "check-ignore", "--quiet", "--", str(fixture_path)],
+        cwd=repository,
+        check=False,
+    )
+
+    assert result.returncode == 1, "Speaker-Referenzfixture darf nicht ignoriert werden"

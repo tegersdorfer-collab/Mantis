@@ -5,6 +5,7 @@ import wave
 import numpy as np
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from web.routers.voice import build_router
 
@@ -78,6 +79,66 @@ def test_speaker_enrollment_translates_short_recording_to_bad_request(monkeypatc
 
     assert response.status_code == 400
     assert "20 Sekunden" in response.json()["detail"]
+
+
+def test_speaker_enrollment_rejects_more_than_twelve_files_before_service(monkeypatch):
+    service = FakeSpeakerService()
+    files = [
+        ("audio", (f"satz-{index}.wav", _wav(1), "audio/wav"))
+        for index in range(13)
+    ]
+
+    response = _client(service, monkeypatch).post(
+        "/api/voice/speaker/enroll", files=files,
+    )
+
+    assert response.status_code == 413
+    assert service.received is None
+
+
+def test_speaker_enrollment_streams_uploads_in_bounded_chunks(monkeypatch):
+    service = FakeSpeakerService()
+    read_sizes = []
+    original_read = StarletteUploadFile.read
+
+    async def tracked_read(upload, size=-1):
+        read_sizes.append(size)
+        return await original_read(upload, size)
+
+    monkeypatch.setattr(StarletteUploadFile, "read", tracked_read)
+    response = _client(service, monkeypatch).post(
+        "/api/voice/speaker/enroll",
+        files=[("audio", ("satz.wav", _wav(20), "audio/wav"))],
+    )
+
+    assert response.status_code == 200
+    assert read_sizes
+    assert all(0 < size <= 64 * 1024 for size in read_sizes)
+
+
+def test_speaker_enrollment_rejects_more_than_four_megabytes(monkeypatch):
+    service = FakeSpeakerService()
+    oversized = b"x" * (4 * 1024 * 1024 + 1)
+
+    response = _client(service, monkeypatch).post(
+        "/api/voice/speaker/enroll",
+        files=[("audio", ("groß.wav", oversized, "audio/wav"))],
+    )
+
+    assert response.status_code == 413
+    assert service.received is None
+
+
+def test_speaker_enrollment_rejects_more_than_ninety_seconds_before_service(monkeypatch):
+    service = FakeSpeakerService()
+
+    response = _client(service, monkeypatch).post(
+        "/api/voice/speaker/enroll",
+        files=[("audio", ("lang.wav", _wav(91), "audio/wav"))],
+    )
+
+    assert response.status_code == 413
+    assert service.received is None
 
 
 def test_speaker_delete_resets_profile(monkeypatch):
