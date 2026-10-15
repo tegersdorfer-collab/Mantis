@@ -43,6 +43,19 @@ class TestWakeWordDetector:
         results = [detector.check(b"\x00\x00" * 1280) for _ in range(wakeword.CONSECUTIVE_HITS_REQUIRED)]
         assert results == [False] * (wakeword.CONSECUTIVE_HITS_REQUIRED - 1) + [True]
 
+    def test_debounced_hit_exposes_end_of_first_positive_frame(self, tmp_path):
+        detector = make_detector_with_scores(
+            tmp_path, scores=[0.8] * wakeword.CONSECUTIVE_HITS_REQUIRED,
+        )
+
+        results = [
+            detector.check(b"\x00\x00" * wakeword.WAKEWORD_REQUIRED_SAMPLES)
+            for _ in range(wakeword.CONSECUTIVE_HITS_REQUIRED)
+        ]
+
+        assert results[-1] is True
+        assert detector.first_positive_frame_end_sample == wakeword.WAKEWORD_REQUIRED_SAMPLES
+
     def test_check_resets_streak_on_a_low_score(self, tmp_path):
         # Trifft mehrfach über der Schwelle, dann einmal darunter, dann wieder mehrfach
         # darüber - der Streak muss beim Unterschreiten zurückgesetzt werden, nicht

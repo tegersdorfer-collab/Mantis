@@ -14,6 +14,26 @@ _ABBREVIATION_BEFORE_PERIOD = re.compile(
     r"st|geb|bspw)\s*$",
     re.IGNORECASE,
 )
+_ACOUSTIC_WAKEWORD_PREFIX = re.compile(
+    r"^\s*(?:meintest|mehr[\s-]+das|mertes|mantasy|bantas|mann[\s-]+das|"
+    r"mentiones|mendes|mandis|mentis|mantis)\b[\s,;:!?-]*(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+
+
+def normalize_wakeword_transcript(text: str, *, wakeword_triggered: bool) -> str:
+    """Setzt eine akustisch bestätigte Anrede für den Gesprächskontext voran."""
+    raw = str(text or "")
+    if not wakeword_triggered:
+        return raw
+    value = raw.strip()
+    if not value:
+        return value
+    match = _ACOUSTIC_WAKEWORD_PREFIX.match(value)
+    if match is not None:
+        rest = match.group("rest").strip()
+        return f"Mantis, {rest}" if rest else "Mantis"
+    return f"Mantis, {value}"
 
 
 def _is_date_or_abbreviation_period(value: str, match: re.Match) -> bool:

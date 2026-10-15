@@ -79,6 +79,13 @@ class WakeWordDetector:
         self._threshold = threshold
         self._buffer = np.zeros(BUFFER_SAMPLES, dtype=np.int16)
         self._consecutive_hits = 0
+        self._samples_processed = 0
+        self._first_positive_frame_end_sample: int | None = None
+
+    @property
+    def first_positive_frame_end_sample(self) -> int | None:
+        """Ende des ersten über der Schwelle liegenden Frames der Treffer-Serie."""
+        return self._first_positive_frame_end_sample
 
     def check(self, pcm_chunk: bytes) -> bool:
         n_samples = len(pcm_chunk) // 2
@@ -91,11 +98,13 @@ class WakeWordDetector:
                 f"core/voice_stream.py::VoiceStreamSession)."
             )
         chunk = np.array(struct.unpack(f"<{n_samples}h", pcm_chunk), dtype=np.int16)
+        self._samples_processed += n_samples
         self._buffer = np.concatenate([self._buffer, chunk])[-BUFFER_SAMPLES:]
 
         embeddings = self._audio_features._get_embeddings(self._buffer)
         if embeddings.shape[0] < N_FRAMES:
             self._consecutive_hits = 0
+            self._first_positive_frame_end_sample = None
             return False
 
         scores = []
@@ -106,8 +115,11 @@ class WakeWordDetector:
         score = max(scores) if scores else 0.0
 
         if score >= self._threshold:
+            if self._consecutive_hits == 0:
+                self._first_positive_frame_end_sample = self._samples_processed
             self._consecutive_hits += 1
         else:
             self._consecutive_hits = 0
+            self._first_positive_frame_end_sample = None
 
         return self._consecutive_hits >= CONSECUTIVE_HITS_REQUIRED

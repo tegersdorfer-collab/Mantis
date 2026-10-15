@@ -107,6 +107,32 @@ class FakeVAD:
 
 
 class TestVadSegmenter:
+    def test_silence_age_and_smart_turn_mode_control_segment_end(self):
+        seg = vad.VadSegmenter(FakeVAD([0.9, 0.1, 0.1, 0.9]), chunk_ms=100)
+        seg.process_chunk(silence_chunk())
+        seg.set_smart_turn_mode("model_incomplete")
+        seg.process_chunk(silence_chunk())
+        seg.process_chunk(silence_chunk())
+
+        assert seg.current_silence_ms == 200
+        assert seg._silence_threshold_ms() == 2000
+
+        seg.process_chunk(silence_chunk())
+
+        assert seg.current_silence_ms == 0
+        assert seg.smart_turn_mode is None
+
+    def test_model_complete_turn_ends_on_the_next_silent_frame(self):
+        seg = vad.VadSegmenter(FakeVAD([0.9, 0.9, 0.9, 0.1]), chunk_ms=100)
+        for _ in range(3):
+            seg.process_chunk(silence_chunk())
+        seg.set_smart_turn_mode("model_complete")
+
+        event = seg.process_chunk(silence_chunk())
+
+        assert event is not None
+        assert event.silence_ms == 100
+
     def test_incomplete_utterance_uses_two_second_silence_default(self):
         segmenter = vad.VadSegmenter(FakeVAD([]), chunk_ms=32)
         segmenter.set_partial_transcript("Mantis erinnere mich an")

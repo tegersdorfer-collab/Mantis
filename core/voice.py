@@ -139,7 +139,9 @@ def _conversation_active(conversation: VoiceConversationWindow | None = None) ->
     return conversation.is_active() if conversation is not None else False
 
 
-async def transcribe_audio_with_hint(audio_path: str) -> tuple[str, bool]:
+async def transcribe_audio_with_hint(
+    audio_path: str, *, normalize_wakeword: bool = True,
+) -> tuple[str, bool]:
     """Liefert den normalisierten Text und einen nicht-freigebenden Namenshinweis."""
     global _parakeet_unavailable
     engine = getattr(config, "STT_ENGINE", "parakeet")
@@ -150,13 +152,15 @@ async def transcribe_audio_with_hint(audio_path: str) -> tuple[str, bool]:
                 raw_text = await _transcribe_parakeet(audio_path)
                 if not _parakeet_unavailable:
                     return (
-                        _normalize_voice_transcript(raw_text),
+                        _normalize_voice_transcript(raw_text)
+                        if normalize_wakeword else raw_text,
                         has_voice_wakeword_hint(raw_text),
                     )
         log.warning("Parakeet nicht verfügbar – ab jetzt whisper.cpp")
 
     raw_text = await _transcribe_whisper(audio_path)
-    return _normalize_voice_transcript(raw_text), has_voice_wakeword_hint(raw_text)
+    text = _normalize_voice_transcript(raw_text) if normalize_wakeword else raw_text
+    return text, has_voice_wakeword_hint(raw_text)
 
 
 async def transcribe_audio(audio_path: str) -> str:
@@ -171,7 +175,7 @@ def partial_stt_executor_available() -> bool:
 
 
 async def transcribe_audio_partial_with_hint(
-    audio_path: str,
+    audio_path: str, *, normalize_wakeword: bool = True,
 ) -> tuple[str, bool] | None:
     """Teil-STT plus Weckworthinweis; bei belegtem STT-Pfad wird er verworfen."""
     global _parakeet_unavailable
@@ -185,11 +189,13 @@ async def transcribe_audio_partial_with_hint(
             raw_text = await _transcribe_parakeet(audio_path)
             if not _parakeet_unavailable:
                 return (
-                    _normalize_voice_transcript(raw_text),
+                    _normalize_voice_transcript(raw_text)
+                    if normalize_wakeword else raw_text,
                     has_voice_wakeword_hint(raw_text),
                 )
         raw_text = await _transcribe_whisper_locked(audio_path)
-        return _normalize_voice_transcript(raw_text), has_voice_wakeword_hint(raw_text)
+        text = _normalize_voice_transcript(raw_text) if normalize_wakeword else raw_text
+        return text, has_voice_wakeword_hint(raw_text)
     finally:
         _whisper_lock.release()
 

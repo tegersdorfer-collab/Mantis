@@ -101,10 +101,21 @@ class MantisSettings(BaseSettings):
     VOICE_ADAPTIVE_SILENCE: bool = True
     VOICE_SILENCE_FAST_MS: int = Field(default=450, gt=0)
     VOICE_SILENCE_SLOW_MS: int = Field(default=2000, gt=0)
+    VOICE_SMART_TURN: bool = True
+    VOICE_SMART_TURN_TRIGGER_MS: int = Field(default=250, gt=0)
+    VOICE_SMART_TURN_COMPLETE: float = Field(default=0.6, ge=0, le=1)
+    VOICE_SMART_TURN_INCOMPLETE: float = Field(default=0.3, ge=0, le=1)
+    VOICE_SMART_TURN_MODEL: str = str(
+        Path(__file__).resolve().parent
+        / "data" / "turn" / "smart-turn-v3.2-cpu.onnx"
+    )
+    VOICE_RECORD_SEGMENTS: bool = False
+    VOICE_RECORD_MAX_FILES: int = Field(default=300, ge=2)
     VOICE_PARTIAL_STT_MS: int = Field(default=700, ge=0)
     VOICE_PARTIAL_STALE_MS: int = Field(default=400, gt=0)
     VOICE_PARTIAL_MAX_MS: int = Field(default=900, gt=0)
     VOICE_WAKE_PREROLL_MS: int = Field(default=1500, ge=0)
+    VOICE_WAKE_CROP_OFFSET_MS: int = 0
     VOICE_BARGEIN: bool = True
     VOICE_BARGEIN_MIN_SPEECH_MS: int = Field(default=300, gt=0)
     VOICE_BARGEIN_MIN_RMS: int = Field(default=800, ge=0)

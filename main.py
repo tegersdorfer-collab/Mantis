@@ -204,6 +204,12 @@ async def main():
     fillers_task = schedule_voice_fillers_preload(preload_task)
     if fillers_task is not None:
         orchestrator._bg_tasks.append(fillers_task)
+    from core.smart_turn import schedule_smart_turn_preload
+    smart_turn_preload_task = schedule_smart_turn_preload(
+        fillers_task or preload_task,
+    )
+    if smart_turn_preload_task is not None:
+        orchestrator._bg_tasks.append(smart_turn_preload_task)
     asyncio.create_task(api_server.serve())
     log.info(f"🖥️  Dashboard läuft auf http://{dashboard_host}:{cfg.DASHBOARD_PORT} (bindet auf {dashboard_host})")
     if cfg.GYM_ENABLED:

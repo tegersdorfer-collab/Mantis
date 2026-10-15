@@ -428,6 +428,7 @@ class SegmentEvent:
     audio: bytes
     duration_ms: float
     last_speech_sample_index: int | None = None
+    silence_ms: float = 0.0
 
 
 class VadSegmenter:
@@ -460,6 +461,7 @@ class VadSegmenter:
         self._partial_transcript_sample_index: int | None = None
         self._last_speech_sample_index: int | None = None
         self._current_chunk_is_speech = False
+        self._smart_turn_mode: str | None = None
 
     @property
     def is_speaking(self) -> bool:
@@ -472,6 +474,17 @@ class VadSegmenter:
     @property
     def current_chunk_is_speech(self) -> bool:
         return self._current_chunk_is_speech
+
+    @property
+    def current_silence_ms(self) -> float:
+        return self._silence_ms
+
+    @property
+    def smart_turn_mode(self) -> str | None:
+        return self._smart_turn_mode
+
+    def set_smart_turn_mode(self, mode: str | None) -> None:
+        self._smart_turn_mode = mode
 
     @property
     def current_speech_ms(self) -> float:
@@ -502,6 +515,10 @@ class VadSegmenter:
             )
 
     def _silence_threshold_ms(self) -> int:
+        if self._smart_turn_mode in {"model_pending", "model_incomplete"}:
+            return int(getattr(config, "VOICE_SILENCE_SLOW_MS", 2000))
+        if self._smart_turn_mode == "model_complete":
+            return 1
         base = int(getattr(config, "VOICE_SILENCE_MS", 800))
         if not getattr(config, "VOICE_ADAPTIVE_SILENCE", True):
             return base
@@ -531,6 +548,7 @@ class VadSegmenter:
         self._current_chunk_is_speech = is_speech
 
         if is_speech:
+            self._smart_turn_mode = None
             self._silence_ms = 0.0
             if not self._speaking:
                 self._speaking = True
@@ -561,11 +579,13 @@ class VadSegmenter:
                 self._partial_transcript = ""
                 self._partial_transcript_sample_index = None
                 self._last_speech_sample_index = None
+                self._smart_turn_mode = None
                 if self._speech_ms >= MIN_SEGMENT_MS:
                     return SegmentEvent(
                         audio=segment,
                         duration_ms=total_ms,
                         last_speech_sample_index=last_speech_sample_index,
+                        silence_ms=self._silence_ms,
                     )
                 return None
 

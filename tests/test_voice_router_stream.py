@@ -933,12 +933,13 @@ def test_websocket_bargein_stops_playback_cancels_old_turn_and_accepts_followup(
     [
         ("Licht aus", "Licht aus.", False, False),
         ("Licht aus", "Das Licht ist an.", False, False),
+        ("Mantis, das Licht aus", "das Licht aus.", False, False),
         ("Schalte das Licht aus", "Ich schalte das Licht an.", True, True),
         ("Schalte das Licht an", "Ich schalte das Licht aus.", True, True),
         ("Stopp, mach lieber das Licht aus", "Die Lampe bleibt an.", True, True),
     ],
     ids=[
-        "tts-echo", "room-speech", "opposite-command-aus", "opposite-command-an",
+        "tts-echo", "room-speech", "tts-echo-prefixed", "opposite-command-aus", "opposite-command-an",
         "addressed-interruption",
     ],
 )
@@ -954,8 +955,12 @@ def test_bargein_segment_requires_non_echo_and_address_check(
     second_audio_end_sent = asyncio.Event()
     second_turn_finished = asyncio.Event()
     second_address_check_finished = asyncio.Event()
+    unexpected_tool_started = asyncio.Event()
     address_checks = []
-    expect_address_check = not (transcript == "Licht aus" and reply == "Licht aus.")
+    prefixed_echo = transcript == "Mantis, das Licht aus" and reply == "das Licht aus."
+    expect_address_check = not (
+        (transcript == "Licht aus" and reply == "Licht aus.") or prefixed_echo
+    )
 
     class FakeSession:
         def __init__(self, **kwargs):
@@ -969,7 +974,12 @@ def test_bargein_segment_requires_non_echo_and_address_check(
                 await self.callbacks["on_bargein"](time.monotonic())
                 return None
             if chunk == b"final":
-                return {"text": transcript, "stt_ms": 1.0, "bargein": True}
+                result = {"text": transcript, "stt_ms": 1.0, "bargein": True}
+                if prefixed_echo:
+                    result.update(
+                        raw_text="das Licht aus", wakeword_triggered=True,
+                    )
+                return result
             return None
 
         async def close(self):
@@ -1014,6 +1024,9 @@ def test_bargein_segment_requires_non_echo_and_address_check(
                 return {"text": json.dumps({
                     "type": "playback_stopped", "turn_id": stop["turn_id"],
                 })}
+            if prefixed_echo and not forwarded and self.receive_index == 6:
+                await asyncio.sleep(0.05)
+                return {"type": "websocket.disconnect"}
             if forwarded and self.receive_index == 6:
                 await asyncio.wait_for(second_audio_end_sent.wait(), timeout=1)
                 chunks = [item for item in self.sent if item.get("type") == "audio_chunk"]
@@ -1038,6 +1051,8 @@ def test_bargein_segment_requires_non_echo_and_address_check(
             if execution_gate is not None and not await execution_gate():
                 raise asyncio.CancelledError
             self.calls.append(text)
+            if len(self.calls) > 1:
+                unexpected_tool_started.set()
             if len(self.calls) == 1:
                 return reply, []
             return "Befehl ausgeführt.", []
@@ -1079,9 +1094,11 @@ def test_bargein_segment_requires_non_echo_and_address_check(
     assert orchestrator.calls == (
         ["Mantis, sag etwas.", transcript] if forwarded else ["Mantis, sag etwas."]
     )
-    if transcript == "Licht aus" and reply == "Licht aus.":
+    if (transcript == "Licht aus" and reply == "Licht aus.") or prefixed_echo:
         assert [text for text, _context in address_checks] == ["Mantis, sag etwas."]
-    else:
+    if prefixed_echo:
+        assert not unexpected_tool_started.is_set()
+    elif not (transcript == "Licht aus" and reply == "Licht aus."):
         assert address_checks[-1] == (transcript, reply)
 
 
@@ -2084,6 +2101,35 @@ def test_voice_latency_event_contains_phase_timings(monkeypatch):
     assert detail["llm_calls"][0]["output_tokens"] == 9
 
 
+def test_voice_latency_event_includes_smart_turn_decision_fields(monkeypatch):
+    logged = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            return "Hallo.", []
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+    asyncio.run(sende_streaming_antwort(
+        FakeWebSocket(), "Hi", FakeOrchestrator(),
+        address_metrics={
+            "turn_model_p": 0.91,
+            "turn_model_ms": 13.4,
+            "turn_decision": "model_complete",
+            "silence_used_ms": 288,
+        },
+    ))
+
+    detail = logged[0][2]
+    assert detail["turn_model_p"] == 0.91
+    assert detail["turn_model_ms"] == 13.4
+    assert detail["turn_decision"] == "model_complete"
+    assert detail["silence_used_ms"] == 288
+
+
 def test_voice_latency_records_partial_reuse_and_saved_context_time(monkeypatch):
     from core.voice_prework import VoiceTurnPrework
 
@@ -2465,7 +2511,8 @@ def test_incomplete_voice_segment_is_processed_without_continuation_timer(monkey
     import web.routers.voice as voice_router
 
     text = "Mantis erinnere mich an"
-    responses = {text: ("Worauf soll ich dich erinnern?", [])}
+    addressed_text = "Mantis, erinnere mich an"
+    responses = {addressed_text: ("Worauf soll ich dich erinnern?", [])}
     orchestrator, handler, agent, persisted = _make_real_voice_orchestrator(
         monkeypatch, responses,
     )
@@ -2505,14 +2552,14 @@ def test_incomplete_voice_segment_is_processed_without_continuation_timer(monkey
 
     audio_responses = [item for item in websocket.sent if "audio_b64" in item]
     assert len(audio_responses) == 1
-    assert audio_responses[0]["text"] == text
+    assert audio_responses[0]["text"] == addressed_text
     assert audio_responses[0]["audio_b64"] == base64.b64encode(b"voice-test-audio").decode()
-    assert [call["text"] for call in agent.calls] == [text]
+    assert [call["text"] for call in agent.calls] == [addressed_text]
     assert [(turn.role, turn.content) for turn in handler.kzg.get_turns()] == [
-        ("user", text), ("assistant", "Worauf soll ich dich erinnern?"),
+        ("user", addressed_text), ("assistant", "Worauf soll ich dich erinnern?"),
     ]
     assert [(role, content) for role, content, _channel, _meta in persisted] == [
-        ("user", text), ("assistant", "Worauf soll ich dich erinnern?"),
+        ("user", addressed_text), ("assistant", "Worauf soll ich dich erinnern?"),
     ]
 
 
@@ -2524,7 +2571,8 @@ def test_incomplete_voice_phrase_spans_1800ms_pause_in_one_real_segment(monkeypa
 
     incomplete = "Mantis erinnere mich an"
     complete = "Mantis erinnere mich an den Müll morgen früh"
-    responses = {complete: ("Ich erinnere dich morgen früh.", [{"tool": "set_reminder"}])}
+    addressed_complete = "Mantis, erinnere mich an den Müll morgen früh"
+    responses = {addressed_complete: ("Ich erinnere dich morgen früh.", [{"tool": "set_reminder"}])}
     orchestrator, handler, agent, persisted = _make_real_voice_orchestrator(
         monkeypatch, responses,
     )
@@ -2582,17 +2630,17 @@ def test_incomplete_voice_phrase_spans_1800ms_pause_in_one_real_segment(monkeypa
     audio_responses = [item for item in websocket.sent if "audio_b64" in item]
     assert len(final_segments) == 1
     assert len(agent.calls) == 1
-    assert agent.calls[0]["text"] == complete
+    assert agent.calls[0]["text"] == addressed_complete
     assert "set_reminder" in agent.calls[0]["tools"]
     assert agent.calls[0]["force"] is True
     assert len(audio_responses) == 1
-    assert audio_responses[0]["text"] == complete
+    assert audio_responses[0]["text"] == addressed_complete
     assert audio_responses[0]["audio_b64"] == base64.b64encode(b"voice-test-audio").decode()
     assert [(turn.role, turn.content) for turn in handler.kzg.get_turns()] == [
-        ("user", complete), ("assistant", "Ich erinnere dich morgen früh."),
+        ("user", addressed_complete), ("assistant", "Ich erinnere dich morgen früh."),
     ]
     assert [(role, content) for role, content, _channel, _meta in persisted] == [
-        ("user", complete), ("assistant", "Ich erinnere dich morgen früh."),
+        ("user", addressed_complete), ("assistant", "Ich erinnere dich morgen früh."),
     ]
 
 
