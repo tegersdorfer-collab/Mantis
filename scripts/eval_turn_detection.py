@@ -96,7 +96,13 @@ def _load_capture(wav_path: Path) -> tuple[bytes, dict]:
     return audio, metadata
 
 
-def _partial_text_at(metadata: dict, sample_index: int, audio: bytes) -> str:
+def _partial_text_at(
+    metadata: dict,
+    sample_index: int,
+    audio: bytes,
+    *,
+    allow_untimed_partial: bool = False,
+) -> str:
     offset_ms = max(0, sample_index) * 1000 / SAMPLE_RATE
     partials = metadata.get("partial_transcripts") or []
     eligible = [
@@ -104,8 +110,11 @@ def _partial_text_at(metadata: dict, sample_index: int, audio: bytes) -> str:
         if float(item.get("offset_ms", 0)) <= offset_ms
     ]
     if eligible:
-        return str(eligible[-1].get("text") or "")
-    return str(metadata.get("partial_text") or metadata.get("transcript") or "")
+        latest = max(eligible, key=lambda item: float(item.get("offset_ms", 0)))
+        return str(latest.get("text") or "")
+    if allow_untimed_partial:
+        return str(metadata.get("partial_text") or "")
+    return ""
 
 
 def _model_decision(probability: float) -> str:
@@ -151,7 +160,9 @@ async def evaluate_directory(
         audio_samples = len(audio) // 2
         speech_end = int(metadata.get("last_speech_sample_index") or audio_samples)
         speech_end = min(audio_samples, max(0, speech_end))
-        terminal_text = _partial_text_at(metadata, speech_end, audio)
+        terminal_text = _partial_text_at(
+            metadata, speech_end, audio, allow_untimed_partial=True,
+        )
         capture_name = wav_path.stem
         for silence_ms in SILENCE_CANDIDATES_MS:
             rows.append(await _evaluate_checkpoint(

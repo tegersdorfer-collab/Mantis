@@ -18,7 +18,7 @@ from core.voice_segments import record_voice_segment
 from core.voice_text import normalize_wakeword_transcript
 
 SAMPLE_RATE = 16000
-WAKEWORD_SAFETY_MARGIN_MS = 100
+WAKEWORD_SAFETY_MARGIN_MS = 150
 
 # Silero VAD's ONNX export requires exactly 512 samples (32ms @ 16kHz) per
 # speech_probability() call. openWakeWord's documented standard chunk size is
@@ -70,12 +70,17 @@ def crop_wakeword_audio(
     segment_start_sample: int,
     wakeword_hit_sample: int | None,
 ) -> tuple[bytes, int]:
-    """Schneidet ab 100 ms vor dem Treffer; ohne Treffer bleibt Audio unverändert."""
+    """Schneidet konservativ vor dem ersten Trefferframe; ohne Treffer bleibt Audio."""
     segment_start = max(0, int(segment_start_sample))
     if wakeword_hit_sample is None:
         return bytes(pcm_audio), segment_start
     safety_samples = int(SAMPLE_RATE * WAKEWORD_SAFETY_MARGIN_MS / 1000)
-    crop_start = max(segment_start, int(wakeword_hit_sample) - safety_samples)
+    offset_ms = float(getattr(config, "VOICE_WAKE_CROP_OFFSET_MS", 0))
+    offset_samples = int(SAMPLE_RATE * offset_ms / 1000)
+    crop_start = max(
+        segment_start,
+        int(wakeword_hit_sample) + offset_samples - safety_samples,
+    )
     offset_samples = crop_start - segment_start
     return bytes(pcm_audio[offset_samples * 2:]), crop_start
 
@@ -144,6 +149,7 @@ class VoiceStreamSession:
         self._partial_runs = 0
         self._partial_skip_reasons = {reason: 0 for reason in PARTIAL_SKIP_REASONS}
         self._partial_text = ""
+        self._partial_raw_text = ""
         self._partial_heuristic_text = ""
         self._partial_wakeword_hint = False
         self._partial_transcripts: list[dict] = []
@@ -190,6 +196,7 @@ class VoiceStreamSession:
         self._partial_runs = 0
         self._partial_skip_reasons = {reason: 0 for reason in PARTIAL_SKIP_REASONS}
         self._partial_text = ""
+        self._partial_raw_text = ""
         self._partial_heuristic_text = ""
         self._partial_wakeword_hint = False
         self._partial_transcripts = []
@@ -214,7 +221,16 @@ class VoiceStreamSession:
             self._wakeword_samples_processed += len(frame) // 2
             detected = bool(self._wakeword.check(frame))
             if detected and not self._wakeword_detected:
-                self._wakeword_hits.append(self._wakeword_samples_processed)
+                hit_sample = getattr(
+                    self._wakeword, "first_positive_frame_end_sample", None,
+                )
+                try:
+                    hit_sample = int(hit_sample)
+                except (TypeError, ValueError):
+                    hit_sample = self._wakeword_samples_processed
+                if not 0 <= hit_sample <= self._wakeword_samples_processed:
+                    hit_sample = self._wakeword_samples_processed
+                self._wakeword_hits.append(hit_sample)
             self._wakeword_detected = detected
 
         result = None
@@ -321,6 +337,7 @@ class VoiceStreamSession:
                 )
             )
             text = None
+            raw_text = ""
             partial_as_final = False
             if partial_covers_speech:
                 self._finalizing = True
@@ -347,24 +364,27 @@ class VoiceStreamSession:
                     from core.voice import has_voice_wakeword_hint
 
                     wakeword_hint = has_voice_wakeword_hint(str(raw_text or ""))
+                raw_text = str(raw_text or "").strip()
                 text = normalize_wakeword_transcript(
-                    str(raw_text or ""), wakeword_triggered=wake_fired,
+                    raw_text, wakeword_triggered=wake_fired,
                 )
             elif partial_as_final:
+                raw_text = str(self._partial_raw_text or text or "").strip()
                 from core.voice import has_voice_wakeword_hint
 
                 wakeword_hint = bool(
                     self._partial_wakeword_hint
-                    or has_voice_wakeword_hint(str(text or ""))
+                    or has_voice_wakeword_hint(raw_text)
                 )
                 text = normalize_wakeword_transcript(
-                    str(text or ""), wakeword_triggered=wake_fired,
+                    raw_text, wakeword_triggered=wake_fired,
                 )
             partial_text = self._partial_text or partial_text
             stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
             partial_transcripts = list(self._partial_transcripts)
             result = {
                 "text": text,
+                "raw_text": raw_text,
                 "addressed": True,
                 "wakeword_triggered": wake_fired,
                 "wakeword_hint": bool(wakeword_hint),
@@ -526,13 +546,20 @@ class VoiceStreamSession:
             return
         if self._smart_turn_task is not None and not self._smart_turn_task.done():
             return
-        if self._turn_decision in {"model_complete", "heuristic", "fallback"}:
+        if self._turn_decision in {"model_complete", "fallback"}:
+            return
+        if self._turn_decision == "heuristic" and self._turn_model_p is not None:
             return
         if (
             self._turn_decision == "model_incomplete"
             and self._next_smart_turn_check_ms is not None
             and silence_ms < self._next_smart_turn_check_ms
         ):
+            return
+        if getattr(self._smart_turn, "ready", None) is False:
+            self._turn_decision = "heuristic"
+            self._next_smart_turn_check_ms = None
+            self._set_smart_turn_mode("heuristic")
             return
         audio = getattr(self._segmenter, "current_audio", b"")
         if not isinstance(audio, (bytes, bytearray)) or not audio:
@@ -721,6 +748,7 @@ class VoiceStreamSession:
             getattr(self._segmenter, "is_speaking", None) is True or self._finalizing
         ):
             self._partial_text = text
+            self._partial_raw_text = raw_text
             self._partial_heuristic_text = raw_text
             self._partial_wakeword_hint = bool(wakeword_hint)
             self._partial_transcripts.append({

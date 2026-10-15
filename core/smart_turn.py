@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -50,6 +51,7 @@ class SmartTurnAnalyzer:
         self._output_name: str | None = None
         self._closed = False
         self._load_error: Exception | None = None
+        self._ready = False
 
     async def predict(self, pcm_audio: bytes) -> SmartTurnPrediction:
         """Führt die Vorhersage außerhalb des Event-Loops aus."""
@@ -61,11 +63,22 @@ class SmartTurnAnalyzer:
         )
 
     async def warmup(self) -> None:
-        """Lädt das Modell im Worker vor dem ersten stillen Turn-Check."""
+        """Lädt Feature-Extractor und Modell und führt eine Dummy-Inferenz aus."""
         if self._closed:
             raise RuntimeError("SmartTurnAnalyzer ist geschlossen")
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._executor, self._get_runtime)
+        await loop.run_in_executor(self._executor, self._warmup_sync)
+
+    @property
+    def ready(self) -> bool:
+        """True, sobald Runtime, Features und eine erste Modell-Inferenz bereit sind."""
+        return self._ready
+
+    def _warmup_sync(self) -> None:
+        if self._ready:
+            return
+        dummy_audio = np.full(WINDOW_SAMPLES, 512, dtype="<i2").tobytes()
+        self._predict_sync(dummy_audio)
 
     def _predict_sync(self, pcm_audio: bytes) -> SmartTurnPrediction:
         session, extractor, input_name, output_name = self._get_runtime()
@@ -75,7 +88,13 @@ class SmartTurnAnalyzer:
         if len(samples) < WINDOW_SAMPLES:
             samples = np.pad(samples, (WINDOW_SAMPLES - len(samples), 0))
         features = extractor(
-            samples, sampling_rate=SAMPLE_RATE, return_tensors="np",
+            samples,
+            sampling_rate=SAMPLE_RATE,
+            return_tensors="np",
+            padding="max_length",
+            max_length=WINDOW_SAMPLES,
+            truncation=True,
+            do_normalize=True,
         )["input_features"]
         features = np.asarray(features, dtype=np.float32)
         if features.shape != (1, 80, 800):
@@ -88,6 +107,7 @@ class SmartTurnAnalyzer:
             raise ValueError(
                 f"Smart-Turn-Modell lieferte keine Wahrscheinlichkeit: {probability}"
             )
+        self._ready = True
         elapsed_ms = (time.perf_counter() - started) * 1000
         return SmartTurnPrediction(probability, round(elapsed_ms, 1))
 
@@ -113,12 +133,15 @@ class SmartTurnAnalyzer:
                         f"Smart-Turn-Modell nicht gefunden: {self.model_path}"
                     )
 
-                import onnxruntime as ort
+                factory = self._session_factory or _create_onnx_session
+                if self._session_factory is None:
+                    import onnxruntime as ort
 
-                options = ort.SessionOptions()
+                    options = ort.SessionOptions()
+                else:
+                    options = SimpleNamespace()
                 options.intra_op_num_threads = 2
                 options.inter_op_num_threads = 1
-                factory = self._session_factory or _create_onnx_session
                 session = factory(
                     str(self.model_path),
                     sess_options=options,
@@ -180,6 +203,32 @@ def get_smart_turn_analyzer() -> SmartTurnAnalyzer:
         if _default_analyzer is None:
             _default_analyzer = SmartTurnAnalyzer()
         return _default_analyzer
+
+
+async def preload_smart_turn(after_task: asyncio.Task | None = None) -> None:
+    """Lädt Smart Turn vor; optional erst nach einem anderen lokalen Modell-Preload."""
+    if not getattr(config, "VOICE_SMART_TURN", True):
+        return
+    if after_task is not None:
+        await asyncio.gather(after_task, return_exceptions=True)
+    analyzer = get_smart_turn_analyzer()
+    try:
+        await analyzer.warmup()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        warn_unavailable_once(exc, analyzer.model_path)
+
+
+def schedule_smart_turn_preload(
+    after_task: asyncio.Task | None = None,
+) -> asyncio.Task | None:
+    """Plant das Modell-Laden im Hintergrund ein, sofern Smart Turn aktiviert ist."""
+    if not getattr(config, "VOICE_SMART_TURN", True):
+        return None
+    return asyncio.create_task(
+        preload_smart_turn(after_task), name="smart-turn-preload",
+    )
 
 
 def warn_unavailable_once(error: Exception, model_path: str | Path | None = None) -> None:

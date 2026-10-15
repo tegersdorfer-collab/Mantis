@@ -33,6 +33,7 @@ from core.voice import (
 )
 from core import fast_commands
 from core.voice_prework import VoicePreworkCache
+from core.voice_text import normalize_wakeword_transcript
 from core.voice_stream import (
     VoiceStreamSession, partial_stt_executor_available, transcribe_pcm_partial,
 )
@@ -1269,12 +1270,12 @@ def build_router(orch=None) -> APIRouter:
 
         async def process_voice_result(result: dict) -> None:
             nonlocal active_playback, active_response_task
-            text = str(result.get("text") or "").strip()
+            raw_text = str(result.get("raw_text") or result.get("text") or "").strip()
             # Echo-Texte stammen vom Empfangszeitpunkt (Einreihen), nicht von der
             # Abarbeitung: langsame Adress-Checks davor dürfen das Fenster nicht schließen.
             echo_texts = list(result.pop("_echo_texts", ()))
             echo_texts.extend(_recent_tts_echo_texts(time.monotonic()))
-            if _is_recent_tts_echo(text, echo_texts):
+            if _is_recent_tts_echo(raw_text, echo_texts):
                 log.debug("Voice-Transkript als Echo der letzten TTS-Blöcke verworfen")
                 if prework_cache is not None:
                     prework_cache.clear()
@@ -1285,7 +1286,7 @@ def build_router(orch=None) -> APIRouter:
             await _cancel_pending_address_tasks()
 
             conversation_context = conversation_window.address_context()
-            command = fast_commands.match_voice(text)
+            command = fast_commands.match_voice(raw_text)
             is_local_reflex = command is not None and command.tool == "voice_reflex"
             playback_or_window_active = (
                 active_playback is not None and active_playback.playback_active
@@ -1299,8 +1300,12 @@ def build_router(orch=None) -> APIRouter:
             result["address_check_mode"] = address_mode
             result["address_check_ms"] = None
             wakeword_hint = bool(
-                result.get("wakeword_hint") or has_voice_wakeword_hint(text)
+                result.get("wakeword_hint") or has_voice_wakeword_hint(raw_text)
             )
+            text = normalize_wakeword_transcript(
+                raw_text, wakeword_triggered=wakeword_triggered,
+            )
+            result["text"] = text
 
             address_decision: asyncio.Future | None = None
             execution_gate = None
@@ -1340,7 +1345,7 @@ def build_router(orch=None) -> APIRouter:
                     address_kwargs["conversation_context"] = conversation_context
                 if wakeword_hint:
                     address_kwargs["wakeword_hint"] = True
-                return await is_addressed_to_mantis(text, **address_kwargs)
+                return await is_addressed_to_mantis(raw_text, **address_kwargs)
 
             if address_mode == "window" and command is not None and command.label == "stopp":
                 if active_playback is not None and active_playback.playback_active:

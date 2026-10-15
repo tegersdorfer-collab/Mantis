@@ -933,12 +933,13 @@ def test_websocket_bargein_stops_playback_cancels_old_turn_and_accepts_followup(
     [
         ("Licht aus", "Licht aus.", False, False),
         ("Licht aus", "Das Licht ist an.", False, False),
+        ("Mantis, das Licht aus", "das Licht aus.", False, False),
         ("Schalte das Licht aus", "Ich schalte das Licht an.", True, True),
         ("Schalte das Licht an", "Ich schalte das Licht aus.", True, True),
         ("Stopp, mach lieber das Licht aus", "Die Lampe bleibt an.", True, True),
     ],
     ids=[
-        "tts-echo", "room-speech", "opposite-command-aus", "opposite-command-an",
+        "tts-echo", "room-speech", "tts-echo-prefixed", "opposite-command-aus", "opposite-command-an",
         "addressed-interruption",
     ],
 )
@@ -954,8 +955,12 @@ def test_bargein_segment_requires_non_echo_and_address_check(
     second_audio_end_sent = asyncio.Event()
     second_turn_finished = asyncio.Event()
     second_address_check_finished = asyncio.Event()
+    unexpected_tool_started = asyncio.Event()
     address_checks = []
-    expect_address_check = not (transcript == "Licht aus" and reply == "Licht aus.")
+    prefixed_echo = transcript == "Mantis, das Licht aus" and reply == "das Licht aus."
+    expect_address_check = not (
+        (transcript == "Licht aus" and reply == "Licht aus.") or prefixed_echo
+    )
 
     class FakeSession:
         def __init__(self, **kwargs):
@@ -969,7 +974,12 @@ def test_bargein_segment_requires_non_echo_and_address_check(
                 await self.callbacks["on_bargein"](time.monotonic())
                 return None
             if chunk == b"final":
-                return {"text": transcript, "stt_ms": 1.0, "bargein": True}
+                result = {"text": transcript, "stt_ms": 1.0, "bargein": True}
+                if prefixed_echo:
+                    result.update(
+                        raw_text="das Licht aus", wakeword_triggered=True,
+                    )
+                return result
             return None
 
         async def close(self):
@@ -1014,6 +1024,9 @@ def test_bargein_segment_requires_non_echo_and_address_check(
                 return {"text": json.dumps({
                     "type": "playback_stopped", "turn_id": stop["turn_id"],
                 })}
+            if prefixed_echo and not forwarded and self.receive_index == 6:
+                await asyncio.sleep(0.05)
+                return {"type": "websocket.disconnect"}
             if forwarded and self.receive_index == 6:
                 await asyncio.wait_for(second_audio_end_sent.wait(), timeout=1)
                 chunks = [item for item in self.sent if item.get("type") == "audio_chunk"]
@@ -1038,6 +1051,8 @@ def test_bargein_segment_requires_non_echo_and_address_check(
             if execution_gate is not None and not await execution_gate():
                 raise asyncio.CancelledError
             self.calls.append(text)
+            if len(self.calls) > 1:
+                unexpected_tool_started.set()
             if len(self.calls) == 1:
                 return reply, []
             return "Befehl ausgeführt.", []
@@ -1079,9 +1094,11 @@ def test_bargein_segment_requires_non_echo_and_address_check(
     assert orchestrator.calls == (
         ["Mantis, sag etwas.", transcript] if forwarded else ["Mantis, sag etwas."]
     )
-    if transcript == "Licht aus" and reply == "Licht aus.":
+    if (transcript == "Licht aus" and reply == "Licht aus.") or prefixed_echo:
         assert [text for text, _context in address_checks] == ["Mantis, sag etwas."]
-    else:
+    if prefixed_echo:
+        assert not unexpected_tool_started.is_set()
+    elif not (transcript == "Licht aus" and reply == "Licht aus."):
         assert address_checks[-1] == (transcript, reply)
 
 

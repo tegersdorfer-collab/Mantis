@@ -99,7 +99,11 @@ def _smart_turn_session(analyzer, monkeypatch, *, transcript="mach das Licht an"
 
 @pytest.mark.parametrize(
     ("probabilities", "expected_decision", "max_silence_ms", "min_checks"),
-    [([0.9], "model_complete", 400, 1), ([0.1] * 8, "model_incomplete", 2048, 5)],
+    [
+        ([0.9], "model_complete", 400, 1),
+        ([0.6], "model_complete", 400, 1),
+        ([0.1] * 8, "model_incomplete", 2048, 5),
+    ],
 )
 def test_smart_turn_scores_choose_fast_end_or_recheck_until_slow_limit(
     monkeypatch, probabilities, expected_decision, max_silence_ms, min_checks,
@@ -224,7 +228,227 @@ def test_smart_turn_model_is_warmed_in_background_when_speech_starts(monkeypatch
     assert asyncio.run(run()) is True
 
 
-def test_wakeword_audio_crop_starts_one_hundred_ms_before_the_hit():
+def test_unready_smart_turn_uses_heuristic_without_waiting_for_prediction(monkeypatch):
+    import config
+    import core.voice_stream as voice_stream
+    from core.vad import VadSegmenter
+
+    class FakeVAD:
+        def speech_probability(self, frame):
+            return 1.0 if frame != b"\0" * len(frame) else 0.0
+
+    class ColdAnalyzer:
+        ready = False
+
+        def __init__(self):
+            self.predictions = 0
+            self.release = asyncio.Event()
+
+        async def warmup(self):
+            await self.release.wait()
+
+        async def predict(self, _audio):
+            self.predictions += 1
+            raise AssertionError("Vor Bereitschaft darf predict nicht starten")
+
+    monkeypatch.setattr(config, "VOICE_SMART_TURN", True, raising=False)
+    monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800, raising=False)
+    monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", False, raising=False)
+    monkeypatch.setattr(
+        voice_stream, "transcribe_pcm",
+        AsyncMock(return_value=("Mach das Licht an", False)),
+    )
+    analyzer = ColdAnalyzer()
+    session = VoiceStreamSession(
+        vad_segmenter=VadSegmenter(FakeVAD(), chunk_ms=32),
+        wakeword_detector=MagicMock(),
+        conversation_active_fn=lambda: True,
+        partial_interval_ms=0,
+        partial_executor_available=lambda: False,
+        smart_turn_analyzer=analyzer,
+    )
+    speech = b"\x10\x00" * 512
+    silence = b"\0\0" * 512
+
+    async def run():
+        for _ in range(12):
+            await session.handle_chunk(speech, muted=False)
+        result = None
+        for _ in range(30):
+            result = await session.handle_chunk(silence, muted=False)
+            if result is not None:
+                break
+            await asyncio.sleep(0)
+        await session.close()
+        return result
+
+    result = asyncio.run(run())
+
+    assert result is not None
+    assert result["turn_decision"] == "heuristic"
+    assert analyzer.predictions == 0
+
+
+def test_smart_turn_can_start_after_warmup_finishes_mid_segment(monkeypatch):
+    from core.smart_turn import SmartTurnPrediction
+
+    class WarmingAnalyzer:
+        def __init__(self):
+            self.ready = False
+            self.release = asyncio.Event()
+            self.predictions = 0
+
+        async def warmup(self):
+            await self.release.wait()
+            self.ready = True
+
+        async def predict(self, _audio):
+            self.predictions += 1
+            return SmartTurnPrediction(0.9, 1.0)
+
+    analyzer = WarmingAnalyzer()
+    session, _segmenter = _smart_turn_session(analyzer, monkeypatch)
+    speech = b"\x10\x00" * 512
+    silence = b"\0\0" * 512
+
+    async def run():
+        for _ in range(12):
+            await session.handle_chunk(speech, muted=False)
+        for _ in range(10):
+            await session.handle_chunk(silence, muted=False)
+            await asyncio.sleep(0)
+        assert analyzer.predictions == 0
+        analyzer.release.set()
+        await asyncio.sleep(0)
+        await session.handle_chunk(silence, muted=False)
+        await asyncio.sleep(0)
+        result = await session.handle_chunk(silence, muted=False)
+        await session.close()
+        return result
+
+    result = asyncio.run(run())
+
+    assert result is not None
+    assert result["turn_decision"] == "model_complete"
+    assert analyzer.predictions == 1
+
+
+def test_resumed_speech_cancels_a_running_smart_turn_check(monkeypatch):
+    from core.smart_turn import SmartTurnPrediction
+    from core.vad import VadSegmenter
+
+    class FakeVAD:
+        def speech_probability(self, frame):
+            return 1.0 if frame != b"\0" * len(frame) else 0.0
+
+    class BlockingAnalyzer:
+        ready = True
+
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def predict(self, _audio):
+            self.started.set()
+            await self.release.wait()
+            return SmartTurnPrediction(0.9, 1.0)
+
+    analyzer = BlockingAnalyzer()
+    segmenter = VadSegmenter(FakeVAD(), chunk_ms=32)
+    session, _ = _smart_turn_session(analyzer, monkeypatch)
+    session._segmenter = segmenter
+    speech = b"\x10\x00" * 512
+    silence = b"\0\0" * 512
+
+    async def run():
+        for _ in range(12):
+            await session.handle_chunk(speech, muted=False)
+        for _ in range(20):
+            await session.handle_chunk(silence, muted=False)
+            if analyzer.started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert analyzer.started.is_set()
+        resumed_result = await session.handle_chunk(speech, muted=False)
+        analyzer.release.set()
+        await asyncio.sleep(0)
+        silence_result = await session.handle_chunk(silence, muted=False)
+        await session.close()
+        return resumed_result, silence_result, segmenter.is_speaking
+
+    resumed_result, silence_result, is_speaking = asyncio.run(run())
+
+    assert resumed_result is None
+    assert silence_result is None
+    assert is_speaking is True
+
+
+def test_debounced_wakeword_crop_uses_first_positive_frame_end(monkeypatch):
+    import struct
+    import config
+    import core.voice_stream as voice_stream
+    from core.vad import SegmentEvent
+
+    class DebouncedWakeword:
+        def __init__(self):
+            self.calls = 0
+            self.first_positive_frame_end_sample = None
+            self.hit_frame_end_sample = None
+
+        def check(self, _frame):
+            self.calls += 1
+            if self.calls == 10:
+                self.first_positive_frame_end_sample = 12_800  # 800 ms
+            if self.calls == 12:
+                self.hit_frame_end_sample = 15_360  # 960 ms after debounce
+                return True
+            return False
+
+    class Segmenter:
+        is_speaking = False
+        current_chunk_is_speech = False
+        current_silence_ms = 800
+
+        def __init__(self):
+            self.audio = bytearray()
+
+        def process_chunk(self, frame):
+            self.audio.extend(frame)
+            if len(self.audio) == 60 * 512 * 2:
+                return SegmentEvent(
+                    audio=bytes(self.audio), duration_ms=2720,
+                    last_speech_sample_index=20_000, silence_ms=800,
+                )
+            return None
+
+    audio = struct.pack("<30720h", *range(30_720))
+    wakeword = DebouncedWakeword()
+    captured = []
+
+    async def transcribe(pcm):
+        captured.append(pcm)
+        return "Mach das Licht an", False
+
+    session = VoiceStreamSession(
+        vad_segmenter=Segmenter(),
+        wakeword_detector=wakeword,
+        conversation_active_fn=lambda: False,
+        partial_interval_ms=0,
+        partial_executor_available=lambda: False,
+    )
+    monkeypatch.setattr(config, "VOICE_WAKE_CROP_OFFSET_MS", 0, raising=False)
+    monkeypatch.setattr(voice_stream, "transcribe_pcm", transcribe)
+
+    result = asyncio.run(session.handle_chunk(audio, muted=False))
+
+    assert wakeword.first_positive_frame_end_sample == 12_800
+    assert wakeword.hit_frame_end_sample == 15_360
+    assert result is not None and result["wakeword_triggered"] is True
+    assert result["wakeword_position_ms"] == 800
+    assert struct.unpack("<h", captured[0][:2])[0] == 10_400
+
+
+def test_wakeword_audio_crop_keeps_a_conservative_preroll():
     from core.voice_stream import crop_wakeword_audio
 
     samples = list(range(5000))
@@ -237,8 +461,8 @@ def test_wakeword_audio_crop_starts_one_hundred_ms_before_the_hit():
         audio, segment_start_sample=500, wakeword_hit_sample=None,
     )
 
-    assert absolute_start == 1400
-    assert __import__("struct").unpack("<h", cropped[:2])[0] == 900
+    assert absolute_start == 600
+    assert __import__("struct").unpack("<h", cropped[:2])[0] == 100
     assert unchanged == audio
     assert unchanged_start == 500
 
@@ -327,7 +551,7 @@ def test_partial_transcription_uses_wakeword_crop_and_safe_prefix(
     partial_text, heuristic_text = asyncio.run(run())
 
     if wakeword_hit:
-        assert partial_audio == [segment_audio[4752:]]
+        assert partial_audio == [segment_audio[3152:]]
         assert partial_text == "Mantis, bitte mach das Licht an"
         assert heuristic_text == "Mentis, bitte mach das Licht an"
     else:
@@ -495,7 +719,7 @@ def test_final_transcription_uses_wakeword_crop_and_only_prefixes_with_acoustic_
     result = asyncio.run(session.handle_chunk(vad_frame(), muted=False))
 
     if wakeword_hit:
-        assert transcribed_audio == [segment_audio[5776:]]
+        assert transcribed_audio == [segment_audio[4176:]]
         assert result["text"] == "Mantis, wie spät ist es?"
     else:
         assert transcribed_audio == [segment_audio]

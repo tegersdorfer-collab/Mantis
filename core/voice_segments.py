@@ -52,6 +52,9 @@ def record_voice_segment(
         "channels": 1,
         "sample_width_bytes": 2,
     }
+    json_bytes = json.dumps(
+        payload, ensure_ascii=False, indent=2,
+    ).encode("utf-8")
     limit = int(
         getattr(config, "VOICE_RECORD_MAX_FILES", 300)
         if max_files is None else max_files
@@ -60,11 +63,13 @@ def record_voice_segment(
         raise ValueError("VOICE_RECORD_MAX_FILES muss WAV- und JSON-Datei erlauben")
     with _RECORD_LOCK:
         daily_dir.mkdir(parents=True, exist_ok=True)
-        _write_atomic(wav_path, wav_buffer.getvalue())
-        _write_atomic(
-            json_path,
-            json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
-        )
+        try:
+            _write_atomic(wav_path, wav_buffer.getvalue())
+            _write_atomic(json_path, json_bytes)
+        except Exception:
+            wav_path.unlink(missing_ok=True)
+            json_path.unlink(missing_ok=True)
+            raise
         _trim_recordings(root, limit)
     return wav_path, json_path
 
@@ -79,8 +84,17 @@ def _write_atomic(path: Path, content: bytes) -> None:
 
 
 def _trim_recordings(root: Path, maximum_files: int) -> None:
-    manifests = sorted(root.rglob("*.json"))
-    maximum_pairs = maximum_files // 2
-    for old_manifest in manifests[:-maximum_pairs]:
-        old_manifest.with_suffix(".wav").unlink(missing_ok=True)
-        old_manifest.unlink(missing_ok=True)
+    recordings: dict[Path, list[Path]] = {}
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix in {".wav", ".json"}:
+            recordings.setdefault(path.with_suffix(""), []).append(path)
+
+    file_count = sum(len(paths) for paths in recordings.values())
+    if file_count <= maximum_files:
+        return
+    for _stem, paths in sorted(recordings.items(), key=lambda item: str(item[0])):
+        if file_count <= maximum_files:
+            break
+        for path in paths:
+            path.unlink(missing_ok=True)
+            file_count -= 1
