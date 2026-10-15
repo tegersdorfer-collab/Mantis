@@ -24,6 +24,8 @@ from domains.inbox import service as inbox_service
 from domains.inbox.capture import CaptureDecision, classify_capture
 from domains.inbox.query import is_inbox_request
 from domains.inbox.vision import SUPPORTED_IMAGE_TYPES
+from core.voice_prework import VoiceTurnPrework
+from core.voice_text import partial_text_matches_final
 import config
 
 log = logging.getLogger(__name__)
@@ -90,6 +92,30 @@ _INBOX_DELETE_REPLY = re.compile(
     re.IGNORECASE,
 )
 _INBOX_DELETE_CONFIRMATION_TTL = 5 * 60
+
+
+def _keyword_tool_selection(text: str) -> tuple[list[str], bool]:
+    """Schnelle lokale Vorauswahl; löst keine Cloud-Klassifikation aus."""
+    try:
+        names = skills.T.select_tools(text)
+        force = bool(names) and (
+            skills.T.is_action(text)
+            or any(
+                skills.T.REGISTRY[name].category == "inbox"
+                for name in names if name in skills.T.REGISTRY
+            )
+        )
+        return names, force
+    except Exception as exc:
+        log.warning("Keyword-Tool-Auswahl fehlgeschlagen (%s)", type(exc).__name__)
+        return [], False
+
+
+def _same_normalized_transcript(left: str, right: str) -> bool:
+    return (
+        partial_text_matches_final(left, right)
+        and partial_text_matches_final(right, left)
+    )
 
 
 @dataclass(frozen=True)
@@ -646,9 +672,22 @@ class MessageHandler:
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
 
+    async def prepare_voice_turn(self, text: str) -> VoiceTurnPrework:
+        """Baut Voice-Kontext und lokale Tool-Vorauswahl ohne Cloud-Klassifikation."""
+        started = time.perf_counter()
+        keyword_tools, force_tools = _keyword_tool_selection(text)
+        system = await self.prompt_builder.build(text)
+        return VoiceTurnPrework(
+            text=text,
+            system=system,
+            keyword_tools=tuple(keyword_tools),
+            force_tools=force_tools,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+
     async def dashboard_respond(
         self, text: str, stream_cb=None, agent=None, channel_name: str = "web",
-        resume_idle_cb=None,
+        resume_idle_cb=None, prework: VoiceTurnPrework | None = None,
     ) -> tuple[str, list]:
         self._begin_user_turn()
         self._start_turn()
@@ -660,7 +699,8 @@ class MessageHandler:
                 return "", []
 
             response, trace = await self._agent_turn(text, channel_name=channel_name,
-                                                     stream_cb=stream_cb, agent=agent)
+                                                     stream_cb=stream_cb, agent=agent,
+                                                     prework=prework)
             self._finish_turn(text, response, trace, channel_name=channel_name, agent=agent)
             return response, trace
         finally:
@@ -670,11 +710,16 @@ class MessageHandler:
 
     async def _agent_turn(self, text: str, channel_name: str,
                           stream_cb=None, agent=None,
-                          inbox_context: InboxTurnContext | None = None) -> tuple[str, list]:
+                          inbox_context: InboxTurnContext | None = None,
+                          prework: VoiceTurnPrework | None = None) -> tuple[str, list]:
         """Prompt bauen, Tools wählen, Agent laufen lassen — mit Fehler-Fallback."""
         voice_turn = channel_name == "voice" and agent is not None
         agent = agent or self.agent
         max_tokens = config.VOICE_MAX_TOKENS if voice_turn else 4000
+        prework_matches = bool(
+            voice_turn and prework is not None
+            and partial_text_matches_final(prework.text, text)
+        )
 
         if inbox_context is not None:
             tool_name = _inbox_tool_for(text)
@@ -752,24 +797,18 @@ class MessageHandler:
         # während der Prompt gebaut wird, statt hinterherzuhängen.
         async def _timed_build():
             with voice_timing.phase("context_ms"):
+                if prework_matches:
+                    voice_timing.mark_partial_reused(prework.elapsed_ms)
+                    return prework.system
                 return await self.prompt_builder.build(text)
 
         def _keyword_selection():
-            try:
-                names = skills.T.select_tools(text)
-                force = bool(names) and (
-                    skills.T.is_action(text)
-                    or any(
-                        skills.T.REGISTRY[name].category == "inbox"
-                        for name in names if name in skills.T.REGISTRY
-                    )
-                )
-                return names, force
-            except Exception as exc:
-                log.warning(
-                    "Keyword-Tool-Auswahl fehlgeschlagen (%s)", type(exc).__name__,
-                )
-                return [], False
+            if prework_matches and _same_normalized_transcript(prework.text, text):
+                return list(prework.keyword_tools), prework.force_tools
+            # Tool-Freigaben für geänderte Teiltexte werden immer aus dem finalen
+            # Transkript neu berechnet. Die asynchrone Klassifikation darunter
+            # erhält ebenfalls ausschließlich den finalen Text.
+            return _keyword_tool_selection(text)
 
         async def _timed_select():
             with voice_timing.phase("tool_select_ms"):

@@ -22,6 +22,7 @@ from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 import config
 from core import db, tts, voice_fillers, voice_timing
 from core.voice import transcribe_audio, is_addressed_to_mantis, mark_conversation_active, _conversation_active
+from core.voice_prework import VoicePreworkCache
 from core.voice_stream import VoiceStreamSession
 from core.stream_events import StreamEvent
 from core.tts import _first_early_stream_boundary, synthesize, synthesize_stream
@@ -47,6 +48,7 @@ def _record_voice_latency(
     address_check_ms: float | None = None,
     first_token_ms: float | None = None,
     first_tts_block_ms: float | None = None,
+    first_answer_audio_ms: float | None = None,
     filler: str | None = None,
     filler_ms: float | None = None,
 ) -> dict:
@@ -56,6 +58,7 @@ def _record_voice_latency(
         "address_check_ms": address_check_ms,
         "first_token_ms": first_token_ms,
         "first_tts_block_ms": first_tts_block_ms,
+        "first_answer_audio_ms": first_answer_audio_ms,
         "filler": filler,
         "filler_ms": filler_ms,
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
@@ -73,7 +76,14 @@ def _mark_reflex(trace) -> None:
         voice_timing.mark_reflex()
 
 
-async def sende_antwort(websocket, text: str, reply: str | None, audio_streaming: bool) -> None:
+async def sende_antwort(
+    websocket,
+    text: str,
+    reply: str | None,
+    audio_streaming: bool,
+    *,
+    started_at: float | None = None,
+) -> float | None:
     """Schickt die Antwort — als Tonblöcke (audio_streaming) oder als ein audio_b64.
 
     Blockweise beginnt die Wiedergabe nach dem ersten Satz statt nach der ganzen
@@ -81,6 +91,9 @@ async def sende_antwort(websocket, text: str, reply: str | None, audio_streaming
     stummgeschaltet, bis audio_end kommt — deshalb MUSS audio_end auch im
     Fehlerfall gesendet werden, sonst bleibt er dauerhaft stumm.
     """
+    if started_at is None:
+        started_at = time.perf_counter()
+    first_answer_audio_ms = None
     if not (audio_streaming and reply):
         audio_b64 = None
         if reply is not None:
@@ -90,10 +103,11 @@ async def sende_antwort(websocket, text: str, reply: str | None, audio_streaming
                 log.error(f"TTS für Voice-Antwort fehlgeschlagen: {e}")
                 ogg = b""
             if ogg:
+                first_answer_audio_ms = round((time.perf_counter() - started_at) * 1000, 1)
                 audio_b64 = base64.b64encode(ogg).decode("ascii")
         await websocket.send_json(
             {"text": text, "addressed": True, "reply": reply, "audio_b64": audio_b64})
-        return
+        return first_answer_audio_ms
 
     await websocket.send_json({
         "text": text, "addressed": True, "reply": reply,
@@ -113,12 +127,15 @@ async def sende_antwort(websocket, text: str, reply: str | None, audio_streaming
         except Exception as e:
             log.error(f"TTS-Streaming fehlgeschlagen: {e}")
             break
+        if ogg and first_answer_audio_ms is None:
+            first_answer_audio_ms = round((time.perf_counter() - started_at) * 1000, 1)
         await websocket.send_json({
             "type": "audio_chunk", "seq": seq,
             "b64": base64.b64encode(ogg).decode("ascii"),
         })
         seq += 1
     await websocket.send_json({"type": "audio_end", "count": seq})
+    return first_answer_audio_ms
 
 
 def _sentence_complete(text: str) -> bool:
@@ -137,6 +154,9 @@ async def sende_streaming_antwort(
     stt_ms: float | None = None,
     address_check_ms: float | None = None,
     started_at: float | None = None,
+    prework=None,
+    partial_runs: int = 0,
+    partial_as_final: bool = False,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> str | None:
     """Leitet fertige Antwortsätze parallel zur laufenden Cloud-Antwort an TTS."""
@@ -144,6 +164,7 @@ async def sende_streaming_antwort(
         started_at = time.perf_counter()
     first_token_ms = None
     first_tts_block_ms = None
+    first_answer_audio_ms = None
     filler_kind: str | None = None
     filler_ms: float | None = None
     pending_filler = None
@@ -180,10 +201,12 @@ async def sende_streaming_antwort(
         pending_filler = selected
         state_changed.set()
 
-    async def send_audio_chunk(audio: bytes) -> None:
-        nonlocal sequence, first_tts_block_ms
+    async def send_audio_chunk(audio: bytes, *, answer: bool = False) -> None:
+        nonlocal sequence, first_tts_block_ms, first_answer_audio_ms
         if first_tts_block_ms is None:
             first_tts_block_ms = round((time.perf_counter() - started_at) * 1000, 1)
+        if answer and first_answer_audio_ms is None:
+            first_answer_audio_ms = round((time.perf_counter() - started_at) * 1000, 1)
         await websocket.send_json({
             "type": "audio_chunk",
             "seq": sequence,
@@ -268,7 +291,12 @@ async def sende_streaming_antwort(
 
     async def produce_response() -> None:
         try:
-            reply, trace = await orch.voice_respond(text, stream_cb=on_update)
+            if prework is None:
+                reply, trace = await orch.voice_respond(text, stream_cb=on_update)
+            else:
+                reply, trace = await orch.voice_respond(
+                    text, stream_cb=on_update, prework=prework,
+                )
             _mark_reflex(trace)
             reply = reply or ""
             response.append((reply or None, None))
@@ -365,7 +393,7 @@ async def sende_streaming_antwort(
                     pending_audio = audio
                     has_pending_audio = True
                 else:
-                    await send_audio_chunk(audio)
+                    await send_audio_chunk(audio, answer=True)
                 continue
 
             if response_finished and ack_done:
@@ -392,6 +420,9 @@ async def sende_streaming_antwort(
 
     timing_token = voice_timing.start()
     turn_state, turn_token = tts._start_tts_turn()
+    timing = voice_timing.current()
+    timing.partial_runs = max(0, int(partial_runs))
+    timing.partial_as_final = bool(partial_as_final)
     if getattr(config, "VOICE_FILLERS_ENABLED", True):
         ack_task = asyncio.create_task(send_ack_after_delay(), name="voice-filler-ack-delay")
     responder = asyncio.create_task(produce_response())
@@ -440,6 +471,7 @@ async def sende_streaming_antwort(
                     address_check_ms=address_check_ms,
                     first_token_ms=first_token_ms,
                     first_tts_block_ms=first_tts_block_ms,
+                    first_answer_audio_ms=first_answer_audio_ms,
                     filler=filler_kind,
                     filler_ms=filler_ms,
                 )
@@ -463,6 +495,7 @@ def build_router(orch=None) -> APIRouter:
         stt_ms = None
         address_check_ms = None
         first_tts_block_ms = None
+        first_answer_audio_ms = None
         reply = None
         audio_b64 = None
         timing_token = None
@@ -493,6 +526,7 @@ def build_router(orch=None) -> APIRouter:
                     log.error(f"TTS für Voice-Antwort fehlgeschlagen: {e}")
                     ogg = b""
                 if ogg:
+                    first_answer_audio_ms = round((time.perf_counter() - started_at) * 1000, 1)
                     audio_b64 = base64.b64encode(ogg).decode("ascii")
                     first_tts_block_ms = round((time.perf_counter() - started_at) * 1000, 1)
         finally:
@@ -501,6 +535,7 @@ def build_router(orch=None) -> APIRouter:
                     orch, started_at, stt_ms=stt_ms,
                     address_check_ms=address_check_ms,
                     first_tts_block_ms=first_tts_block_ms,
+                    first_answer_audio_ms=first_answer_audio_ms,
                 )
             finally:
                 if timing_token is not None:
@@ -528,10 +563,16 @@ def build_router(orch=None) -> APIRouter:
         from core.wakeword import WakeWordDetector
         wakeword_path = Path(__file__).parent.parent.parent / "data" / "wakeword" / "mantis.onnx"
         wakeword_detector = WakeWordDetector(wakeword_path)
+        prepare_voice_turn = getattr(orch, "prepare_voice_turn", None)
+        prework_cache = (
+            VoicePreworkCache(prepare_voice_turn)
+            if callable(prepare_voice_turn) else None
+        )
         session = VoiceStreamSession(
             vad_segmenter=segmenter,
             wakeword_detector=wakeword_detector,
             conversation_active_fn=_conversation_active,
+            on_partial=prework_cache.offer if prework_cache is not None else None,
         )
 
         muted = False
@@ -561,12 +602,18 @@ def build_router(orch=None) -> APIRouter:
                     continue
 
                 text = result["text"]
+                prework = prework_cache.take_for(text) if prework_cache is not None else None
+                if prework_cache is not None:
+                    prework_cache.clear()
                 if audio_streaming and orch is not None:
                     try:
                         await sende_streaming_antwort(
                             websocket, text, orch,
                             stt_ms=result.get("stt_ms"),
                             started_at=result.get("turn_started_at"),
+                            prework=prework,
+                            partial_runs=result.get("partial_runs", 0),
+                            partial_as_final=result.get("partial_as_final", False),
                         )
                         mark_conversation_active()
                     except (WebSocketDisconnect, RuntimeError) as e:
@@ -576,15 +623,24 @@ def build_router(orch=None) -> APIRouter:
 
                 started_at = result.get("turn_started_at", time.perf_counter())
                 first_tts_block_ms = None
+                first_answer_audio_ms = None
                 reply = None
                 timing_token = None
                 try:
                     if orch is not None:
                         timing_token = voice_timing.start()
-                        reply, trace = await orch.voice_respond(text)
+                        timing = voice_timing.current()
+                        timing.partial_runs = max(0, int(result.get("partial_runs", 0)))
+                        timing.partial_as_final = bool(result.get("partial_as_final", False))
+                        if prework is None:
+                            reply, trace = await orch.voice_respond(text)
+                        else:
+                            reply, trace = await orch.voice_respond(text, prework=prework)
                         _mark_reflex(trace)
                         mark_conversation_active()
-                    await sende_antwort(websocket, text, reply, audio_streaming)
+                    first_answer_audio_ms = await sende_antwort(
+                        websocket, text, reply, audio_streaming, started_at=started_at,
+                    )
                     first_tts_block_ms = (
                         round((time.perf_counter() - started_at) * 1000, 1)
                         if reply and not audio_streaming else None
@@ -600,6 +656,7 @@ def build_router(orch=None) -> APIRouter:
                         _record_voice_latency(
                             orch, started_at, stt_ms=result.get("stt_ms"),
                             first_tts_block_ms=first_tts_block_ms,
+                            first_answer_audio_ms=first_answer_audio_ms,
                         )
                     finally:
                         if timing_token is not None:
@@ -608,5 +665,11 @@ def build_router(orch=None) -> APIRouter:
             log.info("Voice-WebSocket-Verbindung geschlossen")
         except Exception as e:
             log.error(f"Voice-WebSocket-Handler abgebrochen: {e}")
+        finally:
+            try:
+                await session.close()
+            finally:
+                if prework_cache is not None:
+                    await prework_cache.close()
 
     return router

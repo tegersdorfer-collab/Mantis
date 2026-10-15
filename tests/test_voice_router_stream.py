@@ -190,6 +190,7 @@ def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkey
     assert logged[0][2]["address_check_ms"] == 8
     assert logged[0][2]["first_token_ms"] is not None
     assert logged[0][2]["first_tts_block_ms"] is not None
+    assert logged[0][2]["first_answer_audio_ms"] is not None
     assert logged[0][2]["total_ms"] >= logged[0][2]["first_tts_block_ms"]
     assert logged[0][2]["model"] == "openai/gpt-6-luna"
     assert logged[0][2]["stage"] == "Backend"
@@ -282,6 +283,7 @@ def test_ack_filler_is_suppressed_for_fallback_voice(monkeypatch):
     assert ws.gesendet[-2]["reply"] == "Das ist die Antwort."
     assert logged[0][2]["filler"] is None
     assert logged[0][2]["filler_ms"] is None
+    assert logged[0][2]["first_answer_audio_ms"] is not None
 
 
 def test_ack_filler_uses_preselected_main_voice_before_answer_audio(monkeypatch):
@@ -808,6 +810,90 @@ def test_voice_latency_event_contains_phase_timings(monkeypatch):
     assert detail["llm_calls"][0]["output_tokens"] == 9
 
 
+def test_voice_latency_records_partial_reuse_and_saved_context_time(monkeypatch):
+    from core.voice_prework import VoiceTurnPrework
+
+    logged = []
+    prework = VoiceTurnPrework(
+        text="Was steht heute an",
+        system="Vorgewärmter Kontext",
+        keyword_tools=("get_task",),
+        force_tools=False,
+        elapsed_ms=64.5,
+    )
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None, prework=None):
+            assert prework is not None
+            assert prework.system == "Vorgewärmter Kontext"
+            from core import voice_timing
+            voice_timing.mark_partial_reused(prework.elapsed_ms)
+            return "Die Termine.", []
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+
+    asyncio.run(sende_streaming_antwort(
+        FakeWebSocket(),
+        "Was steht heute an, bitte",
+        FakeOrchestrator(),
+        prework=prework,
+        partial_runs=2,
+        partial_as_final=True,
+    ))
+
+    detail = logged[0][2]
+    assert detail["partial_runs"] == 2
+    assert detail["partial_as_final"] is True
+    assert detail["partial_reused"] is True
+    assert detail["saved_ms"] == 64.5
+
+
+def test_voice_latency_does_not_claim_reflex_prework_was_reused(monkeypatch):
+    from core.voice_prework import VoiceTurnPrework
+
+    logged = []
+    prework = VoiceTurnPrework(
+        text="Wie spät ist es",
+        system="Vorbereiteter Kontext",
+        keyword_tools=(),
+        force_tools=False,
+        elapsed_ms=82.0,
+    )
+
+    class ReflexOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None, prework=None):
+            assert prework is not None
+            from core import voice_timing
+            voice_timing.mark_partial_reused(prework.elapsed_ms)
+            return "Es ist 09:07 Uhr.", [{"tool": "voice_reflex", "reflex": True}]
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield b"audio"
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
+
+    asyncio.run(sende_streaming_antwort(
+        FakeWebSocket(),
+        "Wie spät ist es?",
+        ReflexOrchestrator(),
+        prework=prework,
+        partial_runs=1,
+        partial_as_final=True,
+    ))
+
+    detail = logged[0][2]
+    assert detail["reflex"] is True
+    assert detail["partial_runs"] == 1
+    assert detail["partial_as_final"] is True
+    assert detail["partial_reused"] is False
+    assert detail["saved_ms"] == 0
+
+
 def test_streaming_voice_turn_resets_timing_context(monkeypatch):
     from core import voice_timing
 
@@ -865,6 +951,66 @@ def test_streaming_reflex_trace_sets_voice_latency_flag(monkeypatch):
 
     assert logged[0][2]["reflex"] is True
     assert voice_timing.current() is None
+
+
+def test_websocket_disconnect_closes_voice_session_and_partial_cache(monkeypatch):
+    import core.vad as vad
+    import core.wakeword as wakeword
+    import web.routers.voice as voice_router
+
+    sessions = []
+    caches = []
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            self.closed = False
+            sessions.append(self)
+
+        async def close(self):
+            self.closed = True
+
+        async def handle_chunk(self, *_args, **_kwargs):
+            return None
+
+    class FakeCache:
+        def __init__(self, _prepare):
+            self.closed = False
+            caches.append(self)
+
+        def offer(self, _text):
+            pass
+
+        def take_for(self, _text):
+            return None
+
+        def clear(self):
+            pass
+
+        async def close(self):
+            self.closed = True
+
+    class FakeWebSocket:
+        async def accept(self):
+            pass
+
+        async def receive(self):
+            return {"type": "websocket.disconnect"}
+
+    class FakeOrchestrator:
+        async def prepare_voice_turn(self, _text):
+            return None
+
+    monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
+    monkeypatch.setattr(voice_router, "VoicePreworkCache", FakeCache)
+    monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
+    monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
+
+    router = build_router(FakeOrchestrator())
+    endpoint = next(route.endpoint for route in router.routes if route.path == "/ws/voice/stream")
+    asyncio.run(endpoint(FakeWebSocket()))
+
+    assert len(sessions) == 1 and sessions[0].closed
+    assert len(caches) == 1 and caches[0].closed
 
 
 def test_reflex_turn_does_not_choose_filler_while_tts_is_slow(monkeypatch):

@@ -198,11 +198,15 @@ class Orchestrator:
             resume_idle_cb=self.idle_loop.resume,
         )
 
-    async def voice_respond(self, text: str, stream_cb=None) -> tuple[str, list]:
+    async def prepare_voice_turn(self, text: str):
+        """Bereitet Kontext und lokale Tool-Auswahl parallel zur Spracheingabe vor."""
+        return await self.msg_handler.prepare_voice_turn(text)
+
+    async def voice_respond(self, text: str, stream_cb=None, prework=None) -> tuple[str, list]:
         """Wie dashboard_respond, aber über die Voice-Variante der Cloud-Kette."""
         return await self.msg_handler.dashboard_respond(
             text, stream_cb, agent=self.voice_agent, channel_name="voice",
-            resume_idle_cb=self.idle_loop.resume,
+            resume_idle_cb=self.idle_loop.resume, prework=prework,
         )
 
     def lzg_embed(self, text: str) -> list[float]:
