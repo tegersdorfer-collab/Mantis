@@ -4,6 +4,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import struct
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import core.vad as vad
 
 
@@ -132,6 +134,16 @@ class TestVadSegmenter:
         assert len(emitted) == 1
         assert emitted[0].duration_ms >= 500
 
+    def test_segment_event_tracks_last_speech_sample_before_silence_padding(self):
+        probs = [0.1] * 2 + [0.9] * 10 + [0.1] * 25
+        seg = vad.VadSegmenter(FakeVAD(probs), chunk_ms=32)
+
+        emitted = [seg.process_chunk(silence_chunk()) for _ in probs]
+        segment = next(event for event in emitted if event is not None)
+
+        assert segment.last_speech_sample_index == 12 * 512
+        assert len(segment.audio) // 2 == 37 * 512
+
     def test_discards_segment_shorter_than_min_duration(self):
         # nur 200ms Sprache (< MIN_SEGMENT_MS=300) dann Stille
         probs = [0.9] * 2 + [0.1] * 9
@@ -139,3 +151,261 @@ class TestVadSegmenter:
         seg = vad.VadSegmenter(fake, chunk_ms=100)
         events = [seg.process_chunk(silence_chunk()) for _ in range(len(probs))]
         assert all(e is None for e in events)
+
+    def test_completed_german_utterances_use_fast_silence(self, monkeypatch):
+        import config
+        from core.vad import utterance_is_complete
+
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True)
+        monkeypatch.setattr(config, "VOICE_SILENCE_FAST_MS", 450)
+        monkeypatch.setattr(config, "VOICE_SILENCE_SLOW_MS", 1200)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800)
+        completed = [
+            "wie spät ist es",
+            "mach das Licht an",
+            "was steht heute an",
+            "Wie wird das Wetter morgen",
+            "spiel meine Lieblingsmusik",
+            "lies mir die Termine vor",
+            "wie war mein Schlaf",
+            "kannst du die Aufgabe abhaken",
+            "was gibt es heute zum Abendessen",
+            "stell den Timer auf zehn Minuten",
+        ]
+
+        assert all(utterance_is_complete(text) for text in completed)
+        seg = vad.VadSegmenter(FakeVAD([0.9] * 3 + [0.1] * 8), chunk_ms=100)
+        for _ in range(3):
+            seg.process_chunk(silence_chunk())
+        seg.set_partial_transcript("mach das Licht an")
+        events = [None] * 3 + [seg.process_chunk(silence_chunk()) for _ in range(8)]
+        emitted_at = next(i for i, event in enumerate(events) if event is not None) - 2
+        assert emitted_at == 5
+
+    def test_complete_but_stale_partial_keeps_standard_silence(self, monkeypatch):
+        import config
+
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True)
+        monkeypatch.setattr(config, "VOICE_SILENCE_FAST_MS", 450)
+        monkeypatch.setattr(config, "VOICE_SILENCE_SLOW_MS", 1200)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800)
+        monkeypatch.setattr(config, "VOICE_PARTIAL_STALE_MS", 400, raising=False)
+        seg = vad.VadSegmenter(FakeVAD([0.9] * 16 + [0.1] * 25), chunk_ms=32)
+        for _ in range(16):
+            seg.process_chunk(silence_chunk())
+        seg.set_partial_transcript("mach das Licht an", audio_end_sample_index=0)
+
+        events = [seg.process_chunk(silence_chunk()) for _ in range(25)]
+        emitted_at = next(i for i, event in enumerate(events) if event is not None) + 1
+
+        assert emitted_at == 25
+
+    def test_unfinished_german_utterances_use_slow_silence(self, monkeypatch):
+        import config
+        from core.vad import utterance_is_complete
+
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True)
+        monkeypatch.setattr(config, "VOICE_SILENCE_FAST_MS", 450)
+        monkeypatch.setattr(config, "VOICE_SILENCE_SLOW_MS", 1200)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800)
+        unfinished = [
+            "erinner mich an",
+            "kannst du mir und",
+            "ich wollte fragen ob",
+            "wenn ich morgen Zeit habe",
+            "weil ich heute",
+            "stell den Timer auf",
+            "ich muss noch",
+            "kannst du vielleicht",
+            "das neue",
+            "und danach",
+            "ähm also",
+        ]
+
+        assert not any(utterance_is_complete(text) for text in unfinished)
+        seg = vad.VadSegmenter(FakeVAD([0.9] * 3 + [0.1] * 13), chunk_ms=100)
+        seg.set_partial_transcript("ich wollte fragen ob")
+        events = [seg.process_chunk(silence_chunk()) for _ in range(16)]
+        emitted_at = next(i for i, event in enumerate(events) if event is not None) - 2
+        assert emitted_at == 12
+
+    def test_no_partial_text_keeps_800ms_and_adaptive_setting_can_be_disabled(self, monkeypatch):
+        import config
+
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800)
+        no_partial = vad.VadSegmenter(FakeVAD([0.9] * 3 + [0.1] * 9), chunk_ms=100)
+        events = [no_partial.process_chunk(silence_chunk()) for _ in range(12)]
+        assert next(i for i, event in enumerate(events) if event is not None) - 2 == 8
+
+        monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", False)
+        monkeypatch.setattr(config, "VOICE_SILENCE_MS", 300)
+        disabled = vad.VadSegmenter(FakeVAD([0.9] * 3 + [0.1] * 4), chunk_ms=100)
+        disabled.set_partial_transcript("mach das Licht an")
+        events = [disabled.process_chunk(silence_chunk()) for _ in range(7)]
+        assert next(i for i, event in enumerate(events) if event is not None) - 2 == 3
+
+
+def test_utterance_completion_is_conservative_for_openings_and_fragments():
+    from core.vad import utterance_is_complete
+
+    unfinished = [
+        "ich würde gerne",
+        "kannst du",
+        "Mantis kannst du",
+        "ich möchte",
+        "wie viel",
+        "was ist mit",
+    ]
+
+    assert [text for text in unfinished if utterance_is_complete(text)] == []
+
+
+def test_utterance_completion_accepts_explicitly_finished_patterns():
+    from core.vad import utterance_is_complete
+
+    completed = [
+        "Wie spät ist es?",
+        "Was steht heute an?",
+        "Wie wird das Wetter morgen?",
+        "Mach das Licht an",
+        "Schalte den Ventilator aus",
+        "Stell den Timer auf zehn Minuten",
+        "Kannst du die Aufgabe abhaken",
+        "Ich möchte die Aufgabe abhaken",
+        "Stopp",
+        "Danke",
+        "Pause",
+        "Weiter",
+        "Lauter",
+        "Leiser",
+    ]
+
+    assert [text for text in completed if not utterance_is_complete(text)] == []
+
+
+@pytest.mark.parametrize(("text", "expected_state"), [
+    ("Wie spät ist es?", "COMPLETE"),
+    ("Was steht heute an?", "COMPLETE"),
+    ("Wie wird das Wetter morgen?", "COMPLETE"),
+    ("Mach das Licht an", "COMPLETE"),
+    ("Mach die Musik an", "COMPLETE"),
+    ("Schalte das Licht aus", "COMPLETE"),
+    ("Schalte das Licht ein", "COMPLETE"),
+    ("Schalte den Ventilator ein", "COMPLETE"),
+    ("Stell den Timer ein", "COMPLETE"),
+    ("Erinner mich an ein", "INCOMPLETE"),
+    ("Gib mir ein", "INCOMPLETE"),
+    ("Stell den Timer auf ein", "INCOMPLETE"),
+    ("Hol mir aus der Küche ein", "INCOMPLETE"),
+    ("Lies mir heute ein", "INCOMPLETE"),
+    ("Kauf mir ein", "INCOMPLETE"),
+    ("Schalte den Fernseher um ein", "INCOMPLETE"),
+    ("Schalte das Licht und ein", "INCOMPLETE"),
+    ("Stell den Wecker bis ein", "INCOMPLETE"),
+    ("Stell dem Kunden ein", "INCOMPLETE"),
+    ("Stell der Kundin ein", "INCOMPLETE"),
+    ("Stell einen Timer ein", "COMPLETE"),
+    ("Schalte unsere Lampen ein", "COMPLETE"),
+    ("Schalte diesen Ventilator ein", "COMPLETE"),
+    ("Mach das Licht ab", "COMPLETE"),
+    ("Mach die Musik lauter", "COMPLETE"),
+    ("Lies mal die Nachrichten vor", "COMPLETE"),
+    ("Schalte den Ventilator aus", "COMPLETE"),
+    ("Stell den Timer auf zehn Minuten", "COMPLETE"),
+    ("Kannst du die Aufgabe abhaken", "COMPLETE"),
+    ("Ich möchte die Aufgabe abhaken", "COMPLETE"),
+    ("Lies mir die Termine vor", "COMPLETE"),
+    ("Spiele meine Lieblingsmusik", "COMPLETE"),
+    ("Mantis läuft", "COMPLETE"),
+    ("Was kostet der Kaffee?", "COMPLETE"),
+    ("Danke", "COMPLETE"),
+    ("Pause", "COMPLETE"),
+    ("Stopp", "COMPLETE"),
+    ("Weiter", "COMPLETE"),
+    ("Lauter", "COMPLETE"),
+    ("Leiser", "COMPLETE"),
+    ("spiel meine Lieblingsmusik", "COMPLETE"),
+    ("wie war mein Schlaf", "COMPLETE"),
+    ("was gibt es heute zum Abendessen", "COMPLETE"),
+    ("Mach den Branch Merge", "INCOMPLETE"),
+    ("Schalte das Licht", "INCOMPLETE"),
+    ("Mach das Licht", "INCOMPLETE"),
+    ("Dreh die Musik", "INCOMPLETE"),
+    ("Mach mal", "INCOMPLETE"),
+    ("Lies mal", "INCOMPLETE"),
+    ("Mach mal kurz", "INCOMPLETE"),
+    ("Mach Licht", "UNKNOWN"),
+    ("Wie geht es dir", "COMPLETE"),
+    ("Was meinst du", "COMPLETE"),
+    ("Wer bist du", "COMPLETE"),
+    ("Was ist das", "COMPLETE"),
+    ("Danke dir", "UNKNOWN"),
+    ("Kannst du mir helfen", "COMPLETE"),
+    ("Ich würde gerne", "INCOMPLETE"),
+    ("Kannst du", "INCOMPLETE"),
+    ("Mantis kannst du", "INCOMPLETE"),
+    ("Ich möchte", "INCOMPLETE"),
+    ("Wie viel", "INCOMPLETE"),
+    ("Was ist mit", "INCOMPLETE"),
+    ("Wie kann ich am besten", "INCOMPLETE"),
+    ("Was ist der beste", "INCOMPLETE"),
+    ("Erinner mich an", "INCOMPLETE"),
+    ("Kannst du mir und", "INCOMPLETE"),
+    ("Ich wollte fragen ob", "INCOMPLETE"),
+    ("Wenn ich morgen Zeit habe", "INCOMPLETE"),
+    ("Weil ich heute", "INCOMPLETE"),
+    ("Stell den Timer auf", "INCOMPLETE"),
+    ("Ich muss noch", "INCOMPLETE"),
+    ("Kannst du vielleicht", "INCOMPLETE"),
+    ("Kannst du den Branch", "INCOMPLETE"),
+    ("Das neue", "INCOMPLETE"),
+    ("Und danach", "INCOMPLETE"),
+    ("Ähm also", "INCOMPLETE"),
+    ("Wie ist das Wetter in", "INCOMPLETE"),
+    ("Was steht heute an und", "INCOMPLETE"),
+    ("Spiele Musik von", "INCOMPLETE"),
+    ("Spiele die Musik des", "INCOMPLETE"),
+    ("Spiele Musik also", "INCOMPLETE"),
+    ("Erzähl mir etwas über", "INCOMPLETE"),
+    ("Ich brauche einen", "INCOMPLETE"),
+    ("Ich bin", "INCOMPLETE"),
+    ("Ich habe", "INCOMPLETE"),
+    ("Guten Morgen", "UNKNOWN"),
+    ("Alles klar", "UNKNOWN"),
+    ("Okay", "UNKNOWN"),
+    ("Wie bitte?", "UNKNOWN"),
+    ("Ja", "UNKNOWN"),
+    ("Ja, genau", "UNKNOWN"),
+    ("Mhm", "UNKNOWN"),
+    ("Aha", "UNKNOWN"),
+    ("Interessant", "UNKNOWN"),
+    ("Kaffee mit Milch", "UNKNOWN"),
+    ("Die aktuelle Version", "UNKNOWN"),
+    ("Der Branch ist sauber", "UNKNOWN"),
+    ("Das klingt gut", "UNKNOWN"),
+    ("Du bist nett", "UNKNOWN"),
+    ("Der Branch ist online", "UNKNOWN"),
+])
+def test_german_utterances_use_complete_incomplete_and_unknown_silence_classes(
+    monkeypatch, text, expected_state,
+):
+    import config
+
+    monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True)
+    monkeypatch.setattr(config, "VOICE_SILENCE_FAST_MS", 450)
+    monkeypatch.setattr(config, "VOICE_SILENCE_SLOW_MS", 1200)
+    monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800)
+    segmenter = vad.VadSegmenter(FakeVAD([]), chunk_ms=100)
+    segmenter.set_partial_transcript(text, audio_end_sample_index=0)
+    segmenter._last_speech_sample_index = 0
+
+    expected_silence_ms = {
+        "COMPLETE": 450,
+        "INCOMPLETE": 1200,
+        "UNKNOWN": 800,
+    }[expected_state]
+
+    assert vad.classify_utterance(text).value == expected_state
+    assert vad.utterance_is_complete(text) is (expected_state == "COMPLETE")
+    assert segmenter._silence_threshold_ms() == expected_silence_ms

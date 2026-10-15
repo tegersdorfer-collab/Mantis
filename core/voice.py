@@ -28,7 +28,7 @@ import time
 import wave
 
 import config
-from core import decisions, fast, fast_commands
+from core import decisions, fast, fast_commands, stt_runtime
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,50 @@ VOICE_ADDRESS_TIMEOUT_S = 3.0
 _conversation_active_until = 0.0
 
 
+def _audio_duration_seconds(audio_path: str) -> float:
+    """Liest die Dauer einer WAV-Datei, ohne ihren Audioinhalt einzulesen."""
+    try:
+        with wave.open(str(audio_path), "rb") as audio_file:
+            sample_rate = audio_file.getframerate()
+            if sample_rate > 0:
+                return audio_file.getnframes() / sample_rate
+    except (OSError, EOFError, wave.Error):
+        pass
+    return 0.0
+
+
+def _record_stt_runtime(audio_path: str, started_at: float) -> None:
+    elapsed_ms = max(0.0, (time.perf_counter() - started_at) * 1000)
+    stt_runtime.record_stt_runtime(_audio_duration_seconds(audio_path), elapsed_ms)
+
+
+async def _await_worker_completion(awaitable):
+    """Hält den STT-Lock, bis ein nativer Worker-Thread wirklich fertig ist.
+
+    Das Abbrechen eines asyncio-Awaiters beendet einen bereits laufenden Thread
+    nicht. Der Thread-Future bleibt deshalb abgeschirmt und wird vor dem
+    Weiterreichen der Cancellation abgewartet.
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Ein weiterer cancel() darf den Lock nicht freigeben, solange
+                # der nicht abbrechbare Native-Worker noch auf dem Modell läuft.
+                continue
+            except BaseException:
+                break
+        try:
+            task.result()
+        except BaseException:
+            pass
+        raise
+
+
 def mark_conversation_active() -> None:
     """Vom Voice-Router nach jeder erfolgreichen Mantis-Antwort aufzurufen."""
     global _conversation_active_until
@@ -85,6 +129,30 @@ async def transcribe_audio(audio_path: str) -> str:
         log.warning("Parakeet nicht verfügbar – ab jetzt whisper.cpp")
 
     return _normalize_voice_transcript(await _transcribe_whisper(audio_path))
+
+
+def partial_stt_executor_available() -> bool:
+    """Teil-STT darf nur starten, wenn weder finaler noch anderer STT-Lauf aktiv ist."""
+    return not _whisper_lock.locked()
+
+
+async def transcribe_audio_partial(audio_path: str) -> str | None:
+    """Nicht-blockierender Teil-STT-Versuch; bei belegtem STT-Pfad wird er verworfen."""
+    global _parakeet_unavailable
+    if _whisper_lock.locked():
+        return None
+
+    await _whisper_lock.acquire()
+    try:
+        engine = getattr(config, "STT_ENGINE", "parakeet")
+        if engine == "parakeet" and not _parakeet_unavailable:
+            text = await _transcribe_parakeet(audio_path)
+            if not _parakeet_unavailable:
+                return _normalize_voice_transcript(text)
+        text = await _transcribe_whisper_locked(audio_path)
+        return _normalize_voice_transcript(text)
+    finally:
+        _whisper_lock.release()
 
 
 def _edit_distance_at_most_one(left: str, right: str) -> int:
@@ -149,7 +217,11 @@ def _warmup_parakeet(model) -> None:
             wav_file.setsampwidth(2)
             wav_file.setframerate(16_000)
             wav_file.writeframes(b"\0\0" * 16_000)
+        started_at = time.perf_counter()
         model.transcribe(wav_path)
+        stt_runtime.record_stt_runtime(
+            1.0, max(0.0, (time.perf_counter() - started_at) * 1000),
+        )
     finally:
         if wav_path is not None:
             Path(wav_path).unlink(missing_ok=True)
@@ -171,13 +243,13 @@ async def preload_parakeet() -> None:
         model_id = getattr(config, "STT_PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
         try:
             loop = asyncio.get_running_loop()
-            _parakeet_model = await loop.run_in_executor(
+            _parakeet_model = await _await_worker_completion(loop.run_in_executor(
                 _parakeet_executor, _load_parakeet_model, model_id,
-            )
+            ))
             try:
-                await loop.run_in_executor(
+                await _await_worker_completion(loop.run_in_executor(
                     _parakeet_executor, _warmup_parakeet, _parakeet_model,
-                )
+                ))
             except Exception as exc:
                 log.warning("Parakeet-Warmup fehlgeschlagen (%s)", type(exc).__name__)
             log.info("Parakeet-Modell im Hintergrund vorgeladen")
@@ -204,9 +276,9 @@ async def _transcribe_parakeet(audio_path: str) -> str:
         log.info(f"🔊 Lade Parakeet-Modell '{model_id}' …")
         try:
             loop = asyncio.get_running_loop()
-            _parakeet_model = await loop.run_in_executor(
+            _parakeet_model = await _await_worker_completion(loop.run_in_executor(
                 _parakeet_executor, _load_parakeet_model, model_id,
-            )
+            ))
         except ImportError:
             log.warning("parakeet-mlx nicht installiert")
             _parakeet_unavailable = True
@@ -219,7 +291,11 @@ async def _transcribe_parakeet(audio_path: str) -> str:
 
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(_parakeet_executor, _parakeet_model.transcribe, audio_path)
+        started_at = time.perf_counter()
+        result = await _await_worker_completion(
+            loop.run_in_executor(_parakeet_executor, _parakeet_model.transcribe, audio_path)
+        )
+        _record_stt_runtime(audio_path, started_at)
         return (result.text or "").strip()
     except Exception as e:
         # Laufzeitfehler (kaputte Datei o.ä.) — kein Grund, die Engine zu wechseln.
@@ -229,6 +305,12 @@ async def _transcribe_parakeet(audio_path: str) -> str:
 
 async def _transcribe_whisper(audio_path: str) -> str:
     """whisper.cpp medium — der Stand vor dem 22.09.2026, jetzt Fallback."""
+    async with _whisper_lock:
+        return await _transcribe_whisper_locked(audio_path)
+
+
+async def _transcribe_whisper_locked(audio_path: str) -> str:
+    """Whisper-Transkription bei bereits gehaltenem `_whisper_lock`."""
     global _whisper_model
     try:
         from pywhispercpp.model import Model
@@ -243,19 +325,22 @@ async def _transcribe_whisper(audio_path: str) -> str:
     # löst häufiger überlappende Segmente aus, die vorher selten gleichzeitig
     # eintrafen). Modell-Laden UND Transkription laufen daher beide unter
     # demselben Lock, nicht nur das Laden.
-    async with _whisper_lock:
-        if _whisper_model is None:
-            log.info("🔊 Lade whisper.cpp-Modell 'medium' …")
-            _whisper_model = await asyncio.to_thread(
-                Model, "medium", language="de", print_realtime=False, print_progress=False
-            )
+    if _whisper_model is None:
+        log.info("🔊 Lade whisper.cpp-Modell 'medium' …")
+        _whisper_model = await _await_worker_completion(asyncio.to_thread(
+            Model, "medium", language="de", print_realtime=False, print_progress=False,
+        ))
 
-        try:
-            segments = await asyncio.to_thread(_whisper_model.transcribe, audio_path)
-            return " ".join(s.text for s in segments).strip()
-        except Exception as e:
-            log.error(f"Whisper-Transkription fehlgeschlagen: {e}")
-            return ""
+    try:
+        started_at = time.perf_counter()
+        segments = await _await_worker_completion(
+            asyncio.to_thread(_whisper_model.transcribe, audio_path)
+        )
+        _record_stt_runtime(audio_path, started_at)
+        return " ".join(s.text for s in segments).strip()
+    except Exception as e:
+        log.error(f"Whisper-Transkription fehlgeschlagen: {e}")
+        return ""
 
 
 async def is_addressed_to_mantis(text: str) -> bool:

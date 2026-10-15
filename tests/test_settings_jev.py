@@ -51,3 +51,23 @@ def test_voice_silence_setting_defaults_to_800ms_and_requires_positive_value():
     assert s.VOICE_SILENCE_MS == 800
     with pytest.raises(ValidationError):
         MantisSettings(_env_file=None, VOICE_SILENCE_MS=0)
+
+
+def test_adaptive_voice_settings_have_expected_defaults_and_require_positive_intervals():
+    from pydantic import ValidationError
+    import pytest
+
+    s = MantisSettings(_env_file=None)
+
+    assert s.VOICE_ADAPTIVE_SILENCE is True
+    assert s.VOICE_SILENCE_FAST_MS == 450
+    assert s.VOICE_SILENCE_SLOW_MS == 1200
+    assert s.VOICE_PARTIAL_STT_MS == 700
+    assert s.VOICE_PARTIAL_MAX_MS == 600
+    assert s.VOICE_PARTIAL_STALE_MS == 400
+    with pytest.raises(ValidationError):
+        MantisSettings(_env_file=None, VOICE_PARTIAL_STT_MS=0)
+    with pytest.raises(ValidationError):
+        MantisSettings(_env_file=None, VOICE_PARTIAL_STALE_MS=0)
+    with pytest.raises(ValidationError):
+        MantisSettings(_env_file=None, VOICE_PARTIAL_MAX_MS=0)

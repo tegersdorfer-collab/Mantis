@@ -216,9 +216,15 @@ class TestTranscribeParakeet:
 
     def test_warmup_fehler_laesst_vorgeladenes_modell_verfuegbar(self, monkeypatch):
         from concurrent.futures import ThreadPoolExecutor
+        from core import stt_runtime
 
         monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
         monkeypatch.setattr(voice.config, "STT_PRELOAD", True, raising=False)
+        recorded_runtimes = []
+        monkeypatch.setattr(
+            stt_runtime, "record_stt_runtime",
+            lambda duration_s, elapsed_ms: recorded_runtimes.append((duration_s, elapsed_ms)),
+        )
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-parakeet")
         monkeypatch.setattr(voice, "_parakeet_executor", executor)
         model = MagicMock()
@@ -233,6 +239,7 @@ class TestTranscribeParakeet:
         assert voice._parakeet_model is model
         assert voice._parakeet_unavailable is False
         model.transcribe.assert_called_once()
+        assert recorded_runtimes == []
 
     def test_vorladen_ist_per_setting_abschaltbar(self, monkeypatch):
         monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
@@ -383,6 +390,101 @@ def test_voice_settings_default_to_short_answers_and_stt_preload(monkeypatch):
     assert settings.STT_PRELOAD is True
 
 
+def test_stt_runtime_estimate_learns_from_warmup_and_final_runs(monkeypatch, tmp_path):
+    import time
+    import wave
+    from collections import deque
+
+    from core import stt_runtime
+
+    monkeypatch.setattr(
+        stt_runtime, "_samples", deque(maxlen=stt_runtime._SAMPLE_WINDOW),
+    )
+    monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
+    monkeypatch.setattr(voice, "_parakeet_unavailable", False)
+
+    def timed_transcribe(_path):
+        time.sleep(0.02)
+        return MagicMock(text="Okay Mantis")
+
+    model = MagicMock()
+    model.transcribe.side_effect = timed_transcribe
+    monkeypatch.setattr(voice, "_parakeet_model", model)
+
+    voice._warmup_parakeet(model)
+
+    assert len(stt_runtime._samples) == 1
+    assert stt_runtime.estimate_stt_runtime_ms(1.0) < 550
+
+    audio_path = tmp_path / "one-second.wav"
+    with wave.open(str(audio_path), "wb") as audio_file:
+        audio_file.setnchannels(1)
+        audio_file.setsampwidth(2)
+        audio_file.setframerate(16_000)
+        audio_file.writeframes(b"\0\0" * 16_000)
+
+    assert asyncio.run(voice.transcribe_audio(str(audio_path))) == "Okay Mantis"
+
+    assert len(stt_runtime._samples) == 2
+    assert stt_runtime.estimate_stt_runtime_ms(1.0) < 550
+
+
+def test_failed_parakeet_inference_does_not_record_stt_runtime(monkeypatch):
+    recorded = []
+    model = MagicMock()
+    model.transcribe.side_effect = RuntimeError("Inference fehlgeschlagen")
+    monkeypatch.setattr(voice, "_parakeet_model", model)
+    monkeypatch.setattr(
+        voice, "_record_stt_runtime",
+        lambda audio_path, started_at: recorded.append((audio_path, started_at)),
+    )
+
+    assert asyncio.run(voice._transcribe_parakeet("/tmp/fake.wav")) == ""
+    assert recorded == []
+
+
+def test_cancelled_whisper_transcription_does_not_record_stt_runtime(monkeypatch):
+    import threading
+    import time
+    from types import ModuleType
+
+    from core import stt_runtime
+
+    package = ModuleType("pywhispercpp")
+    package.__path__ = []
+    model_module = ModuleType("pywhispercpp.model")
+    model_module.Model = object
+    monkeypatch.setitem(sys.modules, "pywhispercpp", package)
+    monkeypatch.setitem(sys.modules, "pywhispercpp.model", model_module)
+
+    started = threading.Event()
+
+    def transcribe(_audio_path):
+        started.set()
+        time.sleep(0.02)
+        return [MagicMock(text="fertig")]
+
+    model = MagicMock()
+    model.transcribe.side_effect = transcribe
+    monkeypatch.setattr(voice, "_whisper_model", model)
+    recorded = []
+    monkeypatch.setattr(
+        stt_runtime, "record_stt_runtime",
+        lambda duration_s, elapsed_ms: recorded.append((duration_s, elapsed_ms)),
+    )
+
+    async def cancel_after_transcription_starts():
+        task = asyncio.create_task(voice._transcribe_whisper("/tmp/fake.wav"))
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_after_transcription_starts())
+
+    assert recorded == []
+
+
 def test_whisper_voice_transcript_also_normalizes_the_initial_wake_word(monkeypatch):
     monkeypatch.setattr(voice.config, "STT_ENGINE", "whisper")
     monkeypatch.setattr(
@@ -470,6 +572,38 @@ class TestTranscribeAudio:
         with patch("builtins.__import__", side_effect=fake_import):
             text = asyncio.run(voice.transcribe_audio("/tmp/fake.wav"))
         assert text == ""
+
+
+class TestPartialTranscription:
+    def test_teil_stt_keine_wartezeit_wenn_finaler_executor_belegt_ist(self):
+        async def run():
+            await voice._whisper_lock.acquire()
+            try:
+                assert voice.partial_stt_executor_available() is False
+                return await asyncio.wait_for(
+                    voice.transcribe_audio_partial("/tmp/nicht-zu-oeffnen.wav"),
+                    timeout=0.05,
+                )
+            finally:
+                voice._whisper_lock.release()
+
+        assert asyncio.run(run()) is None
+
+    def test_teil_stt_nutzt_den_gemeinsamen_lock_und_normalisiert_text(self, monkeypatch):
+        monkeypatch.setattr(voice.config, "STT_ENGINE", "whisper")
+        calls = []
+
+        async def fake_whisper(path):
+            calls.append((path, voice._whisper_lock.locked()))
+            return "Bantas, los."
+
+        monkeypatch.setattr(voice, "_transcribe_whisper_locked", fake_whisper)
+
+        result = asyncio.run(voice.transcribe_audio_partial("/tmp/fake.wav"))
+
+        assert result == "Mantis, los."
+        assert calls == [("/tmp/fake.wav", True)]
+        assert voice.partial_stt_executor_available() is True
 
 
 class TestIsAddressedToMantis:
