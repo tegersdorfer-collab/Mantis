@@ -107,6 +107,19 @@ class FakeVAD:
 
 
 class TestVadSegmenter:
+    def test_tracks_current_speech_duration_and_energy_only_for_speech_frames(self):
+        seg = vad.VadSegmenter(FakeVAD([0.9, 0.9, 0.1]), chunk_ms=32)
+        leise = struct.pack("<512h", *([1000] * 512))
+        laut = struct.pack("<512h", *([3000] * 512))
+        stille = silence_chunk()
+
+        seg.process_chunk(leise)
+        seg.process_chunk(laut)
+        seg.process_chunk(stille)
+
+        assert seg.current_speech_ms == 64
+        assert seg.current_speech_rms == pytest.approx(((1000**2 + 3000**2) / 2) ** 0.5)
+
     def test_silence_threshold_uses_config_setting(self, monkeypatch):
         import config
 

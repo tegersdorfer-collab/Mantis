@@ -7,23 +7,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import base64
 import io
 import wave
-import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import core.voice as voice
 from web.routers.voice import build_router
-
-
-@pytest.fixture(autouse=True)
-def _reset_conversation_window():
-    """voice_segment() ruft bei Adressierung mark_conversation_active() echt auf —
-    ohne Reset würde das den globalen Status über Testgrenzen hinweg verschmutzen."""
-    voice._conversation_active_until = 0.0
-    yield
-    voice._conversation_active_until = 0.0
 
 
 def _make_client(orch=None) -> TestClient:

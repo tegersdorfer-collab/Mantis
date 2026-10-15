@@ -1,8 +1,6 @@
 """Pro-Verbindung Session-Manager für /ws/voice/stream: kombiniert Silero-VAD-
-Segmentierung mit openWakeWord-Erkennung. Ersetzt für den WebSocket-Pfad sowohl
-die client-seitige RMS-Erkennung als auch den LLM-basierten
-is_addressed_to_mantis()-Text-Check aus core/voice.py (siehe
-docs/superpowers/specs/2026-07-05-vad-wakeword-streaming-design.md)."""
+Segmentierung mit openWakeWord-Erkennung. Der Router lässt erkannte Sprache durch
+den Adress-Check aus core/voice.py laufen, bevor daraus ein Agent-Turn entsteht."""
 from __future__ import annotations
 
 import asyncio
@@ -75,6 +73,8 @@ class VoiceStreamSession:
         on_partial: Callable[[str], None] | None = None,
         partial_interval_ms: float | None = None,
         clock: Callable[[], float] | None = None,
+        bargein_active_fn: Callable[[], bool] | None = None,
+        on_bargein: Callable[[float], Awaitable[None]] | None = None,
     ):
         self._segmenter = vad_segmenter
         self._wakeword = wakeword_detector
@@ -94,6 +94,9 @@ class VoiceStreamSession:
             config.VOICE_PARTIAL_STT_MS if partial_interval_ms is None else partial_interval_ms
         )
         self._clock = clock or time.monotonic
+        self._bargein_active_fn = bargein_active_fn or (lambda: False)
+        self._on_bargein = on_bargein
+        self._bargein_notified = False
         self._speech_started_at: float | None = None
         self._last_partial_at: float | None = None
         self._partial_task: asyncio.Task | None = None
@@ -107,6 +110,7 @@ class VoiceStreamSession:
 
     def _reset_segment_state(self) -> None:
         self._segment_generation += 1
+        self._bargein_notified = False
         self._speech_started_at = None
         self._last_partial_at = None
         self._partial_runs = 0
@@ -136,6 +140,7 @@ class VoiceStreamSession:
             del self._vad_buffer[:VAD_FRAME_BYTES]
 
             segment = self._segmenter.process_chunk(frame)
+            await self._maybe_trigger_bargein()
             if segment is None:
                 self._maybe_start_partial()
                 continue
@@ -194,6 +199,26 @@ class VoiceStreamSession:
             }
 
         return result
+
+    async def _maybe_trigger_bargein(self) -> None:
+        if (
+            self._bargein_notified
+            or self._on_bargein is None
+            or not getattr(config, "VOICE_BARGEIN", True)
+            or not self._bargein_active_fn()
+            or getattr(self._segmenter, "is_speaking", None) is not True
+            or getattr(self._segmenter, "current_chunk_is_speech", None) is not True
+        ):
+            return
+        speech_ms = float(getattr(self._segmenter, "current_speech_ms", 0.0) or 0.0)
+        rms = float(getattr(self._segmenter, "current_speech_rms", 0.0) or 0.0)
+        if speech_ms < float(getattr(config, "VOICE_BARGEIN_MIN_SPEECH_MS", 300)):
+            return
+        if rms < float(getattr(config, "VOICE_BARGEIN_MIN_RMS", 800)):
+            return
+
+        self._bargein_notified = True
+        await self._on_bargein(self._clock())
 
     def _maybe_start_partial(self) -> None:
         if self._closed:

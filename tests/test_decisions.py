@@ -174,8 +174,9 @@ def test_voice_and_fact_jev_wrappers_use_bench_questions_and_default_band(monkey
     address_state, address_questions = calls[0]
     assert address_state == {"transkript": "Mantis, Licht an"}
     assert address_questions["voice_address"].instructions == (
-        "Das Transkript ist eine Anfrage oder ein Befehl an den persönlichen Sprachassistenten im Raum "
-        "(auch ohne Namensnennung), nicht Selbstgespräch oder Gespräch mit einer anderen Person."
+        "Die neue Spracheingabe ist an den persönlichen Sprachassistenten im Raum gerichtet "
+        "(auch ohne Namensnennung), nicht Selbstgespräch oder Gespräch mit einer anderen Person. "
+        "Eine letzte Antwort des Assistenten ist nur Gesprächskontext und kein Beleg für eine Anrede."
     )
     verify_state, verify_questions = calls[1]
     assert verify_state == {

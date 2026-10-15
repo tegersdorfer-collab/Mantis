@@ -19,9 +19,14 @@ export function startVoiceCaptureStream(
   let currentReplyAudio: HTMLAudioElement | null = null;
   let player: StreamingAudioPlayer | null = null;
 
-  function sendMute(value: boolean): void {
+  function sendProgress(
+    blockId: string, playedMs: number, finished: boolean, skipped: boolean,
+  ): void {
     if (ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: 'mute', value }));
+      ws.send(JSON.stringify({
+        type: 'playback_progress', block_id: blockId,
+        played_ms: playedMs, finished, ...(skipped ? { skipped: true } : {}),
+      }));
     }
   }
 
@@ -34,28 +39,15 @@ export function startVoiceCaptureStream(
       }
       const audio = new Audio(`data:audio/ogg;base64,${audioB64}`);
       currentReplyAudio = audio;
-      sendMute(true);
-      // Solange Mantis spricht: Server-seitige VAD/Wake-Word-Auswertung pausieren
-      // (per Mute-Flag), sonst hört das Mikrofon Mantis' eigene Stimme und löst
-      // ein neues Segment aus (Echo-Vermeidung, siehe alte voice-capture.ts).
-      const stopPlayingFlag = () => sendMute(false);
-      audio.onended = stopPlayingFlag;
-      audio.onerror = stopPlayingFlag;
-      audio.play().catch(stopPlayingFlag);
-    } catch {
-      sendMute(false);
-    }
+      audio.play().catch(() => {});
+    } catch { /* nicht verfügbare Audioausgabe ignorieren */ }
   }
 
   function startStreamingPlayback(): StreamingAudioPlayer {
     player?.stop();
-    sendMute(true);
-    // Stummschaltung hält über ALLE Blöcke und endet erst, wenn der letzte Ton
-    // verklungen ist — sonst nimmt das Mikrofon Mantis' eigene Stimme auf.
     player = new StreamingAudioPlayer(() => {
       player = null;
-      sendMute(false);
-    });
+    }, sendProgress);
     return player;
   }
 
@@ -63,9 +55,24 @@ export function startVoiceCaptureStream(
     try {
       const msg = JSON.parse(ev.data) as Record<string, unknown>;
 
+      if (msg.type === 'stop_playback') {
+        player?.stop();
+        player = null;
+        if (currentReplyAudio) {
+          currentReplyAudio.pause();
+          currentReplyAudio.onended = null;
+          currentReplyAudio.onerror = null;
+          currentReplyAudio = null;
+        }
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: 'playback_stopped', turn_id: msg.turn_id }));
+        }
+        return;
+      }
+
       if (msg.type === 'audio_chunk') {
         (player ?? startStreamingPlayback())
-          .push(msg.seq as number, msg.b64 as string)
+          .push(msg.seq as number, msg.b64 as string, String(msg.block_id ?? msg.seq))
           .catch(() => {});
         return;
       }
@@ -76,8 +83,7 @@ export function startVoiceCaptureStream(
 
       const result = msg as unknown as VoiceSegmentResult;
       if (result.audio_streaming) {
-        // Tonblöcke folgen gleich — jetzt schon stummschalten, damit zwischen
-        // Textantwort und erstem Block kein Eigenecho durchrutscht.
+        // Tonblöcke folgen gleich. Der Worklet streamt das Mikrofon parallel weiter.
         startStreamingPlayback();
       } else if (result.audio_b64) {
         playReplyAudio(result.audio_b64);
@@ -88,16 +94,25 @@ export function startVoiceCaptureStream(
     }
   };
 
-  // Streaming anfordern. Der Server bleibt ohne dieses Hello beim alten
-  // Ein-Block-Protokoll (iOS-Apps, /api/voice/segment).
+  // Fortschritt ist opt-in; ältere Server können das zusätzliche Feld ignorieren.
   const sendeHello = () => {
-    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'hello', audio: 'stream' }));
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        type: 'hello', audio: 'stream', playback_progress: true,
+      }));
+    }
   };
   if (ws.readyState === 1) sendeHello();
   else ws.onopen = sendeHello;
 
   navigator.mediaDevices
-    .getUserMedia({ audio: true })
+    .getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    })
     .then(async (mediaStream) => {
       if (stopped) {
         mediaStream.getTracks().forEach((t) => t.stop());
@@ -121,6 +136,14 @@ export function startVoiceCaptureStream(
 
   return () => {
     stopped = true;
+    player?.stop();
+    player = null;
+    if (currentReplyAudio) {
+      currentReplyAudio.pause();
+      currentReplyAudio.onended = null;
+      currentReplyAudio.onerror = null;
+      currentReplyAudio = null;
+    }
     if (workletNode) workletNode.port.onmessage = null;
     if (stream) stream.getTracks().forEach((t) => t.stop());
     if (audioCtx) audioCtx.close();

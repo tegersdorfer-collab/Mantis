@@ -251,8 +251,8 @@ Zuerst die volle Ideen-Sammlung nach Thema, danach die Priorisierung nach **Effe
 
 ### Sofort-Fixes (hohe Priorität, konkret gemeldete Bugs)
 - [x] **Adress-Erkennung ignoriert Folge-Antworten** — behoben (Commit 9d3670d):
-  `mark_conversation_active()` öffnet ein 15s-Fenster nach jeder Mantis-Antwort,
-  in dem Folge-Sprache ohne Namen/klaren Befehl automatisch als adressiert gilt.
+  Das 15s-Fenster und die letzte Mantis-Antwort gehören zur jeweiligen Voice-Session;
+  Folge-Sprache durchläuft mit diesem Kontext erneut den Adress-Check.
 - [x] **TTS-Engine-Wahl abgeschlossen für diese Session** — Piper
   (de_DE-thorsten-high) gewählt: 0.7s Laden, ~1.6s Synthese, native deutsche
   Aussprache. Getestete Alternativen: Kokoro (kein Deutsch), Chatterbox-

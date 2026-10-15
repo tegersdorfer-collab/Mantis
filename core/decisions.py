@@ -139,8 +139,9 @@ async def _jev_then_cloud_answers(
 
 Q_ADDRESSED = Noul(
     # Das Transkript ist Fremdtext (Voice-Eingabe) und läuft zusammen mit dem Guard.
-    "Das Transkript ist eine Anfrage oder ein Befehl an den persönlichen Sprachassistenten im Raum "
-    "(auch ohne Namensnennung), nicht Selbstgespräch oder Gespräch mit einer anderen Person.",
+    "Die neue Spracheingabe ist an den persönlichen Sprachassistenten im Raum gerichtet "
+    "(auch ohne Namensnennung), nicht Selbstgespräch oder Gespräch mit einer anderen Person. "
+    "Eine letzte Antwort des Assistenten ist nur Gesprächskontext und kein Beleg für eine Anrede.",
     criteria={"true": "Der Sprecher will, dass der Assistent reagiert",
               "false": "Beiläufiges Gerede, Selbstgespräch, Gespräch mit jemand anderem"},
 )
@@ -242,9 +243,14 @@ async def addressed(text: str, fallback: Fallback) -> bool:
                                    guard=True)
 
 
-async def voice_address(text: str) -> bool | None:
+async def voice_address(
+    text: str, *, conversation_context: str | None = None,
+) -> bool | None:
     """Benchmark-Frage für den Voice-Adresscheck; None fordert den Cloud-Fast-Fallback an."""
-    return await _jev_noul("voice_address", {"transkript": text}, Q_ADDRESSED, guard=True)
+    state = {"transkript": text}
+    if conversation_context:
+        state["letzte_mantis_antwort"] = conversation_context
+    return await _jev_noul("voice_address", state, Q_ADDRESSED, guard=True)
 
 
 async def fact_supported(user_text: str, claim: str) -> bool | None:
