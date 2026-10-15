@@ -242,8 +242,7 @@ def _apply_voice_tool_context_policy(
             name for name in names if name in _VOICE_CONTEXT_READ_ONLY_TOOLS
         )
         return list(read_only), False
-    if has_previous_user and not _has_direct_voice_tool_intent(text):
-        return [], False
+    # Ohne geerbten Kontext ist die Auswahl allein aus dem aktuellen Satz entstanden.
     return list(names), bool(force)
 
 

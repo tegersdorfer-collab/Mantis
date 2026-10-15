@@ -2697,9 +2697,10 @@ def test_voice_router_limits_followup_tools_to_read_only_and_drops_old_action_co
     assert "set_reminder" in delete_turn["tools"]
 
     joke_turn = agent.calls[5]
-    assert joke_turn["keyword_tools"] == []
+    # Kein geerbter Aktionskontext: kein Zwang, keine Erinnerungs-Freigabe aus dem Löschbefehl.
+    # Die Standardauswahl ohne Vorturn bleibt erhalten (wie auf main).
+    assert "set_reminder" not in joke_turn["keyword_tools"]
     assert joke_turn["keyword_force"] is False
-    assert joke_turn["tools"] == []
     assert joke_turn["force"] is False
     assert "set_reminder" not in joke_turn["tools"]
     assert set(texts[1:]) <= set(orchestrator.prepared_texts)
