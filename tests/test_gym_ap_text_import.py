@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -75,6 +76,83 @@ def synthetic_import_database(monkeypatch):
     return install
 
 
+@pytest.fixture
+def synthetic_writable_import_database(monkeypatch):
+    state = {"exercises": [], "workouts": [], "sets": []}
+
+    class Cursor:
+        def execute(self, sql, params=()):
+            statement = " ".join(sql.lower().split())
+            self.rows = []
+            self.row = None
+            if statement.startswith("select pg_advisory_xact_lock"):
+                return
+            if statement.startswith("select id,name,equipment,unit,load_mode from exercises"):
+                self.rows = [dict(row) for row in state["exercises"]]
+            elif statement.startswith("select w.id as workout_id"):
+                workout_date = params[0]
+                for workout in state["workouts"]:
+                    if workout["date"] != workout_date:
+                        continue
+                    workout_sets = [
+                        item for item in state["sets"]
+                        if item["workout_id"] == workout["id"]
+                    ]
+                    if not workout_sets:
+                        workout_sets = [{
+                            "exercise_id": None, "weight_kg": None, "reps": None,
+                        }]
+                    self.rows.extend({
+                        "workout_id": workout["id"], "title": workout["title"],
+                        "created_at": workout["created_at"], **item,
+                    } for item in workout_sets)
+            elif statement.startswith("insert into workouts"):
+                row = {
+                    "id": len(state["workouts"]) + 1,
+                    "date": params[0], "title": params[1],
+                    "created_at": params[4],
+                }
+                state["workouts"].append(row)
+                self.row = {"id": row["id"]}
+            elif statement.startswith("insert into exercises"):
+                row = {
+                    "id": len(state["exercises"]) + 1,
+                    "name": params[0], "equipment": params[5],
+                    "unit": params[3], "load_mode": params[9],
+                }
+                state["exercises"].append(row)
+                self.row = dict(row)
+            elif statement.startswith("select id,name,equipment,unit,load_mode from exercises where name=%s"):
+                self.row = next(
+                    (dict(row) for row in state["exercises"] if row["name"] == params[0]),
+                    None,
+                )
+            elif statement.startswith("insert into workout_sets"):
+                state["sets"].append({
+                    "workout_id": params[0], "exercise_id": params[1],
+                    "set_index": params[2], "reps": params[3],
+                    "weight_kg": params[4],
+                })
+            elif statement.startswith("insert into exercise_aliases"):
+                return
+            else:
+                raise AssertionError(f"Unerwartete Import-SQL-Abfrage: {statement}")
+
+        def fetchall(self):
+            return [dict(row) for row in self.rows]
+
+        def fetchone(self):
+            return dict(self.row) if self.row is not None else None
+
+    @contextmanager
+    def open_cursor():
+        yield Cursor()
+
+    monkeypatch.setattr(db, "cursor", open_cursor)
+    monkeypatch.setattr(ap_text_import, "load_aliases", lambda: {})
+    return state
+
+
 def _workout(name, equipment):
     return APWorkout(
         "Synthetic AP resolver", datetime(2098, 4, 3, 17, 20, tzinfo=ZoneInfo("Europe/Berlin")),
@@ -141,6 +219,29 @@ def test_import_resolves_full_equipment_alias_before_base_alias():
     )
 
 
+def test_import_full_equipment_alias_beats_raw_name_equipment_match():
+    exercise = APExercise(
+        "Synthetic Incline Press", "Smith machine", "reps", (APSet(1, 60, 8),),
+    )
+    aliases = {
+        ap_text_import.normalize_alias(
+            "Synthetic Incline Press · Smith machine",
+        ): ["Synthetic Smith Incline Press"],
+    }
+    rows = [
+        {"id": 40, "name": "Synthetic Incline Press", "equipment": "smith_machine",
+         "unit": "reps", "load_mode": "external"},
+        {"id": 41, "name": "Synthetic Smith Incline Press", "equipment": None,
+         "unit": "reps", "load_mode": "external"},
+    ]
+
+    canonical, equipment, matched = _canonical_exercise(exercise, aliases, rows)
+
+    assert (canonical, equipment, matched["id"]) == (
+        "Synthetic Smith Incline Press", "smith_machine", 41,
+    )
+
+
 def test_import_falls_back_to_base_alias_when_full_equipment_alias_is_missing():
     exercise = APExercise("Incline Press", "Smith machine", "reps", ())
     aliases = {
@@ -201,6 +302,33 @@ def test_import_detects_duplicate_even_if_time_and_title_differ(
         "Synthetic AP plan", started_at.replace(minute=20), 45,
         (APExercise(exercise_name, None, "reps", (
             APSet(1, 60, 8), APSet(2, 60, 8),
+        )),),
+    )
+
+    report = import_workouts([ap_workout], dry_run=True)
+
+    assert (report.workouts_created, report.workouts_skipped) == (0, 1)
+    assert [(item.title, item.existing_title) for item in report.skipped_workouts] == [
+        ("Synthetic AP plan", "Gym"),
+    ]
+    assert report.unclear_workouts == ()
+
+
+def test_import_skips_workout_at_exactly_fifty_percent_set_overlap(
+    synthetic_import_database,
+):
+    exercise_name = "Synthetic Half-overlap Press"
+    started_at = datetime(2098, 4, 3, 17, 22, tzinfo=ZoneInfo("Europe/Berlin"))
+    synthetic_import_database(
+        [{"id": 18, "name": exercise_name, "equipment": None,
+          "unit": "reps", "load_mode": "external"}],
+        [{"workout_id": 7, "title": "Gym", "created_at": started_at,
+          "exercise_id": 18, "weight_kg": 60.0, "reps": 8}],
+    )
+    ap_workout = APWorkout(
+        "Synthetic AP plan", started_at.replace(minute=20), 45,
+        (APExercise(exercise_name, None, "reps", (
+            APSet(1, 60, 8), APSet(2, 62, 7),
         )),),
     )
 
@@ -532,6 +660,43 @@ def test_dry_run_counts_without_writing_rows(ap_import_database):
     ]
     assert db.query_one("SELECT id FROM workouts WHERE title=%s", (title,)) is None
     assert db.query_one("SELECT id FROM exercises WHERE name=%s", (name,)) is None
+
+
+def test_dry_run_and_write_reports_agree_on_repeated_new_exercise(
+    synthetic_writable_import_database,
+):
+    token = uuid4().hex
+    exercise_name = f"Synthetic {token} Cable Press"
+    workouts = [
+        APWorkout(
+            f"Synthetic AP plan A {token}",
+            datetime(2098, 4, 7, 17, 20, tzinfo=ZoneInfo("Europe/Berlin")),
+            45,
+            (APExercise(exercise_name, "Cable", "reps", (
+                APSet(1, 60, 8), APSet(2, 60, 8),
+            )),),
+        ),
+        APWorkout(
+            f"Synthetic AP plan B {token}",
+            datetime(2098, 4, 7, 17, 22, tzinfo=ZoneInfo("Europe/Berlin")),
+            45,
+            (APExercise(exercise_name, "Cable", "reps", (
+                APSet(1, 60, 8), APSet(2, 60, 8),
+            )),),
+        ),
+    ]
+
+    dry_report = import_workouts(workouts, dry_run=True)
+    write_report = import_workouts(workouts)
+
+    assert replace(dry_report, dry_run=False) == write_report
+    assert (
+        write_report.workouts_created,
+        write_report.workouts_skipped,
+        write_report.exercises_created,
+        write_report.sets_created,
+        len(write_report.unclear_workouts),
+    ) == (1, 1, 1, 2, 0)
 
 
 @pytest.mark.db

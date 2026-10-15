@@ -435,6 +435,7 @@ def _canonical_exercise(
     resolved, ambiguous, _fuzzy = resolve_alias(
         source_alias, aliases, allow_typo=False,
     )
+    explicit_full_alias = source_alias != exercise.name and resolved is not None
     if not resolved and not ambiguous:
         resolved, ambiguous, _fuzzy = resolve_alias(
             raw_base, aliases, allow_typo=False,
@@ -453,10 +454,19 @@ def _canonical_exercise(
         if target_equipment is None and legacy:
             target_equipment = _equipment_code(legacy.equipment)
         alias_options.append((canonical, target_equipment, candidate_equipment))
-    options = (
-        [*alias_options, raw_option]
-        if source_alias != exercise.name else [raw_option, *alias_options]
-    )
+    if explicit_full_alias:
+        # Ein expliziter Vollalias benennt das Ziel direkt. Seine gespeicherte
+        # Übung darf nicht von der Geräteausstattung oder dem Rohname verdrängt werden.
+        for canonical, target_equipment, *_rest in alias_options:
+            matches = _family_rows(rows, canonical)
+            if matches:
+                return canonical, equipment or target_equipment, _preferred_row(matches, canonical)
+        options = alias_options
+    else:
+        options = (
+            [*alias_options, raw_option]
+            if source_alias != exercise.name else [raw_option, *alias_options]
+        )
 
     # Eine schon vorhandene, explizite Variante für das importierte Gerät hat Vorrang.
     exact_matches = []
@@ -599,8 +609,11 @@ def _workout_set_signatures(
         canonical, equipment, exercise_row = _canonical_exercise(
             item, aliases, exercise_rows,
         )
-        if exercise_row is not None and exercise_row.get("id") is not None:
-            exercise_key = f"id:{exercise_row['id']}"
+        if exercise_row is not None:
+            if exercise_row.get("id") is not None:
+                exercise_key = f"id:{exercise_row['id']}"
+            else:
+                exercise_key = f"name:{normalize_alias(exercise_row['name'])}"
         else:
             storage_name = _variant_name(canonical, equipment, exercise_rows)
             exercise_key = f"name:{normalize_alias(storage_name)}"
