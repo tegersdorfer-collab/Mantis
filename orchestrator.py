@@ -204,13 +204,14 @@ class Orchestrator:
 
     async def voice_respond(
         self, text: str, stream_cb=None, prework=None, defer_finish: bool = False,
-        interrupt_check=None,
+        interrupt_check=None, execution_gate=None,
     ) -> tuple[str, list]:
         """Wie dashboard_respond, aber über die Voice-Variante der Cloud-Kette."""
         return await self.msg_handler.dashboard_respond(
             text, stream_cb, agent=self.voice_agent, channel_name="voice",
             resume_idle_cb=self.idle_loop.resume, prework=prework,
             defer_finish=defer_finish, interrupt_check=interrupt_check,
+            execution_gate=execution_gate,
         )
 
     def finish_voice_turn(self, text: str, reply: str, trace: list) -> None:

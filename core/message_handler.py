@@ -4,6 +4,7 @@ Zuständig für: ReAct-Loop, Streaming, Post-Turn-Learning, Persistenz.
 """
 import asyncio
 from copy import deepcopy
+from collections.abc import Awaitable, Callable
 import json
 import logging
 import re
@@ -29,6 +30,13 @@ from core.voice_text import partial_text_matches_final
 import config
 
 log = logging.getLogger(__name__)
+
+
+async def _require_execution_gate(
+    execution_gate: Callable[[], Awaitable[bool]] | None,
+) -> None:
+    if execution_gate is not None and not await execution_gate():
+        raise asyncio.CancelledError
 
 VOICE_RESPONSE_INSTRUCTIONS = (
     "## Sprachmodus\n"
@@ -317,10 +325,14 @@ class MessageHandler:
 
     # ── Alpha Progression Link ────────────────────────────────────────────────
 
-    async def _handle_alpha_progression(self, text: str, channel_name: str) -> str | None:
+    async def _handle_alpha_progression(
+        self, text: str, channel_name: str,
+        execution_gate: Callable[[], Awaitable[bool]] | None = None,
+    ) -> str | None:
         url = self.alphaprogression.extract_link(text)
         if not url:
             return None
+        await _require_execution_gate(execution_gate)
         BUS.emit("thinking", "Alpha Progression wird importiert…")
         try:
             loop = asyncio.get_running_loop()
@@ -689,20 +701,47 @@ class MessageHandler:
         self, text: str, stream_cb=None, agent=None, channel_name: str = "web",
         resume_idle_cb=None, prework: VoiceTurnPrework | None = None,
         defer_finish: bool = False, interrupt_check=None,
+        execution_gate: Callable[[], Awaitable[bool]] | None = None,
     ) -> tuple[str, list]:
         self._begin_user_turn()
         self._start_turn()
-        try:
-            self.kzg.add("user", text)
-            self._persist_msg("user", text, channel=channel_name)
+        speculative = execution_gate is not None
+        user_committed = not speculative
 
-            if await self._handle_alpha_progression(text, channel_name):
+        async def authorize_execution() -> bool:
+            nonlocal user_committed
+            if execution_gate is None:
+                return True
+            if not await execution_gate():
+                return False
+            if not user_committed:
+                self.kzg.add("user", text)
+                self._persist_msg("user", text, channel=channel_name)
+                user_committed = True
+            return True
+
+        try:
+            if not speculative:
+                self.kzg.add("user", text)
+                self._persist_msg("user", text, channel=channel_name)
+
+            if await self._handle_alpha_progression(
+                text, channel_name,
+                execution_gate=authorize_execution if speculative else None,
+            ):
                 return "", []
 
             response, trace = await self._agent_turn(text, channel_name=channel_name,
                                                      stream_cb=stream_cb, agent=agent,
                                                      prework=prework,
-                                                     interrupt_check=interrupt_check)
+                                                     interrupt_check=interrupt_check,
+                                                     execution_gate=(
+                                                         authorize_execution if speculative else None
+                                                     ),
+                                                     transient_user_message=speculative)
+            await _require_execution_gate(
+                authorize_execution if speculative else None,
+            )
             if not defer_finish:
                 self._finish_turn(text, response, trace, channel_name=channel_name, agent=agent)
             return response, trace
@@ -727,7 +766,9 @@ class MessageHandler:
                           stream_cb=None, agent=None,
                           inbox_context: InboxTurnContext | None = None,
                           prework: VoiceTurnPrework | None = None,
-                          interrupt_check=None) -> tuple[str, list]:
+                          interrupt_check=None,
+                          execution_gate: Callable[[], Awaitable[bool]] | None = None,
+                          transient_user_message: bool = False) -> tuple[str, list]:
         """Prompt bauen, Tools wählen, Agent laufen lassen — mit Fehler-Fallback."""
         voice_turn = channel_name == "voice" and agent is not None
         agent = agent or self.agent
@@ -756,6 +797,8 @@ class MessageHandler:
                 if voice_turn:
                     system += "\n\n" + VOICE_RESPONSE_INSTRUCTIONS
                 messages = self.kzg.recent_messages(max_tokens=3000)
+                if transient_user_message:
+                    messages.append({"role": "user", "content": text})
                 if voice_turn:
                     messages = _messages_with_voice_reminder(messages, text)
                 if voice_turn and interrupt_check is not None and interrupt_check():
@@ -771,6 +814,8 @@ class MessageHandler:
                 )
                 if voice_turn and interrupt_check is not None:
                     run_kwargs["interrupt_check"] = interrupt_check
+                if voice_turn and execution_gate is not None:
+                    run_kwargs["execution_gate"] = execution_gate
                 token = INBOX_TURN_CONTEXT.set(inbox_context)
                 try:
                     return await agent.run(**run_kwargs)
@@ -786,6 +831,8 @@ class MessageHandler:
         fast = fast_commands.match_voice(text) if voice_turn else fast_commands.match(text)
         if fast is not None:
             if voice_turn:
+                await _require_execution_gate(execution_gate)
+            if voice_turn:
                 voice_timing.mark_reflex()
             if fast.tool == "voice_reflex":
                 result = fast.args["response"]
@@ -795,6 +842,8 @@ class MessageHandler:
             try:
                 if voice_turn and interrupt_check is not None and interrupt_check():
                     raise asyncio.CancelledError
+                if voice_turn:
+                    await _require_execution_gate(execution_gate)
                 result = await skills.T.execute(fast.tool, fast.args)
             except Exception as e:
                 result = f"❌ {fast.tool} fehlgeschlagen: {e}"
@@ -813,6 +862,8 @@ class MessageHandler:
             try:
                 if voice_turn and interrupt_check is not None and interrupt_check():
                     raise asyncio.CancelledError
+                if voice_turn:
+                    await _require_execution_gate(execution_gate)
                 result = await skill_request.erzeuge(skill_req, self.bg_llm)
             except Exception as e:
                 log.error(f"Skill-Fast-Path fehlgeschlagen: {e}")
@@ -868,6 +919,8 @@ class MessageHandler:
             if voice_turn:
                 system += "\n\n" + VOICE_RESPONSE_INSTRUCTIONS
             messages = self.kzg.recent_messages(max_tokens=3000)
+            if transient_user_message:
+                messages.append({"role": "user", "content": text})
             if voice_turn:
                 messages = _messages_with_voice_reminder(messages, text)
             run_kwargs = dict(
@@ -878,6 +931,8 @@ class MessageHandler:
             )
             if voice_turn and interrupt_check is not None:
                 run_kwargs["interrupt_check"] = interrupt_check
+            if voice_turn and execution_gate is not None:
+                run_kwargs["execution_gate"] = execution_gate
             if voice_turn and interrupt_check is not None and interrupt_check():
                 raise asyncio.CancelledError
             if tool_selection_task is not None:

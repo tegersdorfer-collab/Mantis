@@ -108,6 +108,103 @@ def test_interrupt_flag_prevents_agent_tool_dispatch(echo_tool, monkeypatch):
     assert calls == []
 
 
+@pytest.mark.parametrize("authorized", [True, False], ids=["authorized", "rejected"])
+def test_execution_gate_holds_tool_dispatch_until_address_check(echo_tool, monkeypatch, authorized):
+    calls = []
+    permission_requested = asyncio.Event()
+    release_permission = asyncio.Event()
+
+    async def execute_echo(text=""):
+        calls.append(text)
+        return f"ECHO:{text}"
+
+    async def execution_gate():
+        permission_requested.set()
+        await release_permission.wait()
+        return authorized
+
+    monkeypatch.setattr(toolreg.REGISTRY["echo"], "handler", execute_echo)
+    backend = FakeBackend([
+        ("", [_tc("echo", {"text": "Mantis rufen"})]),
+        ("Fertig.", []),
+    ])
+
+    async def run():
+        task = asyncio.create_task(Agent(backend).run(
+            [{"role": "user", "content": "Ambient speech"}], system="s",
+            execution_gate=execution_gate,
+        ))
+        await asyncio.wait_for(permission_requested.wait(), timeout=0.2)
+        assert calls == []
+        release_permission.set()
+        if authorized:
+            result = await task
+            assert result[0] == "Fertig."
+            assert calls == ["Mantis rufen"]
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert calls == []
+
+    asyncio.run(run())
+
+
+def test_math_guard_does_not_start_costly_retry_before_address_check(echo_tool):
+    permission_requested = asyncio.Event()
+    release_permission = asyncio.Event()
+    backend = FakeBackend([
+        ("Der Mittelwert ~ 73 pro Tag", []),
+        ("", [_tc("calculate", {"expression": "511/7"})]),
+    ])
+
+    async def execution_gate():
+        permission_requested.set()
+        await release_permission.wait()
+        return False
+
+    async def run():
+        task = asyncio.create_task(Agent(backend).run(
+            [{"role": "user", "content": "rechne"}], system="s",
+            execution_gate=execution_gate,
+        ))
+        await asyncio.wait_for(permission_requested.wait(), timeout=0.2)
+        assert len(backend.calls) == 1
+        release_permission.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(backend.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_unpermitted_tool_cannot_trigger_followup_llm_before_address_check(echo_tool):
+    permission_requested = asyncio.Event()
+    release_permission = asyncio.Event()
+    backend = FakeBackend([
+        ("", [_tc("echo", {"text": "unauthorized"})]),
+        ("Fertig.", []),
+    ])
+
+    async def execution_gate():
+        permission_requested.set()
+        await release_permission.wait()
+        return False
+
+    async def run():
+        task = asyncio.create_task(Agent(backend).run(
+            [{"role": "user", "content": "Ambient speech"}], system="s",
+            allowed_tools=["calculate"], execution_gate=execution_gate,
+        ))
+        await asyncio.wait_for(permission_requested.wait(), timeout=0.2)
+        assert len(backend.calls) == 1
+        release_permission.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(backend.calls) == 1
+
+    asyncio.run(run())
+
+
 def test_interrupt_after_agent_step_prevents_tool_start(echo_tool, monkeypatch):
     calls = []
     interrupted = False

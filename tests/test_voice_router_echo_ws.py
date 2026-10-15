@@ -27,7 +27,10 @@ def _run_scenario(monkeypatch, scenario):
 
         async def handle_chunk(self, chunk, muted=False):
             if chunk == b"init":
-                return {"text": "Mantis, sag etwas.", "stt_ms": 1}
+                return {
+                    "text": "Mantis, sag etwas.", "stt_ms": 1,
+                    "wakeword_triggered": True,
+                }
             if chunk == b"A":
                 return {"text": "Was gibt es heute zum Essen", "stt_ms": 1}
             if chunk == b"B":
@@ -78,8 +81,8 @@ def _run_scenario(monkeypatch, scenario):
         return "mantis" in text.lower()
 
     async def resp(ws, text, orch, *, playback, **kw):
-        log.append(f"TURN {text}")
         if text == "Mantis, sag etwas.":
+            log.append(f"TURN {text}")
             b = playback.register_block(
                 0, _fake_opus(200), text="Mantis, schalte das Licht aus.", sentence_id=1,
             )
@@ -87,6 +90,10 @@ def _run_scenario(monkeypatch, scenario):
             await ws.send_json({"type": "audio_chunk", "block_id": b, "b64": ""})
             playback.mark_audio_end(1)
             return "Mantis, schalte das Licht aus."
+        execution_gate = kw.get("execution_gate")
+        if execution_gate is not None and not await execution_gate():
+            return None
+        log.append(f"TURN {text}")
         log.append(f"TOOL_EXECUTED {text}")
         return "ok"
 

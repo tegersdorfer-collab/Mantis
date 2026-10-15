@@ -602,18 +602,13 @@ class TestPartialTranscription:
 
 
 class TestIsAddressedToMantis:
-    def test_namensnennung_liefert_true_ohne_llm_call(self):
-        with patch("core.decisions.voice_address", new=AsyncMock()) as mock_jev, \
+    def test_textuelles_weckwort_braucht_ohne_openwakeword_den_adresscheck(self):
+        text = "Mantis, wie wird das Wetter morgen?"
+        with patch("core.decisions.voice_address", new=AsyncMock(return_value=True)) as mock_jev, \
              patch("core.fast.yes_no", new=AsyncMock()) as mock_yes_no:
-            result = asyncio.run(voice.is_addressed_to_mantis("Mantis, wie wird das Wetter morgen?"))
+            result = asyncio.run(voice.is_addressed_to_mantis(text))
         assert result is True
-        mock_jev.assert_not_awaited()
-        mock_yes_no.assert_not_called()
-
-    def test_namensnennung_gross_klein_unabhaengig(self):
-        with patch("core.fast.yes_no", new=AsyncMock()) as mock_yes_no:
-            result = asyncio.run(voice.is_addressed_to_mantis("hey MANTIS wie geht's"))
-        assert result is True
+        mock_jev.assert_awaited_once_with(text)
         mock_yes_no.assert_not_called()
 
     @pytest.mark.parametrize("text", [
@@ -621,14 +616,31 @@ class TestIsAddressedToMantis:
         "Mentis wie spät ist es?", "Manthis wie spät ist es?",
         "Hey Mantis, wie spät ist es?", "Okay Mantis wie spät ist es?",
     ])
-    def test_asr_wakeword_varianten_adressieren_ohne_cloud_check(self, text):
-        with patch("core.decisions.voice_address", new=AsyncMock(return_value=None)) as mock_jev, \
+    def test_textuelle_weckwortvarianten_geben_keine_toolfreigabe(self, text):
+        with patch("core.decisions.voice_address", new=AsyncMock(return_value=False)) as mock_jev, \
              patch("core.fast.yes_no", new=AsyncMock(return_value=False)) as mock_yes_no:
             result = asyncio.run(voice.is_addressed_to_mantis(text))
 
-        assert result is True
-        mock_jev.assert_not_awaited()
+        assert result is False
+        mock_jev.assert_awaited_once()
         mock_yes_no.assert_not_awaited()
+
+    @pytest.mark.parametrize("word", ["Mentiones", "Mentions", "Mantes", "Mandis", "Mentis"])
+    def test_parakeet_fehlhoerungen_sind_nur_adresscheckhinweis(self, word):
+        text = f"{word}, erzähle mir etwas"
+        with patch("core.decisions.voice_address", new=AsyncMock(return_value=False)) as mock_jev, \
+             patch("core.fast.yes_no", new=AsyncMock(return_value=False)) as mock_yes_no:
+            result = asyncio.run(voice.is_addressed_to_mantis(text))
+
+        assert result is False
+        mock_jev.assert_awaited_once_with(text, wakeword_hint=True)
+        mock_yes_no.assert_not_awaited()
+
+    @pytest.mark.parametrize("word", ["Mentiones", "Mentions", "Mantes", "Mandis", "Mentis"])
+    def test_parakeet_fehlhoerungen_werden_fuer_commandrouting_normalisiert(self, word):
+        assert voice._normalize_voice_transcript(f"{word}, wie spät ist es?") == (
+            "Mantis, wie spät ist es?"
+        )
 
     def test_mantas_is_not_a_wakeword_and_uses_the_normal_address_check(self):
         text = "Mantas, wie spät ist es?"

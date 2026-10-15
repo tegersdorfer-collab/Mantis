@@ -472,7 +472,10 @@ def test_dashboard_routes_persist_both_roles_with_ingress_channel(monkeypatch, c
 
 def test_voice_route_persists_both_roles_with_voice_channel(monkeypatch):
     orchestrator, inserted, idle_loop = _make_orchestrator(monkeypatch)
-    monkeypatch.setattr(voice, "transcribe_audio", AsyncMock(return_value="Wie wird mein Tag?"))
+    monkeypatch.setattr(
+        voice, "transcribe_audio_with_hint",
+        AsyncMock(return_value=("Wie wird mein Tag?", False)),
+    )
     monkeypatch.setattr(voice, "is_addressed_to_mantis", AsyncMock(return_value=True))
     monkeypatch.setattr(voice, "synthesize", AsyncMock(return_value=b"audio"))
     app = FastAPI()
@@ -521,6 +524,56 @@ def test_overlapping_dashboard_and_voice_turns_keep_idle_loop_paused_until_last_
 
     asyncio.run(run_turns())
     assert idle_loop._state == "idle"
+
+
+@pytest.mark.parametrize("authorized", [True, False], ids=["authorized", "rejected"])
+def test_speculative_voice_turn_commits_history_only_after_address_check(monkeypatch, authorized):
+    orchestrator, inserted, _idle_loop = _make_orchestrator(monkeypatch)
+    handler = orchestrator.msg_handler
+
+    class KZG:
+        def __init__(self):
+            self.turns = []
+
+        def add(self, role, content):
+            self.turns.append(SimpleNamespace(role=role, content=content))
+
+        def recent_messages(self, max_tokens):
+            return [SimpleNamespace(role=turn.role, content=turn.content) for turn in self.turns]
+
+    handler.kzg = KZG()
+    permission_requested = asyncio.Event()
+    release_permission = asyncio.Event()
+
+    async def execution_gate():
+        permission_requested.set()
+        await release_permission.wait()
+        return authorized
+
+    async def run():
+        task = asyncio.create_task(orchestrator.voice_respond(
+            "Ambient speech", execution_gate=execution_gate, defer_finish=True,
+        ))
+        await asyncio.wait_for(permission_requested.wait(), timeout=0.2)
+        assert inserted == []
+        assert handler.kzg.turns == []
+        user_message = orchestrator.voice_agent.run.await_args.kwargs["messages"][-1]
+        assert user_message["role"] == "user"
+        assert "Ambient speech" in user_message["content"]
+        release_permission.set()
+        if authorized:
+            await task
+            assert _persisted_role_channels(inserted) == [("user", "voice")]
+            assert [(turn.role, turn.content) for turn in handler.kzg.turns] == [
+                ("user", "Ambient speech"),
+            ]
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert inserted == []
+            assert handler.kzg.turns == []
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])

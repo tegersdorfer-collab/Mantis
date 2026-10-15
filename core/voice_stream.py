@@ -28,10 +28,9 @@ WAKEWORD_FRAME_BYTES = 1280 * 2  # 2560 bytes
 log = logging.getLogger(__name__)
 
 
-async def transcribe_pcm(pcm_audio: bytes) -> str:
-    """Schreibt rohes PCM als WAV und transkribiert über die bestehende
-    Whisper-Pipeline (core.voice.transcribe_audio erwartet einen Dateipfad)."""
-    from core.voice import transcribe_audio
+async def transcribe_pcm(pcm_audio: bytes) -> tuple[str, bool]:
+    """Schreibt PCM als WAV und liefert Text plus nicht-freigebenden Namenshinweis."""
+    from core.voice import transcribe_audio_with_hint
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
         with wave.open(tmp.name, "wb") as wav_file:
@@ -39,12 +38,12 @@ async def transcribe_pcm(pcm_audio: bytes) -> str:
             wav_file.setsampwidth(2)
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(pcm_audio)
-        return await transcribe_audio(tmp.name)
+        return await transcribe_audio_with_hint(tmp.name)
 
 
-async def transcribe_pcm_partial(pcm_audio: bytes) -> str | None:
+async def transcribe_pcm_partial(pcm_audio: bytes) -> tuple[str, bool] | None:
     """Versucht einen Teil-STT-Lauf; bei belegtem gemeinsamen STT-Lock wird er verworfen."""
-    from core.voice import transcribe_audio_partial
+    from core.voice import transcribe_audio_partial_with_hint
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
         with wave.open(tmp.name, "wb") as wav_file:
@@ -52,7 +51,7 @@ async def transcribe_pcm_partial(pcm_audio: bytes) -> str | None:
             wav_file.setsampwidth(2)
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(pcm_audio)
-        return await transcribe_audio_partial(tmp.name)
+        return await transcribe_audio_partial_with_hint(tmp.name)
 
 
 def partial_stt_executor_available() -> bool:
@@ -68,7 +67,9 @@ class VoiceStreamSession:
         wakeword_detector,
         conversation_active_fn: Callable[[], bool],
         *,
-        partial_transcriber: Callable[[bytes], Awaitable[str | None]] | None = None,
+        partial_transcriber: Callable[
+            [bytes], Awaitable[str | tuple[str, bool] | None]
+        ] | None = None,
         partial_executor_available: Callable[[], bool] | None = None,
         on_partial: Callable[[str], None] | None = None,
         partial_interval_ms: float | None = None,
@@ -102,6 +103,7 @@ class VoiceStreamSession:
         self._partial_task: asyncio.Task | None = None
         self._partial_runs = 0
         self._partial_text = ""
+        self._partial_wakeword_hint = False
         self._partial_audio_end_sample_index: int | None = None
         self._partial_run_generation: int | None = None
         self._finalizing = False
@@ -115,6 +117,7 @@ class VoiceStreamSession:
         self._last_partial_at = None
         self._partial_runs = 0
         self._partial_text = ""
+        self._partial_wakeword_hint = False
         self._partial_audio_end_sample_index = None
         self._partial_run_generation = None
         setter = getattr(self._segmenter, "set_partial_transcript", None)
@@ -183,14 +186,31 @@ class VoiceStreamSession:
                     partial_text = text
                     partial_as_final = bool(text)
 
+            wakeword_hint = False
             if not text:
-                text = await transcribe_pcm(segment.audio)
+                transcript = await transcribe_pcm(segment.audio)
+                if isinstance(transcript, tuple) and len(transcript) == 2:
+                    text, wakeword_hint = transcript
+                else:
+                    text = transcript
+                    from core.voice import has_voice_wakeword_hint
+
+                    wakeword_hint = has_voice_wakeword_hint(str(text or ""))
+            elif partial_as_final:
+                from core.voice import has_voice_wakeword_hint
+
+                wakeword_hint = bool(
+                    self._partial_wakeword_hint
+                    or has_voice_wakeword_hint(str(text or ""))
+                )
             partial_text = self._partial_text or partial_text
             stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
             self._reset_segment_state()
             result = {
                 "text": text,
                 "addressed": True,
+                "wakeword_triggered": wake_fired,
+                "wakeword_hint": bool(wakeword_hint),
                 "stt_ms": stt_ms,
                 "turn_started_at": turn_started_at,
                 "partial_runs": partial_runs,
@@ -280,13 +300,22 @@ class VoiceStreamSession:
         self, audio: bytes, generation: int, audio_end_sample_index: int,
     ) -> str | None:
         try:
-            text = await self._partial_transcriber(audio)
+            transcript = await self._partial_transcriber(audio)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.debug("Teil-STT fehlgeschlagen (%s)", type(exc).__name__)
             return None
 
+        if transcript is None:
+            return None
+        if isinstance(transcript, tuple) and len(transcript) == 2:
+            text, wakeword_hint = transcript
+        else:
+            text = transcript
+            from core.voice import has_voice_wakeword_hint
+
+            wakeword_hint = has_voice_wakeword_hint(str(text or ""))
         if text is None:
             return None
         text = str(text).strip()
@@ -296,6 +325,7 @@ class VoiceStreamSession:
             getattr(self._segmenter, "is_speaking", None) is True or self._finalizing
         ):
             self._partial_text = text
+            self._partial_wakeword_hint = bool(wakeword_hint)
             setter = getattr(self._segmenter, "set_partial_transcript", None)
             if callable(setter):
                 try:

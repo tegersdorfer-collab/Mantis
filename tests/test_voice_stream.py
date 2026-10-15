@@ -211,6 +211,7 @@ class TestVoiceStreamSession:
         result = asyncio.run(session.handle_chunk(wakeword_frame(), muted=False))
 
         assert result["text"] == "hallo mantis" and result["addressed"] is True
+        assert result["wakeword_triggered"] is True
         assert isinstance(result["stt_ms"], float) and result["stt_ms"] >= 0
         assert isinstance(result["turn_started_at"], float)
 
@@ -223,6 +224,7 @@ class TestVoiceStreamSession:
         result = asyncio.run(session.handle_chunk(vad_frame(), muted=False))
 
         assert result["text"] == "und morgen?" and result["addressed"] is True
+        assert result["wakeword_triggered"] is False
         assert isinstance(result["stt_ms"], float) and result["stt_ms"] >= 0
 
     def test_small_chunks_are_buffered_until_full_vad_frame(self):
@@ -459,12 +461,12 @@ class TestVoiceStreamSession:
                     clock.advance(1.4)
                     partial_started.set()
                     await release_partial.wait()
-                    return "Mantis, was steht heute an"
+                    return "Mentiones, was steht heute an"
                 final_calls.append(path)
                 return "Finales Mantis-Transkript"
 
             async def partial_stt(_audio):
-                return await voice.transcribe_audio_partial("partial")
+                return await voice.transcribe_audio_partial_with_hint("partial")
 
             async def final_stt(_audio):
                 return await voice.transcribe_audio("final")
@@ -496,6 +498,7 @@ class TestVoiceStreamSession:
             result = await final_task
 
             assert result["text"] == "Mantis, was steht heute an"
+            assert result["wakeword_hint"] is True
             assert result["partial_as_final"] is True
             assert result["partial_runs"] == 1
             assert final_calls == []

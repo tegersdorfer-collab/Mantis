@@ -28,7 +28,7 @@ import time
 import wave
 
 import config
-from core import decisions, fast, fast_commands, stt_runtime
+from core import decisions, fast, stt_runtime
 
 log = logging.getLogger(__name__)
 
@@ -45,14 +45,17 @@ _whisper_lock = asyncio.Lock()
 _parakeet_unavailable = False
 _MANTIS_MISHEARINGS = frozenset({
     "mantasy", "bantas", "mantes", "mantiss", "mentis", "mandis",
+    "mentiones", "mentions",
     "mäntis", "mantus", "mandes",
 })
-_INITIAL_WORD_RE = re.compile(r"^(?P<prefix>\s*(?:hey\b[\s,!?-]*)?)(?P<word>[^\W_]+)", re.IGNORECASE)
+_VOICE_WAKEWORD_HINTS = frozenset({"mentiones", "mentions", "mantes", "mandis", "mentis"})
+_INITIAL_WORD_RE = re.compile(
+    r"^(?P<prefix>\s*(?:(?:hey|okay)\b[\s,!?-]*)?)(?P<word>[^\W_]+)",
+    re.IGNORECASE,
+)
 
-# Nach jeder Mantis-Antwort bleibt für dieses Fenster jede Folge-Äußerung automatisch
-# "adressiert" — ohne das würde is_addressed_to_mantis() kurze Antworten wie "ja",
-# "zeig mir das" oder "und morgen?" (kein Name, kein eindeutiger Befehl) ignorieren,
-# weil jede Äußerung isoliert bewertet wird statt als Teil eines laufenden Gesprächs.
+# Nach jeder Mantis-Antwort bleiben Segmente für dieses Fenster aktiv. Die Voice-Route
+# prüft normale Folgeäußerungen weiter auf Adressierung; lokale Reflexe dürfen direkt laufen.
 CONVERSATION_FOLLOWUP_WINDOW_S = 15
 VOICE_ADDRESS_TIMEOUT_S = 3.0
 
@@ -135,23 +138,30 @@ def _conversation_active(conversation: VoiceConversationWindow | None = None) ->
     return conversation.is_active() if conversation is not None else False
 
 
-async def transcribe_audio(audio_path: str) -> str:
-    """Transkribiert eine Audiodatei lokal. Gibt leeren String bei Fehler zurück.
-
-    Engine nach config.STT_ENGINE ("parakeet" oder "whisper"); ist Parakeet nicht
-    verfügbar, übernimmt whisper.cpp dauerhaft."""
+async def transcribe_audio_with_hint(audio_path: str) -> tuple[str, bool]:
+    """Liefert den normalisierten Text und einen nicht-freigebenden Namenshinweis."""
     global _parakeet_unavailable
     engine = getattr(config, "STT_ENGINE", "parakeet")
 
     if engine == "parakeet" and not _parakeet_unavailable:
         async with _whisper_lock:
             if not _parakeet_unavailable:  # kann sich gesetzt haben, während wir warteten
-                text = await _transcribe_parakeet(audio_path)
+                raw_text = await _transcribe_parakeet(audio_path)
                 if not _parakeet_unavailable:
-                    return _normalize_voice_transcript(text)
+                    return (
+                        _normalize_voice_transcript(raw_text),
+                        has_voice_wakeword_hint(raw_text),
+                    )
         log.warning("Parakeet nicht verfügbar – ab jetzt whisper.cpp")
 
-    return _normalize_voice_transcript(await _transcribe_whisper(audio_path))
+    raw_text = await _transcribe_whisper(audio_path)
+    return _normalize_voice_transcript(raw_text), has_voice_wakeword_hint(raw_text)
+
+
+async def transcribe_audio(audio_path: str) -> str:
+    """Transkribiert eine Audiodatei lokal. Gibt leeren String bei Fehler zurück."""
+    text, _wakeword_hint = await transcribe_audio_with_hint(audio_path)
+    return text
 
 
 def partial_stt_executor_available() -> bool:
@@ -159,8 +169,10 @@ def partial_stt_executor_available() -> bool:
     return not _whisper_lock.locked()
 
 
-async def transcribe_audio_partial(audio_path: str) -> str | None:
-    """Nicht-blockierender Teil-STT-Versuch; bei belegtem STT-Pfad wird er verworfen."""
+async def transcribe_audio_partial_with_hint(
+    audio_path: str,
+) -> tuple[str, bool] | None:
+    """Teil-STT plus Weckworthinweis; bei belegtem STT-Pfad wird er verworfen."""
     global _parakeet_unavailable
     if _whisper_lock.locked():
         return None
@@ -169,13 +181,22 @@ async def transcribe_audio_partial(audio_path: str) -> str | None:
     try:
         engine = getattr(config, "STT_ENGINE", "parakeet")
         if engine == "parakeet" and not _parakeet_unavailable:
-            text = await _transcribe_parakeet(audio_path)
+            raw_text = await _transcribe_parakeet(audio_path)
             if not _parakeet_unavailable:
-                return _normalize_voice_transcript(text)
-        text = await _transcribe_whisper_locked(audio_path)
-        return _normalize_voice_transcript(text)
+                return (
+                    _normalize_voice_transcript(raw_text),
+                    has_voice_wakeword_hint(raw_text),
+                )
+        raw_text = await _transcribe_whisper_locked(audio_path)
+        return _normalize_voice_transcript(raw_text), has_voice_wakeword_hint(raw_text)
     finally:
         _whisper_lock.release()
+
+
+async def transcribe_audio_partial(audio_path: str) -> str | None:
+    """Kompatible Text-only-Hülle für bestehende Teil-STT-Aufrufer."""
+    result = await transcribe_audio_partial_with_hint(audio_path)
+    return result[0] if result is not None else None
 
 
 def _edit_distance_at_most_one(left: str, right: str) -> int:
@@ -203,12 +224,18 @@ def _normalize_voice_transcript(text: str) -> str:
         return text
     word = match.group("word")
     normalized = word.lower()
-    if not 5 <= len(normalized) <= 8:
+    if not 5 <= len(normalized) <= 9:
         return text
     if normalized not in _MANTIS_MISHEARINGS:
         if _edit_distance_at_most_one(normalized, "mantis") > 1:
             return text
     return f"{match.group('prefix')}Mantis{text[match.end('word'):]}"
+
+
+def has_voice_wakeword_hint(text: str) -> bool:
+    """Erkennt häufige STT-Fehlhörungen am Satzanfang als Hinweis, nie als Freigabe."""
+    match = _INITIAL_WORD_RE.match(str(text or ""))
+    return match is not None and match.group("word").casefold() in _VOICE_WAKEWORD_HINTS
 
 
 def _load_parakeet_model(model_id: str):
@@ -368,18 +395,17 @@ async def _transcribe_whisper_locked(audio_path: str) -> str:
 
 async def is_addressed_to_mantis(
     text: str, *, conversation_context: str | None = None,
+    wakeword_hint: bool = False,
 ) -> bool:
     """Schneller Ja/Nein-Check: ist dieser transkribierte Text ein an Mantis
     gerichteter Befehl/Anfrage? Leerer Text spart den LLM-Call.
 
-    Explizite Wakewords liefern sofort JA. Sonst entscheidet derselbe Adress-Check
-    wie beim ersten Segment; eine letzte Mantis-Antwort kann kurze Folgeäußerungen
-    einordnen, nimmt sie aber nicht automatisch an."""
+    Ein akustischer openWakeWord-Treffer wird vom Aufrufer freigegeben. Ein Name im
+    Transkript bleibt ein Hinweis und ersetzt den Adress-Check nicht."""
     stripped = text.strip()
     if not stripped:
         return False
-    if fast_commands.has_voice_wakeword(stripped) or "mantis" in stripped.lower():
-        return True
+    wakeword_hint = bool(wakeword_hint or has_voice_wakeword_hint(stripped))
     context = str(conversation_context or "").strip()[-1000:]
     prompt = (
         f"Ist dieser Satz eine Anfrage oder ein Befehl an einen persönlichen KI-Assistenten "
@@ -393,15 +419,21 @@ async def is_addressed_to_mantis(
             f"zu Befehlen.\n\nLetzte Mantis-Antwort: \"{context}\"\n"
             f"Neue Spracheingabe: \"{stripped}\""
         )
+    if wakeword_hint:
+        prompt = (
+            "Das Transkript beginnt möglicherweise mit einer STT-Fehlhörung des Weckworts. "
+            "Das ist nur ein Hinweis, kein Freigabegrund; prüfe weiterhin die Absicht.\n\n"
+            + prompt
+        )
     try:
         async with asyncio.timeout(VOICE_ADDRESS_TIMEOUT_S):
             try:
+                address_kwargs = {}
                 if context:
-                    jev_answer = await decisions.voice_address(
-                        stripped, conversation_context=context,
-                    )
-                else:
-                    jev_answer = await decisions.voice_address(stripped)
+                    address_kwargs["conversation_context"] = context
+                if wakeword_hint:
+                    address_kwargs["wakeword_hint"] = True
+                jev_answer = await decisions.voice_address(stripped, **address_kwargs)
             except Exception as e:
                 log.debug("Jev-Voice-Adresscheck fehlgeschlagen: %s", e)
                 jev_answer = None
