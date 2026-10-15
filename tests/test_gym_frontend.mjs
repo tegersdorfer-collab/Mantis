@@ -63,16 +63,18 @@ function createFrontend({
       this._innerHTML = value;
       draftInputs.length = 0;
       tenRmValues.length = 0;
+      const datasetFromAttributes = (attributes) => Object.fromEntries(
+        [...attributes.matchAll(/\bdata-([a-z0-9-]+)="([^"]*)"/g)].map(([, name, value]) => [
+          name.replace(/-([a-z])/g, (_match, character) => character.toUpperCase()),
+          value,
+        ]),
+      );
       for (const match of value.matchAll(/<input\b(?=[^>]*\bdata-draft-input\b)([^>]*)>/g)) {
         const attributes = match[1];
         const attribute = (name) => attributes.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1];
         let currentValue = attribute("value") ?? "";
         draftInputs.push({
-          dataset: {
-            clientId: attribute("data-client-id"),
-            index: attribute("data-index"),
-            field: attribute("data-field"),
-          },
+          dataset: datasetFromAttributes(attributes),
           matches: (selector) => selector === "[data-draft-input]",
           writeCount: 0,
           get value() { return currentValue; },
@@ -81,10 +83,9 @@ function createFrontend({
       }
       for (const match of value.matchAll(/<span\b(?=[^>]*\bdata-tenrm-row\b)([^>]*)>([\s\S]*?)<\/span>/g)) {
         const attributes = match[1];
-        const rowId = attributes.match(/\bdata-tenrm-row="([^"]*)"/)?.[1];
         let currentText = match[2];
         tenRmValues.push({
-          dataset: { row: rowId },
+          dataset: datasetFromAttributes(attributes),
           matches: (selector) => selector === "[data-tenrm-row]",
           get textContent() { return currentText; },
           set textContent(value) { currentText = String(value); },
@@ -186,13 +187,23 @@ function createFrontend({
         && entry.dataset.field === field);
     },
     draftInputs() { return [...draftInputs]; },
-    tenRmValue(rowId) { return tenRmValues.find((entry) => entry.dataset.row === rowId)?.textContent; },
-    beginTouch({ y = 0, scrollTop = 0, handle = false } = {}) {
-      const sheet = { scrollTop };
+    tenRmValue(rowId) { return tenRmValues.find((entry) => entry.dataset.tenrmRow === rowId)?.textContent; },
+    beginTouch({ y = 0, scrollTop = 0, innerScrollTop, handle = false } = {}) {
+      const sheet = { scrollTop, parentElement: null };
+      const scrollContainer = innerScrollTop === undefined
+        ? sheet
+        : { className: "picker-list", scrollTop: innerScrollTop, parentElement: sheet };
       const target = {
+        className: handle ? "sheet-grabber" : "picker-row",
+        scrollTop: 0,
+        parentElement: scrollContainer,
         closest(selector) {
-          if (selector === ".sheet-dismissable, .workout-sheet") return sheet;
-          if (selector === ".sheet-grabber") return handle ? {} : null;
+          let element = this;
+          while (element) {
+            if (selector === ".sheet-dismissable, .workout-sheet" && element === sheet) return sheet;
+            if (selector === ".sheet-grabber" && element.className === "sheet-grabber") return element;
+            element = element.parentElement;
+          }
           return null;
         },
       };
@@ -1537,6 +1548,24 @@ test("Trainings-Sheet rechnet einen Satz als 10RM um und erlaubt ein anderes Zie
   assert.match(screen(), /data-tenrm-target/);
 });
 
+test("live 10RM updates through the browser camelCase dataset property", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ prefill: [{ weight_kg: 60, reps: 8 }] }));
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes('class="exercise-list"')), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  const rowId = app.draftInputs()[0].dataset.clientId;
+
+  app.input(0, "weight_kg", "70");
+
+  assert.equal(app.tenRmValue(rowId), "66,5 kg");
+});
+
 test("Zeitübungen im Trainings-Sheet zeigen SECS und keine 10RM-Spalte", async () => {
   const state = {
     session: { id: 1, title: "Lower A", started_at: "2026-10-14T10:00:00Z" },
@@ -2037,4 +2066,142 @@ test("plan names from untrusted state stay HTML escaped", async () => {
   assert.equal(await waitFor(() => screen().includes("Safe plan")), true);
   assert.match(screen(), /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
   assert.doesNotMatch(screen(), /<img src=x/);
+});
+
+const apHome = {
+  active_plan: { name: "New plan", days: [{ id: 4, name: "Lower A", exercises: [{ name: "Leg Press", muscle: "Quads" }] }] },
+  week_number: 8,
+  next_day: { id: 4 },
+  week_days: [{ date: "2035-10-01", today: true, trained: true }],
+};
+
+test("closing an empty training sheet keeps it closed and the running-workout bar reopens it", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, {
+        session: { id: 12, title: "Lower A", started_at: "2035-10-01T12:00:00Z" },
+        exercises: [],
+        home: apHome,
+      });
+      if (url === "/api/exercises") return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes("empty-training")), true);
+  await app.click("close-training");
+  assert.doesNotMatch(screen(), /empty-training/);
+  assert.match(screen(), /data-action="continue-session"/);
+  assert.match(screen(), /class="exercise-list"/);
+  app.run("render()");
+  assert.doesNotMatch(screen(), /empty-training/);
+
+  await app.click("continue-session");
+  assert.match(screen(), /empty-training/);
+});
+
+test("touch close gesture ignores drags that start inside a scrolled inner list", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes('class="exercise-list"')), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+
+  const inner = app.beginTouch({ y: 30, scrollTop: 0, innerScrollTop: 42 });
+  app.endTouch(inner, 200);
+  assert.equal(app.run("selectedExercise"), "Squats");
+
+  const atTop = app.beginTouch({ y: 30, scrollTop: 0, innerScrollTop: 0 });
+  app.endTouch(atTop, 200);
+  assert.equal(app.run("selectedExercise"), null);
+});
+
+test("history set editor uses a text field that shows and accepts decimal commas", async () => {
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (options.method === "PATCH") return response(200, {});
+      if (url.startsWith("/api/workouts/")) return response(200, {
+        title: "Lower A", date: "2026-10-08", duration_min: 5, set_count: 1, volume_kg: 0,
+        sets: [{ id: 71, exercise_id: 5, exercise: "Bench Press", set_index: 1, weight_kg: 62.5, reps: 8, unit: "reps" }],
+      });
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  app.run(`activeTab = "history"; selectedWorkoutId = 9; workoutDetail = {
+    title: "Lower A", date: "2026-10-08", duration_min: 5, set_count: 1, volume_kg: 0,
+    sets: [{ id: 71, exercise_id: 5, exercise: "Bench Press", set_index: 1, weight_kg: 62.5, reps: 8, unit: "reps" }],
+  }; render();`);
+  await app.click("edit-history-set", { setId: "71" });
+
+  assert.match(screen(), /data-field="weight_kg" type="text" inputmode="decimal"[^>]*value="62,5"|data-field="weight_kg"[^>]*type="text"[^>]*value="62,5"/);
+  assert.doesNotMatch(screen(), /data-field="weight_kg"[^>]*type="number"/);
+  await app.run("saveHistorySet()");
+  const patch = app.calls.find((call) => call.method === "PATCH");
+  assert.ok(patch);
+  assert.equal(JSON.parse(patch.body).weight_kg, 62.5);
+});
+
+test("last workout of an exercise is a vertical card with a dated plan-day header", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ session: { id: 1, title: "Lower A", started_at: "2026-10-14T10:00:00Z" } }));
+      if (url.startsWith("/api/history?")) return response(200, [
+        { date: "2026-09-22", sets: [{ weight_kg: 60, reps: 8 }, { weight_kg: 62.5, reps: 6 }] },
+      ]);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  await app.click("open-exercise", { exercise: "Squats" });
+  await waitFor(() => screen().includes("history-table-row"));
+
+  assert.match(screen(), /<article class="last-workout-card"><header class="last-workout-head">Tue, Sep 22nd · Lower A<\/header>/);
+  assert.doesNotMatch(screen(), /class="history-line"/);
+  assert.match(cssSource, /\.last-workout-card\s*\{[^}]*display:\s*block/s);
+});
+
+test("home screen uses its own day classes, ring number and blue week link", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ session: null, home: apHome }));
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  assert.equal(await waitFor(() => screen().includes("Lower A")), true);
+
+  assert.match(screen(), /<strong class="home-day-name">Lower A<\/strong>/);
+  assert.doesNotMatch(screen(), /class="plan-day-name">Lower A/);
+  assert.match(cssSource, /\.home-day-name\s*\{(?=[^}]*font-size:\s*22px)(?=[^}]*font-weight:\s*400)(?=[^}]*color:\s*#fff)/s);
+  assert.match(cssSource, /\.plan-day-number\s*\{[^}]*border:\s*1\.5px solid #636366;[^}]*background:\s*transparent/s);
+  assert.match(cssSource, /\.week-number\s*\{(?=[^}]*font-size:\s*20px)(?=[^}]*font-weight:\s*600)(?=[^}]*color:\s*#0A84FF)/si);
+});
+
+test("library pills are capitalised for display only and unset equipment shows no subtitle", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  app.run(`activeTab = "exercises"; exerciseDirectory = [
+    { id: 1, name: "Treadmill", muscle: "cardio", equipment: "" },
+    { id: 2, name: "Bench Press", muscle: "Chest", equipment: "barbell" },
+  ]; render();`);
+
+  assert.match(screen(), /data-muscle="cardio"[^>]*>Cardio</);
+  assert.doesNotMatch(screen(), /Equipment not set/);
+  assert.match(screen(), /<small><\/small>|<small>Barbell<\/small>/);
+  assert.doesNotMatch(screen(), /<strong>Treadmill<\/strong><small>[^<]+/);
 });

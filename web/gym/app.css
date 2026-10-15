@@ -217,7 +217,9 @@ p {
 .week-number {
   margin-left: auto;
   background: transparent;
-  color: var(--blue);
+  color: #0A84FF;
+  font-size: 20px;
+  font-weight: 600;
 }
 
 .plan-menu-button {
@@ -368,18 +370,20 @@ p {
   place-items: center;
   width: 31px;
   height: 31px;
+  border: 1.5px solid #636366;
   border-radius: 50%;
-  background: var(--group);
+  background: transparent;
   color: var(--secondary);
   font-size: 0.84rem;
-  font-weight: 680;
+  font-weight: 500;
 }
 
-.plan-day-name {
+.home-day-name {
   overflow: hidden;
   min-width: 0;
+  color: #fff;
   font-size: 22px;
-  font-weight: 650;
+  font-weight: 400;
   letter-spacing: -0.025em;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2444,4 +2448,19 @@ textarea:focus-visible {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+.last-workout-card {
+  display: block;
+  margin-top: 10px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: var(--group);
+}
+
+.last-workout-head {
+  margin-bottom: 8px;
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 600;
 }

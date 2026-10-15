@@ -9,6 +9,7 @@ const tabBar = document.querySelector("#tab-bar");
 let screenMode = "loading";
 let appState = null;
 let selectedExercise = null;
+let trainingSheetClosed = false;
 let editingSet = null;
 let finishSummary = null;
 let notice = "";
@@ -279,6 +280,11 @@ function muscleLabel(muscle) {
     calves: "Calves", lats: "Lats", traps: "Traps", "lower back": "Lower back", neck: "Neck" })[muscle] ?? muscle;
 }
 
+function capitalize(text) {
+  const value = String(text ?? "");
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
 function equipmentLabel(equipment) {
   const normalized = String(equipment || "").trim().toLowerCase();
   return ({
@@ -491,7 +497,7 @@ function updateDraftTenRm(exercise, draft) {
   const value = estimateRm(draft.weight_kg, draft.reps);
   const label = value === null ? "–" : `${formatWeight(value)} kg`;
   for (const field of screen.querySelectorAll("[data-tenrm-row]")) {
-    if (field.dataset.row === draft.client_id) field.textContent = label;
+    if (field.dataset.tenrmRow === draft.client_id) field.textContent = label;
   }
 }
 
@@ -532,7 +538,7 @@ function renderHome() {
     return `<button class="plan-day-row${isNext ? " is-next" : ""}" type="button"
       data-action="start-day" data-day-id="${day.id}" aria-label="Start ${escapeHtml(day.name)}">
       <span class="plan-day-number">${index + 1}</span>
-      <strong class="plan-day-name">${escapeHtml(day.name)}</strong>
+      <strong class="home-day-name">${escapeHtml(day.name)}</strong>
       <span class="day-exercise-tiles">${tiles}${more}</span>
     </button>`;
   }).join("");
@@ -544,7 +550,7 @@ function renderHome() {
   const emptyDay = plan?.days?.length
     ? days
     : `<button class="plan-day-row empty-plan-card" type="button" data-action="start-free"><span class="plan-day-number">+</span>
-        <strong class="plan-day-name">Start free training</strong></button>`;
+        <strong class="home-day-name">Start free training</strong></button>`;
   const planMenu = planMenuOpen ? `<div class="home-plan-menu" role="menu" aria-label="Plan options">
       <button type="button" data-action="tab" data-tab="plans">Edit plans</button>
       <button type="button" data-action="create-plan">Create plan</button>
@@ -636,7 +642,7 @@ function renderEditPanel(set, unit = "reps") {
   </section>`;
 }
 
-function renderHistory(exercise) {
+function renderHistory(exercise, planName = "") {
   const items = histories[exercise.name];
   if (items === undefined) return '<p class="quiet-copy">Loading workout history …</p>';
   if (items.error) return `<p class="quiet-copy">${escapeHtml(items.error)}</p>`;
@@ -646,7 +652,8 @@ function renderHistory(exercise) {
     const rows = item.sets.map((set, index) => `<div class="history-table-row${timed ? " is-timed" : ""}">
       <span>${escapeHtml(set.set_index ?? index + 1)}</span><span>${formatWeight(set.weight_kg)}</span>
       <span>${escapeHtml(set.reps)}${timed ? " s" : ""}</span>${timed ? "" : `<span>${formatWeight(estimateRm(set.weight_kg, set.reps))}</span>`}</div>`).join("");
-    return `<article class="history-line"><strong>${escapeHtml(formatOrdinalEnglishDate(item.date))}</strong>
+    const heading = [formatOrdinalEnglishDate(item.date), item.title ? planDayName(item.title) : planName].filter(Boolean).join(" · ");
+    return `<article class="last-workout-card"><header class="last-workout-head">${escapeHtml(heading)}</header>
       <div class="history-table-heading${timed ? " is-timed" : ""}"><span>#</span><span>KG</span><span>${timed ? "SECS" : "REPS"}</span>${timed ? "" : "<span>10RM</span>"}</div>${rows}</article>`;
   }).join("")}</div>`;
 }
@@ -729,7 +736,7 @@ function renderExercise() {
       <div class="sheet-footer"><button class="text-button" type="button" data-action="open-help">Help</button>
         <button class="button add-set-row" type="button" data-action="add-draft">+ Set</button>
         ${appState?.session ? '<button class="text-button finish-session-link" type="button" data-action="finish">Finish</button>' : ""}</div>
-      <div class="exercise-history"><strong>Last workout · ${escapeHtml(planName)}</strong>${renderHistory(exercise)}</div>
+      <div class="exercise-history"><strong>Last workout · ${escapeHtml(planName)}</strong>${renderHistory(exercise, planName)}</div>
       ${sessionExercisePickerOpen ? renderExercisePicker(sessionExercisePickerKind) : ""}
     </section>`;
 }
@@ -844,7 +851,7 @@ function renderHistorySetDialog() {
   return `<div class="modal-backdrop history-set-backdrop" data-action="cancel-history-edit" aria-hidden="true"></div>
     <section class="history-set-dialog" role="dialog" aria-modal="true" aria-label="Edit set">
       <header><h2>Edit set ${escapeHtml(set.set_index)}</h2><button class="sheet-close" type="button" data-action="cancel-history-edit">Close</button></header>
-      <div class="history-set-fields"><label>KG<input data-history-edit data-field="weight_kg" type="number" step="0.25"
+      <div class="history-set-fields"><label>KG<input data-history-edit data-field="weight_kg" type="text"
           value="${escapeHtml(historyEditSet.weight_kg)}" inputmode="decimal"></label>
         <label>${amountLabel}<input data-history-edit data-field="reps" type="number" step="1"
           value="${escapeHtml(historyEditSet.reps)}" inputmode="numeric"></label></div>
@@ -963,13 +970,13 @@ function renderExerciseLibrary() {
   }
   const entries = exerciseDirectory ?? [];
   const muscles = [...new Set(entries.map((item) => item.muscle).filter(Boolean))].sort();
-  const filterButtons = [["", "All"], ...muscles.map((muscle) => [muscle, muscleLabel(mappedMuscles(muscle)[0]) || muscle])]
+  const filterButtons = [["", "All"], ...muscles.map((muscle) => [muscle, capitalize(muscleLabel(mappedMuscles(muscle)[0]) || muscle)])]
     .map(([muscle, label]) => `<button class="muscle-filter${exerciseMuscle === muscle ? " is-active" : ""}" type="button"
       data-action="filter-library-muscle" data-muscle="${escapeHtml(muscle)}" aria-pressed="${exerciseMuscle === muscle}">${escapeHtml(label)}</button>`)
     .join("");
   const rows = entries.map((item) => `<button class="library-row" type="button" data-action="open-library-exercise" data-exercise-id="${item.id}">
     <span class="exercise-library-tile" aria-hidden="true">${escapeHtml(exerciseInitials(item))}</span>
-    <span class="library-row-copy"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(equipmentLabel(item.equipment))}</small></span>
+    <span class="library-row-copy"><strong>${escapeHtml(item.name)}</strong><small>${item.equipment ? escapeHtml(equipmentLabel(item.equipment)) : ""}</small></span>
     <span class="library-row-chevron" aria-hidden="true">›</span></button>`).join("");
   const form = showNewExerciseForm ? `<form id="new-exercise-form" class="inline-form">
     <h2>New exercise</h2><label>Name<input name="name" required maxlength="100"></label>
@@ -1080,6 +1087,7 @@ function renderProfile() {
 }
 
 function render() {
+  if (!appState?.session || (appState.exercises ?? []).length) trainingSheetClosed = false;
   if (screenMode === "login") screen.innerHTML = renderLogin();
   else if (screenMode === "loading") screen.innerHTML = `${renderBrand()}<div class="loading-panel">Loading workout …</div>`;
   else if (screenMode === "error") screen.innerHTML = `${renderBrand()}
@@ -1089,7 +1097,7 @@ function render() {
     </section>`;
   else if (screenMode === "summary") screen.innerHTML = renderSummary();
   else if (activeTab === "training" && selectedExercise) screen.innerHTML = renderExercise();
-  else if (activeTab === "training" && appState?.session && !(appState.exercises ?? []).length) screen.innerHTML = renderEmptyTraining();
+  else if (activeTab === "training" && appState?.session && !trainingSheetClosed && !(appState.exercises ?? []).length) screen.innerHTML = renderEmptyTraining();
   else if (activeTab === "training") screen.innerHTML = renderHome();
   else if (activeTab === "history") screen.innerHTML = renderWorkoutHistory();
   else if (activeTab === "profile") screen.innerHTML = renderProfile();
@@ -1650,6 +1658,7 @@ async function startFreeTraining() {
 
 async function continueSession() {
   activeTab = "training";
+  trainingSheetClosed = false;
   await refreshState();
   const exercises = appState?.exercises ?? [];
   const next = exercises.find((exercise) => !exercise.skipped
@@ -2168,6 +2177,7 @@ document.addEventListener("click", async (event) => {
     void loadHistory(selectedExercise);
   } else if (action === "close-training") {
     selectedExercise = null;
+    trainingSheetClosed = true;
     exerciseMenuOpen = false;
     removeStored("gym_view");
     render();
@@ -2473,12 +2483,19 @@ window.addEventListener("online", () => void handleReconnect());
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") void handleReconnect();
 });
+function scrolledToTop(target, sheet) {
+  for (let element = target; element; element = element.parentElement) {
+    if (Number(element.scrollTop) > 0) return false;
+    if (element === sheet) return true;
+  }
+  return Number(sheet.scrollTop) === 0;
+}
 document.addEventListener("touchstart", (event) => {
   const sheet = event.target.closest(".sheet-dismissable, .workout-sheet");
   if (!sheet) return;
   const startY = event.changedTouches?.[0]?.clientY;
   sheetStartY = startY !== undefined
-    && (event.target.closest(".sheet-grabber") || sheet.scrollTop === 0)
+    && (event.target.closest(".sheet-grabber") || scrolledToTop(event.target, sheet))
     ? startY : null;
 }, { passive: true });
 document.addEventListener("touchend", (event) => {
@@ -2488,6 +2505,7 @@ document.addEventListener("touchend", (event) => {
   if (distance < 90 || !event.target.closest(".sheet-dismissable, .workout-sheet")) return;
   if (activeTab === "training") {
     selectedExercise = null;
+    trainingSheetClosed = true;
     removeStored("gym_view");
     render();
   } else if (activeTab === "history") {
@@ -2509,8 +2527,9 @@ document.addEventListener("keydown", (event) => {
   } else if (exerciseDetailMenuOpen) {
     exerciseDetailMenuOpen = false;
     render();
-  } else if (activeTab === "training" && selectedExercise) {
+  } else if (activeTab === "training" && (selectedExercise || appState?.session)) {
     selectedExercise = null;
+    trainingSheetClosed = true;
     removeStored("gym_view");
     render();
   } else if (activeTab === "history") {
