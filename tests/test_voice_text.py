@@ -15,7 +15,7 @@ def test_numeric_sentence_end_keeps_the_complete_sentence():
     "mishearing",
     [
         "Meintest", "Mehr das", "Mertes", "Mantasy", "Bantas", "Mann das",
-        "Mentiones", "Mendes", "Mandis", "Mentis",
+        "Mentiones", "Mendes", "Mandis", "Mentis", "Mantas",
     ],
 )
 def test_acoustic_wakeword_replaces_known_initial_mishearing(mishearing):
@@ -28,7 +28,7 @@ def test_acoustic_wakeword_replaces_known_initial_mishearing(mishearing):
     "mishearing",
     [
         "Meintest", "Mehr das", "Mertes", "Mantasy", "Bantas", "Mann das",
-        "Mentiones", "Mendes", "Mandis", "Mentis",
+        "Mentiones", "Mendes", "Mandis", "Mentis", "Mantas",
     ],
 )
 def test_mantis_like_transcript_is_never_rewritten_without_acoustic_wakeword(mishearing):

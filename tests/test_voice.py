@@ -89,13 +89,17 @@ class TestTranscribeParakeet:
         ("Bandas, erzähl mir was.", "Bandas, erzähl mir was."),
         ("Bitte Mantasy erklären", "Bitte Mantasy erklären"),
     ])
-    def test_normalisiert_nur_mantis_aehnliches_erstes_wort(self, monkeypatch, raw, expected):
+    def test_normalisiert_mantis_aehnliches_erstes_wort_nur_nach_wakeword(
+        self, monkeypatch, raw, expected,
+    ):
         monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet")
         model = MagicMock()
         model.transcribe.return_value = MagicMock(text=raw)
         voice._parakeet_model = model
 
-        text = asyncio.run(voice.transcribe_audio("/tmp/fake.wav"))
+        text, _hint = asyncio.run(voice.transcribe_audio_with_hint(
+            "/tmp/fake.wav", wakeword_triggered=True,
+        ))
 
         assert text == expected
 
@@ -591,13 +595,26 @@ def test_cancelled_whisper_transcription_does_not_record_stt_runtime(monkeypatch
     assert recorded == []
 
 
-def test_whisper_voice_transcript_also_normalizes_the_initial_wake_word(monkeypatch):
+def test_whisper_voice_transcript_normalizes_only_after_acoustic_wakeword(monkeypatch):
     monkeypatch.setattr(voice.config, "STT_ENGINE", "whisper")
     monkeypatch.setattr(
         voice, "_transcribe_whisper", AsyncMock(return_value="Bantas, zeig mir das."),
     )
 
-    assert asyncio.run(voice.transcribe_audio("/tmp/fake.wav")) == "Mantis, zeig mir das."
+    text, _hint = asyncio.run(voice.transcribe_audio_with_hint(
+        "/tmp/fake.wav", wakeword_triggered=True,
+    ))
+    assert text == "Mantis, zeig mir das."
+
+
+def test_stt_does_not_normalize_mantas_without_an_acoustic_wakeword(monkeypatch):
+    raw = "Mantas, wie spät ist es?"
+    monkeypatch.setattr(voice.config, "STT_ENGINE", "whisper")
+    monkeypatch.setattr(voice, "_transcribe_whisper", AsyncMock(return_value=raw))
+
+    result = asyncio.run(voice.transcribe_audio_with_hint("/tmp/fake.wav"))
+
+    assert result == (raw, False)
 
 
 class TestTranscribeAudio:
@@ -705,9 +722,11 @@ class TestPartialTranscription:
 
         monkeypatch.setattr(voice, "_transcribe_whisper_locked", fake_whisper)
 
-        result = asyncio.run(voice.transcribe_audio_partial("/tmp/fake.wav"))
+        result = asyncio.run(voice.transcribe_audio_partial_with_hint(
+            "/tmp/fake.wav", wakeword_triggered=True,
+        ))
 
-        assert result == "Mantis, los."
+        assert result == ("Mantis, los.", False)
         assert calls == [("/tmp/fake.wav", True)]
         assert voice.partial_stt_executor_available() is True
 
@@ -747,9 +766,11 @@ class TestIsAddressedToMantis:
         mock_jev.assert_awaited_once_with(text, wakeword_hint=True)
         mock_yes_no.assert_not_awaited()
 
-    @pytest.mark.parametrize("word", ["Mentiones", "Mentions", "Mantes", "Mandis", "Mentis"])
+    @pytest.mark.parametrize("word", ["Mentiones", "Mentions", "Mantes", "Mandis", "Mentis", "Mantas"])
     def test_parakeet_fehlhoerungen_werden_fuer_commandrouting_normalisiert(self, word):
-        assert voice._normalize_voice_transcript(f"{word}, wie spät ist es?") == (
+        assert voice._normalize_voice_transcript(
+            f"{word}, wie spät ist es?", wakeword_triggered=True,
+        ) == (
             "Mantis, wie spät ist es?"
         )
 

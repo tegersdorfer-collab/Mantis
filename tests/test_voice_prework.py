@@ -268,6 +268,30 @@ def test_speculative_followup_selects_tools_from_previous_user_context(monkeypat
     ]
 
 
+def test_reminder_followup_does_not_inherit_force_from_previous_turn():
+    from core import message_handler
+
+    previous_text = "Erinnere mich morgen um sieben an den Müll"
+    previous_tools, previous_force = message_handler._keyword_tool_selection(previous_text)
+    assert "set_reminder" in previous_tools
+    assert previous_force is True
+
+    handler = object.__new__(message_handler.MessageHandler)
+    handler.kzg = type("KZG", (), {
+        "recent_messages": lambda _self, **_kwargs: [{
+            "role": "user", "content": previous_text,
+        }],
+    })()
+    handler.prompt_builder = type("PromptBuilder", (), {
+        "build": lambda _self, text, **_kwargs: asyncio.sleep(0, result=f"Kontext: {text}"),
+    })()
+
+    followup = asyncio.run(handler.prepare_voice_turn("Und morgen um acht?"))
+
+    assert followup.force_tools is False
+    assert "set_reminder" not in followup.keyword_tools
+
+
 def test_agent_turn_discards_prework_for_distant_final_text(monkeypatch):
     from core import message_handler
 
