@@ -810,6 +810,61 @@ MIGRATIONS = [
     "ALTER TABLE health_data DROP COLUMN IF EXISTS recovery_pct;",
 ]
 
+MIGRATIONS.extend([
+    # Gym-Tracker v2: eigener Trainingsplan, getrennt von der importierten Historie.
+    """
+    CREATE TABLE IF NOT EXISTS gym_plans (
+        id          SERIAL PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE,
+        start_date  DATE NOT NULL,
+        active      BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS gym_one_active_plan_idx ON gym_plans (active) WHERE active=TRUE;",
+    """
+    CREATE TABLE IF NOT EXISTS gym_plan_days (
+        id          SERIAL PRIMARY KEY,
+        plan_id     INT NOT NULL REFERENCES gym_plans(id) ON DELETE CASCADE,
+        name        TEXT NOT NULL,
+        sort_order  INT NOT NULL DEFAULT 0,
+        UNIQUE (plan_id, name)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS gym_plan_days_order_idx ON gym_plan_days (plan_id, sort_order, id);",
+    """
+    CREATE TABLE IF NOT EXISTS gym_plan_exercises (
+        id          SERIAL PRIMARY KEY,
+        day_id      INT NOT NULL REFERENCES gym_plan_days(id) ON DELETE CASCADE,
+        exercise_id INT NOT NULL REFERENCES exercises(id) ON DELETE RESTRICT,
+        sort_order  INT NOT NULL DEFAULT 0,
+        target_sets INT NOT NULL DEFAULT 3,
+        rep_min     INT NOT NULL DEFAULT 6,
+        rep_max     INT NOT NULL DEFAULT 10,
+        rest_s      INT NOT NULL DEFAULT 180,
+        UNIQUE (day_id, exercise_id)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS gym_plan_exercises_order_idx ON gym_plan_exercises (day_id, sort_order, id);",
+    """
+    CREATE TABLE IF NOT EXISTS gym_workout_exercises (
+        id          SERIAL PRIMARY KEY,
+        workout_id  INT NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
+        exercise_id INT NOT NULL REFERENCES exercises(id) ON DELETE RESTRICT,
+        sort_order  INT NOT NULL DEFAULT 0,
+        target_sets INT NOT NULL DEFAULT 3,
+        rep_min     INT NOT NULL DEFAULT 6,
+        rep_max     INT NOT NULL DEFAULT 10,
+        rest_s      INT NOT NULL DEFAULT 180,
+        note        TEXT NOT NULL DEFAULT '',
+        skipped     BOOLEAN NOT NULL DEFAULT FALSE,
+        UNIQUE (workout_id, exercise_id)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS gym_workout_exercises_order_idx ON gym_workout_exercises (workout_id, sort_order, id);",
+])
+
 
 def _backfill_legacy_exercise_metadata(cur) -> None:
     """Füllt Gym-Metadaten der Import-Bestandsübungen, nur wo sie noch NULL sind.

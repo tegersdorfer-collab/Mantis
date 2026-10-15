@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 import config
-from domains.gym import tracker
+from domains.gym import library, plans, tracker
 
 
 COOKIE = "mantis_gym"
@@ -40,6 +40,66 @@ class SetBody(BaseModel):
 class SetPatch(BaseModel):
     weight_kg: float | None = None
     reps: int | None = None
+
+
+class PlanBody(BaseModel):
+    name: str
+    start_date: str | None = None
+
+
+class PlanPatch(BaseModel):
+    name: str | None = None
+    start_date: str | None = None
+
+
+class DayBody(BaseModel):
+    name: str
+
+
+class DayOrderBody(BaseModel):
+    day_ids: list[int]
+
+
+class ExerciseOrderBody(BaseModel):
+    entry_ids: list[int]
+
+
+class PlanExerciseBody(BaseModel):
+    exercise_id: int
+    target_sets: int = 3
+    rep_min: int | None = None
+    rep_max: int | None = None
+    rest_s: int = plans.DEFAULT_REST_SECONDS
+
+
+class PlanExercisePatch(BaseModel):
+    sort_order: int | None = None
+    target_sets: int | None = None
+    rep_min: int | None = None
+    rep_max: int | None = None
+    rest_s: int | None = None
+
+
+class ExerciseBody(BaseModel):
+    name: str
+    muscle: str | None = None
+    equipment: str | None = None
+    rep_min: int = 6
+    rep_max: int = 10
+
+
+class SessionStartBody(BaseModel):
+    day_id: int | None = None
+
+
+class SessionExerciseBody(BaseModel):
+    exercise_id: int
+
+
+class SessionExercisePatch(BaseModel):
+    sort_order: int | None = None
+    note: str | None = None
+    skipped: bool | None = None
 
 
 def _token_ok(value: str) -> bool:
@@ -174,7 +234,155 @@ def create_gym_app() -> FastAPI:
 
     @api.get("/state")
     async def state():
-        return await asyncio.to_thread(tracker.get_state)
+        current = await asyncio.to_thread(tracker.get_state)
+        if current.get("session"):
+            current["exercises"] = await asyncio.to_thread(
+                plans.session_exercises,
+                int(current["session"]["id"]),
+                current["session"].get("title"),
+                current.get("exercises", []),
+            )
+        current["home"] = await asyncio.to_thread(plans.home_state)
+        return current
+
+    @api.post("/sessions/start")
+    async def start_session(body: SessionStartBody):
+        if body.day_id is not None:
+            return await asyncio.to_thread(plans.start_plan_session, body.day_id)
+        return await asyncio.to_thread(plans.start_free_session)
+
+    @api.post("/sessions/{workout_id}/exercises")
+    async def add_session_exercise(workout_id: int, body: SessionExerciseBody):
+        return await asyncio.to_thread(
+            plans.add_session_exercise, workout_id, body.exercise_id
+        )
+
+    @api.patch("/sessions/{workout_id}/exercises/{entry_id}")
+    async def update_session_exercise(
+        workout_id: int, entry_id: int, body: SessionExercisePatch,
+    ):
+        return await asyncio.to_thread(
+            plans.update_session_exercise,
+            workout_id,
+            entry_id,
+            **body.model_dump(exclude_unset=True),
+        )
+
+    @api.get("/plans")
+    async def list_plans():
+        return await asyncio.to_thread(plans.list_plans)
+
+    @api.post("/plans")
+    async def create_plan(body: PlanBody):
+        return await asyncio.to_thread(plans.create_plan, body.name, body.start_date)
+
+    @api.get("/plans/{plan_id}")
+    async def get_plan(plan_id: int):
+        return await asyncio.to_thread(plans.get_plan, plan_id)
+
+    @api.patch("/plans/{plan_id}")
+    async def update_plan(plan_id: int, body: PlanPatch):
+        return await asyncio.to_thread(
+            plans.update_plan, plan_id, **body.model_dump(exclude_unset=True)
+        )
+
+    @api.post("/plans/{plan_id}/activate")
+    async def activate_plan(plan_id: int):
+        return await asyncio.to_thread(plans.activate_plan, plan_id)
+
+    @api.post("/plans/{plan_id}/days")
+    async def add_plan_day(plan_id: int, body: DayBody):
+        return await asyncio.to_thread(plans.add_day, plan_id, body.name)
+
+    @api.put("/plans/{plan_id}/days/order")
+    async def reorder_plan_days(plan_id: int, body: DayOrderBody):
+        return await asyncio.to_thread(plans.reorder_days, plan_id, body.day_ids)
+
+    @api.patch("/plan-days/{day_id}")
+    async def update_plan_day(day_id: int, body: DayBody):
+        return await asyncio.to_thread(plans.update_day, day_id, name=body.name)
+
+    @api.delete("/plan-days/{day_id}", status_code=204)
+    async def delete_plan_day(day_id: int):
+        await asyncio.to_thread(plans.delete_day, day_id)
+        return Response(status_code=204)
+
+    @api.post("/plan-days/{day_id}/exercises")
+    async def add_plan_exercise(day_id: int, body: PlanExerciseBody):
+        return await asyncio.to_thread(
+            plans.add_exercise,
+            day_id,
+            body.exercise_id,
+            target_sets=body.target_sets,
+            rep_min=body.rep_min,
+            rep_max=body.rep_max,
+            rest_s=body.rest_s,
+        )
+
+    @api.put("/plan-days/{day_id}/exercises/order")
+    async def reorder_plan_exercises(day_id: int, body: ExerciseOrderBody):
+        return await asyncio.to_thread(plans.reorder_exercises, day_id, body.entry_ids)
+
+    @api.patch("/plan-exercises/{entry_id}")
+    async def update_plan_exercise(entry_id: int, body: PlanExercisePatch):
+        return await asyncio.to_thread(
+            plans.update_plan_exercise,
+            entry_id,
+            **body.model_dump(exclude_unset=True),
+        )
+
+    @api.delete("/plan-exercises/{entry_id}", status_code=204)
+    async def delete_plan_exercise(entry_id: int):
+        await asyncio.to_thread(plans.delete_plan_exercise, entry_id)
+        return Response(status_code=204)
+
+    @api.get("/exercises")
+    async def list_exercises(search: str = "", muscle: str | None = None):
+        return await asyncio.to_thread(library.list_exercises, search, muscle)
+
+    @api.post("/exercises")
+    async def create_exercise(body: ExerciseBody):
+        return await asyncio.to_thread(
+            library.create_exercise,
+            body.name,
+            body.muscle,
+            body.equipment,
+            body.rep_min,
+            body.rep_max,
+        )
+
+    @api.get("/exercises/{exercise_id}")
+    async def exercise_detail(exercise_id: int):
+        return await asyncio.to_thread(library.exercise_detail, exercise_id)
+
+    @api.get("/workouts")
+    async def workout_list(limit: int = 50):
+        return await asyncio.to_thread(library.workout_list, limit)
+
+    @api.get("/workouts/{workout_id}")
+    async def workout_detail(workout_id: int):
+        return await asyncio.to_thread(library.workout_detail, workout_id)
+
+    @api.patch("/workouts/{workout_id}/sets/{set_id}")
+    async def update_history_set(workout_id: int, set_id: int, body: SetPatch):
+        values = body.model_dump(exclude_unset=True)
+        return await asyncio.to_thread(
+            library.update_history_set,
+            workout_id,
+            set_id,
+            values.get("weight_kg"),
+            values.get("reps"),
+        )
+
+    @api.delete("/workouts/{workout_id}/sets/{set_id}", status_code=204)
+    async def delete_history_set(workout_id: int, set_id: int):
+        await asyncio.to_thread(library.delete_history_set, workout_id, set_id)
+        return Response(status_code=204)
+
+    @api.delete("/workouts/{workout_id}", status_code=204)
+    async def delete_workout(workout_id: int):
+        await asyncio.to_thread(library.delete_workout, workout_id)
+        return Response(status_code=204)
 
     @api.post("/sets")
     async def add_set(body: SetBody):

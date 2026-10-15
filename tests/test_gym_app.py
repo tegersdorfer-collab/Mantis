@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 import config
-from domains.gym import tracker
+from domains.gym import plans, tracker
 from web.gym_app import create_gym_app
 
 
@@ -15,6 +15,11 @@ def client(monkeypatch):
         tracker,
         "get_state",
         lambda: {"session": None, "exercises": []},
+    )
+    monkeypatch.setattr(
+        plans,
+        "home_state",
+        lambda: {"active_plan": None, "week_number": None, "week_days": [], "next_day": None},
     )
     return TestClient(create_gym_app())
 
@@ -82,3 +87,17 @@ def test_api_also_accepts_a_bearer_token(client):
     response = client.get("/api/state", headers={"Authorization": "Bearer t"})
 
     assert response.status_code == 200
+
+
+def test_v2_routes_remain_authenticated_and_reject_a_foreign_write_origin(logged_in):
+    unauthenticated = TestClient(create_gym_app())
+    assert unauthenticated.get("/api/plans").status_code == 401
+    assert unauthenticated.get("/api/exercises").status_code == 401
+    assert unauthenticated.get("/api/workouts").status_code == 401
+    response = logged_in.post(
+        "/api/sessions/start",
+        json={"day_id": 1},
+        headers={"Origin": "http://evil.example"},
+    )
+
+    assert response.status_code == 403
