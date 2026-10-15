@@ -357,6 +357,14 @@ def test_voice_stop_reflex_is_exact():
     assert stop.args == {"response": "Okay."}
 
 
+def test_voice_okay_is_a_no_side_effect_reflex():
+    okay = match_voice("Okay.")
+
+    assert okay is not None
+    assert okay.tool == "voice_reflex"
+    assert okay.args == {"response": "Okay."}
+
+
 def test_voice_timer_and_volume_commands_are_narrow_and_deterministic():
     from datetime import datetime
     from zoneinfo import ZoneInfo

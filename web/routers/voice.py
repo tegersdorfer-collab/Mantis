@@ -27,7 +27,11 @@ from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 
 import config
 from core import db, tts, voice_fillers, voice_timing
-from core.voice import VoiceConversationWindow, transcribe_audio, is_addressed_to_mantis
+from core.voice import (
+    VoiceConversationWindow, has_voice_wakeword_hint,
+    transcribe_audio_with_hint, is_addressed_to_mantis,
+)
+from core import fast_commands
 from core.voice_prework import VoicePreworkCache
 from core.voice_stream import VoiceStreamSession
 from core.stream_events import StreamEvent
@@ -295,6 +299,48 @@ class _PlaybackTurn:
         return " ".join(parts).strip()
 
 
+class _AudioOutputGate:
+    """Hält TTS und Audioversand bis zur Adressentscheidung zurück."""
+
+    def __init__(self, *, open: bool = False):
+        self._event = asyncio.Event()
+        if open:
+            self._event.set()
+        self._waiting_at: float | None = None
+        self._held_ms = 0.0
+        self._resolved = bool(open)
+        self._rejected = False
+
+    @property
+    def held_ms(self) -> float:
+        return round(self._held_ms, 1)
+
+    async def wait(self) -> None:
+        if self._rejected:
+            raise asyncio.CancelledError
+        if self._event.is_set():
+            return
+        if self._waiting_at is None:
+            self._waiting_at = time.perf_counter()
+        await self._event.wait()
+
+    def _resolve(self, *, release: bool) -> None:
+        if self._resolved:
+            return
+        self._resolved = True
+        if self._waiting_at is not None:
+            self._held_ms = max(0.0, (time.perf_counter() - self._waiting_at) * 1000)
+        self._rejected = not release
+        if release:
+            self._event.set()
+
+    def release(self) -> None:
+        self._resolve(release=True)
+
+    def reject(self) -> None:
+        self._resolve(release=False)
+
+
 def _voice_backend_details(orch) -> tuple[str, str]:
     agent = getattr(orch, "voice_agent", None)
     backend = getattr(agent, "backend", None) or getattr(agent, "_backend", None)
@@ -311,6 +357,8 @@ def _record_voice_latency(
     *,
     stt_ms: float | None,
     address_check_ms: float | None = None,
+    address_check_mode: str | None = None,
+    held_ms: float | None = None,
     first_token_ms: float | None = None,
     first_tts_block_ms: float | None = None,
     first_answer_audio_ms: float | None = None,
@@ -323,6 +371,8 @@ def _record_voice_latency(
     detail = {
         "stt_ms": stt_ms,
         "address_check_ms": address_check_ms,
+        "address_check_mode": address_check_mode,
+        "held_ms": held_ms,
         "first_token_ms": first_token_ms,
         "first_tts_block_ms": first_tts_block_ms,
         "first_answer_audio_ms": first_answer_audio_ms,
@@ -454,12 +504,17 @@ async def sende_streaming_antwort(
     *,
     stt_ms: float | None = None,
     address_check_ms: float | None = None,
+    address_check_mode: str | None = None,
+    held_ms: float | None = None,
+    address_metrics: dict | None = None,
     started_at: float | None = None,
     prework=None,
     partial_runs: int = 0,
     partial_as_final: bool = False,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     playback: _PlaybackTurn | None = None,
+    execution_gate: Callable[[], Awaitable[bool]] | None = None,
+    output_gate: _AudioOutputGate | None = None,
     defer_history: bool = False,
     wait_for_playback: bool = False,
     interrupt_check: Callable[[], bool] | None = None,
@@ -518,6 +573,8 @@ async def sende_streaming_antwort(
         sentence_id: int | None = None,
     ) -> None:
         nonlocal sequence, first_tts_block_ms, first_answer_audio_ms
+        if output_gate is not None:
+            await output_gate.wait()
         if first_tts_block_ms is None:
             first_tts_block_ms = round((time.perf_counter() - started_at) * 1000, 1)
         if answer and first_answer_audio_ms is None:
@@ -634,6 +691,17 @@ async def sende_streaming_antwort(
                     for parameter in parameters
                 ):
                     respond_kwargs["interrupt_check"] = interrupt_check
+            if execution_gate is not None:
+                try:
+                    parameters = inspect.signature(orch.voice_respond).parameters.values()
+                except (TypeError, ValueError):
+                    parameters = ()
+                if any(
+                    parameter.name == "execution_gate"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                ):
+                    respond_kwargs["execution_gate"] = execution_gate
             reply, trace = await orch.voice_respond(text, **respond_kwargs)
             _mark_reflex(trace)
             reply = reply or ""
@@ -670,6 +738,8 @@ async def sende_streaming_antwort(
                         continue
                     sentence_id = next_sentence_id
                     next_sentence_id += 1
+                    if output_gate is not None:
+                        await output_gate.wait()
                     stream = synthesize_stream(sentence).__aiter__()
                     completed = False
                     has_audio = False
@@ -875,7 +945,15 @@ async def sende_streaming_antwort(
             try:
                 _record_voice_latency(
                     orch, started_at, stt_ms=stt_ms,
-                    address_check_ms=address_check_ms,
+                    address_check_ms=(
+                        address_metrics.get("address_check_ms", address_check_ms)
+                        if address_metrics is not None else address_check_ms
+                    ),
+                    address_check_mode=(
+                        address_metrics.get("address_check_mode", address_check_mode)
+                        if address_metrics is not None else address_check_mode
+                    ),
+                    held_ms=(output_gate.held_ms if output_gate is not None else held_ms),
                     first_token_ms=first_token_ms,
                     first_tts_block_ms=first_tts_block_ms,
                     first_answer_audio_ms=first_answer_audio_ms,
@@ -905,6 +983,7 @@ def build_router(orch=None) -> APIRouter:
         started_at = time.perf_counter()
         stt_ms = None
         address_check_ms = None
+        address_check_mode = "blocking"
         first_tts_block_ms = None
         first_answer_audio_ms = None
         reply = None
@@ -916,12 +995,14 @@ def build_router(orch=None) -> APIRouter:
                 tmp.write(await audio.read())
                 tmp.flush()
                 stt_started = time.perf_counter()
-                text = await transcribe_audio(tmp.name)
+                text, wakeword_hint = await transcribe_audio_with_hint(tmp.name)
                 stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
 
             if text:
                 address_started = time.perf_counter()
-                addressed = await is_addressed_to_mantis(text)
+                addressed = await is_addressed_to_mantis(
+                    text, wakeword_hint=wakeword_hint,
+                )
                 address_check_ms = round((time.perf_counter() - address_started) * 1000, 1)
             else:
                 addressed = False
@@ -944,6 +1025,8 @@ def build_router(orch=None) -> APIRouter:
                 _record_voice_latency(
                     orch, started_at, stt_ms=stt_ms,
                     address_check_ms=address_check_ms,
+                    address_check_mode=address_check_mode,
+                    held_ms=0,
                     first_tts_block_ms=first_tts_block_ms,
                     first_answer_audio_ms=first_answer_audio_ms,
                 )
@@ -988,6 +1071,8 @@ def build_router(orch=None) -> APIRouter:
         active_playback: _PlaybackTurn | None = None
         active_response_task: asyncio.Task | None = None
         background_response_tasks: set[asyncio.Task] = set()
+        background_address_tasks: set[asyncio.Task] = set()
+        pending_address_tasks: set[asyncio.Task] = set()
         playback_turns: dict[str, _PlaybackTurn] = {}
         recent_tts_turns: deque[_PlaybackTurn] = deque()
         conversation_window = VoiceConversationWindow()
@@ -1007,6 +1092,23 @@ def build_router(orch=None) -> APIRouter:
                     task.exception()
                 except BaseException:
                     pass
+
+        def _address_task_done(task: asyncio.Task) -> None:
+            background_address_tasks.discard(task)
+            pending_address_tasks.discard(task)
+            if not task.cancelled():
+                try:
+                    task.exception()
+                except BaseException:
+                    pass
+
+        async def _cancel_pending_address_tasks() -> None:
+            tasks = tuple(pending_address_tasks)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         def _detach_active_response() -> None:
             nonlocal active_response_task
@@ -1076,6 +1178,8 @@ def build_router(orch=None) -> APIRouter:
 
         async def run_streaming_response(
             result: dict, text: str, prework, playback: _PlaybackTurn,
+            execution_gate: Callable[[], Awaitable[bool]] | None,
+            output_gate: _AudioOutputGate,
         ) -> None:
             nonlocal active_response_task, active_playback
             try:
@@ -1083,11 +1187,15 @@ def build_router(orch=None) -> APIRouter:
                     send_socket, text, orch,
                     stt_ms=result.get("stt_ms"),
                     address_check_ms=result.get("address_check_ms"),
+                    address_check_mode=result.get("address_check_mode"),
+                    address_metrics=result,
                     started_at=result.get("turn_started_at"),
                     prework=prework,
                     partial_runs=result.get("partial_runs", 0),
                     partial_as_final=result.get("partial_as_final", False),
                     playback=playback,
+                    execution_gate=execution_gate,
+                    output_gate=output_gate,
                     defer_history=callable(getattr(orch, "finish_voice_turn", None)),
                     wait_for_playback=(
                         supports_playback_progress
@@ -1130,44 +1238,191 @@ def build_router(orch=None) -> APIRouter:
                     prework_cache.clear()
                 return
 
-            address_started = time.perf_counter()
+            # Eine neuere Äußerung ersetzt einen noch ungeklärten spekulativen Turn.
+            # So können mehrere Checks nicht später in falscher Reihenfolge freigeben.
+            await _cancel_pending_address_tasks()
+
             conversation_context = conversation_window.address_context()
-
-            async def check_address() -> bool:
-                if conversation_context:
-                    return await is_addressed_to_mantis(
-                        text, conversation_context=conversation_context,
-                    )
-                return await is_addressed_to_mantis(text)
-
-            address_task = asyncio.create_task(
-                check_address(), name="voice-address-check",
+            command = fast_commands.match_voice(text)
+            is_local_reflex = command is not None and command.tool == "voice_reflex"
+            playback_or_window_active = (
+                active_playback is not None and active_playback.playback_active
+            ) or conversation_window.is_active()
+            wakeword_triggered = bool(result.get("wakeword_triggered"))
+            window_reflex = is_local_reflex and playback_or_window_active
+            immediate = wakeword_triggered or window_reflex
+            address_mode = "wakeword" if wakeword_triggered else (
+                "window" if window_reflex else "speculative"
             )
-            addressed = await address_task
-            result["address_check_ms"] = round(
-                (time.perf_counter() - address_started) * 1000, 1,
+            result["address_check_mode"] = address_mode
+            result["address_check_ms"] = None
+            wakeword_hint = bool(
+                result.get("wakeword_hint") or has_voice_wakeword_hint(text)
             )
-            if not addressed:
-                if prework_cache is not None:
-                    prework_cache.clear()
-                return
 
-            if active_playback is not None and active_playback.playback_active:
-                await stop_for_bargein(time.monotonic())
-            _detach_active_response()
-            active_playback = None
+            address_decision: asyncio.Future | None = None
+            execution_gate = None
+            output_gate = _AudioOutputGate(open=immediate)
+            if not immediate:
+                address_decision = asyncio.get_running_loop().create_future()
+
+                async def wait_for_address() -> bool:
+                    return await asyncio.shield(address_decision)
+
+                execution_gate = wait_for_address
+
             prework = prework_cache.take_for(text) if prework_cache is not None else None
             if prework_cache is not None:
                 prework_cache.clear()
+
+            async def call_voice_response():
+                kwargs = {}
+                if prework is not None:
+                    kwargs["prework"] = prework
+                if execution_gate is not None:
+                    try:
+                        parameters = inspect.signature(orch.voice_respond).parameters.values()
+                    except (TypeError, ValueError):
+                        parameters = ()
+                    if any(
+                        parameter.name == "execution_gate"
+                        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters
+                    ):
+                        kwargs["execution_gate"] = execution_gate
+                return await orch.voice_respond(text, **kwargs)
+
+            async def check_address() -> bool:
+                address_kwargs = {}
+                if conversation_context:
+                    address_kwargs["conversation_context"] = conversation_context
+                if wakeword_hint:
+                    address_kwargs["wakeword_hint"] = True
+                return await is_addressed_to_mantis(text, **address_kwargs)
+
+            if address_mode == "window" and command is not None and command.label == "stopp":
+                if active_playback is not None and active_playback.playback_active:
+                    await stop_for_bargein(time.monotonic())
+
+            if immediate:
+                if active_playback is not None and active_playback.playback_active:
+                    await stop_for_bargein(time.monotonic())
+                _detach_active_response()
+                active_playback = None
+
             if audio_streaming and orch is not None:
                 playback = _PlaybackTurn()
-                active_playback = playback
-                playback_turns[playback.turn_id] = playback
-                recent_tts_turns.append(playback)
-                active_response_task = asyncio.create_task(
-                    run_streaming_response(result, text, prework, playback),
-                    name="voice-response-turn",
+                if immediate:
+                    active_playback = playback
+                    playback_turns[playback.turn_id] = playback
+                    recent_tts_turns.append(playback)
+                    active_response_task = asyncio.create_task(
+                        run_streaming_response(
+                            result, text, prework, playback, None, output_gate,
+                        ),
+                        name="voice-response-turn",
+                    )
+                    return
+
+                response_task = asyncio.create_task(
+                    run_streaming_response(
+                        result, text, prework, playback, execution_gate, output_gate,
+                    ),
+                    name="voice-speculative-response-turn",
                 )
+                background_response_tasks.add(response_task)
+                response_task.add_done_callback(_response_task_done)
+
+                async def resolve_streaming_address() -> None:
+                    nonlocal active_playback, active_response_task
+                    address_started = time.perf_counter()
+                    try:
+                        addressed = await check_address()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.debug(
+                            "Voice-Adresscheck fehlgeschlagen (%s)", type(exc).__name__,
+                        )
+                        addressed = False
+                    result["address_check_ms"] = round(
+                        (time.perf_counter() - address_started) * 1000, 1,
+                    )
+                    pending_address_tasks.discard(asyncio.current_task())
+                    if not addressed:
+                        if not address_decision.done():
+                            address_decision.set_result(False)
+                        output_gate.reject()
+                        response_task.cancel()
+                        await asyncio.gather(response_task, return_exceptions=True)
+                        return
+
+                    if active_playback is not None and active_playback.playback_active:
+                        await stop_for_bargein(time.monotonic())
+                    _detach_active_response()
+                    active_playback = playback
+                    playback_turns[playback.turn_id] = playback
+                    recent_tts_turns.append(playback)
+                    active_response_task = response_task
+                    if not address_decision.done():
+                        address_decision.set_result(True)
+                    output_gate.release()
+
+                async def resolve_streaming_address_safely() -> None:
+                    try:
+                        await resolve_streaming_address()
+                    except asyncio.CancelledError:
+                        if not address_decision.done():
+                            address_decision.set_result(False)
+                        output_gate.reject()
+                        response_task.cancel()
+                        await asyncio.gather(response_task, return_exceptions=True)
+                        raise
+
+                address_task = asyncio.create_task(
+                    resolve_streaming_address_safely(),
+                    name="voice-address-resolution",
+                )
+                background_address_tasks.add(address_task)
+                pending_address_tasks.add(address_task)
+                address_task.add_done_callback(_address_task_done)
+                return
+
+            if not immediate and orch is None:
+                started_at = result.get("turn_started_at", time.perf_counter())
+
+                async def resolve_address_without_orchestrator() -> None:
+                    address_started = time.perf_counter()
+                    try:
+                        addressed = await check_address()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.debug(
+                            "Voice-Adresscheck fehlgeschlagen (%s)", type(exc).__name__,
+                        )
+                        addressed = False
+                    result["address_check_ms"] = round(
+                        (time.perf_counter() - address_started) * 1000, 1,
+                    )
+                    pending_address_tasks.discard(asyncio.current_task())
+                    if not address_decision.done():
+                        address_decision.set_result(bool(addressed))
+                    if not addressed:
+                        output_gate.reject()
+                    _record_voice_latency(
+                        orch, started_at, stt_ms=result.get("stt_ms"),
+                        address_check_ms=result.get("address_check_ms"),
+                        address_check_mode=address_mode, held_ms=output_gate.held_ms,
+                    )
+
+                address_task = asyncio.create_task(
+                    resolve_address_without_orchestrator(),
+                    name="voice-address-resolution",
+                )
+                background_address_tasks.add(address_task)
+                pending_address_tasks.add(address_task)
+                address_task.add_done_callback(_address_task_done)
                 return
 
             started_at = result.get("turn_started_at", time.perf_counter())
@@ -1175,16 +1430,103 @@ def build_router(orch=None) -> APIRouter:
             first_answer_audio_ms = None
             reply = None
             timing_token = None
+            if not immediate and orch is not None:
+                timing_token = voice_timing.start()
+                timing = voice_timing.current()
+                timing.partial_runs = max(0, int(result.get("partial_runs", 0)))
+                timing.partial_as_final = bool(result.get("partial_as_final", False))
+                response_task = asyncio.create_task(
+                    call_voice_response(), name="voice-speculative-response",
+                )
+                background_response_tasks.add(response_task)
+                response_task.add_done_callback(_response_task_done)
+
+                async def resolve_nonstream_address() -> None:
+                    nonlocal active_playback, active_response_task
+                    local_reply = None
+                    local_first_audio_ms = None
+                    local_first_tts_block_ms = None
+                    try:
+                        address_started = time.perf_counter()
+                        try:
+                            addressed = await check_address()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            log.debug(
+                                "Voice-Adresscheck fehlgeschlagen (%s)", type(exc).__name__,
+                            )
+                            addressed = False
+                        result["address_check_ms"] = round(
+                            (time.perf_counter() - address_started) * 1000, 1,
+                        )
+                        pending_address_tasks.discard(asyncio.current_task())
+                        if not addressed:
+                            if not address_decision.done():
+                                address_decision.set_result(False)
+                            output_gate.reject()
+                            response_task.cancel()
+                            await asyncio.gather(response_task, return_exceptions=True)
+                            return
+                        if active_playback is not None and active_playback.playback_active:
+                            await stop_for_bargein(time.monotonic())
+                        _detach_active_response()
+                        active_playback = None
+                        if not address_decision.done():
+                            address_decision.set_result(True)
+                        output_gate.release()
+                        local_reply, trace = await response_task
+                        _mark_reflex(trace)
+                        conversation_window.mark_active(local_reply)
+                        await output_gate.wait()
+                        local_first_audio_ms = await sende_antwort(
+                            websocket, text, local_reply, audio_streaming,
+                            started_at=started_at,
+                        )
+                        local_first_tts_block_ms = (
+                            round((time.perf_counter() - started_at) * 1000, 1)
+                            if local_reply else None
+                        )
+                    except (WebSocketDisconnect, RuntimeError) as exc:
+                        log.info("Voice-WebSocket beim Antwortversand getrennt: %s", exc)
+                    finally:
+                        _record_voice_latency(
+                            orch, started_at, stt_ms=result.get("stt_ms"),
+                            address_check_ms=result.get("address_check_ms"),
+                            address_check_mode=address_mode,
+                            held_ms=output_gate.held_ms,
+                            first_tts_block_ms=local_first_tts_block_ms,
+                            first_answer_audio_ms=local_first_audio_ms,
+                        )
+
+                async def resolve_nonstream_address_safely() -> None:
+                    try:
+                        await resolve_nonstream_address()
+                    except asyncio.CancelledError:
+                        if not address_decision.done():
+                            address_decision.set_result(False)
+                        output_gate.reject()
+                        response_task.cancel()
+                        await asyncio.gather(response_task, return_exceptions=True)
+                        raise
+
+                address_task = asyncio.create_task(
+                    resolve_nonstream_address_safely(),
+                    name="voice-address-resolution",
+                )
+                background_address_tasks.add(address_task)
+                pending_address_tasks.add(address_task)
+                address_task.add_done_callback(_address_task_done)
+                voice_timing.reset(timing_token)
+                return
+
             try:
                 if orch is not None:
                     timing_token = voice_timing.start()
                     timing = voice_timing.current()
                     timing.partial_runs = max(0, int(result.get("partial_runs", 0)))
                     timing.partial_as_final = bool(result.get("partial_as_final", False))
-                    if prework is None:
-                        reply, trace = await orch.voice_respond(text)
-                    else:
-                        reply, trace = await orch.voice_respond(text, prework=prework)
+                    reply, trace = await call_voice_response()
                     _mark_reflex(trace)
                     conversation_window.mark_active(reply)
                 first_answer_audio_ms = await sende_antwort(
@@ -1200,6 +1542,9 @@ def build_router(orch=None) -> APIRouter:
                 try:
                     _record_voice_latency(
                         orch, started_at, stt_ms=result.get("stt_ms"),
+                        address_check_ms=result.get("address_check_ms"),
+                        address_check_mode=address_mode,
+                        held_ms=output_gate.held_ms,
                         first_tts_block_ms=first_tts_block_ms,
                         first_answer_audio_ms=first_answer_audio_ms,
                     )
@@ -1278,6 +1623,7 @@ def build_router(orch=None) -> APIRouter:
                 if not turn_processor.done():
                     turn_processor.cancel()
                 tasks_to_finish = set(background_response_tasks)
+                tasks_to_finish.update(background_address_tasks)
                 if active_response_task is not None:
                     tasks_to_finish.add(active_response_task)
                 tasks_to_finish.add(turn_processor)

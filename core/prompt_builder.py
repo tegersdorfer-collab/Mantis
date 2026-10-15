@@ -23,15 +23,21 @@ def _is_recallless_acknowledgement(text: str) -> bool:
 class CacheableSystemPrompt(str):
     """Systemtext mit Metadaten, wo der stabile, cachebare Präfix endet."""
 
-    def __new__(cls, value: str, cache_prefix: str):
+    def __new__(
+        cls, value: str, cache_prefix: str, recall_ids: tuple[int, ...] = (),
+    ):
         prompt = super().__new__(cls, value)
         prompt.cache_prefix = cache_prefix
+        prompt.recall_ids = tuple(recall_ids)
         return prompt
 
     def __add__(self, suffix: str):
         if not isinstance(suffix, str):
             return NotImplemented
-        return type(self)(super().__add__(suffix), cache_prefix=self.cache_prefix)
+        return type(self)(
+            super().__add__(suffix), cache_prefix=self.cache_prefix,
+            recall_ids=self.recall_ids,
+        )
 
 
 class PromptBuilder:
@@ -68,22 +74,31 @@ class PromptBuilder:
 
     # ── Memory / KG Context ───────────────────────────────────────────────────
 
-    def memory_context(self, query_text: str, embedding) -> str:
+    def book_recall(self, memory_ids) -> None:
+        """Bucht Recall-Zähler und merkt die IDs für die Verifikations-Heuristik."""
+        ids = list(dict.fromkeys(memory_ids or ()))
+        self._last_mem_ids = ids
+        for memory_id in ids:
+            try:
+                self.forgetting.bump_recall(memory_id)
+            except Exception:
+                pass
+
+    def memory_context(
+        self, query_text: str, embedding, *, speculative: bool = False,
+    ) -> tuple[str, tuple[int, ...]]:
         try:
             if embedding is not None:
                 mems = self.lzg.search_hybrid(query_text, embedding, top_k=config.LZG_TOP_K)
             else:
                 mems = self.lzg.get_all(limit=10)
-            self._last_mem_ids = [m.id for m in mems]
-            for m in mems:
-                try:
-                    self.forgetting.bump_recall(m.id)
-                except Exception:
-                    pass
-            return self.lzg.format_for_context(mems)
+            memory_ids = tuple(m.id for m in mems)
+            if not speculative:
+                self.book_recall(memory_ids)
+            return self.lzg.format_for_context(mems), memory_ids
         except Exception as e:
             log.debug(f"Memory-Kontext: {e}")
-            return "—"
+            return "—", ()
 
     def kg_context(self) -> str:
         try:
@@ -107,16 +122,18 @@ class PromptBuilder:
 
     # ── System-Prompt zusammenbauen ───────────────────────────────────────────
 
-    async def build(self, user_text: str) -> str:
+    async def build(self, user_text: str, *, speculative: bool = False) -> str:
         async def _embed_and_mem():
             if _is_recallless_acknowledgement(user_text) or self.recall_gate(user_text):
-                return "—"
+                return "—", ()
             try:
                 embedding = await self.embed_llm.embed(user_text)
             except Exception as e:
                 log.debug(f"Embed fehlgeschlagen: {e}")
                 embedding = None
-            return await asyncio.to_thread(self.memory_context, user_text, embedding)
+            return await asyncio.to_thread(
+                self.memory_context, user_text, embedding, speculative=speculative,
+            )
 
         results = await asyncio.gather(
             _embed_and_mem(),
@@ -138,7 +155,11 @@ class PromptBuilder:
                 clean.append("")
             else:
                 clean.append(r)
-        (mem_ctx, dash_ctx, task_ctx, kg_ctx, dir_ctx, warm_profile, skill_ctx) = clean
+        mem_result, dash_ctx, task_ctx, kg_ctx, dir_ctx, warm_profile, skill_ctx = clean
+        if isinstance(mem_result, tuple) and len(mem_result) == 2:
+            mem_ctx, recall_ids = mem_result
+        else:
+            mem_ctx, recall_ids = mem_result, ()
         mem_ctx = mem_ctx or "—"
 
         behavior = self.reflection.behavior_notes()
@@ -188,4 +209,6 @@ class PromptBuilder:
         situation_ctx = situation.prompt_context()
         if situation_ctx:
             prompt += f"\n{situation_ctx}\n"
-        return CacheableSystemPrompt(prompt, cache_prefix=cache_prefix)
+        return CacheableSystemPrompt(
+            prompt, cache_prefix=cache_prefix, recall_ids=recall_ids,
+        )

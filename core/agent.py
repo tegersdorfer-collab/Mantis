@@ -13,7 +13,7 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from core import tools as toolreg
 from core import voice_timing
@@ -160,6 +160,7 @@ class Agent:
         dry_run_tools: bool = False,
         tool_selection_task: asyncio.Future | None = None,
         interrupt_check: Callable[[], bool] | None = None,
+        execution_gate: Callable[[], Awaitable[bool]] | None = None,
     ) -> tuple[str, list[dict]]:
         """
         Führt den ReAct-Loop aus.
@@ -200,6 +201,10 @@ class Agent:
         )
         trace: list[dict] = []
 
+        async def require_execution_permission() -> None:
+            if execution_gate is not None and not await execution_gate():
+                raise asyncio.CancelledError
+
         async def resolve_tool_selection(*, wait: bool) -> bool:
             nonlocal tool_selection_task, schemas, permitted_tools, force_tools
             if tool_selection_task is None:
@@ -216,6 +221,8 @@ class Agent:
         for step in range(self._max_steps):
             if interrupt_check is not None and interrupt_check():
                 raise asyncio.CancelledError
+            if step > 0:
+                await require_execution_permission()
             await resolve_tool_selection(wait=False)
             is_first = step == 0
             force = force_tools and is_first and bool(schemas)
@@ -238,6 +245,7 @@ class Agent:
                     t["tool"] == "calculate" for t in trace
                 ):
                     log.debug("Math-Guard: erzwinge calculate-Tool-Call")
+                    await require_execution_permission()
                     await self._end_attempt(stream_cb, attempt_id, final=False)
                     msgs.append({"role": "assistant", "content": content or ""})
                     msgs.append({
@@ -262,6 +270,7 @@ class Agent:
                 # Kein Tool-Call obwohl erwartet → einmal retry
                 elif force_tools and is_first and schemas:
                     log.debug("Kein Tool-Call trotz force_tools – retry")
+                    await require_execution_permission()
                     await self._end_attempt(stream_cb, attempt_id, final=False)
                     msgs.append({"role": "assistant", "content": content or ""})
                     msgs.append({
@@ -312,6 +321,7 @@ class Agent:
                 elif dry_run_tools:
                     result = f"[Eval-Dry-Run] Tool '{name}' würde ausgeführt (Argumente akzeptiert)."
                 else:
+                    await require_execution_permission()
                     if stream_cb is not None:
                         await stream_cb(StreamEvent(
                             "tool_start", attempt_id or "", tool_name=name,

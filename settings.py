@@ -103,7 +103,8 @@ class MantisSettings(BaseSettings):
     VOICE_SILENCE_SLOW_MS: int = Field(default=1200, gt=0)
     VOICE_PARTIAL_STT_MS: int = Field(default=700, gt=0)
     VOICE_PARTIAL_STALE_MS: int = Field(default=400, gt=0)
-    VOICE_PARTIAL_MAX_MS: int = Field(default=600, gt=0)
+    VOICE_PARTIAL_MAX_MS: int = Field(default=900, gt=0)
+    VOICE_WAKE_PREROLL_MS: int = Field(default=1500, ge=0)
     VOICE_BARGEIN: bool = True
     VOICE_BARGEIN_MIN_SPEECH_MS: int = Field(default=300, gt=0)
     VOICE_BARGEIN_MIN_RMS: int = Field(default=800, ge=0)

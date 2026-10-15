@@ -5,14 +5,16 @@ from collections import deque
 import math
 import threading
 
-INITIAL_MS_PER_AUDIO_SECOND = 400.0
-FIXED_OVERHEAD_MS = 150.0
+INITIAL_MS_PER_AUDIO_SECOND = 150.0
+FIXED_OVERHEAD_MS = 100.0
 _SAMPLE_WINDOW = 10
 _samples: deque[float] = deque(maxlen=_SAMPLE_WINDOW)
 _samples_lock = threading.Lock()
 
 
-def record_stt_runtime(audio_seconds: float, elapsed_ms: float) -> None:
+def record_stt_runtime(
+    audio_seconds: float, elapsed_ms: float, *, replace_samples: bool = False,
+) -> None:
     """Speichert eine STT-Laufzeit als Millisekunden pro Audiosekunde."""
     try:
         audio_seconds = float(audio_seconds)
@@ -27,6 +29,8 @@ def record_stt_runtime(audio_seconds: float, elapsed_ms: float) -> None:
     ):
         return
     with _samples_lock:
+        if replace_samples:
+            _samples.clear()
         _samples.append(elapsed_ms / audio_seconds)
 
 

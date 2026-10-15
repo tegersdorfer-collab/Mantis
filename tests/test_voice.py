@@ -377,12 +377,14 @@ class TestTranscribeParakeet:
 def test_voice_settings_default_to_short_answers_and_stt_preload(monkeypatch):
     monkeypatch.delenv("VOICE_MAX_TOKENS", raising=False)
     monkeypatch.delenv("STT_PRELOAD", raising=False)
+    monkeypatch.delenv("VOICE_WAKE_PREROLL_MS", raising=False)
     from settings import MantisSettings
 
     settings = MantisSettings(_env_file=None)
 
     assert settings.VOICE_MAX_TOKENS == 500
     assert settings.STT_PRELOAD is True
+    assert settings.VOICE_WAKE_PREROLL_MS == 1500
 
 
 def test_stt_runtime_estimate_learns_from_warmup_and_final_runs(monkeypatch, tmp_path):
@@ -422,6 +424,24 @@ def test_stt_runtime_estimate_learns_from_warmup_and_final_runs(monkeypatch, tmp
 
     assert len(stt_runtime._samples) == 2
     assert stt_runtime.estimate_stt_runtime_ms(1.0) < 550
+
+
+def test_parakeet_warmup_replaces_old_runtime_average_using_its_audio_duration(monkeypatch):
+    from collections import deque
+    from types import SimpleNamespace
+
+    from core import stt_runtime
+
+    monkeypatch.setattr(
+        stt_runtime, "_samples", deque([400.0, 300.0], maxlen=stt_runtime._SAMPLE_WINDOW),
+    )
+    elapsed = iter((10.0, 10.12))
+    monkeypatch.setattr(voice.time, "perf_counter", lambda: next(elapsed))
+
+    voice._warmup_parakeet(SimpleNamespace(transcribe=lambda _path: None))
+
+    assert list(stt_runtime._samples) == pytest.approx([120.0])
+    assert stt_runtime.estimate_stt_runtime_ms(2.0) == pytest.approx(340.0)
 
 
 def test_failed_parakeet_inference_does_not_record_stt_runtime(monkeypatch):
@@ -602,18 +622,13 @@ class TestPartialTranscription:
 
 
 class TestIsAddressedToMantis:
-    def test_namensnennung_liefert_true_ohne_llm_call(self):
-        with patch("core.decisions.voice_address", new=AsyncMock()) as mock_jev, \
+    def test_textuelles_weckwort_braucht_ohne_openwakeword_den_adresscheck(self):
+        text = "Mantis, wie wird das Wetter morgen?"
+        with patch("core.decisions.voice_address", new=AsyncMock(return_value=True)) as mock_jev, \
              patch("core.fast.yes_no", new=AsyncMock()) as mock_yes_no:
-            result = asyncio.run(voice.is_addressed_to_mantis("Mantis, wie wird das Wetter morgen?"))
+            result = asyncio.run(voice.is_addressed_to_mantis(text))
         assert result is True
-        mock_jev.assert_not_awaited()
-        mock_yes_no.assert_not_called()
-
-    def test_namensnennung_gross_klein_unabhaengig(self):
-        with patch("core.fast.yes_no", new=AsyncMock()) as mock_yes_no:
-            result = asyncio.run(voice.is_addressed_to_mantis("hey MANTIS wie geht's"))
-        assert result is True
+        mock_jev.assert_awaited_once_with(text)
         mock_yes_no.assert_not_called()
 
     @pytest.mark.parametrize("text", [
@@ -621,14 +636,31 @@ class TestIsAddressedToMantis:
         "Mentis wie spät ist es?", "Manthis wie spät ist es?",
         "Hey Mantis, wie spät ist es?", "Okay Mantis wie spät ist es?",
     ])
-    def test_asr_wakeword_varianten_adressieren_ohne_cloud_check(self, text):
-        with patch("core.decisions.voice_address", new=AsyncMock(return_value=None)) as mock_jev, \
+    def test_textuelle_weckwortvarianten_geben_keine_toolfreigabe(self, text):
+        with patch("core.decisions.voice_address", new=AsyncMock(return_value=False)) as mock_jev, \
              patch("core.fast.yes_no", new=AsyncMock(return_value=False)) as mock_yes_no:
             result = asyncio.run(voice.is_addressed_to_mantis(text))
 
-        assert result is True
-        mock_jev.assert_not_awaited()
+        assert result is False
+        mock_jev.assert_awaited_once()
         mock_yes_no.assert_not_awaited()
+
+    @pytest.mark.parametrize("word", ["Mentiones", "Mentions", "Mantes", "Mandis", "Mentis"])
+    def test_parakeet_fehlhoerungen_sind_nur_adresscheckhinweis(self, word):
+        text = f"{word}, erzähle mir etwas"
+        with patch("core.decisions.voice_address", new=AsyncMock(return_value=False)) as mock_jev, \
+             patch("core.fast.yes_no", new=AsyncMock(return_value=False)) as mock_yes_no:
+            result = asyncio.run(voice.is_addressed_to_mantis(text))
+
+        assert result is False
+        mock_jev.assert_awaited_once_with(text, wakeword_hint=True)
+        mock_yes_no.assert_not_awaited()
+
+    @pytest.mark.parametrize("word", ["Mentiones", "Mentions", "Mantes", "Mandis", "Mentis"])
+    def test_parakeet_fehlhoerungen_werden_fuer_commandrouting_normalisiert(self, word):
+        assert voice._normalize_voice_transcript(f"{word}, wie spät ist es?") == (
+            "Mantis, wie spät ist es?"
+        )
 
     def test_mantas_is_not_a_wakeword_and_uses_the_normal_address_check(self):
         text = "Mantas, wie spät ist es?"

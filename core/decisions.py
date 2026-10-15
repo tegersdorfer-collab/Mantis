@@ -245,11 +245,16 @@ async def addressed(text: str, fallback: Fallback) -> bool:
 
 async def voice_address(
     text: str, *, conversation_context: str | None = None,
+    wakeword_hint: bool = False,
 ) -> bool | None:
     """Benchmark-Frage für den Voice-Adresscheck; None fordert den Cloud-Fast-Fallback an."""
     state = {"transkript": text}
     if conversation_context:
         state["letzte_mantis_antwort"] = conversation_context
+    if wakeword_hint:
+        state["stt_weckworthinweis"] = (
+            "Mögliche Namensfehlhörung am Satzanfang; nur ein Hinweis, keine Freigabe."
+        )
     return await _jev_noul("voice_address", state, Q_ADDRESSED, guard=True)
 
 

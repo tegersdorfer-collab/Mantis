@@ -472,7 +472,10 @@ def test_dashboard_routes_persist_both_roles_with_ingress_channel(monkeypatch, c
 
 def test_voice_route_persists_both_roles_with_voice_channel(monkeypatch):
     orchestrator, inserted, idle_loop = _make_orchestrator(monkeypatch)
-    monkeypatch.setattr(voice, "transcribe_audio", AsyncMock(return_value="Wie wird mein Tag?"))
+    monkeypatch.setattr(
+        voice, "transcribe_audio_with_hint",
+        AsyncMock(return_value=("Wie wird mein Tag?", False)),
+    )
     monkeypatch.setattr(voice, "is_addressed_to_mantis", AsyncMock(return_value=True))
     monkeypatch.setattr(voice, "synthesize", AsyncMock(return_value=b"audio"))
     app = FastAPI()
@@ -521,6 +524,188 @@ def test_overlapping_dashboard_and_voice_turns_keep_idle_loop_paused_until_last_
 
     asyncio.run(run_turns())
     assert idle_loop._state == "idle"
+
+
+@pytest.mark.parametrize("authorized", [True, False], ids=["authorized", "rejected"])
+def test_speculative_voice_turn_commits_history_only_after_address_check(monkeypatch, authorized):
+    orchestrator, inserted, _idle_loop = _make_orchestrator(monkeypatch)
+    handler = orchestrator.msg_handler
+
+    class KZG:
+        def __init__(self):
+            self.turns = []
+
+        def add(self, role, content):
+            self.turns.append(SimpleNamespace(role=role, content=content))
+
+        def recent_messages(self, max_tokens):
+            return [SimpleNamespace(role=turn.role, content=turn.content) for turn in self.turns]
+
+    handler.kzg = KZG()
+    permission_requested = asyncio.Event()
+    release_permission = asyncio.Event()
+
+    async def execution_gate():
+        permission_requested.set()
+        await release_permission.wait()
+        return authorized
+
+    async def run():
+        task = asyncio.create_task(orchestrator.voice_respond(
+            "Ambient speech", execution_gate=execution_gate, defer_finish=True,
+        ))
+        await asyncio.wait_for(permission_requested.wait(), timeout=0.2)
+        assert inserted == []
+        assert handler.kzg.turns == []
+        user_message = orchestrator.voice_agent.run.await_args.kwargs["messages"][-1]
+        assert user_message["role"] == "user"
+        assert "Ambient speech" in user_message["content"]
+        release_permission.set()
+        if authorized:
+            await task
+            assert _persisted_role_channels(inserted) == [("user", "voice")]
+            assert [(turn.role, turn.content) for turn in handler.kzg.turns] == [
+                ("user", "Ambient speech"),
+            ]
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert inserted == []
+            assert handler.kzg.turns == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("authorized", [False, True], ids=["rejected", "authorized"])
+def test_speculative_voice_state_and_recall_change_only_after_address_approval(
+    monkeypatch, authorized,
+):
+    from core.prompt_builder import PromptBuilder
+
+    orchestrator, inserted, idle_loop = _make_orchestrator(monkeypatch)
+    handler = orchestrator.msg_handler
+
+    class KZG:
+        def __init__(self):
+            self.turns = []
+
+        def add(self, role, content):
+            self.turns.append(SimpleNamespace(role=role, content=content))
+
+        def get_recent_turns(self, **_kwargs):
+            return []
+
+        def recent_messages(self, max_tokens):
+            return [
+                {"role": turn.role, "content": turn.content}
+                for turn in self.turns
+            ]
+
+    kzg = KZG()
+    handler.kzg = kzg
+    recalled = []
+    memory = SimpleNamespace(id=17)
+    handler.lzg = SimpleNamespace(
+        save_kzg_turn=lambda *_args: None,
+        search_hybrid=lambda *_args, **_kwargs: [memory],
+        format_for_context=lambda memories: ", ".join(str(item.id) for item in memories),
+    )
+    handler.forgetting = SimpleNamespace(bump_recall=recalled.append)
+    builder = PromptBuilder(
+        embed_llm=SimpleNamespace(embed=AsyncMock(return_value=[0.1, 0.2])),
+        lzg=handler.lzg,
+        kzg=kzg,
+        kg=SimpleNamespace(
+            format_for_context=lambda: "",
+            format_directives=lambda: "",
+            warm_profile=lambda: "",
+        ),
+        reflection=SimpleNamespace(behavior_notes=lambda: ""),
+        dashboard=SimpleNamespace(format_for_context=lambda: ""),
+        forgetting=handler.forgetting,
+        identity="IDENTITY",
+    )
+    builder._task_ctx = lambda: ""
+    builder._last_mem_ids = [99]
+    monkeypatch.setattr("core.prompt_builder.skill_md.build_skill_context", lambda _text: "")
+    monkeypatch.setattr("core.situation.prompt_context", lambda: "")
+    handler.prompt_builder = builder
+
+    remote_begins = []
+    handler.agent_remote = SimpleNamespace(
+        begin_user_turn=lambda msg: remote_begins.append(msg),
+    )
+    handler._pending_inbox_deletions = {
+        "123": object(),
+        "456": object(),
+    }
+    pending_confirmations = dict(handler._pending_inbox_deletions)
+    activity_marks = []
+    orchestrator._last_user_ts = 0.0
+    original_mark_active = orchestrator._mark_user_active
+
+    def mark_active():
+        activity_marks.append(True)
+        original_mark_active()
+
+    handler.on_user_active = mark_active
+    permission_requested = asyncio.Event()
+    release_permission = asyncio.Event()
+
+    async def execution_gate():
+        permission_requested.set()
+        await release_permission.wait()
+        return authorized
+
+    async def run():
+        prework = await handler.prepare_voice_turn("Erzähl mir etwas")
+        assert recalled == []
+        assert builder._last_mem_ids == [99]
+
+        task = asyncio.create_task(orchestrator.voice_respond(
+            "Erzähl mir etwas", prework=prework,
+            execution_gate=execution_gate, defer_finish=True,
+        ))
+        await asyncio.wait_for(permission_requested.wait(), timeout=0.5)
+
+        assert handler._pending_inbox_deletions == pending_confirmations
+        assert remote_begins == []
+        assert activity_marks == []
+        assert orchestrator._user_active() is False
+        assert handler._active_turns == 0
+        assert recalled == []
+        assert builder._last_mem_ids == [99]
+        assert inserted == []
+        assert kzg.turns == []
+
+        release_permission.set()
+        if authorized:
+            await task
+            assert handler._pending_inbox_deletions == {}
+            assert remote_begins == [None]
+            assert activity_marks == [True]
+            assert orchestrator._user_active() is True
+            assert recalled == [17]
+            assert builder._last_mem_ids == [17]
+            assert _persisted_role_channels(inserted) == [("user", "voice")]
+            assert [(turn.role, turn.content) for turn in kzg.turns] == [
+                ("user", "Erzähl mir etwas"),
+            ]
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert handler._pending_inbox_deletions == pending_confirmations
+            assert remote_begins == []
+            assert activity_marks == []
+            assert orchestrator._user_active() is False
+            assert recalled == []
+            assert builder._last_mem_ids == [99]
+            assert inserted == []
+            assert kzg.turns == []
+        assert handler._active_turns == 0
+        assert idle_loop._state == "idle"
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])

@@ -8,6 +8,7 @@ import tempfile
 import time
 import wave
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 
 import config
@@ -28,10 +29,9 @@ WAKEWORD_FRAME_BYTES = 1280 * 2  # 2560 bytes
 log = logging.getLogger(__name__)
 
 
-async def transcribe_pcm(pcm_audio: bytes) -> str:
-    """Schreibt rohes PCM als WAV und transkribiert über die bestehende
-    Whisper-Pipeline (core.voice.transcribe_audio erwartet einen Dateipfad)."""
-    from core.voice import transcribe_audio
+async def transcribe_pcm(pcm_audio: bytes) -> tuple[str, bool]:
+    """Schreibt PCM als WAV und liefert Text plus nicht-freigebenden Namenshinweis."""
+    from core.voice import transcribe_audio_with_hint
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
         with wave.open(tmp.name, "wb") as wav_file:
@@ -39,12 +39,12 @@ async def transcribe_pcm(pcm_audio: bytes) -> str:
             wav_file.setsampwidth(2)
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(pcm_audio)
-        return await transcribe_audio(tmp.name)
+        return await transcribe_audio_with_hint(tmp.name)
 
 
-async def transcribe_pcm_partial(pcm_audio: bytes) -> str | None:
+async def transcribe_pcm_partial(pcm_audio: bytes) -> tuple[str, bool] | None:
     """Versucht einen Teil-STT-Lauf; bei belegtem gemeinsamen STT-Lock wird er verworfen."""
-    from core.voice import transcribe_audio_partial
+    from core.voice import transcribe_audio_partial_with_hint
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
         with wave.open(tmp.name, "wb") as wav_file:
@@ -52,7 +52,7 @@ async def transcribe_pcm_partial(pcm_audio: bytes) -> str | None:
             wav_file.setsampwidth(2)
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(pcm_audio)
-        return await transcribe_audio_partial(tmp.name)
+        return await transcribe_audio_partial_with_hint(tmp.name)
 
 
 def partial_stt_executor_available() -> bool:
@@ -68,7 +68,9 @@ class VoiceStreamSession:
         wakeword_detector,
         conversation_active_fn: Callable[[], bool],
         *,
-        partial_transcriber: Callable[[bytes], Awaitable[str | None]] | None = None,
+        partial_transcriber: Callable[
+            [bytes], Awaitable[str | tuple[str, bool] | None]
+        ] | None = None,
         partial_executor_available: Callable[[], bool] | None = None,
         on_partial: Callable[[str], None] | None = None,
         partial_interval_ms: float | None = None,
@@ -79,7 +81,10 @@ class VoiceStreamSession:
         self._segmenter = vad_segmenter
         self._wakeword = wakeword_detector
         self._conversation_active_fn = conversation_active_fn
-        self._wake_fired_in_segment = False
+        self._wakeword_hits: deque[int] = deque()
+        self._wakeword_detected = False
+        self._wakeword_samples_processed = 0
+        self._vad_samples_processed = 0
         # Independent byte-accumulation buffers: the two detectors require
         # different frame sizes (see VAD_FRAME_BYTES / WAKEWORD_FRAME_BYTES
         # above), so incoming raw chunks (arbitrary size, e.g. 8ms from the
@@ -102,6 +107,7 @@ class VoiceStreamSession:
         self._partial_task: asyncio.Task | None = None
         self._partial_runs = 0
         self._partial_text = ""
+        self._partial_wakeword_hint = False
         self._partial_audio_end_sample_index: int | None = None
         self._partial_run_generation: int | None = None
         self._finalizing = False
@@ -115,6 +121,7 @@ class VoiceStreamSession:
         self._last_partial_at = None
         self._partial_runs = 0
         self._partial_text = ""
+        self._partial_wakeword_hint = False
         self._partial_audio_end_sample_index = None
         self._partial_run_generation = None
         setter = getattr(self._segmenter, "set_partial_transcript", None)
@@ -131,22 +138,39 @@ class VoiceStreamSession:
         while len(self._wakeword_buffer) >= WAKEWORD_FRAME_BYTES:
             frame = bytes(self._wakeword_buffer[:WAKEWORD_FRAME_BYTES])
             del self._wakeword_buffer[:WAKEWORD_FRAME_BYTES]
-            if self._wakeword.check(frame):
-                self._wake_fired_in_segment = True
+            self._wakeword_samples_processed += len(frame) // 2
+            detected = bool(self._wakeword.check(frame))
+            if detected and not self._wakeword_detected:
+                self._wakeword_hits.append(self._wakeword_samples_processed)
+            self._wakeword_detected = detected
 
         result = None
         while len(self._vad_buffer) >= VAD_FRAME_BYTES:
             frame = bytes(self._vad_buffer[:VAD_FRAME_BYTES])
             del self._vad_buffer[:VAD_FRAME_BYTES]
 
+            was_speaking = getattr(self._segmenter, "is_speaking", None) is True
             segment = self._segmenter.process_chunk(frame)
+            self._vad_samples_processed += len(frame) // 2
             await self._maybe_trigger_bargein()
             if segment is None:
-                self._maybe_start_partial()
+                if (
+                    was_speaking
+                    and getattr(self._segmenter, "is_speaking", None) is not True
+                ):
+                    self._discard_wakeword_hits_through(self._vad_samples_processed)
+                    self._reset_segment_state()
+                else:
+                    self._maybe_start_partial()
                 continue
 
-            wake_fired = self._wake_fired_in_segment
-            self._wake_fired_in_segment = False
+            segment_end_sample = self._vad_samples_processed
+            segment_start_sample = max(
+                0, segment_end_sample - len(segment.audio) // 2,
+            )
+            wake_fired = self._wakeword_fired_for_segment(
+                segment_start_sample, segment_end_sample,
+            )
 
             if not wake_fired and not self._conversation_active_fn():
                 self._reset_segment_state()
@@ -183,14 +207,31 @@ class VoiceStreamSession:
                     partial_text = text
                     partial_as_final = bool(text)
 
+            wakeword_hint = False
             if not text:
-                text = await transcribe_pcm(segment.audio)
+                transcript = await transcribe_pcm(segment.audio)
+                if isinstance(transcript, tuple) and len(transcript) == 2:
+                    text, wakeword_hint = transcript
+                else:
+                    text = transcript
+                    from core.voice import has_voice_wakeword_hint
+
+                    wakeword_hint = has_voice_wakeword_hint(str(text or ""))
+            elif partial_as_final:
+                from core.voice import has_voice_wakeword_hint
+
+                wakeword_hint = bool(
+                    self._partial_wakeword_hint
+                    or has_voice_wakeword_hint(str(text or ""))
+                )
             partial_text = self._partial_text or partial_text
             stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
             self._reset_segment_state()
             result = {
                 "text": text,
                 "addressed": True,
+                "wakeword_triggered": wake_fired,
+                "wakeword_hint": bool(wakeword_hint),
                 "stt_ms": stt_ms,
                 "turn_started_at": turn_started_at,
                 "partial_runs": partial_runs,
@@ -199,6 +240,26 @@ class VoiceStreamSession:
             }
 
         return result
+
+    def _discard_wakeword_hits_through(self, sample_index: int) -> None:
+        while self._wakeword_hits and self._wakeword_hits[0] <= sample_index:
+            self._wakeword_hits.popleft()
+        # _wakeword_detected bleibt: Ein anhaltendes Detektorsignal ist keine neue Flanke.
+
+    def _wakeword_fired_for_segment(self, start_sample: int, end_sample: int) -> bool:
+        preroll_samples = int(
+            max(0, float(getattr(config, "VOICE_WAKE_PREROLL_MS", 1500)))
+            * SAMPLE_RATE / 1000
+        )
+        earliest_sample = max(0, start_sample - preroll_samples)
+        while self._wakeword_hits and self._wakeword_hits[0] < earliest_sample:
+            self._wakeword_hits.popleft()
+        fired = any(
+            earliest_sample <= hit <= end_sample
+            for hit in self._wakeword_hits
+        )
+        self._discard_wakeword_hits_through(end_sample)
+        return fired
 
     async def _maybe_trigger_bargein(self) -> None:
         if (
@@ -227,9 +288,6 @@ class VoiceStreamSession:
             return
         if getattr(self._segmenter, "current_chunk_is_speech", None) is not True:
             return
-        if not (self._wake_fired_in_segment or self._conversation_active_fn()):
-            return
-
         now = self._clock()
         if self._speech_started_at is None:
             self._speech_started_at = now
@@ -244,6 +302,7 @@ class VoiceStreamSession:
             return
         if self._partial_task is not None and not self._partial_task.done():
             return
+        self._last_partial_at = now
         if self._partial_task is not None:
             try:
                 self._partial_task.result()
@@ -269,7 +328,6 @@ class VoiceStreamSession:
         audio_end_sample_index = len(audio) // 2
         self._partial_audio_end_sample_index = audio_end_sample_index
         self._partial_run_generation = generation
-        self._last_partial_at = now
         self._partial_task = asyncio.create_task(
             self._run_partial(audio, generation, audio_end_sample_index),
             name="voice-partial-stt",
@@ -280,13 +338,22 @@ class VoiceStreamSession:
         self, audio: bytes, generation: int, audio_end_sample_index: int,
     ) -> str | None:
         try:
-            text = await self._partial_transcriber(audio)
+            transcript = await self._partial_transcriber(audio)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.debug("Teil-STT fehlgeschlagen (%s)", type(exc).__name__)
             return None
 
+        if transcript is None:
+            return None
+        if isinstance(transcript, tuple) and len(transcript) == 2:
+            text, wakeword_hint = transcript
+        else:
+            text = transcript
+            from core.voice import has_voice_wakeword_hint
+
+            wakeword_hint = has_voice_wakeword_hint(str(text or ""))
         if text is None:
             return None
         text = str(text).strip()
@@ -296,6 +363,7 @@ class VoiceStreamSession:
             getattr(self._segmenter, "is_speaking", None) is True or self._finalizing
         ):
             self._partial_text = text
+            self._partial_wakeword_hint = bool(wakeword_hint)
             setter = getattr(self._segmenter, "set_partial_transcript", None)
             if callable(setter):
                 try:
@@ -322,6 +390,8 @@ class VoiceStreamSession:
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
         self._partial_task = None
+        self._wakeword_hits.clear()
+        self._wakeword_detected = False
         self._partial_text = ""
         self._partial_audio_end_sample_index = None
         self._partial_run_generation = None
