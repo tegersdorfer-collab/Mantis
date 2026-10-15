@@ -381,6 +381,14 @@ class TTSTurnState:
     audio_emitted: bool = False
 
 
+class TTSSynthesisIncompleteError(RuntimeError):
+    """Ein TTS-Textteil fehlte; synthesized_text enthält den fertigen Präfix."""
+
+    def __init__(self, message: str, *, synthesized_text: str):
+        super().__init__(message)
+        self.synthesized_text = synthesized_text.strip()
+
+
 _active_tts_turn: contextvars.ContextVar[TTSTurnState | None] = contextvars.ContextVar(
     "active_tts_turn",
     default=None,
@@ -1912,6 +1920,7 @@ async def synthesize_stream(
 
     stuecke = _split_for_streaming(text)
     turn_state = _active_tts_turn.get() or TTSTurnState()
+    completed_parts: list[str] = []
     async with _lock:
         for i, stueck in enumerate(stuecke):
             emitted_in_piece = False
@@ -1928,11 +1937,15 @@ async def synthesize_stream(
                         len(ogg) // 1024,
                     )
                     yield ogg
+                if not emitted_in_piece:
+                    raise RuntimeError("TTS-Textteil lieferte kein Audio")
             except Exception as e:
-                # Ein kaputtes Stück darf die restliche Antwort nicht verschlucken.
                 log.error("TTS-Stück %s fehlgeschlagen: %s", i, redact_error_text(e))
-                if emitted_in_piece:
-                    raise
+                raise TTSSynthesisIncompleteError(
+                    f"TTS-Stück {i + 1} fehlgeschlagen: {redact_error_text(e)}",
+                    synthesized_text=" ".join(completed_parts),
+                ) from e
+            completed_parts.append(stueck)
 
 
 async def list_voices() -> list[str]:

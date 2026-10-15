@@ -1213,9 +1213,12 @@ class TestElevenLabs:
         async def collect():
             _state, token = tts._start_tts_turn()
             try:
-                chunks = []
-                for sentence in ("Erster Satz.", "Zweiter Satz.", "Dritter Satz."):
-                    chunks.extend([chunk async for chunk in tts.synthesize_stream(sentence)])
+                chunks = [
+                    chunk async for chunk in tts.synthesize_stream("Erster Satz.")
+                ]
+                for sentence in ("Zweiter Satz.", "Dritter Satz."):
+                    with pytest.raises(tts.TTSSynthesisIncompleteError):
+                        [chunk async for chunk in tts.synthesize_stream(sentence)]
                 return chunks
             finally:
                 tts._end_tts_turn(token)

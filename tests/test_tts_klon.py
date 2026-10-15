@@ -382,6 +382,56 @@ for line in sys.stdin:
     assert counter_file.read_text(encoding="utf-8") == "2"
 
 
+def test_streaming_reports_failure_after_a_previous_text_part_succeeded(
+    monkeypatch, tmp_path,
+):
+    request_count_file = tmp_path / "klon-stream-requests"
+    worker_source = f'''import json, sys
+counter_path = {str(request_count_file)!r}
+print(json.dumps({{"ready": True}}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    try:
+        count = int(open(counter_path, encoding="utf-8").read()) + 1
+    except FileNotFoundError:
+        count = 1
+    open(counter_path, "w", encoding="utf-8").write(str(count))
+    if count == 1:
+        print(json.dumps({{"id": request["id"], "seq": 0,
+            "pcm_b64": {_pcm_payload()!r}, "sample_rate": 24000}}), flush=True)
+        print(json.dumps({{"id": request["id"], "done": True}}), flush=True)
+    else:
+        print(json.dumps({{"id": request["id"], "error": "Folgeversuch fehlgeschlagen"}}), flush=True)
+'''
+    _configure_klon(monkeypatch, tmp_path, worker_source)
+    monkeypatch.setattr(tts, "_BOUND_ENGINE_RETRY_TIMEOUT_S", 0.5, raising=False)
+    monkeypatch.setattr(tts, "_wav_to_ogg", lambda _wav: _fake_ogg())
+    monkeypatch.setattr(tts, "_record_klon_usage", lambda _text: None, raising=False)
+    state = tts.TTSTurnState()
+    text = "Der erste Teil dieses Satzes endet hier, und der Rest fällt aus."
+    completed_prefix = "Der erste Teil dieses Satzes endet hier,"
+
+    async def collect():
+        chunks = []
+        stream = tts.synthesize_stream(text)
+        token = tts._active_tts_turn.set(state)
+        try:
+            with pytest.raises(RuntimeError, match="TTS-Stück") as exc_info:
+                async for chunk in stream:
+                    chunks.append(chunk)
+            return chunks, exc_info.value.synthesized_text
+        finally:
+            tts._active_tts_turn.reset(token)
+            await stream.aclose()
+            await _async_worker_cleanup()
+
+    chunks, synthesized_text = asyncio.run(collect())
+
+    assert chunks == [_fake_ogg()]
+    assert synthesized_text == completed_prefix
+    assert request_count_file.read_text(encoding="utf-8") == "3"
+
+
 def test_streaming_klon_error_after_audio_propagates_incomplete_sentence(
     monkeypatch, tmp_path,
 ):

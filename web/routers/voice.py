@@ -54,6 +54,7 @@ class _PlaybackSentence:
     text: str
     block_ids: list[str] = field(default_factory=list)
     complete: bool = False
+    prefix_complete: bool = False
 
 
 class _PlaybackTurn:
@@ -94,6 +95,13 @@ class _PlaybackTurn:
         sentence = self.sentences.get(sentence_id)
         if sentence is not None:
             sentence.complete = True
+            self.changed.set()
+
+    def mark_sentence_incomplete(self, sentence_id: int, synthesized_text: str) -> None:
+        sentence = self.sentences.get(sentence_id)
+        if sentence is not None:
+            sentence.text = str(synthesized_text or "").strip()
+            sentence.prefix_complete = True
             self.changed.set()
 
     def mark_block_sent(self, block_id: str, *, sent_at: float | None = None) -> bool:
@@ -267,7 +275,8 @@ class _PlaybackTurn:
             if played_ms <= 0:
                 break
             if (
-                sentence.complete and all(block.finished for block in blocks)
+                (sentence.complete or sentence.prefix_complete)
+                and all(block.finished for block in blocks)
                 and not any(block.skipped for block in blocks)
             ):
                 parts.append(sentence.text)
@@ -477,6 +486,7 @@ async def sende_streaming_antwort(
     attempts: dict[str, dict[str, str | bool]] = {}
     has_queued_sentence = False
     spoken_sentences: list[str] = []
+    synthesis_incomplete = False
     response: list[tuple[str | None, list, Exception | None]] = []
     response_trace: list = []
     next_sentence_id = 0
@@ -632,7 +642,7 @@ async def sende_streaming_antwort(
             await queue.join()
             spoken_text = _normalized_speech(" ".join(spoken_sentences))
             final_text = _normalized_speech(reply)
-            if not final_text:
+            if synthesis_incomplete or not final_text:
                 remainder = ""
             elif final_text.startswith(spoken_text):
                 remainder = final_text[len(spoken_text):].strip()
@@ -648,7 +658,7 @@ async def sende_streaming_antwort(
             await queue.put(None)
 
     async def synthesize_sentences() -> None:
-        nonlocal response_audio_ready, next_sentence_id
+        nonlocal response_audio_ready, next_sentence_id, synthesis_incomplete
         try:
             while True:
                 sentence = await queue.get()
@@ -656,6 +666,8 @@ async def sende_streaming_antwort(
                 try:
                     if sentence is None:
                         return
+                    if synthesis_incomplete:
+                        continue
                     sentence_id = next_sentence_id
                     next_sentence_id += 1
                     stream = synthesize_stream(sentence).__aiter__()
@@ -668,7 +680,13 @@ async def sende_streaming_antwort(
                             completed = True
                             break
                         except Exception as exc:
+                            synthesis_incomplete = True
                             log.error("TTS-Streaming fehlgeschlagen: %s", exc)
+                            audio_queue.put_nowait((
+                                "sentence_incomplete", sentence_id,
+                                str(getattr(exc, "synthesized_text", "")), None,
+                            ))
+                            state_changed.set()
                             break
                         if ogg:
                             if not response_audio_ready:
@@ -681,6 +699,13 @@ async def sende_streaming_antwort(
                     if completed and has_audio:
                         spoken_sentences.append(sentence)
                         audio_queue.put_nowait(("sentence_end", sentence_id, sentence, None))
+                    elif completed:
+                        synthesis_incomplete = True
+                        log.error("TTS-Streaming für einen Antwortsatz lieferte kein Audio")
+                        audio_queue.put_nowait((
+                            "sentence_incomplete", sentence_id, "", None,
+                        ))
+                        state_changed.set()
                 finally:
                     if stream is not None:
                         close = getattr(stream, "aclose", None)
@@ -727,6 +752,9 @@ async def sende_streaming_antwort(
                 elif item[0] == "sentence_end":
                     if item[1] is not None:
                         playback.mark_sentence_complete(item[1])
+                elif item[0] == "sentence_incomplete":
+                    if item[1] is not None:
+                        playback.mark_sentence_incomplete(item[1], item[2] or "")
                 else:
                     await send_audio_chunk(
                         item[3] or b"", answer=True,
@@ -829,6 +857,13 @@ async def sende_streaming_antwort(
                         client_disconnected = not playback.interrupted
                     if playback.interrupted:
                         await record_interrupted_turn()
+                    elif synthesis_incomplete and defer_history and not playback.timed_out:
+                        spoken_text = playback.spoken_text()
+                        recorder = getattr(orch, "record_aborted_voice_turn", None)
+                        if not callable(recorder):
+                            recorder = getattr(orch, "record_interrupted_voice_turn", None)
+                        if callable(recorder) and spoken_text:
+                            recorder(spoken_text)
                     elif (
                         defer_history and not playback.timed_out
                         and response_error is None
