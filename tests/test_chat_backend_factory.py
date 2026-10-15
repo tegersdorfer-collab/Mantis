@@ -63,7 +63,7 @@ def _cfg(**overrides):
         "CHATGPT_AUTH_FILE": "/tmp/mantis-chatgpt-auth-test.json",
         "CHATGPT_AUTH_CALLBACK_PORT": 1456,
         "GEMINI_API_KEY": "",
-        "GEMINI_MODEL": "gemini-3-flash",
+        "GEMINI_MODEL": "gemini-3-flash-preview",
         "GEMINI_USD_PER_MTOK_IN": 0.30,
         "GEMINI_USD_PER_MTOK_OUT": 2.50,
         "BG_CHAT_TASKS_USE_CLOUD": True,
@@ -150,7 +150,7 @@ def test_chat_cloud_settings_have_benchmarked_defaults(monkeypatch):
     assert settings.BACKGROUND_CHAIN_ORDER == ["openrouter", "anthropic", "chatgpt-plan"]
     assert settings.VISION_CHAIN_ORDER == ["openrouter", "anthropic", "chatgpt-plan"]
     assert settings.GEMINI_API_KEY == ""
-    assert settings.GEMINI_MODEL == "gemini-3-flash"
+    assert settings.GEMINI_MODEL == "gemini-3-flash-preview"
     assert settings.GEMINI_USD_PER_MTOK_IN == 0.30
     assert settings.GEMINI_USD_PER_MTOK_OUT == 2.50
     assert settings.CHAT_ANTHROPIC_MODEL == "claude-haiku-5-5"

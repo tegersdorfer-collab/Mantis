@@ -2,6 +2,7 @@
 import json
 import logging
 import uuid
+from copy import deepcopy
 from urllib.parse import quote
 
 import httpx
@@ -15,6 +16,18 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://aiplatform.googleapis.com"
 TIMEOUT_S = config.CHAT_CLOUD_TIMEOUT_S
+
+
+class _GeminiText(str):
+    """Text, das die unveränderten Antwort-Parts für Folgeaufrufe mitführt."""
+
+    def __new__(cls, text: str, gemini_parts: list[dict]):
+        instance = super().__new__(cls, text)
+        instance.gemini_parts = deepcopy(gemini_parts)
+        return instance
+
+    def strip(self, chars=None):
+        return type(self)(super().strip(chars), self.gemini_parts)
 
 
 class GeminiAPIError(RuntimeError):
@@ -39,8 +52,12 @@ def _text_parts(content) -> list[dict]:
             continue
         if block.get("type") == "text":
             text = str(block.get("text", ""))
-            if text:
-                result.append({"text": text})
+            part = {"text": text}
+            signature = block.get("thought_signature") or block.get("thoughtSignature")
+            if signature:
+                part["thoughtSignature"] = signature
+            if text or signature:
+                result.append(part)
         elif block.get("type") == "image":
             source = block.get("source") or {}
             if source.get("type") == "base64" and source.get("data"):
@@ -95,27 +112,42 @@ def _history_to_gemini(messages: list[dict]) -> tuple[str | None, list[dict]]:
             continue
 
         if role == "assistant":
-            parts = _text_parts(message.get("content", ""))
-            for call_index, tool_call in enumerate(message.get("tool_calls") or []):
-                function = tool_call.get("function") or {}
-                name = str(function.get("name", ""))
-                if not name:
-                    raise ValueError("Gemini Tool-Aufruf hat keinen Funktionsnamen")
-                call_id = str(
-                    tool_call.get("id") or tool_call.get("tool_use_id")
-                    or f"call_{index}_{call_index}_{uuid.uuid4().hex[:8]}"
-                )
-                args = function.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args) if args.strip() else {}
-                    except (TypeError, ValueError):
+            content = message.get("content", "")
+            saved_parts = getattr(content, "gemini_parts", None)
+            parts = deepcopy(saved_parts) if saved_parts is not None else _text_parts(content)
+            if saved_parts is None:
+                for call_index, tool_call in enumerate(message.get("tool_calls") or []):
+                    function = tool_call.get("function") or {}
+                    name = str(function.get("name", ""))
+                    if not name:
+                        raise ValueError("Gemini Tool-Aufruf hat keinen Funktionsnamen")
+                    call_id = str(
+                        tool_call.get("id") or tool_call.get("tool_use_id")
+                        or f"call_{index}_{call_index}_{uuid.uuid4().hex[:8]}"
+                    )
+                    args = function.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args) if args.strip() else {}
+                        except (TypeError, ValueError):
+                            args = {}
+                    if not isinstance(args, dict):
                         args = {}
-                if not isinstance(args, dict):
-                    args = {}
-                parts.append({"functionCall": {"id": call_id, "name": name, "args": args}})
-                pending_names[call_id] = name
-                pending_ids.append(call_id)
+                    function_part = {"id": call_id, "name": name, "args": args}
+                    signature = tool_call.get("thought_signature") or tool_call.get("thoughtSignature")
+                    part = {"functionCall": function_part}
+                    if signature:
+                        part["thoughtSignature"] = signature
+                    parts.append(part)
+
+            for part in parts:
+                function_call = part.get("functionCall") if isinstance(part, dict) else None
+                if not isinstance(function_call, dict):
+                    continue
+                call_id = str(function_call.get("id") or "")
+                if call_id:
+                    pending_names[call_id] = str(function_call.get("name") or "")
+                    pending_ids.append(call_id)
             _append_content(contents, "model", parts)
             continue
 
@@ -126,6 +158,69 @@ def _history_to_gemini(messages: list[dict]) -> tuple[str | None, list[dict]]:
     return (system or None), contents
 
 
+_SUPPORTED_SCHEMA_FIELDS = frozenset({
+    "type", "nullable", "required", "format", "description", "properties",
+    "items", "enum", "anyOf",
+})
+
+
+def _schema_ref_target(root: dict, ref: str):
+    if not ref.startswith("#/"):
+        return None
+    target = root
+    for raw_key in ref[2:].split("/"):
+        key = raw_key.replace("~1", "/").replace("~0", "~")
+        if not isinstance(target, dict) or key not in target:
+            return None
+        target = target[key]
+    return target
+
+
+def _convert_schema(schema, root: dict, ref_stack: tuple[str, ...] = ()):
+    """Konvertiert JSON-Schema rekursiv ins von Gemini unterstützte Subset."""
+    if isinstance(schema, list):
+        return [_convert_schema(item, root, ref_stack) for item in schema]
+    if not isinstance(schema, dict):
+        return deepcopy(schema)
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref not in ref_stack:
+        target = _schema_ref_target(root, ref)
+        if isinstance(target, dict):
+            resolved = _convert_schema(target, root, (*ref_stack, ref))
+            siblings = {
+                key: value for key, value in schema.items()
+                if key != "$ref"
+            }
+            converted_siblings = _convert_schema(siblings, root, ref_stack)
+            if isinstance(resolved, dict) and isinstance(converted_siblings, dict):
+                return {**resolved, **converted_siblings}
+
+    converted = {}
+    for key in _SUPPORTED_SCHEMA_FIELDS:
+        if key not in schema:
+            continue
+        value = schema[key]
+        if key == "properties" and isinstance(value, dict):
+            converted[key] = {
+                name: _convert_schema(child, root, ref_stack)
+                for name, child in value.items()
+            }
+        elif key == "items":
+            converted[key] = _convert_schema(value, root, ref_stack)
+        elif key == "anyOf" and isinstance(value, list):
+            converted[key] = [_convert_schema(child, root, ref_stack) for child in value]
+        else:
+            converted[key] = deepcopy(value)
+
+    if "oneOf" in schema and isinstance(schema["oneOf"], list):
+        branches = [_convert_schema(child, root, ref_stack) for child in schema["oneOf"]]
+        converted.setdefault("anyOf", []).extend(branches)
+    if "const" in schema:
+        converted["enum"] = [deepcopy(schema["const"])]
+    return converted
+
+
 def _function_declarations(tools: list[dict] | None) -> list[dict]:
     declarations = []
     for tool in tools or []:
@@ -133,12 +228,10 @@ def _function_declarations(tools: list[dict] | None) -> list[dict]:
         name = str(function.get("name", ""))
         if not name:
             raise ValueError("Gemini Tool-Schema hat keinen Funktionsnamen")
-        declaration = {
-            "name": name,
-            "parameters": function.get("parameters") or {
-                "type": "object", "properties": {},
-            },
+        parameters = function.get("parameters") or {
+            "type": "object", "properties": {},
         }
+        declaration = {"name": name, "parameters": _convert_schema(parameters, parameters)}
         if function.get("description"):
             declaration["description"] = function["description"]
         declarations.append(declaration)
@@ -155,7 +248,11 @@ def _required_arguments(tools: list[dict] | None) -> dict[str, list[str]]:
     return result
 
 
-def _normalize_function_call(function_call: dict, required: dict[str, list[str]]) -> dict:
+def _normalize_function_call(
+    function_call: dict,
+    required: dict[str, list[str]],
+    thought_signature: str | None = None,
+) -> dict:
     name = str(function_call.get("name", ""))
     if not name:
         raise ValueError("Gemini Tool-Aufruf hat keinen Funktionsnamen")
@@ -175,11 +272,29 @@ def _normalize_function_call(function_call: dict, required: dict[str, list[str]]
             f"Gemini Tool-Argumente fehlen für Pflichtargumente: {', '.join(missing)}"
         )
     call_id = str(function_call.get("id") or uuid.uuid4().hex)
-    return {
+    call = {
         "id": call_id,
         "tool_use_id": call_id,
         "function": {"name": name, "arguments": args},
     }
+    if thought_signature:
+        call["thought_signature"] = thought_signature
+    return call
+
+
+def _part_signature(part: dict) -> str | None:
+    signature = part.get("thoughtSignature") or part.get("thought_signature")
+    return str(signature) if signature else None
+
+
+def _validate_finish_reason(finish_reason, text: str) -> None:
+    if finish_reason == "STOP":
+        return
+    if finish_reason == "MAX_TOKENS" and text.strip():
+        return
+    if finish_reason is None:
+        raise RuntimeError("Gemini-Antwort hat keinen finishReason")
+    raise RuntimeError(f"Gemini-Antwort mit finishReason {finish_reason!r} beendet")
 
 
 def _extract_response(data: dict, tools: list[dict] | None) -> tuple[str, list[dict]]:
@@ -187,15 +302,25 @@ def _extract_response(data: dict, tools: list[dict] | None) -> tuple[str, list[d
     candidate = candidates[0] if candidates else {}
     content = candidate.get("content") or {}
     text_parts = []
+    response_parts = []
     calls = []
     required = _required_arguments(tools)
     for part in content.get("parts") or []:
+        if not isinstance(part, dict):
+            continue
+        response_parts.append(deepcopy(part))
         if isinstance(part.get("text"), str):
             text_parts.append(part["text"])
         function_call = part.get("functionCall")
         if isinstance(function_call, dict):
-            calls.append(_normalize_function_call(function_call, required))
-    return "".join(text_parts), calls
+            calls.append(_normalize_function_call(
+                function_call, required, _part_signature(part),
+            ))
+    text = "".join(text_parts)
+    _validate_finish_reason(candidate.get("finishReason"), text)
+    if any(_part_signature(part) for part in response_parts):
+        text = _GeminiText(text, response_parts)
+    return text, calls
 
 
 class GeminiBackend(AgentBackend):
@@ -286,8 +411,9 @@ class GeminiBackend(AgentBackend):
     async def _call_streaming(
         self, payload: dict, tools: list[dict] | None, stream_cb: StreamCb,
     ) -> tuple[str, list[dict]]:
-        parts: list[str] = []
-        calls_by_index: dict[tuple[int, int], dict] = {}
+        text_parts: list[str] = []
+        response_parts: list[dict] = []
+        function_calls: list[tuple[dict, str | None]] = []
         usage = None
         completed = False
 
@@ -305,7 +431,6 @@ class GeminiBackend(AgentBackend):
                     if not raw:
                         continue
                     if raw == "[DONE]":
-                        completed = True
                         continue
                     try:
                         event = json.loads(raw)
@@ -323,47 +448,47 @@ class GeminiBackend(AgentBackend):
                     candidates = event.get("candidates") or []
                     if not isinstance(candidates, list):
                         raise RuntimeError("Gemini-Stream enthält ungültige Candidates")
-                    for candidate_index, candidate in enumerate(candidates):
+                    for candidate in candidates:
                         if not isinstance(candidate, dict):
                             raise RuntimeError("Gemini-Stream enthält eine ungültige Candidate")
                         content = candidate.get("content") or {}
-                        candidate_index = candidate.get("index", candidate_index)
-                        for part_index, part in enumerate(content.get("parts") or []):
+                        for part in content.get("parts") or []:
                             if not isinstance(part, dict):
                                 continue
+                            response_parts.append(deepcopy(part))
                             text = part.get("text")
                             if isinstance(text, str) and text:
-                                parts.append(text)
+                                text_parts.append(text)
                                 try:
                                     await stream_cb(text)
                                 except Exception:
                                     pass
                             function_call = part.get("functionCall")
                             if isinstance(function_call, dict):
-                                key = (candidate_index, part_index)
-                                slot = calls_by_index.setdefault(key, {"args": {}})
-                                for field in ("id", "name"):
-                                    if function_call.get(field):
-                                        slot[field] = function_call[field]
-                                args = function_call.get("args")
-                                if isinstance(args, dict):
-                                    slot["args"].update(args)
-                        if candidate.get("finishReason") is not None:
+                                function_calls.append((
+                                    deepcopy(function_call), _part_signature(part),
+                                ))
+                        finish_reason = candidate.get("finishReason")
+                        if finish_reason is not None:
+                            _validate_finish_reason(finish_reason, "".join(text_parts))
                             completed = True
 
             if not completed:
                 raise RuntimeError("Gemini-Stream endete ohne Abschluss")
             required = _required_arguments(tools)
             calls = [
-                _normalize_function_call(slot, required)
-                for _, slot in sorted(calls_by_index.items())
+                _normalize_function_call(function_call, required, signature)
+                for function_call, signature in function_calls
             ]
         except BaseException:
             self._record_usage(usage)
             raise
 
         self._record_usage(usage)
-        return "".join(parts), calls
+        text = "".join(text_parts)
+        if any(_part_signature(part) for part in response_parts):
+            text = _GeminiText(text, response_parts)
+        return text, calls
 
     def _raise_api_error(self, response: httpx.Response, body: dict | None = None) -> None:
         data = body
@@ -404,10 +529,11 @@ class GeminiBackend(AgentBackend):
             return
         try:
             input_tokens = int(usage.get("promptTokenCount") or 0)
-            output_tokens = int(
+            candidate_tokens = int(
                 usage.get("candidatesTokenCount")
                 or usage.get("responseTokenCount") or 0
             )
+            output_tokens = candidate_tokens + int(usage.get("thoughtsTokenCount") or 0)
             input_price = float(config.GEMINI_USD_PER_MTOK_IN)
             output_price = float(config.GEMINI_USD_PER_MTOK_OUT)
             actual_cost = (

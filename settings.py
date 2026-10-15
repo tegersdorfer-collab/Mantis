@@ -187,7 +187,7 @@ class MantisSettings(BaseSettings):
     CHAT_CLOUD_REASONING_EFFORT: str = "low"
     CHAT_CLOUD_TIMEOUT_S: float = 30.0
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-3-flash"
+    GEMINI_MODEL: str = "gemini-3-flash-preview"
     GEMINI_USD_PER_MTOK_IN: float = 0.30
     GEMINI_USD_PER_MTOK_OUT: float = 2.50
     CHAT_AGENT_CHAIN_ORDER: list[str] = Field(

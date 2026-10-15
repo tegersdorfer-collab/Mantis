@@ -80,7 +80,7 @@ def _cloud_backends(cfg, purpose: str, reasoning: str | None) -> list:
     else:
         log.info("Anthropic-Stufe übersprungen (API-Key oder CHAT_ANTHROPIC_MODEL fehlt)")
 
-    gemini_model = str(getattr(cfg, "GEMINI_MODEL", "gemini-3-flash") or "").strip()
+    gemini_model = str(getattr(cfg, "GEMINI_MODEL", "gemini-3-flash-preview") or "").strip()
     gemini_key = str(getattr(cfg, "GEMINI_API_KEY", "") or "").strip()
     if gemini_key and gemini_model:
         stage_groups["gemini"].append(

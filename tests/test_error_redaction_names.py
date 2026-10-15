@@ -41,6 +41,16 @@ def test_redacts_gemini_api_key_from_error_text(monkeypatch):
     assert text.endswith("[REDACTED]")
 
 
+def test_redacts_gemini_api_key_set_directly_in_environment(monkeypatch):
+    synthetic_key = "gemini-env-direct-synthetic-key"
+    monkeypatch.setenv("GEMINI_API_KEY", synthetic_key)
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "", raising=False)
+
+    text = redact_error_text(f"Request rejected: {synthetic_key}")
+
+    assert text == "Request rejected: [REDACTED]"
+
+
 def test_redacts_elevenlabs_key_from_error_text(monkeypatch):
     synthetic_key = "elevenlabs-synthetic-test-key"
     monkeypatch.setattr(config, "ELEVENLABS_API_KEY", synthetic_key, raising=False)
