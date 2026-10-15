@@ -756,6 +756,151 @@ test("hinzugefügte Satzzeilen unterstützen ebenfalls Änderungen und automatis
     JSON.stringify([["62,5", "10"], ["62,5", "8"]]));
 });
 
+test("offene Satzentwürfe werden pro Session, Übung und Satzindex nach Neuladen wiederhergestellt", async () => {
+  const storage = new Map();
+  const state = makeState({ prefill: [
+    { weight_kg: 60, reps: 10 },
+    { weight_kg: 55, reps: 12 },
+  ] });
+  const fetch = async (url) => {
+    if (url === "/api/state") return response(200, state);
+    if (url.startsWith("/api/history?")) return response(200, []);
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const firstApp = createFrontend({ storage, fetch });
+
+  assert.equal(await waitFor(() => firstApp.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  await firstApp.click("open-exercise", { exercise: "Squats" });
+  firstApp.input(0, "weight_kg", "72,5");
+  firstApp.input(1, "reps", "7");
+  await firstApp.click("add-draft");
+  firstApp.input(2, "reps", "6");
+
+  const reloadedApp = createFrontend({ storage, fetch });
+  assert.equal(await waitFor(() => reloadedApp.elements.get("#screen").innerHTML.includes("<h1>Squats</h1>")), true);
+  assert.equal(reloadedApp.draftInput(0, "weight_kg").value, "72,5");
+  assert.equal(reloadedApp.draftInput(1, "reps").value, "7");
+  assert.equal(reloadedApp.draftInput(2, "reps").value, "6");
+});
+
+test("offene Entwürfe bleiben erhalten, wenn der erste Satz die Session eröffnet", async () => {
+  const storage = new Map();
+  const state = makeState({
+    session: null,
+    prefill: [
+      { weight_kg: 60, reps: 10 },
+      { weight_kg: 55, reps: 12 },
+    ],
+  });
+  const fetch = async (url, options = {}) => {
+    if (url === "/api/state") return response(200, structuredClone(state));
+    if (url.startsWith("/api/history?")) return response(200, []);
+    if (url === "/api/sets") {
+      const item = JSON.parse(options.body);
+      const saved = { ...item, id: 12, set_index: 1 };
+      state.session = { id: 42, started_at: "2026-10-14T10:00:00Z" };
+      state.exercises[0].logged.push(saved);
+      return response(200, saved);
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const firstApp = createFrontend({ storage, fetch });
+
+  assert.equal(await waitFor(() => firstApp.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  await firstApp.click("open-exercise", { exercise: "Squats" });
+  firstApp.input(1, "weight_kg", "77,5");
+  await firstApp.click("log-draft", { index: 0 });
+  assert.equal(await waitFor(() => storage.get("gym_queue") === "[]"), true);
+  assert.equal(JSON.parse(storage.get("gym_drafts"))["42"].Squats["2"].weight_kg, "77,5");
+
+  const reloadedApp = createFrontend({ storage, fetch });
+  assert.equal(await waitFor(() => reloadedApp.elements.get("#screen").innerHTML.includes("<h1>Squats</h1>")), true);
+  assert.equal(reloadedApp.draftInput(0, "weight_kg").value, "77,5");
+});
+
+test("Entwürfe anderer Sessions werden beim Laden aufgeräumt", async () => {
+  const storage = new Map([[
+    "gym_drafts",
+    JSON.stringify({
+      1: { Squats: { 1: { weight_kg: "70", reps: "8" } } },
+      2: { Squats: { 1: { weight_kg: "80", reps: "6" } } },
+    }),
+  ]]);
+  const state = makeState({ prefill: [{ weight_kg: 60, reps: 10 }] });
+  state.session.id = 2;
+  const app = createFrontend({
+    storage,
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+
+  assert.deepEqual(JSON.parse(storage.get("gym_drafts")), {
+    2: { Squats: { 1: { weight_kg: "80", reps: "6" } } },
+  });
+});
+
+test("Entwürfe werden nach erfolgreichem Loggen und Abschließen der Session gelöscht", async () => {
+  const storage = new Map();
+  const state = makeState({ prefill: [
+    { weight_kg: 60, reps: 10 },
+    { weight_kg: 55, reps: 12 },
+  ] });
+  const app = createFrontend({
+    storage,
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sets") {
+        const item = JSON.parse(options.body);
+        const saved = { ...item, id: 12, set_index: 1 };
+        state.exercises[0].logged.push(saved);
+        return response(200, saved);
+      }
+      if (url === "/api/finish") return response(200, { duration_min: 1, sets: 1, volume_kg: 600 });
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  app.input(0, "weight_kg", "62,5");
+  assert.equal(storage.has("gym_drafts"), true);
+  await app.click("log-draft", { index: 0 });
+  assert.equal(await waitFor(() => app.storage.get("gym_queue") === "[]"), true);
+  assert.deepEqual(Object.keys(JSON.parse(app.storage.get("gym_drafts"))["1"].Squats), ["2"]);
+
+  await app.click("back");
+  await app.click("finish");
+  assert.equal(app.elements.get("#screen").innerHTML.includes("Training beendet"), true);
+  assert.equal(app.storage.has("gym_drafts"), false);
+});
+
+test("nicht verfügbares localStorage blockiert offene Satzentwürfe nicht", async () => {
+  const app = createFrontend({
+    failGetItem: (key) => key === "gym_drafts",
+    failSetItem: (key) => key === "gym_drafts",
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({
+        prefill: [{ weight_kg: 60, reps: 10 }],
+      }));
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  app.input(0, "weight_kg", "72,5");
+
+  assert.equal(app.draftInput(0, "weight_kg").value, "72,5");
+  assert.equal(app.run('drafts.get("Squats")[0].weight_kg'), "72,5");
+});
+
 test("gym_view wird bei offener Session gespeichert und nach Neuladen wiederhergestellt", async () => {
   const storage = new Map();
   const fetch = async (url) => {

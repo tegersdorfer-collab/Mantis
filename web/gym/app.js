@@ -17,6 +17,7 @@ let histories = {};
 let historyRequestCounter = 0;
 const historyRequestIds = new Map();
 let drafts = new Map();
+const DRAFT_STORAGE_KEY = "gym_drafts";
 let queue = readStored("gym_queue", []);
 if (!Array.isArray(queue)) queue = [];
 queue = queue.filter((item) => item && typeof item.client_id === "string"
@@ -68,6 +69,49 @@ function removeStored(key) {
   } catch (_error) {
     // Private browsing or storage limits must not block a set from being logged.
   }
+}
+
+function readDraftStore() {
+  try {
+    const stored = localStorage.getItem(DRAFT_STORAGE_KEY);
+    if (stored === null) return {};
+    const parsed = JSON.parse(stored);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (_error) {
+    return null;
+  }
+}
+
+function writeDraftStore(stored) {
+  if (!Object.keys(stored).length) {
+    removeStored(DRAFT_STORAGE_KEY);
+    return true;
+  }
+  return writeStored(DRAFT_STORAGE_KEY, stored);
+}
+
+function pruneDraftStore() {
+  const stored = readDraftStore();
+  if (stored === null) return;
+  const sessionId = appState?.session?.id;
+  const activeSessionKey = sessionId === null || sessionId === undefined
+    ? null
+    : String(sessionId);
+  let changed = false;
+  for (const key of Object.keys(stored)) {
+    if (key === activeSessionKey) continue;
+    delete stored[key];
+    changed = true;
+  }
+  if (changed || !Object.keys(stored).length) writeDraftStore(stored);
+}
+
+function clearDraftsForSession(sessionId) {
+  if (sessionId === null || sessionId === undefined) return;
+  const stored = readDraftStore();
+  if (stored === null) return;
+  delete stored[String(sessionId)];
+  writeDraftStore(stored);
 }
 
 function escapeHtml(value) {
@@ -132,12 +176,96 @@ function makeDraft(weight, reps, autoFilled) {
   };
 }
 
+function isObjectRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function storedDraftsFor(exercise) {
+  const sessionId = appState?.session?.id;
+  if (sessionId === null || sessionId === undefined) return {};
+  const stored = readDraftStore();
+  if (!stored) return {};
+  const session = stored[String(sessionId)];
+  const exerciseDrafts = isObjectRecord(session) ? session[exercise.name] : null;
+  return isObjectRecord(exerciseDrafts) ? exerciseDrafts : {};
+}
+
+function restoreDraftValues(draft, stored) {
+  if (!isObjectRecord(stored)) return draft;
+  if (typeof stored.weight_kg === "string" || typeof stored.weight_kg === "number") {
+    draft.weight_kg = inputWeight(stored.weight_kg);
+  }
+  if (typeof stored.reps === "string" || typeof stored.reps === "number") {
+    draft.reps = String(stored.reps);
+  }
+  if (isObjectRecord(stored.userChanged)) {
+    draft.userChanged = {
+      weight_kg: stored.userChanged.weight_kg === true,
+      reps: stored.userChanged.reps === true,
+    };
+  }
+  if (isObjectRecord(stored.autoFilled)) {
+    draft.autoFilled = {
+      weight_kg: inputWeight(stored.autoFilled.weight_kg),
+      reps: String(stored.autoFilled.reps ?? ""),
+    };
+  } else if (stored.autoFilled === null) {
+    draft.autoFilled = null;
+  }
+  return draft;
+}
+
+function persistDraftsFor(exercise) {
+  const sessionId = appState?.session?.id;
+  if (sessionId === null || sessionId === undefined) return;
+  const stored = readDraftStore();
+  if (stored === null) return;
+
+  const sessionKey = String(sessionId);
+  const session = isObjectRecord(stored[sessionKey]) ? stored[sessionKey] : {};
+  const openDrafts = drafts.get(exercise.name) ?? [];
+  const entries = {};
+  openDrafts.forEach((draft, index) => {
+    const setIndex = (exercise.logged ?? []).length + index + 1;
+    entries[String(setIndex)] = {
+      weight_kg: draft.weight_kg,
+      reps: draft.reps,
+      autoFilled: draft.autoFilled ? { ...draft.autoFilled } : null,
+      userChanged: { ...draft.userChanged },
+    };
+  });
+
+  if (Object.keys(entries).length) session[exercise.name] = entries;
+  else delete session[exercise.name];
+  if (Object.keys(session).length) stored[sessionKey] = session;
+  else delete stored[sessionKey];
+  writeDraftStore(stored);
+}
+
 function draftsFor(exercise) {
   if (!drafts.has(exercise.name)) {
     const remaining = (exercise.prefill ?? []).slice((exercise.logged ?? []).length);
-    const initial = remaining.map((set) => makeDraft(set.weight_kg, set.reps, true));
-    if (!initial.length && !(exercise.logged ?? []).length && !(exercise.prefill ?? []).length) {
-      initial.push(makeDraft("", "", false));
+    const saved = storedDraftsFor(exercise);
+    const loggedCount = (exercise.logged ?? []).length;
+    const savedIndices = Object.keys(saved)
+      .map(Number)
+      .filter((setIndex) => Number.isInteger(setIndex) && setIndex > loggedCount);
+    const restoredCount = savedIndices.length
+      ? Math.max(...savedIndices) - loggedCount
+      : 0;
+    const blankFirstSet = !remaining.length && !loggedCount && !(exercise.prefill ?? []).length;
+    const draftCount = Math.max(remaining.length, restoredCount, blankFirstSet ? 1 : 0);
+    const initial = [];
+    for (let index = 0; index < draftCount; index += 1) {
+      const source = remaining[index]
+        ?? initial[index - 1]
+        ?? exercise.logged?.[exercise.logged.length - 1]
+        ?? exercise.prefill?.[exercise.prefill.length - 1]
+        ?? { weight_kg: "", reps: "" };
+      const draft = makeDraft(source.weight_kg, source.reps, Boolean(
+        remaining[index] || index > 0 || exercise.logged?.length || exercise.prefill?.length,
+      ));
+      initial.push(restoreDraftValues(draft, saved[String(loggedCount + index + 1)]));
     }
     drafts.set(exercise.name, initial);
   }
@@ -163,11 +291,13 @@ function updateDraftField(exercise, clientId, field, value) {
       if (input.dataset.clientId === next.client_id && input.dataset.field === field) input.value = value;
     }
   }
+  persistDraftsFor(exercise);
 }
 
 function removeDraft(exercise, clientId) {
   const list = draftsFor(exercise);
   drafts.set(exercise.name, list.filter((draft) => draft.client_id !== clientId));
+  persistDraftsFor(exercise);
 }
 
 function renderBrand() {
@@ -544,11 +674,17 @@ async function refreshState() {
     appState = await response.json();
     const nextSessionId = appState?.session?.id ?? null;
     if (previousSessionId !== nextSessionId) {
-      drafts = new Map();
+      if (previousSessionId !== null || nextSessionId === null) drafts = new Map();
       histories = {};
       editingSet = null;
     }
     restoreExerciseView();
+    pruneDraftStore();
+    if (previousSessionId === null && nextSessionId !== null) {
+      for (const exercise of appState.exercises ?? []) {
+        if (drafts.has(exercise.name)) persistDraftsFor(exercise);
+      }
+    }
     hydrateQueue();
     return true;
   } catch (_error) {
@@ -588,11 +724,17 @@ async function loadState() {
     screenMode = "app";
     const nextSessionId = appState?.session?.id ?? null;
     if (previousSessionId !== nextSessionId) {
-      drafts = new Map();
+      if (previousSessionId !== null || nextSessionId === null) drafts = new Map();
       histories = {};
       editingSet = null;
     }
     restoreExerciseView();
+    pruneDraftStore();
+    if (previousSessionId === null && nextSessionId !== null) {
+      for (const exercise of appState.exercises ?? []) {
+        if (drafts.has(exercise.name)) persistDraftsFor(exercise);
+      }
+    }
     loadError = "";
     hydrateQueue();
     render();
@@ -725,6 +867,7 @@ function addDraft() {
     ?? exercise.prefill[exercise.prefill.length - 1]
     ?? { weight_kg: "", reps: "" };
   list.push(makeDraft(source.weight_kg, source.reps, true));
+  persistDraftsFor(exercise);
   notice = "";
   render();
 }
@@ -802,6 +945,7 @@ async function logDraft(clientId) {
         }
         keepSavedSet(item, reconciled.saved);
         removeDraft(exercise, clientId);
+        if (!appState?.session) await refreshState();
         notice = "Satz synchronisiert. Die lokale Offline-Speicherung ist nicht verfügbar.";
         startTimer(exercise.rest_s);
         return true;
@@ -906,6 +1050,8 @@ async function finishTraining() {
     finishSummary = payload;
     screenMode = "summary";
     selectedExercise = null;
+    clearDraftsForSession(appState?.session?.id);
+    drafts = new Map();
     removeStored("gym_view");
     notice = "";
   } catch (error) {
