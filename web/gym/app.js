@@ -190,7 +190,7 @@ function formatWeight(value) {
 }
 
 function setUnitLabel(set) {
-  return set?.unit === "seconds" ? "s" : "Wdh.";
+  return set?.unit === "seconds" ? "s" : "reps";
 }
 
 function inputWeight(value) {
@@ -202,7 +202,7 @@ function formatDate(value) {
   const date = new Date(`${String(value).slice(0, 10)}T12:00:00`);
   return Number.isNaN(date.getTime())
     ? String(value)
-    : new Intl.DateTimeFormat("de-DE", { day: "numeric", month: "short" }).format(date);
+    : new Intl.DateTimeFormat("en-US", { day: "numeric", month: "short" }).format(date);
 }
 
 function formatEnglishDate(value, options = { weekday: "short", month: "short", day: "numeric" }) {
@@ -211,6 +211,24 @@ function formatEnglishDate(value, options = { weekday: "short", month: "short", 
   return Number.isNaN(parsed.getTime())
     ? String(value)
     : new Intl.DateTimeFormat("en-US", options).format(parsed);
+}
+
+function formatOrdinalEnglishDate(value) {
+  if (!value) return "";
+  const parsed = new Date(`${String(value).slice(0, 10)}T12:00:00`);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  const day = parsed.getDate();
+  const lastTwoDigits = day % 100;
+  const suffix = lastTwoDigits >= 11 && lastTwoDigits <= 13
+    ? "th"
+    : ({ 1: "st", 2: "nd", 3: "rd" }[day % 10] || "th");
+  const weekday = new Intl.DateTimeFormat("en-US", { weekday: "short" }).format(parsed);
+  const month = new Intl.DateTimeFormat("en-US", { month: "short" }).format(parsed);
+  return `${weekday}, ${month} ${day}${suffix}`;
+}
+
+function planDayName(title) {
+  return String(title || "Training").split(" · ", 1)[0];
 }
 
 function localDateString(value = new Date()) {
@@ -259,6 +277,15 @@ function muscleLabel(muscle) {
   return ({ chest: "Chest", shoulders: "Shoulders", biceps: "Biceps", triceps: "Triceps",
     forearms: "Forearms", abs: "Abs", quads: "Quads", hams: "Hamstrings", glutes: "Glutes",
     calves: "Calves", lats: "Lats", traps: "Traps", "lower back": "Lower back", neck: "Neck" })[muscle] ?? muscle;
+}
+
+function equipmentLabel(equipment) {
+  const normalized = String(equipment || "").trim().toLowerCase();
+  return ({
+    barbell: "Barbell", langhantel: "Barbell", dumbbell: "Dumbbell", kurzhantel: "Dumbbell",
+    machine: "Machine", maschine: "Machine", cable: "Cable", kabel: "Cable",
+    bodyweight: "Bodyweight", körpergewicht: "Bodyweight", other: "Other",
+  })[normalized] ?? (equipment ? String(equipment) : "Equipment not set");
 }
 
 function muscleSilhouette(highlighted) {
@@ -312,11 +339,11 @@ function estimateRm(weight, reps, targetReps = tenRmTarget) {
 }
 
 function startedAtLabel() {
-  if (!appState?.session?.started_at) return "Kein Training offen";
+  if (!appState?.session?.started_at) return "No active workout";
   const started = new Date(appState.session.started_at);
-  if (Number.isNaN(started.getTime())) return "Training läuft";
-  const time = new Intl.DateTimeFormat("de-DE", { hour: "2-digit", minute: "2-digit" }).format(started);
-  return `Training läuft seit ${time}`;
+  if (Number.isNaN(started.getTime())) return "Workout in progress";
+  const time = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(started);
+  return `Workout started at ${time}`;
 }
 
 function currentExercise() {
@@ -444,17 +471,28 @@ function updateDraftField(exercise, clientId, field, value) {
   if (previous === value) return;
   draft[field] = value;
   draft.userChanged[field] = true;
+  updateDraftTenRm(exercise, draft);
 
   for (let nextIndex = draftIndex + 1; nextIndex < list.length; nextIndex += 1) {
     const next = list[nextIndex];
     if (next.userChanged[field] || next.autoFilled?.[field] !== previous || next[field] !== previous) continue;
     next[field] = value;
     next.autoFilled[field] = value;
+    updateDraftTenRm(exercise, next);
     for (const input of screen.querySelectorAll("[data-draft-input]")) {
       if (input.dataset.clientId === next.client_id && input.dataset.field === field) input.value = value;
     }
   }
   persistDraftsFor(exercise);
+}
+
+function updateDraftTenRm(exercise, draft) {
+  if (exercise?.target_unit === "seconds") return;
+  const value = estimateRm(draft.weight_kg, draft.reps);
+  const label = value === null ? "–" : `${formatWeight(value)} kg`;
+  for (const field of screen.querySelectorAll("[data-tenrm-row]")) {
+    if (field.dataset.row === draft.client_id) field.textContent = label;
+  }
 }
 
 function removeDraft(exercise, clientId) {
@@ -464,10 +502,7 @@ function removeDraft(exercise, clientId) {
 }
 
 function renderBrand() {
-  return `<div class="brand-row">
-    <span class="brand-mark"><img src="/icon.png" alt=""><span>Mantis Gym</span></span>
-    <span>Krafttraining</span>
-  </div>`;
+  return "";
 }
 
 function renderHome() {
@@ -483,7 +518,7 @@ function renderHome() {
     date.setDate(monday.getDate() + index);
     return { date: localDateString(date), trained: false, today: date.toDateString() === today.toDateString() };
   })).map((day) => {
-    const label = formatEnglishDate(day.date, { weekday: "short" });
+    const label = formatEnglishDate(day.date, { weekday: "short" }).slice(0, 2);
     const dayNumber = String(day.date || "").slice(8, 10).replace(/^0/, "");
     return `<div class="week-day${day.today ? " is-today" : ""}${day.trained ? " is-trained" : ""}">
       <span>${escapeHtml(label)}</span><strong>${escapeHtml(dayNumber)}</strong>
@@ -494,33 +529,33 @@ function renderHome() {
     const tiles = exercises.slice(0, 3).map((item) => renderExerciseTile(item)).join("");
     const more = exercises.length > 3 ? `<span class="exercise-tile more-tile">+${exercises.length - 3}</span>` : "";
     const isNext = home.next_day?.id === day.id;
-    return `<button class="plan-day-card${isNext ? " is-next" : ""}" type="button"
+    return `<button class="plan-day-row${isNext ? " is-next" : ""}" type="button"
       data-action="start-day" data-day-id="${day.id}" aria-label="Start ${escapeHtml(day.name)}">
       <span class="plan-day-number">${index + 1}</span>
-      <span class="plan-day-copy"><strong>${escapeHtml(day.name)}</strong><span>${exercises.length} exercises</span></span>
+      <strong class="plan-day-name">${escapeHtml(day.name)}</strong>
       <span class="day-exercise-tiles">${tiles}${more}</span>
     </button>`;
   }).join("");
   const activeBar = appState?.session
-    ? `<button class="active-workout-bar" type="button" data-action="continue-session" aria-label="Fortsetzen: ${escapeHtml(appState.session.title || planName)}">
+    ? `<button class="active-workout-bar" type="button" data-action="continue-session" aria-label="Continue ${escapeHtml(appState.session.title || planName)}">
         <span aria-hidden="true">⚡</span><strong>${escapeHtml(appState.session.title || planName)}</strong>
         <span>${formatElapsed(workoutElapsedSeconds())}</span></button>`
     : "";
   const emptyDay = plan?.days?.length
     ? days
-    : `<button class="plan-day-card empty-plan-card" type="button" data-action="start-free"><span class="plan-day-number">+</span>
-        <span class="plan-day-copy"><strong>Start free training</strong><span>Build your first day in Plans</span></span></button>`;
+    : `<button class="plan-day-row empty-plan-card" type="button" data-action="start-free"><span class="plan-day-number">+</span>
+        <strong class="plan-day-name">Start free training</strong></button>`;
   const planMenu = planMenuOpen ? `<div class="home-plan-menu" role="menu" aria-label="Plan options">
       <button type="button" data-action="tab" data-tab="plans">Edit plans</button>
       <button type="button" data-action="create-plan">Create plan</button>
       ${appState?.session ? '<button type="button" data-action="finish">Finish workout</button>' : ""}</div>` : "";
-  return `<header class="home-header"><span class="brand-mark">Gym</span>
+  return `<header class="home-header"><span aria-hidden="true"></span>
     <button class="text-button" type="button" data-action="create-plan">Create</button></header>
     <section class="week-strip" aria-label="Training week">${weekDays}</section>
     <section class="home-plan-heading"><h1>${escapeHtml(planName)}</h1>
-      <button class="week-number" type="button" data-action="tab" data-tab="plans">Week ${Number(home.week_number) || 1}</button>
-      <button class="plan-menu-button" type="button" data-action="open-plan-menu" aria-label="Plan options">•••</button>${planMenu}</section>
-    <section class="exercise-list" aria-label="Plan days"><div class="plan-day-list">${emptyDay}</div></section>
+      <button class="plan-menu-button" type="button" data-action="open-plan-menu" aria-label="Plan options">•••</button>${planMenu}
+      <button class="week-number" type="button" data-action="tab" data-tab="plans">Week ${Number(home.week_number) || 1}</button></section>
+    <section class="exercise-list" aria-label="Plan days"><div class="plan-day-list-card"><div class="plan-day-list">${emptyDay}</div></div></section>
     <nav class="home-links" aria-label="More gym tools">
       <button class="text-button" type="button" data-action="tab" data-tab="plans">All plans</button>
       <button class="text-button" type="button" data-action="open-library">Exercises</button>
@@ -530,32 +565,21 @@ function renderHome() {
 
 function measureControl(field, value, mode, index, unit, clientId = "") {
   const inputMode = field === "weight_kg" ? "decimal" : "numeric";
-  const ariaLabel = field === "weight_kg" ? "Gewicht in Kilogramm" : unit === "s" ? "Sekunden" : "Wiederholungen";
-  const action = mode === "edit" ? "adjust-edit" : "adjust-draft";
+  const ariaLabel = field === "weight_kg" ? "Weight in kilograms" : unit === "s" ? "Seconds" : "Repetitions";
   const fieldName = field === "weight_kg" ? "weight_kg" : "reps";
   const renderedValue = fieldName === "weight_kg" ? inputWeight(value) : String(value ?? "");
   const inputAttribute = mode === "edit"
     ? `data-edit-input data-field="${fieldName}"`
     : `data-draft-input data-client-id="${escapeHtml(clientId)}" data-index="${index}" data-field="${fieldName}"`;
-  const clientAttribute = mode === "edit" ? "" : `data-client-id="${escapeHtml(clientId)}"`;
-  return `<div class="measure-cell">
-    <div class="measure-control">
-      <button type="button" aria-label="${fieldName === "weight_kg" ? "Gewicht" : "Wiederholungen"} verringern"
-        data-action="${action}" data-field="${fieldName}" data-index="${index}" ${clientAttribute} data-step="-1">−</button>
-      <input ${inputAttribute} inputmode="${inputMode}" value="${escapeHtml(renderedValue)}"
-        aria-label="${ariaLabel}" autocomplete="off">
-      <button type="button" aria-label="${fieldName === "weight_kg" ? "Gewicht" : "Wiederholungen"} erhöhen"
-        data-action="${action}" data-field="${fieldName}" data-index="${index}" ${clientAttribute} data-step="1">+</button>
-    </div>
-    <span class="measure-unit">${unit}</span>
-  </div>`;
+  return `<input class="measure-control" ${inputAttribute} inputmode="${inputMode}"
+    value="${escapeHtml(renderedValue)}" aria-label="${ariaLabel}" autocomplete="off">`;
 }
 
 function renderLoggedRow(set) {
   const pending = String(set.id).startsWith("pending:");
-  const label = pending ? "Wartet auf Sync" : "Satz bearbeiten";
+  const label = pending ? "Waiting to sync" : "Edit set";
   const timed = set.unit === "seconds";
-  const amountLabel = timed ? "Sekunden" : "Wiederholungen";
+  const amountLabel = timed ? "seconds" : "reps";
   const tenRm = timed ? "" : `<span class="tenrm-value">${formatWeight(estimateRm(set.weight_kg, set.reps))} kg</span>`;
   return `<div class="set-row set-row-complete${timed ? " is-timed" : ""}">
     <span class="set-number">${escapeHtml(set.set_index)}</span>
@@ -572,56 +596,73 @@ function maxAmount(entry) {
 }
 
 function repUnit(entry) {
-  return entry && entry.target_unit === "seconds" ? "s" : "Wdh.";
+  return entry && entry.target_unit === "seconds" ? "s" : "reps";
 }
 
 function targetLabel(entry) {
   if (!entry || !entry.rep_min || !entry.rep_max) return "";
   const span = entry.rep_min === entry.rep_max ? `${entry.rep_min}` : `${entry.rep_min}–${entry.rep_max}`;
-  return ` · Ziel ${span} ${repUnit(entry)}`;
+  return ` · Target ${span} ${repUnit(entry)}`;
 }
 
 function renderDraftRow(draft, index, setNumber, exercise) {
   const timed = exercise?.target_unit === "seconds";
   const unit = timed ? "s" : "reps";
   const value = estimateRm(draft.weight_kg, draft.reps);
-  const tenRm = timed ? "" : `<span class="tenrm-value" data-tenrm-value="${value === null ? "–" : formatWeight(value)}">${value === null ? "–" : `${formatWeight(value)} kg`}</span>`;
+  const tenRm = timed ? "" : `<span class="tenrm-value" data-tenrm-value="${value === null ? "–" : formatWeight(value)}" data-tenrm-row="${escapeHtml(draft.client_id)}">${value === null ? "–" : `${formatWeight(value)} kg`}</span>`;
   return `<div class="set-row${timed ? " is-timed" : ""}">
     <span class="set-number">${setNumber}</span>
     ${measureControl("weight_kg", draft.weight_kg, "draft", index, "kg", draft.client_id)}
     ${measureControl("reps", draft.reps, "draft", index, unit, draft.client_id)}
     ${tenRm}
     <button class="check-button" type="button" data-action="log-draft" data-client-id="${escapeHtml(draft.client_id)}" data-index="${index}"
-      aria-label="Satz ${setNumber} speichern">✓</button>
+      aria-label="Save set ${setNumber}">✓</button>
   </div>`;
 }
 
-function renderEditPanel(set, unit = "Wdh.") {
+function renderEditPanel(set, unit = "reps") {
   if (!editingSet || String(set.id) !== String(editingSet.id)) return "";
-  return `<section class="edit-panel" aria-label="Satz bearbeiten">
-    <h2>Satz bearbeiten</h2>
+  return `<section class="edit-panel" aria-label="Edit set">
+    <h2>Edit set</h2>
     <div class="edit-controls">
       ${measureControl("weight_kg", editingSet.weight_kg, "edit", "", "kg")}
       ${measureControl("reps", editingSet.reps, "edit", "", unit)}
     </div>
     <div class="edit-actions">
-      <button class="button button-primary" type="button" data-action="save-edit">Änderung speichern</button>
-      <button class="button button-danger" type="button" data-action="delete-edit">Satz löschen</button>
-      <button class="button" type="button" data-action="cancel-edit">Abbrechen</button>
+      <button class="button button-primary" type="button" data-action="save-edit">Save changes</button>
+      <button class="button button-danger" type="button" data-action="delete-edit">Delete set</button>
+      <button class="button" type="button" data-action="cancel-edit">Cancel</button>
     </div>
   </section>`;
 }
 
 function renderHistory(exercise) {
   const items = histories[exercise.name];
-  if (items === undefined) return '<p class="quiet-copy">Verlauf wird geladen …</p>';
+  if (items === undefined) return '<p class="quiet-copy">Loading workout history …</p>';
   if (items.error) return `<p class="quiet-copy">${escapeHtml(items.error)}</p>`;
-  if (!items.length) return '<p class="quiet-copy">Noch keine früheren Trainings.</p>';
+  if (!items.length) return '<p class="quiet-copy">No previous workouts.</p>';
   return `<div class="history-list">${items.map((item) => {
-    const sets = item.sets.map((set) => `${formatWeight(set.weight_kg)}×${set.reps}`).join(" · ");
-    return `<div class="history-line"><time>${escapeHtml(formatDate(item.date))}</time>
-      <span>${escapeHtml(sets)}</span></div>`;
+    const timed = item.sets.some((set) => set.unit === "seconds");
+    const rows = item.sets.map((set, index) => `<div class="history-table-row${timed ? " is-timed" : ""}">
+      <span>${escapeHtml(set.set_index ?? index + 1)}</span><span>${formatWeight(set.weight_kg)}</span>
+      <span>${escapeHtml(set.reps)}${timed ? " s" : ""}</span>${timed ? "" : `<span>${formatWeight(estimateRm(set.weight_kg, set.reps))}</span>`}</div>`).join("");
+    return `<article class="history-line"><strong>${escapeHtml(formatOrdinalEnglishDate(item.date))}</strong>
+      <div class="history-table-heading${timed ? " is-timed" : ""}"><span>#</span><span>KG</span><span>${timed ? "SECS" : "REPS"}</span>${timed ? "" : "<span>10RM</span>"}</div>${rows}</article>`;
   }).join("")}</div>`;
+}
+
+function renderEmptyTraining() {
+  const planName = planDayName(appState?.session?.title || "Training");
+  return `${renderHome()}<div class="sheet-backdrop" data-action="close-training" aria-hidden="true"></div>
+    <section class="workout-sheet empty-training" role="dialog" aria-modal="true" aria-label="Training">
+      <button class="sheet-grabber" type="button" data-action="close-training" aria-label="Close training sheet"><span></span></button>
+      <header class="sheet-top"><button class="sheet-close" type="button" data-action="close-training">Close</button>
+        <span class="sheet-plan-link">${escapeHtml(planName)}</span></header>
+      <h1>Training</h1><p class="quiet-copy">There are no exercises in this workout yet.</p>
+      <div class="empty-training-actions"><button class="button button-primary" type="button" data-action="open-session-exercise-picker">Add exercise</button>
+        <button class="button button-danger" type="button" data-action="finish">Finish workout</button></div>
+      ${sessionExercisePickerOpen ? renderExercisePicker("session") : ""}
+    </section>`;
 }
 
 function renderExercise() {
@@ -641,7 +682,7 @@ function renderExercise() {
   })).join("") + (appState?.session
     ? '<button type="button" class="exercise-tile-button" data-action="open-session-exercise-picker" aria-label="Add exercise"><span class="exercise-tile add-exercise-tile">+</span></button>'
     : "");
-  const planName = appState?.home?.active_plan?.name || appState?.session?.title || "Training";
+  const planName = planDayName(appState?.session?.title || appState?.home?.active_plan?.name || "Training");
   const menu = exerciseMenuOpen ? `<div class="exercise-menu" role="menu" aria-label="Exercise options">
     <button type="button" data-action="skip-session-exercise" ${exercise.skipped ? "disabled" : ""}>Skip</button>
     <button type="button" data-action="replace-session-exercise">Replace</button>
@@ -668,7 +709,7 @@ function renderExercise() {
     <label>${timed ? "Seconds" : "Reps"} min<input data-rep-target="rep_min" type="number" min="1" max="${timed ? 600 : 100}" value="${exercise.rep_min || (timed ? 30 : 6)}"></label>
     <label>${timed ? "Seconds" : "Reps"} max<input data-rep-target="rep_max" type="number" min="1" max="${timed ? 600 : 100}" value="${exercise.rep_max || (timed ? 40 : 10)}"></label>
     <button type="button" class="text-button" data-action="save-session-target">Save</button></div>` : "";
-  const completedLabel = exercise.logged.length === 1 ? "1 Satz erledigt" : `${exercise.logged.length} Sätze erledigt`;
+  const completedLabel = exercise.logged.length === 1 ? "1 set completed" : `${exercise.logged.length} sets completed`;
   const setCount = exercise.target_sets || exercise.prefill.length || 1;
   return `${renderHome()}<div class="sheet-backdrop" data-action="close-training" aria-hidden="true"></div>
     <section class="workout-sheet" role="dialog" aria-modal="true" aria-label="Training exercise">
@@ -682,13 +723,13 @@ function renderExercise() {
         <span>${target}</span><span class="sr-only">${escapeHtml(targetLabel(exercise))}</span>
         <button type="button" data-action="edit-rep-target" aria-label="Edit target repetitions">✎</button></p>${repTargetControls}
       <button class="warmup-toggle${showWarmups ? " is-active" : ""}" type="button" data-action="toggle-warmups">1 warm-up set</button>
-      <div class="set-heading${timed ? " is-timed" : ""}" aria-hidden="true"><span>#</span><span>KG ✎</span><span>${amountHeading}</span>${tenRmHeading}<span></span></div>
+      <div class="set-heading${timed ? " is-timed" : ""}" aria-hidden="true"><span>#</span><span>KG</span><span>${amountHeading}</span>${tenRmHeading}<span></span></div>
       <section class="set-list" aria-label="Sets">${warmup}${logged}${draftRows}</section>
       ${editPanel}${noteEditor}
       <div class="sheet-footer"><button class="text-button" type="button" data-action="open-help">Help</button>
         <button class="button add-set-row" type="button" data-action="add-draft">+ Set</button>
         ${appState?.session ? '<button class="text-button finish-session-link" type="button" data-action="finish">Finish</button>' : ""}</div>
-      <div class="exercise-history"><strong>Last training · ${escapeHtml(planName)}</strong>${renderHistory(exercise)}</div>
+      <div class="exercise-history"><strong>Last workout · ${escapeHtml(planName)}</strong>${renderHistory(exercise)}</div>
       ${sessionExercisePickerOpen ? renderExercisePicker(sessionExercisePickerKind) : ""}
     </section>`;
 }
@@ -696,13 +737,13 @@ function renderExercise() {
 function renderLogin() {
   return `${renderBrand()}
     <section class="auth-panel">
-      <h1>Dein Training</h1>
-      <p class="quiet-copy">Melde dich mit deinem Mantis-Zugangsschlüssel an.</p>
+      <h1>Training</h1>
+      <p class="quiet-copy">Sign in with your Mantis access key.</p>
       <form id="login-form">
-        <label for="access-token">Zugangsschlüssel</label>
+        <label for="access-token">Access key</label>
         <input id="access-token" name="token" type="password" autocomplete="off"
           autocapitalize="off" spellcheck="false" required>
-        <button class="button button-primary" type="submit">Anmelden</button>
+        <button class="button button-primary" type="submit">Sign in</button>
         <p class="inline-error">${escapeHtml(loginError)}</p>
       </form>
     </section>`;
@@ -710,15 +751,15 @@ function renderLogin() {
 
 function renderSummary() {
   if (!finishSummary) return renderHome();
-  const setLabel = finishSummary.sets === 1 ? "Satz" : "Sätze";
+  const setLabel = finishSummary.sets === 1 ? "set" : "sets";
   return `${renderBrand()}
     <section class="summary-panel">
-      <h1>Training beendet</h1>
-      <p class="quiet-copy">Gute Arbeit. Deine Session ist gespeichert.</p>
-      <div class="summary-line"><span>Dauer</span><strong>${finishSummary.duration_min} Min.</strong></div>
+      <h1>Workout complete</h1>
+      <p class="quiet-copy">Your workout has been saved.</p>
+      <div class="summary-line"><span>Duration</span><strong>${finishSummary.duration_min} min</strong></div>
       <div class="summary-line"><span>${setLabel}</span><strong>${finishSummary.sets}</strong></div>
-      <div class="summary-line"><span>Volumen</span><strong>${Number(finishSummary.volume_kg).toLocaleString("de-DE", { maximumFractionDigits: 2 })} kg</strong></div>
-      <div class="summary-actions"><button class="button button-primary" type="button" data-action="back-home">Zur Übersicht</button></div>
+      <div class="summary-line"><span>Volume</span><strong>${Number(finishSummary.volume_kg).toLocaleString("en-US", { maximumFractionDigits: 2 })} kg</strong></div>
+      <div class="summary-actions"><button class="button button-primary" type="button" data-action="back-home">Back to training</button></div>
     </section>`;
 }
 
@@ -736,7 +777,7 @@ function renderTabBar() {
     profile: '<svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c.6-4 3-6 7-6s6.4 2 7 6"/></svg>',
     plans: '<svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3"/></svg>',
   };
-  const tabs = [["training", "Training"], ["history", "Verlauf"], ["profile", "Profil"], ["plans", "Plan und Einstellungen"]];
+  const tabs = [["training", "Training"], ["history", "History"], ["profile", "Profile"], ["plans", "Settings"]];
   const selected = activeTab === "exercises" ? "training" : activeTab;
   tabBar.innerHTML = tabs.map(([id, label]) => `<button type="button" class="tab-item${selected === id ? " is-active" : ""}"
     data-action="tab" data-tab="${id}" aria-label="${label}" aria-current="${selected === id ? "page" : "false"}">
@@ -773,7 +814,7 @@ function renderWorkoutHistory() {
     const previews = (workout.exercises ?? []).slice(0, 3).map((exercise) => renderExerciseTile(exercise, { completed: true })).join("");
     const moreCount = Math.max(0, Number(workout.exercise_count || 0) - (workout.exercises ?? []).length);
     return `<button type="button" class="workout-card" data-action="open-workout" data-workout-id="${workout.id}">
-      <span class="workout-copy"><strong>${escapeHtml(workout.title)}</strong><small>${escapeHtml(formatEnglishDate(workout.date))}</small></span>
+      <span class="workout-copy"><strong>${escapeHtml(planDayName(workout.title))}</strong><small>${escapeHtml(formatOrdinalEnglishDate(workout.date))}</small></span>
       <span class="workout-preview">${previews}${moreCount ? `<span class="exercise-tile more-tile">+${moreCount}</span>` : ""}</span></button>`;
   }).join("") : '<p class="quiet-copy">No completed workouts yet.</p>';
   const workoutCount = Number(overviewData?.workout_count ?? workoutHistory.length);
@@ -790,33 +831,54 @@ function renderWorkoutHistory() {
       <div class="chart-filter-row chart-metric-row" aria-label="Chart measure">${[["workouts","Workouts"],["volume","Volume"]].map(([metric,label]) =>
         `<button class="chart-filter${chartMetric === metric ? " is-active" : ""}" type="button" data-action="set-chart-metric" data-metric="${metric}" aria-pressed="${chartMetric === metric}">${label}</button>`).join("")}</div>
     </section>
-    <section class="workout-list" aria-label="Training sessions">${rows}</section>
+    <section class="workout-list-card" aria-label="Training sessions"><div class="workout-list">${rows}</div></section>
   </section>`;
+}
+
+function renderHistorySetDialog() {
+  if (!historyEditSet) return "";
+  const set = workoutDetail?.sets.find((item) => item.id === historyEditSet.id);
+  if (!set) return "";
+  const timed = set.unit === "seconds";
+  const amountLabel = timed ? "SECS" : "REPS";
+  return `<div class="modal-backdrop history-set-backdrop" data-action="cancel-history-edit" aria-hidden="true"></div>
+    <section class="history-set-dialog" role="dialog" aria-modal="true" aria-label="Edit set">
+      <header><h2>Edit set ${escapeHtml(set.set_index)}</h2><button class="sheet-close" type="button" data-action="cancel-history-edit">Close</button></header>
+      <div class="history-set-fields"><label>KG<input data-history-edit data-field="weight_kg" type="number" step="0.25"
+          value="${escapeHtml(historyEditSet.weight_kg)}" inputmode="decimal"></label>
+        <label>${amountLabel}<input data-history-edit data-field="reps" type="number" step="1"
+          value="${escapeHtml(historyEditSet.reps)}" inputmode="numeric"></label></div>
+      <div class="history-set-actions"><button class="button button-primary" type="button" data-action="save-history-set">Save changes</button>
+        <button class="text-button danger-link" type="button" data-action="delete-history-set" data-set-id="${set.id}">Delete set</button></div>
+    </section>`;
 }
 
 function renderWorkoutDetail() {
   const workout = workoutDetail;
   if (!workout) return renderWorkoutHistory();
-  const sets = workout.sets.map((set) => {
-    const editing = historyEditSet && String(historyEditSet.id) === String(set.id);
-    if (editing) {
-      return `<div class="history-set editing"><strong>${escapeHtml(set.exercise)} · Satz ${set.set_index}</strong>
-        <label>kg<input data-history-edit data-field="weight_kg" value="${escapeHtml(historyEditSet.weight_kg)}" inputmode="decimal"></label>
-        <label>${setUnitLabel(set)}<input data-history-edit data-field="reps" value="${escapeHtml(historyEditSet.reps)}" inputmode="numeric"></label>
-        <button class="small-button" type="button" data-action="save-history-set">Speichern</button>
-        <button class="small-button" type="button" data-action="cancel-history-edit">Abbrechen</button></div>`;
-    }
-    return `<div class="history-set"><span><strong>${escapeHtml(set.exercise)}</strong><small>${set.is_warmup ? "Aufwärmen · " : ""}Satz ${set.set_index}</small></span>
-      <span>${formatWeight(set.weight_kg)} kg × ${set.reps} ${setUnitLabel(set)}</span>
-      <button class="small-button" type="button" data-action="edit-history-set" data-set-id="${set.id}" aria-label="Satz bearbeiten">Bearbeiten</button>
-      <button class="small-button" type="button" data-action="delete-history-set" data-set-id="${set.id}" aria-label="Satz löschen">Löschen</button></div>`;
+  const groups = new Map();
+  for (const set of workout.sets) {
+    const key = String(set.exercise_id ?? set.exercise);
+    if (!groups.has(key)) groups.set(key, { name: set.exercise, sets: [] });
+    groups.get(key).sets.push(set);
+  }
+  const exercises = [...groups.values()].map((group) => {
+    const timed = group.sets.some((set) => set.unit === "seconds");
+    const rows = group.sets.map((set) => `<button class="workout-set-row" type="button" data-action="edit-history-set"
+      data-set-id="${set.id}" aria-label="Edit set ${set.set_index}: ${formatWeight(set.weight_kg)} kilograms, ${set.reps} ${timed ? "seconds" : "reps"}">
+      <span>${escapeHtml(set.set_index)}</span><span>${formatWeight(set.weight_kg)}</span><span>${escapeHtml(set.reps)}</span></button>`).join("");
+    return `<article class="workout-exercise-card"><header class="workout-exercise-heading">
+        <span class="exercise-library-tile" aria-hidden="true">${escapeHtml(exerciseInitials({ name: group.name }))}</span>
+        <strong>${escapeHtml(group.name)}</strong></header>
+      <div class="history-table-heading${timed ? " is-timed" : ""}" aria-hidden="true"><span>#</span><span>KG</span><span>${timed ? "SECS" : "REPS"}</span></div>
+      <div class="workout-set-list">${rows}</div></article>`;
   }).join("");
   return `<section class="history-page workout-detail-page sheet-dismissable" role="dialog" aria-modal="true" aria-label="Workout details"><header class="history-top"><button class="sheet-close" type="button" data-action="history-back">Close</button>
     <button class="text-button" type="button" data-action="share-workout">Share</button></header>
-    <h1>${escapeHtml(workout.title)}</h1><p class="subhead">${escapeHtml(formatEnglishDate(workout.date))} · ${workout.duration_min} min · ${workout.set_count} sets</p>
-    <section class="workout-summary"><span>Volumen</span><strong>${formatWeight(workout.volume_kg)} kg</strong></section>
-    <section class="history-sets" aria-label="Sätze">${sets || '<p class="quiet-copy">Keine Sätze gespeichert.</p>'}</section>
-    <button class="button button-danger workout-delete" type="button" data-action="delete-workout">Delete workout</button></section>`;
+    <h1>${escapeHtml(planDayName(workout.title))}</h1><p class="subhead">${escapeHtml(formatOrdinalEnglishDate(workout.date))} · ${workout.duration_min} min</p>
+    <section class="workout-exercise-list" aria-label="Exercises">${exercises || '<p class="quiet-copy">No sets saved.</p>'}</section>
+    <button class="text-button danger-link workout-delete" type="button" data-action="delete-workout">Delete workout</button>
+    ${renderHistorySetDialog()}</section>`;
 }
 
 function renderE1rmChart(history, name) {
@@ -824,7 +886,7 @@ function renderE1rmChart(history, name) {
     .filter((item) => item.e1rm_kg !== null && item.e1rm_kg !== undefined
       && Number.isFinite(Number(item.e1rm_kg)))
     .reverse();
-  if (!points.length) return '<p class="quiet-copy">Für diese Übung gibt es noch keine gewichtete e1RM-Historie.</p>';
+  if (!points.length) return '<p class="quiet-copy">No weighted 1RM history for this exercise yet.</p>';
   const width = 320;
   const height = 150;
   const pad = 22;
@@ -838,7 +900,7 @@ function renderE1rmChart(history, name) {
   }));
   const path = coords.map((point, index) => `${index ? "L" : "M"}${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" ");
   const circles = coords.map((point, index) => `<circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="4"><title>${escapeHtml(points[index].date)} · ${formatWeight(values[index])} kg</title></circle>`).join("");
-  return `<div class="chart-wrap"><svg class="e1rm-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Geschätztes 1RM für ${escapeHtml(name)}">
+  return `<div class="chart-wrap"><svg class="e1rm-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Estimated 1RM for ${escapeHtml(name)}">
     <path class="chart-grid" d="M${pad} ${pad}H${width - pad} M${pad} ${height - pad}H${width - pad}"/>
     <path class="chart-line" d="${path}"/>${circles}</svg>
     <div class="chart-labels"><span>${escapeHtml(formatDate(points[0].date))}</span><span>${formatWeight(values.at(-1))} kg e1RM</span><span>${escapeHtml(formatDate(points.at(-1).date))}</span></div></div>`;
@@ -849,7 +911,7 @@ function renderExerciseLibrary() {
     const history = exerciseDetail.history ?? [];
     const historyUnit = exerciseDetail.unit === "min"
       || history.some((item) => item.sets?.some((set) => set.unit === "seconds"))
-      ? "s" : "Wdh.";
+      ? "s" : "reps";
     const historyRows = history.map((item) => {
       const bestSet = item.best_set
         ? `<small class="best-set">Best set: ${formatWeight(item.best_set.weight_kg)} kg × ${item.best_set.reps} ${setUnitLabel(item.best_set)}</small>`
@@ -861,7 +923,7 @@ function renderExerciseLibrary() {
     const muscles = mappedMuscles(exerciseDetail.muscle);
     const similarCount = (exerciseDirectory ?? []).filter((item) => item.id !== exerciseDetail.id
       && mappedMuscles(item.muscle).some((muscle) => muscles.includes(muscle))).length;
-    const equipment = exerciseDetail.equipment || "—";
+    const equipment = equipmentLabel(exerciseDetail.equipment);
     const type = exerciseDetail.category || exerciseDetail.exercise_type || "Strength";
     const menu = exerciseDetailMenuOpen ? `<div class="exercise-menu detail-menu" role="menu">
       <button type="button" data-action="exercise-detail-tab" data-detail-tab="info">Info</button>
@@ -876,7 +938,7 @@ function renderExerciseLibrary() {
       <article class="exercise-property-card"><span>Weight</span><strong>kg</strong></article>
       <article class="exercise-property-card"><span>Bodyweight</span><strong>0%</strong></article></section>
       <section class="muscle-card"><div class="section-heading-row"><div><span class="eyebrow">MUSCLES</span>
-        <strong>${escapeHtml(exerciseDetail.muscle || "Not set")}</strong></div>
+        <strong>${escapeHtml(mappedMuscles(exerciseDetail.muscle).map(muscleLabel).join(", ") || "Not set")}</strong></div>
         <button class="text-button" type="button" data-action="similar-exercises">Similar (${similarCount})</button></div>
         ${muscleSilhouette(muscles)}
         <div class="muscle-labels">${(exerciseMusclesExpanded ? muscles : muscles.slice(0, 3)).map((muscle) => `<span>${escapeHtml(muscleLabel(muscle))}</span>`).join("") || '<span>Muscle group unknown</span>'}</div>
@@ -901,67 +963,80 @@ function renderExerciseLibrary() {
   }
   const entries = exerciseDirectory ?? [];
   const muscles = [...new Set(entries.map((item) => item.muscle).filter(Boolean))].sort();
+  const filterButtons = [["", "All"], ...muscles.map((muscle) => [muscle, muscleLabel(mappedMuscles(muscle)[0]) || muscle])]
+    .map(([muscle, label]) => `<button class="muscle-filter${exerciseMuscle === muscle ? " is-active" : ""}" type="button"
+      data-action="filter-library-muscle" data-muscle="${escapeHtml(muscle)}" aria-pressed="${exerciseMuscle === muscle}">${escapeHtml(label)}</button>`)
+    .join("");
   const rows = entries.map((item) => `<button class="library-row" type="button" data-action="open-library-exercise" data-exercise-id="${item.id}">
-    <span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.muscle || "Muskelgruppe offen")}${item.equipment ? ` · ${escapeHtml(item.equipment)}` : ""}</small></span>
-    <span aria-hidden="true">›</span></button>`).join("");
+    <span class="exercise-library-tile" aria-hidden="true">${escapeHtml(exerciseInitials(item))}</span>
+    <span class="library-row-copy"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(equipmentLabel(item.equipment))}</small></span>
+    <span class="library-row-chevron" aria-hidden="true">›</span></button>`).join("");
   const form = showNewExerciseForm ? `<form id="new-exercise-form" class="inline-form">
-    <h2>Eigene Übung</h2><label>Name<input name="name" required maxlength="100"></label>
-    <label>Muskelgruppe<input name="muscle" maxlength="60"></label>
-    <label>Gerät<select name="equipment"><option value="">Nicht angegeben</option><option value="barbell">Langhantel</option><option value="dumbbell">Kurzhantel</option><option value="machine">Maschine</option><option value="cable">Kabel</option><option value="bodyweight">Körpergewicht</option><option value="other">Sonstiges</option></select></label>
-    <div class="form-pair"><label>Wdh. min<input name="rep_min" type="number" min="1" max="100" value="6"></label><label>Wdh. max<input name="rep_max" type="number" min="1" max="100" value="10"></label></div>
-    <button class="button button-primary" type="submit">Übung speichern</button><button class="text-button" type="button" data-action="toggle-new-exercise">Abbrechen</button></form>` : "";
-  return `${renderBrand()}<div class="section-heading-row"><div><h1>Übungen</h1><p class="subhead">Bibliothek und Verlauf pro Übung.</p></div>
-    <button class="small-button" type="button" data-action="toggle-new-exercise">+ Eigene</button></div>
-    ${form}<div class="library-filters"><label class="search-field">Suche<input id="library-search" value="${escapeHtml(exerciseSearch)}" placeholder="Übung oder Alias"></label>
-      <label>Muskel<select id="library-muscle"><option value="">Alle</option>${muscles.map((muscle) => `<option value="${escapeHtml(muscle)}"${exerciseMuscle === muscle ? " selected" : ""}>${escapeHtml(muscle)}</option>`).join("")}</select></label></div>
-    <section class="library-list">${rows || '<p class="quiet-copy">Keine passenden Übungen gefunden.</p>'}</section>`;
+    <h2>New exercise</h2><label>Name<input name="name" required maxlength="100"></label>
+    <label>Muscle group<input name="muscle" maxlength="60"></label>
+    <label>Equipment<select name="equipment"><option value="">Not specified</option><option value="barbell">Barbell</option><option value="dumbbell">Dumbbell</option><option value="machine">Machine</option><option value="cable">Cable</option><option value="bodyweight">Bodyweight</option><option value="other">Other</option></select></label>
+    <div class="form-pair"><label>Min reps<input name="rep_min" type="number" min="1" max="100" value="6"></label><label>Max reps<input name="rep_max" type="number" min="1" max="100" value="10"></label></div>
+    <button class="button button-primary" type="submit">Save exercise</button><button class="text-button" type="button" data-action="toggle-new-exercise">Cancel</button></form>` : "";
+  const emptyCopy = exerciseDirectory === null
+    ? "Loading exercises …"
+    : exerciseSearch || exerciseMuscle ? "No matching exercises." : "No exercises yet.";
+  return `<section class="exercise-library-page sheet-dismissable" role="dialog" aria-modal="true" aria-label="Exercises">
+    <header class="history-top"><button class="sheet-close" type="button" data-action="close-library">Close</button>
+      <button class="text-button library-add-button" type="button" data-action="toggle-new-exercise" aria-label="Add exercise">＋</button></header>
+    <h1>Exercises</h1>
+    <label class="library-search"><span class="sr-only">Search exercises</span><input id="library-search" type="search"
+      value="${escapeHtml(exerciseSearch)}" placeholder="Search exercises" autocomplete="off"></label>
+    <div class="muscle-filter-row" role="group" aria-label="Filter by muscle">${filterButtons}</div>
+    ${form}
+    <section class="exercise-library-card"><div class="library-list">${rows || `<p class="quiet-copy library-empty">${emptyCopy}</p>`}</div></section>
+  </section>`;
 }
 
 function renderExercisePicker(kind) {
   const rows = (exerciseDirectory ?? []).map((item) => `<button class="picker-row" type="button" data-action="pick-exercise"
-    data-kind="${kind}" data-exercise-id="${item.id}"><span>${escapeHtml(item.name)}</span><small>${escapeHtml(item.muscle || "")}</small></button>`).join("");
+    data-kind="${kind}" data-exercise-id="${item.id}"><span>${escapeHtml(item.name)}</span><small>${escapeHtml(mappedMuscles(item.muscle).map(muscleLabel).join(", "))}</small></button>`).join("");
   const heading = kind === "replace" ? "Replace exercise" : "Add exercise";
-  return `<div class="modal-backdrop"><section class="picker-modal" role="dialog" aria-modal="true" aria-label="Übung auswählen">
+  return `<div class="modal-backdrop"><section class="picker-modal exercise-picker" role="dialog" aria-modal="true" aria-label="Choose exercise">
     <div class="section-heading-row"><h2>${heading}</h2><button class="small-button" type="button" data-action="close-exercise-picker">Close</button></div>
-    <label class="search-field">Suche<input id="picker-search" value="${escapeHtml(exerciseSearch)}" placeholder="Übung suchen"></label>
-    <div class="picker-list">${rows || '<p class="quiet-copy">Übungen werden geladen …</p>'}</div>
+    <label class="search-field">Search<input id="picker-search" value="${escapeHtml(exerciseSearch)}" placeholder="Search exercises"></label>
+    <div class="picker-list">${rows || '<p class="quiet-copy">Loading exercises …</p>'}</div>
   </section></div>`;
 }
 
 function renderPlanTab() {
-  if (planList === null) return `${renderBrand()}<div class="loading-panel">Plan wird geladen …</div>`;
+  if (planList === null) return `${renderBrand()}<div class="loading-panel">Loading plans …</div>`;
   const active = planList.find((plan) => plan.active);
   const selected = planList.find((plan) => plan.id === selectedPlanId) ?? active ?? planList[0];
   const choices = planList.map((plan) => `<button class="plan-choice${selected?.id === plan.id ? " is-selected" : ""}" type="button"
-    data-action="select-plan" data-plan-id="${plan.id}"><span>${escapeHtml(plan.name)}</span>${plan.active ? '<small>Aktiv</small>' : ""}</button>`).join("");
-  const planForm = `<form id="new-plan-form" class="inline-form compact-form"><label>Neuer Plan<input name="name" required maxlength="100" placeholder="z. B. Upper / Lower"></label>
-    <label>Startdatum<input name="start_date" type="date" value="${localDateString()}"></label>
-    <button class="button" type="submit">Plan anlegen</button><p class="inline-error">${escapeHtml(newPlanError)}</p></form>`;
-  if (!selected) return `${renderBrand()}<h1>Plan</h1><p class="quiet-copy">Noch kein Plan angelegt.</p>${planForm}`;
+    data-action="select-plan" data-plan-id="${plan.id}"><span>${escapeHtml(plan.name)}</span>${plan.active ? '<small>Active</small>' : ""}</button>`).join("");
+  const planForm = `<form id="new-plan-form" class="inline-form compact-form"><label>New plan<input name="name" required maxlength="100" placeholder="e.g. Upper / Lower"></label>
+    <label>Start date<input name="start_date" type="date" value="${localDateString()}"></label>
+    <button class="button" type="submit">Create plan</button><p class="inline-error">${escapeHtml(newPlanError)}</p></form>`;
+  if (!selected) return `${renderBrand()}<h1>Plans</h1><p class="quiet-copy">No plans yet.</p>${planForm}`;
   const days = selected.days.map((day, dayIndex) => `<article class="plan-editor-day">
-    <div class="section-heading-row"><label class="plan-day-name">Tag<input data-day-name="${day.id}" value="${escapeHtml(day.name)}" maxlength="80"></label>
-      <div class="editor-tools"><button class="small-button" type="button" data-action="save-day-name" data-day-id="${day.id}">Speichern</button>
+    <div class="section-heading-row"><label class="plan-day-name">Day<input data-day-name="${day.id}" value="${escapeHtml(day.name)}" maxlength="80"></label>
+      <div class="editor-tools"><button class="small-button" type="button" data-action="save-day-name" data-day-id="${day.id}">Save</button>
         <button class="small-button" type="button" data-action="move-plan-day" data-plan-id="${selected.id}" data-day-index="${dayIndex}" data-direction="-1" ${dayIndex === 0 ? "disabled" : ""}>↑</button>
         <button class="small-button" type="button" data-action="move-plan-day" data-plan-id="${selected.id}" data-day-index="${dayIndex}" data-direction="1" ${dayIndex === selected.days.length - 1 ? "disabled" : ""}>↓</button>
-        <button class="small-button" type="button" data-action="delete-plan-day" data-day-id="${day.id}">Löschen</button></div></div>
+        <button class="small-button" type="button" data-action="delete-plan-day" data-day-id="${day.id}">Delete</button></div></div>
       ${(day.exercises ?? []).map((item, itemIndex) => `<div class="plan-exercise-editor">
         <strong>${escapeHtml(item.name)}</strong><div class="plan-exercise-fields">
-          <label>Sätze<input type="number" min="1" max="20" data-plan-value="target_sets" data-entry-id="${item.id}" value="${item.target_sets}"></label>
-          <label>${item.target_unit === "seconds" ? "Sek." : "Wdh."} min<input type="number" min="1" max="${item.target_unit === "seconds" ? 600 : 100}" data-plan-value="rep_min" data-entry-id="${item.id}" value="${item.rep_min}"></label>
-          <label>${item.target_unit === "seconds" ? "Sek." : "Wdh."} max<input type="number" min="1" max="${item.target_unit === "seconds" ? 600 : 100}" data-plan-value="rep_max" data-entry-id="${item.id}" value="${item.rep_max}"></label>
-          <label>Pause<input type="number" min="0" max="900" step="30" data-plan-value="rest_s" data-entry-id="${item.id}" value="${item.rest_s}"></label></div>
-        <div class="editor-tools"><button class="small-button" type="button" data-action="save-plan-exercise" data-entry-id="${item.id}">Speichern</button>
+          <label>Sets<input type="number" min="1" max="20" data-plan-value="target_sets" data-entry-id="${item.id}" value="${item.target_sets}"></label>
+          <label>${item.target_unit === "seconds" ? "sec" : "reps"} min<input type="number" min="1" max="${item.target_unit === "seconds" ? 600 : 100}" data-plan-value="rep_min" data-entry-id="${item.id}" value="${item.rep_min}"></label>
+          <label>${item.target_unit === "seconds" ? "sec" : "reps"} max<input type="number" min="1" max="${item.target_unit === "seconds" ? 600 : 100}" data-plan-value="rep_max" data-entry-id="${item.id}" value="${item.rep_max}"></label>
+          <label>Rest<input type="number" min="0" max="900" step="30" data-plan-value="rest_s" data-entry-id="${item.id}" value="${item.rest_s}"></label></div>
+        <div class="editor-tools"><button class="small-button" type="button" data-action="save-plan-exercise" data-entry-id="${item.id}">Save</button>
           <button class="small-button" type="button" data-action="move-plan-exercise" data-day-id="${day.id}" data-entry-id="${item.id}" data-entry-index="${itemIndex}" data-direction="-1" ${itemIndex === 0 ? "disabled" : ""}>↑</button>
           <button class="small-button" type="button" data-action="move-plan-exercise" data-day-id="${day.id}" data-entry-id="${item.id}" data-entry-index="${itemIndex}" data-direction="1" ${itemIndex === day.exercises.length - 1 ? "disabled" : ""}>↓</button>
-          <button class="small-button" type="button" data-action="delete-plan-exercise" data-entry-id="${item.id}">Entfernen</button></div></div>`).join("")}
-      <button class="text-button" type="button" data-action="open-plan-exercise-picker" data-day-id="${day.id}">+ Übung hinzufügen</button></article>`).join("");
-  return `${renderBrand()}<h1>Plan bearbeiten</h1><section class="plan-choice-list">${choices}</section>
-    <section class="plan-editor-header"><div><span class="eyebrow">${selected.active ? "AKTIVER PLAN" : "PLAN"}</span>
-      <input class="plan-title-input" data-plan-name value="${escapeHtml(selected.name)}" maxlength="100" aria-label="Planname">
-      <small>Start ${escapeHtml(formatDate(selected.start_date))}</small></div>
-      <button class="small-button" type="button" data-action="save-plan-name" data-plan-id="${selected.id}">Name speichern</button>
-      ${selected.active ? "" : `<button class="button button-primary" type="button" data-action="activate-plan" data-plan-id="${selected.id}">Aktivieren</button>`}</section>
-    <form id="add-day-form" class="inline-form compact-form" data-plan-id="${selected.id}"><label>Neuer Plantag<input name="name" required maxlength="80" placeholder="z. B. Upper C"></label><button class="button" type="submit">Tag hinzufügen</button></form>
+          <button class="small-button" type="button" data-action="delete-plan-exercise" data-entry-id="${item.id}">Remove</button></div></div>`).join("")}
+      <button class="text-button" type="button" data-action="open-plan-exercise-picker" data-day-id="${day.id}">+ Add exercise</button></article>`).join("");
+  return `${renderBrand()}<h1>Edit plan</h1><section class="plan-choice-list">${choices}</section>
+    <section class="plan-editor-header"><div><span class="eyebrow">${selected.active ? "ACTIVE PLAN" : "PLAN"}</span>
+      <input class="plan-title-input" data-plan-name value="${escapeHtml(selected.name)}" maxlength="100" aria-label="Plan name">
+      <small>Started ${escapeHtml(formatDate(selected.start_date))}</small></div>
+      <button class="small-button" type="button" data-action="save-plan-name" data-plan-id="${selected.id}">Save name</button>
+      ${selected.active ? "" : `<button class="button button-primary" type="button" data-action="activate-plan" data-plan-id="${selected.id}">Activate</button>`}</section>
+    <form id="add-day-form" class="inline-form compact-form" data-plan-id="${selected.id}"><label>New workout day<input name="name" required maxlength="80" placeholder="e.g. Upper C"></label><button class="button" type="submit">Add day</button></form>
     ${days}${planForm}${planExercisePickerDayId !== null ? renderExercisePicker("plan") : ""}`;
 }
 
@@ -1006,14 +1081,15 @@ function renderProfile() {
 
 function render() {
   if (screenMode === "login") screen.innerHTML = renderLogin();
-  else if (screenMode === "loading") screen.innerHTML = `${renderBrand()}<div class="loading-panel">Training wird geladen …</div>`;
+  else if (screenMode === "loading") screen.innerHTML = `${renderBrand()}<div class="loading-panel">Loading workout …</div>`;
   else if (screenMode === "error") screen.innerHTML = `${renderBrand()}
-    <section class="error-panel"><h1>Verbindung unterbrochen</h1>
-      <p class="quiet-copy">${escapeHtml(loadError)} Deine wartenden Sätze bleiben auf diesem Gerät.</p>
-      <button class="button button-primary" type="button" data-action="retry">Erneut versuchen</button>
+    <section class="error-panel"><h1>Connection lost</h1>
+      <p class="quiet-copy">${escapeHtml(loadError)} Your pending sets stay on this device.</p>
+      <button class="button button-primary" type="button" data-action="retry">Try again</button>
     </section>`;
   else if (screenMode === "summary") screen.innerHTML = renderSummary();
   else if (activeTab === "training" && selectedExercise) screen.innerHTML = renderExercise();
+  else if (activeTab === "training" && appState?.session && !(appState.exercises ?? []).length) screen.innerHTML = renderEmptyTraining();
   else if (activeTab === "training") screen.innerHTML = renderHome();
   else if (activeTab === "history") screen.innerHTML = renderWorkoutHistory();
   else if (activeTab === "profile") screen.innerHTML = renderProfile();
@@ -1030,7 +1106,7 @@ function render() {
 function renderSyncBanner() {
   const count = queue.length;
   syncHost.innerHTML = count
-    ? `<div class="sync-banner">${count} ${count === 1 ? "Satz ist" : "Sätze sind"} noch nicht synchronisiert.</div>`
+    ? `<div class="sync-banner">${count} ${count === 1 ? "set" : "sets"} waiting to sync.</div>`
     : "";
 }
 
@@ -1041,11 +1117,11 @@ function renderNotice() {
 function timerMarkup(seconds) {
   const minutes = String(Math.floor(seconds / 60)).padStart(2, "0");
   const remainder = String(seconds % 60).padStart(2, "0");
-  return `<div class="timer-dock" role="group" aria-label="Pausentimer">
-    <span class="timer-copy"><span>Pause</span><strong id="timer-value">${minutes}:${remainder}</strong></span>
-    <button class="small-button" type="button" data-action="timer-minus" aria-label="30 Sekunden abziehen">−30</button>
-    <button class="small-button" type="button" data-action="timer-plus" aria-label="30 Sekunden hinzufügen">+30</button>
-    <button class="small-button timer-skip" type="button" data-action="timer-skip">Überspringen</button>
+  return `<div class="timer-dock" role="group" aria-label="Rest timer">
+    <span class="timer-copy"><span>Rest</span><strong id="timer-value">${minutes}:${remainder}</strong></span>
+    <button class="small-button" type="button" data-action="timer-minus" aria-label="Subtract 30 seconds">−30</button>
+    <button class="small-button" type="button" data-action="timer-plus" aria-label="Add 30 seconds">+30</button>
+    <button class="small-button timer-skip" type="button" data-action="timer-skip">Skip</button>
   </div>`;
 }
 
@@ -1194,18 +1270,18 @@ async function reconcileSavedSet(item, saved) {
       : { ...saved, ...values };
     return { ok: true, saved: stored };
   } catch (_error) {
-    return { ok: false, message: "Keine Verbindung für die Korrektur." };
+    return { ok: false, message: "Could not connect to correct the saved set." };
   }
 }
 
 function permanentCorrectionNotice(result) {
-  return `Korrektur nicht möglich, der Server-Wert bleibt gespeichert. ${result.message}`;
+  return `The saved set could not be corrected. The server value is unchanged. ${result.message}`;
 }
 
 function correctionFailureNotice(result) {
   return result.message
-    ? `Korrektur des gespeicherten Satzes fehlgeschlagen. ${result.message}`
-    : "Korrektur des gespeicherten Satzes fehlgeschlagen. Bitte erneut versuchen.";
+    ? `Could not update the saved set. ${result.message}`
+    : "Could not update the saved set. Please try again.";
 }
 
 async function refreshState() {
@@ -1213,7 +1289,7 @@ async function refreshState() {
     const response = await fetch("/api/state", { cache: "no-store" });
     if (response.status === 401 || response.status === 403) {
       screenMode = "login";
-      loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
+      loginError = "Your session expired. Please sign in again.";
       render();
       return false;
     }
@@ -1263,7 +1339,7 @@ async function loadState() {
     const response = await fetch("/api/state", { cache: "no-store" });
     if (response.status === 401 || response.status === 403) {
       screenMode = "login";
-      loginError = "Bitte melde dich an, um dein Training zu öffnen.";
+      loginError = "Sign in to open your workouts.";
       render();
       return false;
     }
@@ -1293,7 +1369,7 @@ async function loadState() {
     return true;
   } catch (_error) {
     screenMode = "error";
-    loadError = "Der Server ist gerade nicht erreichbar.";
+    loadError = "The server is unavailable right now.";
     render();
     return false;
   }
@@ -1317,14 +1393,14 @@ function flushQueue() {
           body: JSON.stringify(item),
         });
       } catch (_error) {
-        notice = "Keine Verbindung. Deine Sätze warten auf den nächsten Sync.";
+        notice = "No connection. Your sets will sync when you're back online.";
         break;
       }
 
       if (response.ok) {
         const saved = await response.json().catch(() => null);
         if (!saved?.id) {
-          notice = "Der Satz konnte nicht bestätigt werden und bleibt für den nächsten Sync gespeichert.";
+          notice = "The set could not be confirmed and will stay queued for sync.";
           break;
         }
         const reconciled = await reconcileSavedSet(item, saved);
@@ -1340,7 +1416,7 @@ function flushQueue() {
         if (!reconciled.ok) {
           if (reconciled.status === 401 || reconciled.status === 403) {
             screenMode = "login";
-            loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
+            loginError = "Your session expired. Please sign in again.";
           }
           notice = correctionFailureNotice(reconciled);
           break;
@@ -1354,7 +1430,7 @@ function flushQueue() {
 
       if (response.status === 401 || response.status === 403) {
         screenMode = "login";
-        loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
+        loginError = "Your session expired. Please sign in again.";
         notice = "";
         break;
       }
@@ -1365,14 +1441,14 @@ function flushQueue() {
         writeStored("gym_queue", queue);
         removePending(item.client_id);
         unconfirmedSetIds.delete(item.client_id);
-        notice = failure.error || failure.detail || "Der Satz war ungültig und wurde verworfen.";
+        notice = failure.error || failure.detail || "The set was invalid and has been discarded.";
         validationRejected = true;
         continue;
       }
 
       notice = response.status >= 500
-        ? "Der Server ist gerade nicht erreichbar. Deine Sätze bleiben gespeichert."
-        : "Der Satz konnte nicht synchronisiert werden und bleibt gespeichert.";
+        ? "The server is unavailable. Your sets are saved on this device."
+        : "The set could not sync and remains saved on this device.";
       break;
     }
 
@@ -1397,12 +1473,12 @@ async function loadHistory(exercise) {
   try {
     const query = new URLSearchParams({ exercise, limit: "5" });
     const response = await fetch(`/api/history?${query.toString()}`);
-    if (!response.ok) throw new Error("Verlauf konnte nicht geladen werden.");
+    if (!response.ok) throw new Error("Could not load workout history.");
     const result = await response.json();
     if (historyRequestIds.get(exercise) === requestId) histories[exercise] = result;
   } catch (_error) {
     if (historyRequestIds.get(exercise) === requestId) {
-      histories[exercise] = { error: "Verlauf nicht verfügbar." };
+      histories[exercise] = { error: "Workout history is unavailable." };
     }
   }
   if (selectedExercise === exercise && historyRequestIds.get(exercise) === requestId) render();
@@ -1430,7 +1506,7 @@ async function loadExerciseList(search = exerciseSearch, muscle = exerciseMuscle
   } catch (error) {
     if (requestId !== exerciseListRequestId) return;
     exerciseDirectory = [];
-    notice = `Übungsbibliothek konnte nicht geladen werden. ${error.message}`;
+    notice = `Could not load the exercise library. ${error.message}`;
   }
   render();
   if (restoreFocus) {
@@ -1449,7 +1525,7 @@ async function loadExerciseDetail(exerciseId) {
     exerciseInstructionsDraft = exerciseDetail.instructions || "";
     notice = "";
   } catch (error) {
-    notice = `Übungsverlauf konnte nicht geladen werden. ${error.message}`;
+    notice = `Could not load exercise details. ${error.message}`;
   }
   render();
 }
@@ -1464,7 +1540,7 @@ async function loadWorkoutList() {
   if (historyResult.status === "fulfilled") workoutHistory = historyResult.value;
   else {
     workoutHistory = [];
-    notice = `Verlauf konnte nicht geladen werden. ${historyResult.reason.message}`;
+    notice = `Could not load workout history. ${historyResult.reason.message}`;
   }
   if (overviewResult.status === "fulfilled") {
     overviewData = overviewResult.value;
@@ -1492,7 +1568,7 @@ async function loadWorkoutDetail(workoutId) {
     historyEditSet = null;
     notice = "";
   } catch (error) {
-    notice = `Training konnte nicht geladen werden. ${error.message}`;
+    notice = `Could not load the workout. ${error.message}`;
   }
   render();
 }
@@ -1506,7 +1582,7 @@ async function loadPlanList(selectId = selectedPlanId) {
     notice = "";
   } catch (error) {
     planList = [];
-    notice = `Plan konnte nicht geladen werden. ${error.message}`;
+    notice = `Could not load plans. ${error.message}`;
   }
   render();
 }
@@ -1548,7 +1624,7 @@ async function startDay(dayId) {
     }
     notice = "";
   } catch (error) {
-    notice = `Training konnte nicht gestartet werden. ${error.message}`;
+    notice = `Could not start the workout. ${error.message}`;
   }
   render();
 }
@@ -1567,7 +1643,7 @@ async function startFreeTraining() {
     }
     notice = "";
   } catch (error) {
-    notice = `Training konnte nicht gestartet werden. ${error.message}`;
+    notice = `Could not start the workout. ${error.message}`;
   }
   render();
 }
@@ -1596,7 +1672,7 @@ async function sendMutation(path, method, body, refresh = "") {
     notice = "";
     return payload ?? true;
   } catch (error) {
-    notice = error.message || "Änderung konnte nicht gespeichert werden.";
+    notice = error.message || "Could not save the change.";
     render();
     return null;
   }
@@ -1685,7 +1761,7 @@ async function saveHistorySet() {
   const maxAmount = timed ? 600 : 100;
   if (!Number.isFinite(weight) || weight <= 0 || weight > 500
     || !Number.isInteger(reps) || reps < 1 || reps > maxAmount) {
-    notice = `Bitte prüfe Gewicht und ${timed ? "Sekunden" : "Wiederholungen"}.`;
+    notice = `Check the weight and ${timed ? "duration" : "reps"}.`;
     render();
     return;
   }
@@ -1702,12 +1778,12 @@ async function saveHistorySet() {
 }
 
 async function deleteHistorySet(setId) {
-  if (!window.confirm("Diesen Satz wirklich löschen?")) return;
+  if (!window.confirm("Delete this set?")) return;
   await sendMutation(`/api/workouts/${selectedWorkoutId}/sets/${setId}`, "DELETE", undefined, "history");
 }
 
 async function deleteSelectedWorkout() {
-  if (!selectedWorkoutId || !window.confirm("Dieses Training mit allen Sätzen wirklich löschen?")) return;
+  if (!selectedWorkoutId || !window.confirm("Delete this workout and all its sets?")) return;
   const deleted = await sendMutation(`/api/workouts/${selectedWorkoutId}`, "DELETE");
   if (deleted !== null) {
     workoutDetail = null;
@@ -1739,7 +1815,7 @@ async function logDraft(clientId) {
   const reps = Number(String(draft.reps).trim());
   const limit = maxAmount(exercise);
   if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || !Number.isInteger(reps) || reps < 1 || reps > limit) {
-    notice = `Gewicht muss über 0 und höchstens 500 kg liegen; ${limit === 600 ? "Sekunden" : "Wiederholungen"}: 1 bis ${limit}.`;
+    notice = `Weight must be above 0 and at most 500 kg; ${limit === 600 ? "seconds" : "reps"}: 1 to ${limit}.`;
     render();
     return;
   }
@@ -1771,22 +1847,22 @@ async function logDraft(clientId) {
         });
         if (response.status === 401 || response.status === 403) {
           screenMode = "login";
-          loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
-          notice = "Satz nicht gespeichert. Bitte nach der Anmeldung erneut abhaken.";
+          loginError = "Your session expired. Please sign in again.";
+          notice = "Set not saved. Sign in, then tap the checkmark again.";
           return false;
         }
         if (!response.ok) {
           const failure = await response.json().catch(() => ({}));
           const detail = failure.error || failure.detail;
           notice = detail
-            ? `Satz nicht gespeichert. ${detail}`
-            : "Satz nicht gespeichert. Bitte Verbindung prüfen und erneut abhaken.";
+            ? `Set not saved. ${detail}`
+            : "Set not saved. Check your connection and tap the checkmark again.";
           return false;
         }
 
         const confirmation = await response.json().catch(() => null);
         if (!confirmation?.id) {
-          notice = "Satz nicht gespeichert. Die Serverbestätigung fehlt; bitte erneut abhaken.";
+          notice = "Set not saved. The server did not confirm it; tap the checkmark again.";
           return false;
         }
         const reconciled = await reconcileSavedSet(item, confirmation);
@@ -1799,7 +1875,7 @@ async function logDraft(clientId) {
         if (!reconciled.ok) {
           if (reconciled.status === 401 || reconciled.status === 403) {
             screenMode = "login";
-            loginError = "Deine Anmeldung ist abgelaufen. Bitte melde dich erneut an.";
+            loginError = "Your session expired. Please sign in again.";
           }
           notice = correctionFailureNotice(reconciled);
           return false;
@@ -1807,11 +1883,11 @@ async function logDraft(clientId) {
         keepSavedSet(item, reconciled.saved);
         removeDraft(exercise, clientId);
         if (!appState?.session) await refreshState();
-        notice = "Satz synchronisiert. Die lokale Offline-Speicherung ist nicht verfügbar.";
+        notice = "Set synced. Offline storage is unavailable on this device.";
         startTimer(exercise.rest_s);
         return true;
       } catch (_error) {
-        notice = "Satz nicht gespeichert. Bitte Verbindung prüfen und erneut abhaken.";
+        notice = "Set not saved. Check your connection and tap the checkmark again.";
         return false;
       }
     })());
@@ -1859,7 +1935,7 @@ async function saveEdit() {
   const weight = parseDecimal(editingSet.weight_kg);
   const reps = Number(String(editingSet.reps).trim());
   if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || !Number.isInteger(reps) || reps < 1 || reps > maxAmount(currentExercise())) {
-    notice = "Bitte prüfe Gewicht und Wiederholungen.";
+    notice = "Check the weight and reps.";
     render();
     return;
   }
@@ -1868,46 +1944,46 @@ async function saveEdit() {
       weight_kg: weight,
       reps,
     });
-    if (!response.ok) throw new Error(payload?.error || payload?.detail || "Änderung fehlgeschlagen.");
+    if (!response.ok) throw new Error(payload?.error || payload?.detail || "Could not save the change.");
     editingSet = null;
     notice = "";
     await refreshState();
   } catch (error) {
-    notice = error.message || "Änderung fehlgeschlagen.";
+    notice = error.message || "Could not save the change.";
   }
   render();
 }
 
 async function deleteEdit() {
   if (!editingSet || String(editingSet.id).startsWith("pending:")) return;
-  if (!window.confirm("Diesen Satz wirklich löschen?")) return;
+  if (!window.confirm("Delete this set?")) return;
   try {
     const response = await fetch(`/api/sets/${editingSet.id}`, { method: "DELETE" });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
-      throw new Error(payload.error || payload.detail || "Löschen fehlgeschlagen.");
+      throw new Error(payload.error || payload.detail || "Could not delete the set.");
     }
     editingSet = null;
     notice = "";
     await refreshState();
   } catch (error) {
-    notice = error.message || "Löschen fehlgeschlagen.";
+    notice = error.message || "Could not delete the set.";
   }
   render();
 }
 
 async function finishTraining() {
-  if (!window.confirm("Training beenden und Session speichern?")) return;
+  if (!window.confirm("Finish and save this workout?")) return;
   const synchronized = await flushQueue();
   await waitForSetSends();
   if (!synchronized || queue.length || unconfirmedSetIds.size) {
-    if (!notice) notice = "Erst synchronisieren, bevor du das Training beendest.";
+    if (!notice) notice = "Sync your sets before finishing the workout.";
     render();
     return;
   }
   try {
     const { response, payload } = await requestJson("/api/finish", "POST");
-    if (!response.ok) throw new Error(payload?.error || payload?.detail || "Training konnte nicht beendet werden.");
+    if (!response.ok) throw new Error(payload?.error || payload?.detail || "Could not finish the workout.");
     finishSummary = payload;
     screenMode = "summary";
     selectedExercise = null;
@@ -1916,7 +1992,7 @@ async function finishTraining() {
     removeStored("gym_view");
     notice = "";
   } catch (error) {
-    notice = error.message || "Training konnte nicht beendet werden.";
+    notice = error.message || "Could not finish the workout.";
   }
   render();
 }
@@ -1957,12 +2033,12 @@ document.addEventListener("submit", async (event) => {
     loginError = "";
     try {
       const { response, payload } = await requestJson("/auth/session", "POST", { token });
-      if (!response.ok) throw new Error(payload?.detail || payload?.error || "Anmeldung fehlgeschlagen.");
+      if (!response.ok) throw new Error(payload?.detail || payload?.error || "Sign in failed.");
       screenMode = "loading";
       await loadState();
       if (screenMode === "app") await flushQueue();
     } catch (error) {
-      loginError = error.message || "Anmeldung fehlgeschlagen.";
+      loginError = error.message || "Sign in failed.";
       render();
       screen.querySelector("#access-token")?.focus();
     }
@@ -2030,6 +2106,12 @@ document.addEventListener("click", async (event) => {
     selectedExercise = null;
     removeStored("gym_view");
     await selectTab("training");
+  } else if (action === "close-library") {
+    exerciseDetail = null;
+    activeTab = "training";
+    render();
+  } else if (action === "filter-library-muscle") {
+    await loadExerciseList(exerciseSearch, button.dataset.muscle || "");
   } else if (action === "set-overview-weeks") {
     const weeks = Number(button.dataset.weeks);
     if (![4, 12, 26].includes(weeks)) return;
@@ -2315,7 +2397,7 @@ document.addEventListener("click", async (event) => {
     [dayIds[index], dayIds[target]] = [dayIds[target], dayIds[index]];
     await sendMutation(`/api/plans/${plan.id}/days/order`, "PUT", { day_ids: dayIds }, "plans");
   } else if (action === "delete-plan-day") {
-    if (!window.confirm("Diesen Plantag mit seinen Übungen entfernen?")) return;
+    if (!window.confirm("Delete this workout day and its exercises?")) return;
     await sendMutation(`/api/plan-days/${button.dataset.dayId}`, "DELETE", undefined, "plans");
   } else if (action === "save-plan-exercise") {
     await savePlanExercise(Number(button.dataset.entryId));
@@ -2349,7 +2431,7 @@ document.addEventListener("click", async (event) => {
     const set = exercise?.logged.find((entry) => String(entry.id) === button.dataset.setId);
     if (!set) return;
     if (String(set.id).startsWith("pending:")) {
-      notice = "Dieser Satz wird noch synchronisiert.";
+      notice = "This set is still syncing.";
     } else {
       editingSet = { ...set, weight_kg: inputWeight(set.weight_kg), reps: String(set.reps) };
       notice = "";
@@ -2392,8 +2474,12 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") void handleReconnect();
 });
 document.addEventListener("touchstart", (event) => {
-  if (!event.target.closest(".sheet-dismissable, .workout-sheet")) return;
-  sheetStartY = event.changedTouches?.[0]?.clientY ?? null;
+  const sheet = event.target.closest(".sheet-dismissable, .workout-sheet");
+  if (!sheet) return;
+  const startY = event.changedTouches?.[0]?.clientY;
+  sheetStartY = startY !== undefined
+    && (event.target.closest(".sheet-grabber") || sheet.scrollTop === 0)
+    ? startY : null;
 }, { passive: true });
 document.addEventListener("touchend", (event) => {
   const endY = event.changedTouches?.[0]?.clientY;
@@ -2408,8 +2494,9 @@ document.addEventListener("touchend", (event) => {
     if (workoutDetail) workoutDetail = null;
     else activeTab = "training";
     render();
-  } else if (activeTab === "exercises" && exerciseDetail) {
-    exerciseDetail = null;
+  } else if (activeTab === "exercises") {
+    if (exerciseDetail) exerciseDetail = null;
+    else activeTab = "training";
     render();
   }
 }, { passive: true });
@@ -2430,8 +2517,9 @@ document.addEventListener("keydown", (event) => {
     if (workoutDetail) workoutDetail = null;
     else activeTab = "training";
     render();
-  } else if (activeTab === "exercises" && exerciseDetail) {
-    exerciseDetail = null;
+  } else if (activeTab === "exercises") {
+    if (exerciseDetail) exerciseDetail = null;
+    else activeTab = "training";
     render();
   }
 });

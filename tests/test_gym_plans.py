@@ -1,6 +1,7 @@
 """Plan-Seed und Planmodell für den Gym-Tracker mit synthetischer Historie."""
 
 from datetime import date, datetime
+from threading import Event, Thread
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -340,6 +341,75 @@ def test_session_exercise_with_logged_sets_cannot_be_replaced_or_removed(plan_da
         )
     with pytest.raises(tracker.TrackerError, match="gespeicherten Sätzen"):
         plans.remove_session_exercise(started["id"], entry["session_exercise_id"])
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("mutation", ["replace", "remove"])
+def test_session_exercise_mutation_waits_for_an_in_flight_set_write(plan_database, monkeypatch, mutation):
+    moment = datetime.now(ZoneInfo("Europe/Berlin"))
+    started = plans.start_free_session(moment)
+    plan_database["workouts"].append(started["id"])
+    exercise_name = f"{plan_database['name']} Canonical"
+    exercise_id = plan_database["exercise_ids"][exercise_name]
+    replacement_id = plan_database["exercise_ids"][f"{plan_database['name']} Cardio"]
+    entry = plans.add_session_exercise(started["id"], exercise_id)
+    set_write_paused = Event()
+    release_set_write = Event()
+    remove_started = Event()
+    remove_finished = Event()
+    write_errors = []
+    remove_errors = []
+    original_exercise_rows = session._exercise_rows
+
+    def pause_set_transaction(cur, target_exercise_id):
+        set_write_paused.set()
+        if not release_set_write.wait(5):
+            raise AssertionError("Satz-Transaktion wurde nicht freigegeben")
+        return original_exercise_rows(cur, target_exercise_id)
+
+    monkeypatch.setattr(session, "_exercise_rows", pause_set_transaction)
+
+    def write_set():
+        try:
+            tracker.log_set(f"synthetic-{uuid4()}", exercise_name, 50, 8, now=moment)
+        except Exception as exc:  # pragma: no cover - nur für Thread-Fehlerbericht
+            write_errors.append(exc)
+
+    def mutate_exercise():
+        remove_started.set()
+        try:
+            if mutation == "replace":
+                plans.update_session_exercise(
+                    started["id"], entry["session_exercise_id"], exercise_id=replacement_id,
+                )
+            else:
+                plans.remove_session_exercise(started["id"], entry["session_exercise_id"])
+        except Exception as exc:
+            remove_errors.append(exc)
+        finally:
+            remove_finished.set()
+
+    writer = Thread(target=write_set)
+    mutator = Thread(target=mutate_exercise)
+    writer.start()
+    try:
+        assert set_write_paused.wait(5), "Satz wurde nicht innerhalb der Transaktion angehalten"
+        mutator.start()
+        assert remove_started.wait(2)
+        mutation_was_blocked_by_workout_lock = not remove_finished.wait(0.2)
+    finally:
+        release_set_write.set()
+        writer.join(timeout=5)
+        if mutator.ident is not None:
+            mutator.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not mutator.is_alive()
+    assert not write_errors
+    assert mutation_was_blocked_by_workout_lock
+    assert len(remove_errors) == 1
+    assert isinstance(remove_errors[0], tracker.TrackerError)
+    assert remove_errors[0].status == 409
 
 
 def _export_text(name, rows):

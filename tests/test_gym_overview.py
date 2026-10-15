@@ -91,6 +91,42 @@ def test_body_measurement_upsert_reuses_existing_body_measurements_table():
         db.execute("DELETE FROM body_measurements WHERE date=%s", (measured_on,))
 
 
+def test_latest_measurement_uses_latest_non_null_value_for_each_metric():
+    try:
+        db.query_one("SELECT 1 AS ready")
+        db.run_migrations()
+    except Exception as exc:
+        pytest.skip(f"mantis_test nicht erreichbar: {type(exc).__name__}")
+
+    measured_on = _test_date()
+    weight_date = measured_on + timedelta(days=1)
+    body_fat_date = measured_on + timedelta(days=2)
+    try:
+        db.execute(
+            "INSERT INTO body_measurements (date,weight_kg,body_fat) VALUES (%s,82.5,24.0)",
+            (measured_on,),
+        )
+        db.execute(
+            "INSERT INTO health_data (date,weight,body_fat) VALUES (%s,79.5,NULL)",
+            (weight_date,),
+        )
+        db.execute(
+            "INSERT INTO body_measurements (date,weight_kg,body_fat) VALUES (%s,NULL,19.5)",
+            (body_fat_date,),
+        )
+
+        measurement = overview._latest_measurement()
+
+        assert measurement == {
+            "date": body_fat_date.isoformat(),
+            "weight_kg": 79.5,
+            "body_fat": 19.5,
+        }
+    finally:
+        db.execute("DELETE FROM body_measurements WHERE date=ANY(%s)", ([measured_on, body_fat_date],))
+        db.execute("DELETE FROM health_data WHERE date=%s", (weight_date,))
+
+
 def test_exercise_instructions_are_persisted_on_the_exercise():
     try:
         db.query_one("SELECT 1 AS ready")

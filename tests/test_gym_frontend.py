@@ -49,9 +49,10 @@ def test_layout_accounts_for_safe_area_and_touch_targets():
     assert "env(safe-area-inset-top)" in app_css
     assert "env(safe-area-inset-bottom)" in app_css
     assert "min-height: 48px" in app_css
-    stepper = re.search(r"\.measure-control button\s*\{([^}]*)\}", app_css)
+    measure = re.search(r"\.measure-control\s*\{([^}]*)\}", app_css)
     timer = re.search(r"\.timer-dock \.small-button\s*\{([^}]*)\}", app_css)
-    assert stepper and "min-width: 44px" in stepper.group(1)
-    assert stepper and "min-height: 48px" in stepper.group(1)
+    assert ".measure-control button" not in app_css
+    assert measure and "min-height: 54px" in measure.group(1)
+    assert measure and "font-size: 1.42rem" in measure.group(1)
     assert timer and "min-width: 48px" in timer.group(1)
     assert timer and "min-height: 48px" in timer.group(1)

@@ -17,6 +17,8 @@ def _measurement_value(row: dict | None) -> dict | None:
     if not row:
         return None
     measured_on = row.get("date")
+    if measured_on is None:
+        return None
     return {
         "date": measured_on.isoformat() if hasattr(measured_on, "isoformat") else str(measured_on),
         "weight_kg": float(row["weight_kg"]) if row.get("weight_kg") is not None else None,
@@ -26,7 +28,7 @@ def _measurement_value(row: dict | None) -> dict | None:
 
 def _latest_measurement() -> dict | None:
     row = db.query_one(
-        """SELECT date,weight_kg,body_fat FROM (
+        """WITH measurements AS (
                SELECT date,weight_kg,body_fat,0 AS source_order
                FROM body_measurements
                WHERE weight_kg IS NOT NULL OR body_fat IS NOT NULL
@@ -34,8 +36,15 @@ def _latest_measurement() -> dict | None:
                SELECT date,weight AS weight_kg,body_fat,1 AS source_order
                FROM health_data
                WHERE weight IS NOT NULL OR body_fat IS NOT NULL
-           ) measurements
-           ORDER BY date DESC,source_order ASC LIMIT 1"""
+           )
+           SELECT MAX(date) AS date,
+                  (SELECT weight_kg FROM measurements
+                   WHERE weight_kg IS NOT NULL
+                   ORDER BY date DESC,source_order ASC LIMIT 1) AS weight_kg,
+                  (SELECT body_fat FROM measurements
+                   WHERE body_fat IS NOT NULL
+                   ORDER BY date DESC,source_order ASC LIMIT 1) AS body_fat
+           FROM measurements"""
     )
     return _measurement_value(row)
 

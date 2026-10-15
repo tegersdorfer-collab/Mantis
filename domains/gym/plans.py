@@ -985,86 +985,95 @@ def add_session_exercise(workout_id: int, exercise_id: int) -> dict:
 
 
 def update_session_exercise(workout_id: int, session_exercise_id: int, **values) -> dict:
-    _open_workout(workout_id)
     allowed = {"sort_order", "note", "skipped", "exercise_id", "target_sets", "rep_min", "rep_max", "rest_s"}
     if not values or values.keys() - allowed:
         raise TrackerError(400, "Ungültige Trainingsübung-Änderung")
-    entry = db.query_one(
-        """SELECT id,exercise_id,sort_order,note,skipped,target_sets,rep_min,rep_max,rest_s,target_unit
-           FROM gym_workout_exercises
-           WHERE workout_id=%s AND id=%s AND removed=FALSE""",
-        (workout_id, session_exercise_id),
-    )
-    if not entry:
-        raise TrackerError(404, "Trainingsübung nicht gefunden")
-    order = values.get("sort_order", int(entry["sort_order"]))
-    note = values.get("note", entry.get("note") or "")
-    skipped = values.get("skipped", bool(entry.get("skipped")))
-    if isinstance(order, bool) or not isinstance(order, int) or order < 0:
-        raise TrackerError(400, "Ungültige Übungsreihenfolge")
-    if not isinstance(note, str) or len(note) > 1000 or not isinstance(skipped, bool):
-        raise TrackerError(400, "Notiz oder Status ist ungültig")
-    exercise_id = values.get("exercise_id", int(entry["exercise_id"]))
-    if isinstance(exercise_id, bool) or not isinstance(exercise_id, int):
-        raise TrackerError(400, "Ungültige Übung")
-    replacing = exercise_id != int(entry["exercise_id"])
-    exercise = db.query_one(
-        "SELECT id,name,muscle,equipment,unit,rep_min,rep_max FROM exercises WHERE id=%s",
-        (exercise_id,),
-    )
-    if not exercise:
-        raise TrackerError(404, "Übung nicht gefunden")
-    if replacing:
-        old_ids = _exercise_ids(int(entry["exercise_id"]))
-        has_logged_sets = bool(old_ids and db.query_one(
-            """SELECT id FROM workout_sets WHERE workout_id=%s
-               AND exercise_id=ANY(%s) LIMIT 1""",
-            (workout_id, old_ids),
-        ))
-        if has_logged_sets:
-            raise TrackerError(409, "Eine Übung mit gespeicherten Sätzen kann nicht ersetzt werden")
-        candidate_ids = set(_exercise_ids(exercise_id))
-        existing_entries = db.query(
-            "SELECT id,exercise_id FROM gym_workout_exercises WHERE workout_id=%s AND id<>%s AND removed=FALSE",
-            (workout_id, session_exercise_id),
-        )
-        if any(candidate_ids.intersection(_exercise_ids(int(item["exercise_id"]))) for item in existing_entries):
-            raise TrackerError(409, "Die Übung ist bereits im Training")
-    target_unit = "seconds" if str(exercise.get("unit") or "").casefold() == "min" else "reps"
-    if replacing:
-        low = 30 if target_unit == "seconds" else int(exercise.get("rep_min") or 6)
-        high = low + SECONDS_RANGE_WIDTH if target_unit == "seconds" else max(low, int(exercise.get("rep_max") or 10))
-        target_sets = int(entry.get("target_sets") or 3)
-        rest_s = int(entry.get("rest_s") or DEFAULT_REST_SECONDS)
-    else:
-        low = int(entry.get("rep_min") or 6)
-        high = int(entry.get("rep_max") or max(low, int(exercise.get("rep_max") or 10)))
-        target_sets = int(entry.get("target_sets") or 3)
-        rest_s = int(entry.get("rest_s") or DEFAULT_REST_SECONDS)
-    target_sets = values.get("target_sets", target_sets)
-    low = values.get("rep_min", low)
-    high = values.get("rep_max", high)
-    rest_s = values.get("rest_s", rest_s)
-    target_sets, low, high, rest_s = _validate_plan_exercise_values(
-        target_sets, low, high, rest_s, target_unit,
-    )
-    if replacing:
-        db.execute(
-            "DELETE FROM gym_workout_exercises WHERE workout_id=%s AND exercise_id=%s AND removed=TRUE",
-            (workout_id, exercise_id),
-        )
-    if "sort_order" in values:
-        rows = db.query(
-            "SELECT id,sort_order FROM gym_workout_exercises WHERE workout_id=%s AND removed=FALSE ORDER BY sort_order,id",
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM workouts WHERE id=%s AND type='gym' AND ended_at IS NULL FOR UPDATE",
             (workout_id,),
         )
-        ordered_ids = [int(row["id"]) for row in rows]
-        if order >= len(ordered_ids):
+        if not cur.fetchone():
+            raise TrackerError(409, "Training ist nicht offen")
+        cur.execute(
+            """SELECT id,exercise_id,sort_order,note,skipped,target_sets,rep_min,rep_max,rest_s,target_unit
+               FROM gym_workout_exercises
+               WHERE workout_id=%s AND id=%s AND removed=FALSE FOR UPDATE""",
+            (workout_id, session_exercise_id),
+        )
+        entry = cur.fetchone()
+        if not entry:
+            raise TrackerError(404, "Trainingsübung nicht gefunden")
+        entry = dict(entry)
+        order = values.get("sort_order", int(entry["sort_order"]))
+        note = values.get("note", entry.get("note") or "")
+        skipped = values.get("skipped", bool(entry.get("skipped")))
+        if isinstance(order, bool) or not isinstance(order, int) or order < 0:
             raise TrackerError(400, "Ungültige Übungsreihenfolge")
-        ordered_ids.remove(session_exercise_id)
-        ordered_ids.insert(order, session_exercise_id)
-        offset = max((int(row["sort_order"]) for row in rows), default=-1) + len(rows) + 1
-        with db.cursor() as cur:
+        if not isinstance(note, str) or len(note) > 1000 or not isinstance(skipped, bool):
+            raise TrackerError(400, "Notiz oder Status ist ungültig")
+        exercise_id = values.get("exercise_id", int(entry["exercise_id"]))
+        if isinstance(exercise_id, bool) or not isinstance(exercise_id, int):
+            raise TrackerError(400, "Ungültige Übung")
+        replacing = exercise_id != int(entry["exercise_id"])
+        cur.execute(
+            "SELECT id,name,muscle,equipment,unit,rep_min,rep_max FROM exercises WHERE id=%s",
+            (exercise_id,),
+        )
+        exercise = cur.fetchone()
+        if not exercise:
+            raise TrackerError(404, "Übung nicht gefunden")
+        exercise = dict(exercise)
+        if replacing:
+            old_ids = _exercise_ids(int(entry["exercise_id"]))
+            cur.execute(
+                """SELECT id FROM workout_sets WHERE workout_id=%s
+                   AND exercise_id=ANY(%s) LIMIT 1""",
+                (workout_id, old_ids),
+            )
+            if old_ids and cur.fetchone():
+                raise TrackerError(409, "Eine Übung mit gespeicherten Sätzen kann nicht ersetzt werden")
+            candidate_ids = set(_exercise_ids(exercise_id))
+            cur.execute(
+                """SELECT id,exercise_id FROM gym_workout_exercises
+                   WHERE workout_id=%s AND id<>%s AND removed=FALSE""",
+                (workout_id, session_exercise_id),
+            )
+            existing_entries = [dict(row) for row in cur.fetchall()]
+            if any(candidate_ids.intersection(_exercise_ids(int(item["exercise_id"]))) for item in existing_entries):
+                raise TrackerError(409, "Die Übung ist bereits im Training")
+        target_unit = "seconds" if str(exercise.get("unit") or "").casefold() == "min" else "reps"
+        if replacing:
+            low = 30 if target_unit == "seconds" else int(exercise.get("rep_min") or 6)
+            high = low + SECONDS_RANGE_WIDTH if target_unit == "seconds" else max(low, int(exercise.get("rep_max") or 10))
+        else:
+            low = int(entry.get("rep_min") or 6)
+            high = int(entry.get("rep_max") or max(low, int(exercise.get("rep_max") or 10)))
+        target_sets = values.get("target_sets", int(entry.get("target_sets") or 3))
+        low = values.get("rep_min", low)
+        high = values.get("rep_max", high)
+        rest_s = values.get("rest_s", int(entry.get("rest_s") or DEFAULT_REST_SECONDS))
+        target_sets, low, high, rest_s = _validate_plan_exercise_values(
+            target_sets, low, high, rest_s, target_unit,
+        )
+        if replacing:
+            cur.execute(
+                "DELETE FROM gym_workout_exercises WHERE workout_id=%s AND exercise_id=%s AND removed=TRUE",
+                (workout_id, exercise_id),
+            )
+        if "sort_order" in values:
+            cur.execute(
+                """SELECT id,sort_order FROM gym_workout_exercises
+                   WHERE workout_id=%s AND removed=FALSE ORDER BY sort_order,id""",
+                (workout_id,),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+            ordered_ids = [int(row["id"]) for row in rows]
+            if order >= len(ordered_ids):
+                raise TrackerError(400, "Ungültige Übungsreihenfolge")
+            ordered_ids.remove(session_exercise_id)
+            ordered_ids.insert(order, session_exercise_id)
+            offset = max((int(row["sort_order"]) for row in rows), default=-1) + len(rows) + 1
             cur.execute(
                 "UPDATE gym_workout_exercises SET sort_order=sort_order+%s WHERE workout_id=%s AND removed=FALSE",
                 (offset, workout_id),
@@ -1074,45 +1083,56 @@ def update_session_exercise(workout_id: int, session_exercise_id: int, **values)
                     "UPDATE gym_workout_exercises SET sort_order=%s WHERE id=%s",
                     (sort_order, entry_id),
                 )
-    db.execute(
-        """UPDATE gym_workout_exercises
-           SET exercise_id=%s,target_sets=%s,rep_min=%s,rep_max=%s,rest_s=%s,target_unit=%s,
-               note=%s,skipped=%s WHERE id=%s""",
-        (exercise_id, target_sets, low, high, rest_s, target_unit, note, skipped, session_exercise_id),
-    )
-    exercise = db.query_one(
-        """SELECT we.id AS session_exercise_id,we.exercise_id,we.sort_order,we.target_sets,
-                  we.rep_min,we.rep_max,we.rest_s,we.note,we.skipped,e.name,e.muscle,e.equipment
-           FROM gym_workout_exercises we JOIN exercises e ON e.id=we.exercise_id WHERE we.id=%s""",
-        (session_exercise_id,),
-    )
+        cur.execute(
+            """UPDATE gym_workout_exercises
+               SET exercise_id=%s,target_sets=%s,rep_min=%s,rep_max=%s,rest_s=%s,target_unit=%s,
+                   note=%s,skipped=%s WHERE id=%s""",
+            (exercise_id, target_sets, low, high, rest_s, target_unit, note, skipped, session_exercise_id),
+        )
+        cur.execute(
+            """SELECT we.id AS session_exercise_id,we.exercise_id,we.sort_order,we.target_sets,
+                      we.rep_min,we.rep_max,we.rest_s,we.note,we.skipped,e.name,e.muscle,e.equipment
+               FROM gym_workout_exercises we JOIN exercises e ON e.id=we.exercise_id WHERE we.id=%s""",
+            (session_exercise_id,),
+        )
+        exercise = dict(cur.fetchone())
     return _session_entry_state(exercise, workout_id)
 
 
 def remove_session_exercise(workout_id: int, session_exercise_id: int) -> None:
-    _open_workout(workout_id)
-    entry = db.query_one(
-        "SELECT id,exercise_id FROM gym_workout_exercises WHERE workout_id=%s AND id=%s AND removed=FALSE",
-        (workout_id, session_exercise_id),
-    )
-    if not entry:
-        raise TrackerError(404, "Trainingsübung nicht gefunden")
-    ids = _exercise_ids(int(entry["exercise_id"]))
-    if ids and db.query_one(
-        """SELECT id FROM workout_sets WHERE workout_id=%s
-           AND exercise_id=ANY(%s) LIMIT 1""",
-        (workout_id, ids),
-    ):
-        raise TrackerError(409, "Eine Übung mit gespeicherten Sätzen kann nicht entfernt werden")
-    db.execute(
-        "UPDATE gym_workout_exercises SET removed=TRUE WHERE workout_id=%s AND id=%s",
-        (workout_id, session_exercise_id),
-    )
-    rows = db.query(
-        "SELECT id FROM gym_workout_exercises WHERE workout_id=%s AND removed=FALSE ORDER BY sort_order,id",
-        (workout_id,),
-    )
     with db.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM workouts WHERE id=%s AND type='gym' AND ended_at IS NULL FOR UPDATE",
+            (workout_id,),
+        )
+        if not cur.fetchone():
+            raise TrackerError(409, "Training ist nicht offen")
+        cur.execute(
+            """SELECT id,exercise_id FROM gym_workout_exercises
+               WHERE workout_id=%s AND id=%s AND removed=FALSE FOR UPDATE""",
+            (workout_id, session_exercise_id),
+        )
+        entry = cur.fetchone()
+        if not entry:
+            raise TrackerError(404, "Trainingsübung nicht gefunden")
+        ids = _exercise_ids(int(entry["exercise_id"]))
+        if ids:
+            cur.execute(
+                """SELECT id FROM workout_sets WHERE workout_id=%s
+                   AND exercise_id=ANY(%s) LIMIT 1""",
+                (workout_id, ids),
+            )
+            if cur.fetchone():
+                raise TrackerError(409, "Eine Übung mit gespeicherten Sätzen kann nicht entfernt werden")
+        cur.execute(
+            "UPDATE gym_workout_exercises SET removed=TRUE WHERE workout_id=%s AND id=%s",
+            (workout_id, session_exercise_id),
+        )
+        cur.execute(
+            "SELECT id FROM gym_workout_exercises WHERE workout_id=%s AND removed=FALSE ORDER BY sort_order,id",
+            (workout_id,),
+        )
+        rows = cur.fetchall()
         for sort_order, row in enumerate(rows):
             cur.execute("UPDATE gym_workout_exercises SET sort_order=%s WHERE id=%s", (sort_order, row["id"]))
 
