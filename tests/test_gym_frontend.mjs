@@ -4,6 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 
 const appSource = await readFile(new URL("../web/gym/app.js", import.meta.url), "utf8");
+let generatedClientIdSequence = 0;
 
 function response(status, payload) {
   return {
@@ -79,7 +80,6 @@ function createFrontend({
   ]);
   let reloads = 0;
   let intervalId = 0;
-  let clientIdSequence = 0;
   const context = vm.createContext({
     document: {
       body: { classList: { toggle() {}, remove() {}, add() {} } },
@@ -114,7 +114,7 @@ function createFrontend({
       get(key) { return key === "token" ? this.form.token : null; }
     },
     URLSearchParams,
-    crypto: { randomUUID: () => `vm-generated-client-id-${++clientIdSequence}` },
+    crypto: { randomUUID: () => `vm-generated-client-id-${++generatedClientIdSequence}` },
     setInterval: () => { intervalId += 1; return intervalId; },
     clearInterval() {},
   });
@@ -274,7 +274,7 @@ test("bei fehlgeschlagener Queue-Persistenz bleibt ein erfolgloser Direktversand
     failSetItem: (key) => key === "gym_queue",
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   app.input(0, "weight_kg", "20");
   app.input(0, "reps", "5");
@@ -302,7 +302,7 @@ test("bei fehlgeschlagener Queue-Persistenz zeigt ein erfolgreicher Direktversan
     failSetItem: (key) => key === "gym_queue",
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   app.input(0, "weight_kg", "60");
   app.input(0, "reps", "10");
@@ -343,7 +343,7 @@ test("Retry nach verlorenem Direktversand korrigiert den idempotenten Satz vor d
     failSetItem: (key) => key === "gym_queue",
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   await app.click("log-draft", { index: "0" });
   assert.equal(app.elements.get("#screen").innerHTML.includes('data-action="log-draft"'), true);
@@ -384,7 +384,7 @@ test("bei fehlgeschlagenem PATCH bleibt der korrigierte Direktversand-Draft offe
     failSetItem: (key) => key === "gym_queue",
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   await app.click("log-draft", { index: "0" });
   app.input(0, "weight_kg", "70");
@@ -543,7 +543,7 @@ test("62,3 wird auf 62,25 gerundet gesendet, ohne PATCH, und das Feld zeigt 62,2
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   const input = app.input(0, "weight_kg", "62,3");
   await app.click("log-draft", { index: "0" });
@@ -602,7 +602,7 @@ test("Änderungen an vorbefüllten Werten übernehmen offene Folgezeilen ohne ei
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   app.input(0, "weight_kg", "62,5");
   app.input(0, "reps", "9");
@@ -637,7 +637,7 @@ test("Input aktualisiert sichtbare Folgefelder und ✓ sendet den angezeigten We
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   const activeInput = app.input(0, "weight_kg", "62,5");
   const nextInput = app.draftInput(1, "weight_kg");
@@ -674,7 +674,7 @@ test("parallele Direktversände entfernen gespeicherte Drafts anhand ihrer ID", 
     failSetItem: (key) => key === "gym_queue",
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   const saveSecondRow = app.click("log-draft", { index: "1" });
   assert.equal(await waitFor(() => pendingResponses.length === 1), true);
@@ -716,7 +716,7 @@ test("Training beenden wartet auf einen laufenden Direktversand und blockiert be
     failSetItem: (key) => key === "gym_queue",
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   app.input(0, "weight_kg", "60");
   app.input(0, "reps", "10");
@@ -746,7 +746,7 @@ test("hinzugefügte Satzzeilen unterstützen ebenfalls Änderungen und automatis
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   await app.click("add-draft");
   app.input(0, "weight_kg", "62,5");
@@ -769,7 +769,7 @@ test("offene Satzentwürfe werden pro Session, Übung und Satzindex nach Neulade
   };
   const firstApp = createFrontend({ storage, fetch });
 
-  assert.equal(await waitFor(() => firstApp.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => firstApp.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await firstApp.click("open-exercise", { exercise: "Squats" });
   firstApp.input(0, "weight_kg", "72,5");
   firstApp.input(1, "reps", "7");
@@ -806,7 +806,7 @@ test("offene Entwürfe bleiben erhalten, wenn der erste Satz die Session eröffn
   };
   const firstApp = createFrontend({ storage, fetch });
 
-  assert.equal(await waitFor(() => firstApp.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => firstApp.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await firstApp.click("open-exercise", { exercise: "Squats" });
   firstApp.input(1, "weight_kg", "77,5");
   await firstApp.click("log-draft", { index: 0 });
@@ -837,7 +837,7 @@ test("Entwürfe anderer Sessions werden beim Laden aufgeräumt", async () => {
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
 
   assert.deepEqual(JSON.parse(storage.get("gym_drafts")), {
     2: { Squats: { 1: { weight_kg: "80", reps: "6" } } },
@@ -866,7 +866,7 @@ test("Entwürfe werden nach erfolgreichem Loggen und Abschließen der Session ge
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   app.input(0, "weight_kg", "62,5");
   assert.equal(storage.has("gym_drafts"), true);
@@ -878,6 +878,151 @@ test("Entwürfe werden nach erfolgreichem Loggen und Abschließen der Session ge
   await app.click("finish");
   assert.equal(app.elements.get("#screen").innerHTML.includes("Training beendet"), true);
   assert.equal(app.storage.has("gym_drafts"), false);
+});
+
+test("client_id eines Direktversands überlebt Reload und verhindert einen doppelten Satz", async () => {
+  const storage = new Map();
+  const state = makeState({ prefill: [{ weight_kg: 65, reps: 8 }] });
+  const serverSets = new Map();
+  const posts = [];
+  const fetch = async (url, options = {}) => {
+    if (url === "/api/state") return response(200, state);
+    if (url.startsWith("/api/history?")) return response(200, []);
+    if (url === "/api/sets" && options.method === "POST") {
+      const item = JSON.parse(options.body);
+      posts.push(item);
+      const existing = serverSets.get(item.client_id);
+      if (existing) return response(200, existing);
+      const saved = { ...item, id: 91, set_index: 1 };
+      serverSets.set(item.client_id, saved);
+      throw new Error("response lost after server saved the set");
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const firstApp = createFrontend({
+    storage,
+    fetch,
+    failSetItem: (key) => key === "gym_queue",
+  });
+
+  assert.equal(await waitFor(() => firstApp.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
+  await firstApp.click("open-exercise", { exercise: "Squats" });
+  firstApp.input(0, "weight_kg", "55");
+  await firstApp.click("log-draft", { index: "0" });
+  assert.equal(serverSets.size, 1);
+
+  const reloadedApp = createFrontend({
+    storage,
+    fetch,
+    failSetItem: (key) => key === "gym_queue",
+  });
+  assert.equal(await waitFor(() => reloadedApp.elements.get("#screen").innerHTML.includes("<h1>Squats</h1>")), true);
+  await reloadedApp.click("log-draft", { index: "0" });
+
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].client_id, posts[1].client_id);
+  assert.equal(serverSets.size, 1);
+  assert.deepEqual(
+    { weight_kg: [...serverSets.values()][0].weight_kg, reps: [...serverSets.values()][0].reps },
+    { weight_kg: 55, reps: 8 },
+  );
+});
+
+test("Serverstand und Queue mit gleicher client_id belegen nach Reload nur einen Satzindex", async () => {
+  const alreadySaved = {
+    id: 92,
+    client_id: queuedSet.client_id,
+    weight_kg: queuedSet.weight_kg,
+    reps: queuedSet.reps,
+    set_index: 1,
+  };
+  const state = makeState({
+    logged: [alreadySaved],
+    prefill: [{ weight_kg: 60, reps: 10 }, { weight_kg: 55, reps: 12 }],
+  });
+  const storage = new Map([["gym_queue", JSON.stringify([queuedSet])]]);
+  let finishPost;
+  const app = createFrontend({
+    storage,
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, state);
+      if (url === "/api/sets") return new Promise((resolve) => { finishPost = resolve; });
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => typeof finishPost === "function"), true);
+  assert.equal(app.run("appState.exercises[0].logged.length"), 1);
+  await app.click("open-exercise", { exercise: "Squats" });
+  assert.equal(app.draftInput(0, "weight_kg")?.dataset.index, "0");
+  assert.match(app.elements.get("#screen").innerHTML, /class="set-number">2<\/span>/);
+  finishPost(response(200, alreadySaved));
+  assert.equal(await waitFor(() => storage.get("gym_queue") === "[]"), true);
+});
+
+test("Entwürfe vor dem ersten Satz bleiben ohne Session über Reload erhalten", async () => {
+  const storage = new Map();
+  const fetch = async (url) => {
+    if (url === "/api/state") return response(200, makeState({
+      session: null,
+      prefill: [{ weight_kg: 60, reps: 10 }],
+    }));
+    if (url.startsWith("/api/history?")) return response(200, []);
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const firstApp = createFrontend({ storage, fetch });
+
+  assert.equal(await waitFor(() => firstApp.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
+  await firstApp.click("open-exercise", { exercise: "Squats" });
+  firstApp.input(0, "weight_kg", "52,5");
+  assert.equal(JSON.parse(storage.get("gym_drafts")).pending.Squats["1"].weight_kg, "52,5");
+
+  const reloadedApp = createFrontend({ storage, fetch });
+  assert.equal(await waitFor(() => reloadedApp.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
+  await reloadedApp.click("open-exercise", { exercise: "Squats" });
+  assert.equal(reloadedApp.draftInput(0, "weight_kg").value, "52,5");
+});
+
+test("beim Sessionstart werden Queue-Sätze vor dem Reindexieren offener Entwürfe eingerechnet", async () => {
+  const queued = { ...queuedSet, client_id: "waiting-before-start", weight_kg: 60, reps: 10 };
+  const storage = new Map([["gym_queue", JSON.stringify([queued])]]);
+  const initial = makeState({
+    session: null,
+    prefill: [
+      { weight_kg: 65, reps: 8 },
+      { weight_kg: 60, reps: 10 },
+      { weight_kg: 55, reps: 12 },
+    ],
+  });
+  const started = makeState({
+    session: { id: 42, started_at: "2026-10-14T10:00:00Z" },
+    prefill: initial.exercises[0].prefill,
+  });
+  let finishPost;
+  let stateRequests = 0;
+  const app = createFrontend({
+    storage,
+    fetch: async (url) => {
+      if (url === "/api/state") {
+        stateRequests += 1;
+        return response(200, stateRequests === 1 ? initial : started);
+      }
+      if (url === "/api/sets") return new Promise((resolve) => { finishPost = resolve; });
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => typeof finishPost === "function"), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  app.input(0, "weight_kg", "57,5");
+  await app.run("refreshState()");
+
+  const stored = JSON.parse(storage.get("gym_drafts"));
+  assert.equal(stored["42"].Squats["2"].weight_kg, "57,5");
+  assert.equal(stored["42"].Squats["3"].reps, "12");
+  finishPost(response(200, { ...queued, id: 93, set_index: 1 }));
 });
 
 test("nicht verfügbares localStorage blockiert offene Satzentwürfe nicht", async () => {
@@ -893,7 +1038,7 @@ test("nicht verfügbares localStorage blockiert offene Satzentwürfe nicht", asy
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
   app.input(0, "weight_kg", "72,5");
 
@@ -910,7 +1055,7 @@ test("gym_view wird bei offener Session gespeichert und nach Neuladen wiederherg
   };
   const firstApp = createFrontend({ storage, fetch });
 
-  assert.equal(await waitFor(() => firstApp.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => firstApp.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await firstApp.click("open-exercise", { exercise: "Bench Press" });
   assert.equal(storage.get("gym_view"), JSON.stringify("Bench Press"));
 
@@ -929,7 +1074,7 @@ test("Fehler beim Lesen oder Schreiben von gym_view blockieren die Übungsansich
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Bench Press" });
   assert.match(app.elements.get("#screen").innerHTML, /<h1>Bench Press<\/h1>/);
 });
@@ -945,7 +1090,7 @@ test("eine erledigte Einzelserie verwendet den Singular", async () => {
     },
   });
 
-  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await app.click("open-exercise", { exercise: "Squats" });
 
   assert.match(app.elements.get("#screen").innerHTML, /1 Satz erledigt/);
@@ -1033,7 +1178,7 @@ test("ein fehlgeschlagener Verlauf zeigt den Hinweis 'Verlauf nicht verfügbar'"
       throw new Error(`Unexpected request: ${url}`);
     },
   });
-  assert.equal(await waitFor(() => failedHistoryApp.elements.get("#screen").innerHTML.includes("Drei Übungen")), true);
+  assert.equal(await waitFor(() => failedHistoryApp.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
   await failedHistoryApp.click("open-exercise", { exercise: "Squats" });
   assert.equal(await waitFor(() => failedHistoryApp.elements.get("#screen").innerHTML.includes("Verlauf nicht verfügbar")), true);
 });
@@ -1121,4 +1266,52 @@ test("reconnect reloads state and flushes queued sets from the error screen", as
   assert.ok(calls.some((call) => call.url === "/api/state" && call.method === "GET"));
   assert.equal(calls.filter((call) => call.url === "/api/sets").length, 1);
   assert.equal(documentListeners.has("visibilitychange"), true);
+});
+
+test("Übungssuche lädt Treffer passend zur Eingabe nach", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url === "/api/exercises" || url.startsWith("/api/exercises?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
+  await app.click("tab", { tab: "exercises" });
+  app.documentListeners.get("input")({
+    target: { id: "library-search", value: "bench", matches: () => false },
+  });
+
+  assert.equal(await waitFor(() => app.calls.some((call) => call.url === "/api/exercises?search=bench")), true);
+});
+
+test("Tabwechsel aus der Trainingszusammenfassung öffnet den gewählten Bereich", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url === "/api/workouts?limit=50") return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
+  app.run('screenMode = "summary"; finishSummary = { sets: 1, duration_min: 1, volume_kg: 10 }; render();');
+  assert.match(app.elements.get("#screen").innerHTML, /Training beendet/);
+
+  await app.click("tab", { tab: "history" });
+
+  assert.match(app.elements.get("#screen").innerHTML, /Noch keine abgeschlossenen Trainings/);
+});
+
+test("offene Session zeigt auch ohne aktiven Plan oben Fortsetzen", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("data-action=\"continue-session\"")), true);
+  assert.match(app.elements.get("#screen").innerHTML, /Fortsetzen/);
 });

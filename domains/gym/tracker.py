@@ -30,9 +30,13 @@ class TrackerError(Exception):
 
 
 def _exercise_name(value: str) -> str:
-    if value not in EXERCISES:
-        raise TrackerError(400, "Unbekannte Übung")
-    return value
+    if value in EXERCISES:
+        return value
+    if isinstance(value, str) and value.strip():
+        row = db.query_one("SELECT name FROM exercises WHERE LOWER(name)=LOWER(%s) LIMIT 1", (value.strip(),))
+        if row:
+            return row["name"]
+    raise TrackerError(400, "Unbekannte Übung")
 
 
 def _weight(value: float) -> float:
@@ -150,7 +154,7 @@ def get_state(now: datetime | None = None) -> dict:
             ids = _exercise_ids(name)
             if ids:
                 logged = db.query(
-                    """SELECT ws.id, ws.weight_kg, ws.reps, ws.set_index
+                    """SELECT ws.id, ws.client_id, ws.weight_kg, ws.reps, ws.set_index
                        FROM workout_sets ws
                        WHERE ws.workout_id=%s AND ws.exercise_id=ANY(%s)
                          AND COALESCE(ws.is_warmup,FALSE)=FALSE
@@ -164,6 +168,7 @@ def get_state(now: datetime | None = None) -> dict:
             "logged": [
                 {
                     "id": int(row["id"]),
+                    "client_id": row.get("client_id"),
                     "weight_kg": float(row["weight_kg"]) if row["weight_kg"] is not None else None,
                     "reps": int(row["reps"]),
                     "set_index": int(row["set_index"]),
@@ -177,6 +182,7 @@ def get_state(now: datetime | None = None) -> dict:
         session_state = {
             "id": int(opened["id"]),
             "date": _iso(opened["date"]),
+            "title": opened.get("title") or "Freies Training",
             "started_at": _iso(opened["created_at"]),
         }
     return {"session": session_state, "exercises": exercises}

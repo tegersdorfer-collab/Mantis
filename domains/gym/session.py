@@ -80,7 +80,7 @@ def _lock_session(cur) -> None:
 def _open_row(cur):
     return _fetchone(
         cur,
-        """SELECT id, date, created_at, last_activity_at, ended_at
+        """SELECT id, date, title, created_at, last_activity_at, ended_at
            FROM workouts WHERE type='gym' AND ended_at IS NULL
            ORDER BY id DESC LIMIT 1 FOR UPDATE""",
     )
@@ -538,11 +538,36 @@ def add_sets(
         }
 
 
+def start_session(title: str = "Freies Training", now: datetime | None = None) -> dict:
+    """Öffnet eine leere Web-Session, damit ein Plantag vor dem ersten Satz feststeht."""
+    clean_title = str(title or "").strip()
+    if not clean_title or len(clean_title) > 160:
+        raise ValueError("Der Workout-Titel muss 1 bis 160 Zeichen lang sein")
+    moment = local_now(now)
+    with db.cursor() as cur:
+        _lock_session(cur)
+        workout = _open_row(cur)
+        if workout and moment >= session_timeout_end(
+            workout.get("last_activity_at") or workout["created_at"]
+        ):
+            _close_timed_out(cur, workout)
+            workout = None
+        if workout is None:
+            workout = _fetchone(
+                cur,
+                """INSERT INTO workouts (date,title,type,last_activity_at)
+                   VALUES (%s,%s,'gym',%s)
+                   RETURNING id,date,title,created_at,last_activity_at,ended_at""",
+                (moment.date(), clean_title, moment),
+            )
+    return workout
+
+
 def open_session(now: datetime | None = None) -> dict | None:
     """Liest eine offene Session und materialisiert den Timeout bei Bedarf."""
     moment = local_now(now)
     workout = db.query_one(
-        """SELECT id, date, created_at, last_activity_at, ended_at
+        """SELECT id, date, title, created_at, last_activity_at, ended_at
            FROM workouts WHERE type='gym' AND ended_at IS NULL ORDER BY id DESC LIMIT 1"""
     )
     if not workout:
