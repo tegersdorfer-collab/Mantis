@@ -303,6 +303,8 @@ def test_utterance_completion_accepts_explicitly_finished_patterns():
     ("Schalte den Fernseher um ein", "INCOMPLETE"),
     ("Schalte das Licht und ein", "INCOMPLETE"),
     ("Stell den Wecker bis ein", "INCOMPLETE"),
+    ("Stell dem Kunden ein", "INCOMPLETE"),
+    ("Stell der Kundin ein", "INCOMPLETE"),
     ("Mach das Licht ab", "COMPLETE"),
     ("Mach die Musik lauter", "COMPLETE"),
     ("Lies mal die Nachrichten vor", "COMPLETE"),

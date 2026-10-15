@@ -183,6 +183,10 @@ def _is_complete_command_particle(words: list[str]) -> bool:
 
 
 _EIN_COMMAND_VERBS = frozenset({"schalte", "schalt", "stell", "stelle", "trag", "trage", "richte", "richt"})
+# Nur Akkusativ-Artikel: 'dem/der Kunden ein …' leitet ein weiteres Objekt ein.
+_EIN_ACCUSATIVE_DETERMINERS = frozenset({
+    "das", "den", "die", "mein", "meine", "meinen", "dein", "deine", "deinen",
+})
 _EIN_BLOCKERS = frozenset({
     "mir", "dir", "uns", "euch", "ihm", "ihr", "heute",
     "auf", "aus", "in", "an", "mit", "von", "zu", "für", "bis", "um", "nach", "vor",
@@ -196,7 +200,7 @@ def _is_complete_ein_command(words: list[str]) -> bool:
     return (
         words[0] in _EIN_COMMAND_VERBS
         and 2 <= len(middle) <= 4
-        and middle[0] in _DETERMINERS
+        and middle[0] in _EIN_ACCUSATIVE_DETERMINERS
         and middle[-1] not in _DETERMINERS
         and not any(
             word in _EIN_BLOCKERS | _OPEN_PREPOSITIONS | _OPEN_CONJUNCTIONS | {"und", "oder", "aber"}
