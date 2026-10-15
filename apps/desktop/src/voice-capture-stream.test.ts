@@ -160,6 +160,7 @@ describe('startVoiceCaptureStream', () => {
       state = 'running';
       currentTime = 0;
       destination = {};
+      output = { gain: { value: 1 }, connect() {} };
       sources: FakeSource[] = [];
       audioWorklet = { addModule: async () => {} };
       constructor() { PlaybackContext.instances.push(this); }
@@ -169,6 +170,7 @@ describe('startVoiceCaptureStream', () => {
         this.sources.push(source);
         return source as unknown as AudioBufferSourceNode;
       }
+      createGain() { return this.output as unknown as GainNode; }
       decodeAudioData(_data: ArrayBuffer) {
         return Promise.resolve({ duration: 1 } as AudioBuffer);
       }
@@ -198,6 +200,11 @@ describe('startVoiceCaptureStream', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
       PlaybackContext.instances[1].currentTime = 0.4;
 
+      ws.onmessage?.({ data: JSON.stringify({ type: 'duck_playback' }) });
+      expect(PlaybackContext.instances[1].output.gain.value).toBe(0.25);
+      ws.onmessage?.({ data: JSON.stringify({ type: 'unduck_playback' }) });
+      expect(PlaybackContext.instances[1].output.gain.value).toBe(1);
+
       ws.onmessage?.({ data: JSON.stringify({ type: 'stop_playback', turn_id: 'turn' }) });
 
       const progress = ws.sent
@@ -213,6 +220,88 @@ describe('startVoiceCaptureStream', () => {
       expect(JSON.parse(ws.sent[ws.sent.length - 1] as string)).toEqual({
         type: 'playback_stopped', turn_id: 'turn',
       });
+      stop();
+    } finally {
+      vi.unstubAllGlobals();
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: originalMediaDevices, configurable: true,
+      });
+    }
+  });
+
+  it('starts a new streaming player at full gain after a ducked player ends', async () => {
+    FakeWebSocket.instances = [];
+    const originalMediaDevices = navigator.mediaDevices;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: {
+        getUserMedia: async () => ({
+          getTracks: () => [{ stop() {} }],
+        } as unknown as MediaStream),
+      }, configurable: true,
+    });
+    class FakeSource {
+      buffer: AudioBuffer | null = null;
+      onended: (() => void) | null = null;
+      connect() {}
+      start() {}
+      stop() {}
+    }
+    class FakeAudioContext {
+      static instances: FakeAudioContext[] = [];
+      state = 'running';
+      currentTime = 0;
+      destination = {};
+      output = { gain: { value: 1 }, connect() {} };
+      sources: FakeSource[] = [];
+      audioWorklet = { addModule: async () => {} };
+      constructor() { FakeAudioContext.instances.push(this); }
+      createMediaStreamSource() { return { connect() {} }; }
+      createGain() { return this.output as unknown as GainNode; }
+      createBufferSource() {
+        const source = new FakeSource();
+        this.sources.push(source);
+        return source as unknown as AudioBufferSourceNode;
+      }
+      decodeAudioData(_data: ArrayBuffer) {
+        return Promise.resolve({ duration: 1 } as AudioBuffer);
+      }
+      resume() { return Promise.resolve(); }
+      close() { return Promise.resolve(); }
+    }
+    class FakeWorkletNode {
+      port = { onmessage: null as ((event: MessageEvent<ArrayBuffer>) => void) | null };
+      constructor() {}
+      connect() {}
+    }
+    vi.stubGlobal('AudioContext', FakeAudioContext);
+    vi.stubGlobal('AudioWorkletNode', FakeWorkletNode);
+    try {
+      const stop = startVoiceCaptureStream(
+        'http://localhost:7779', vi.fn(),
+        (url) => new FakeWebSocket(url) as unknown as WebSocket,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const ws = FakeWebSocket.instances[0];
+      ws.onmessage?.({ data: JSON.stringify({
+        type: 'audio_chunk', seq: 0, block_id: 'old:0', b64: btoa('old'),
+      }) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const oldPlayerContext = FakeAudioContext.instances?.[1];
+      expect(oldPlayerContext?.output.gain.value).toBe(1);
+
+      ws.onmessage?.({ data: JSON.stringify({ type: 'duck_playback' }) });
+      expect(oldPlayerContext?.output.gain.value).toBe(0.25);
+      ws.onmessage?.({ data: JSON.stringify({ type: 'audio_end', count: 1 }) });
+      oldPlayerContext?.sources[0].onended?.();
+
+      ws.onmessage?.({ data: JSON.stringify({
+        type: 'audio_chunk', seq: 0, block_id: 'new:0', b64: btoa('new'),
+      }) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const contexts = FakeAudioContext.instances;
+      expect(contexts).toHaveLength(3);
+      expect(contexts[2].output.gain.value).toBe(1);
       stop();
     } finally {
       vi.unstubAllGlobals();

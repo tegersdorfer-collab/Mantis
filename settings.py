@@ -109,6 +109,13 @@ class MantisSettings(BaseSettings):
         Path(__file__).resolve().parent
         / "data" / "turn" / "smart-turn-v3.2-cpu.onnx"
     )
+    VOICE_SPEAKER_MODEL: str = str(
+        Path(__file__).resolve().parent
+        / "data" / "speaker" / "3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx"
+    )
+    VOICE_SPEAKER_VERIFY: bool = True
+    VOICE_SPEAKER_THRESHOLD: float = Field(default=0.38, ge=0, le=1)  # echte Mitschnitte 15.10.: Timo ≥0,42 (1 s), andere ≤0,33
+    VOICE_SPEAKER_LEARN_MIN: float = Field(default=0.6, ge=0, le=1)
     VOICE_RECORD_SEGMENTS: bool = False
     VOICE_RECORD_MAX_FILES: int = Field(default=300, ge=2)
     VOICE_PARTIAL_STT_MS: int = Field(default=700, ge=0)

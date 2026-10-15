@@ -39,6 +39,7 @@ build/
 
 # Modell-Gewichte (groß, gehören nicht ins Repo)
 *.npz
+!tests/fixtures/speaker_reference_synthetic.npz
 mlx_models/
 # Roboter-Laufzeit-State
 .robot_last

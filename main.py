@@ -210,6 +210,9 @@ async def main():
     )
     if smart_turn_preload_task is not None:
         orchestrator._bg_tasks.append(smart_turn_preload_task)
+    from core.speaker import schedule_speaker_preload
+    speaker_preload_task = schedule_speaker_preload(smart_turn_preload_task)
+    orchestrator._bg_tasks.append(speaker_preload_task)
     asyncio.create_task(api_server.serve())
     log.info(f"🖥️  Dashboard läuft auf http://{dashboard_host}:{cfg.DASHBOARD_PORT} (bindet auf {dashboard_host})")
     if cfg.GYM_ENABLED:

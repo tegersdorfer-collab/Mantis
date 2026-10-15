@@ -17,13 +17,18 @@ import re
 import tempfile
 import time
 import unicodedata
+import wave
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter, UploadFile, File, HTTPException, Request, WebSocket,
+    WebSocketDisconnect,
+)
 
 import config
 from core import db, tts, voice_fillers, voice_timing
@@ -41,6 +46,67 @@ from core.stream_events import StreamEvent
 from core.tts import _first_early_stream_boundary, synthesize, synthesize_stream
 
 log = logging.getLogger("mantis.api")
+
+SPEAKER_ENROLL_MAX_CLIPS = 12
+SPEAKER_ENROLL_MAX_BYTES = 4 * 1024 * 1024
+SPEAKER_ENROLL_MAX_SECONDS = 90.0
+SPEAKER_ENROLL_UPLOAD_TIMEOUT_SECONDS = 30.0
+SPEAKER_ENROLL_SESSION_TTL_SECONDS = 10 * 60.0
+SPEAKER_ENROLL_MAX_SESSIONS = 8
+
+
+def _wav_duration_seconds(payload: bytes) -> float:
+    """Liest die WAV-Dauer aus dem Header, ohne PCM-Frames zu dekodieren."""
+    try:
+        with wave.open(BytesIO(payload), "rb") as source:
+            frame_rate = source.getframerate()
+            if frame_rate <= 0:
+                raise ValueError("Ungültige WAV-Datei")
+            return source.getnframes() / frame_rate
+    except (wave.Error, EOFError) as exc:
+        raise ValueError("Ungültige WAV-Datei") from exc
+
+
+async def _read_bounded_request_body(
+    request: Request, *, max_bytes: int = SPEAKER_ENROLL_MAX_BYTES,
+) -> bytes:
+    """Liest einen Request-Body begrenzt direkt aus dem ASGI-Stream."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        declared_length = content_length.strip()
+        if not declared_length.isascii() or not declared_length.isdigit():
+            raise HTTPException(status_code=400, detail="Ungültiger Content-Length-Header")
+        if int(declared_length) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail="Sprecher-Upload darf insgesamt höchstens 4 MB groß sein",
+            )
+
+    payload = bytearray()
+    try:
+        async with asyncio.timeout(SPEAKER_ENROLL_UPLOAD_TIMEOUT_SECONDS):
+            async for chunk in request.stream():
+                if len(payload) + len(chunk) > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Sprecher-Upload darf insgesamt höchstens 4 MB groß sein",
+                    )
+                payload.extend(chunk)
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=408,
+            detail="Sprecher-Upload dauerte zu lange",
+        ) from exc
+    return bytes(payload)
+
+
+@dataclass(slots=True)
+class _SpeakerEnrollmentSession:
+    clips: list[bytes] = field(default_factory=list)
+    total_bytes: int = 0
+    total_seconds: float = 0.0
+    updated_at: float = field(default_factory=time.monotonic)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @dataclass(slots=True)
@@ -74,6 +140,11 @@ class _PlaybackTurn:
         self.audio_end_count: int | None = None
         self.interrupted = False
         self.bargein_ms: float | None = None
+        self.bargein_decision: str | None = None
+        self.bargein_started_at: float | None = None
+        self.duck_started_at: float | None = None
+        self.duck_ms = 0.0
+        self.ducked = False
         self.progress_reported = False
         self.timed_out = False
         self._first_block_sent_at: float | None = None
@@ -83,10 +154,11 @@ class _PlaybackTurn:
 
     def register_block(
         self, seq: int, audio: bytes, *, text: str | None = None,
-        sentence_id: int | None = None,
+        sentence_id: int | None = None, duration_ms: float | None = None,
     ) -> str:
         block_id = f"{self.turn_id}:{seq}"
-        duration_ms = voice_fillers._ogg_opus_duration_ms(audio)
+        if duration_ms is None:
+            duration_ms = voice_fillers._ogg_opus_duration_ms(audio)
         self.blocks[block_id] = _PlaybackBlock(
             block_id, sentence_id, text, duration_ms,
         )
@@ -97,6 +169,40 @@ class _PlaybackTurn:
             sentence.block_ids.append(block_id)
         self.changed.set()
         return block_id
+
+    def start_duck(self, *, now: float | None = None) -> bool:
+        if self.ducked or self.interrupted or not self.playback_active:
+            return False
+        timestamp = time.monotonic() if now is None else float(now)
+        self.ducked = True
+        self.duck_started_at = timestamp
+        if self.bargein_started_at is None:
+            self.bargein_started_at = timestamp
+        return True
+
+    def finish_duck(
+        self, *, now: float | None = None, decision: str | None = None,
+    ) -> float:
+        if self.ducked and self.duck_started_at is not None:
+            timestamp = time.monotonic() if now is None else float(now)
+            duration_ms = max(0.0, (timestamp - self.duck_started_at) * 1000)
+            self.duck_ms = round(self.duck_ms + duration_ms, 1)
+        else:
+            duration_ms = 0.0
+        self.ducked = False
+        self.duck_started_at = None
+        if decision is not None:
+            self.bargein_decision = decision
+        if decision == "ignored":
+            self.bargein_started_at = None
+        return duration_ms
+
+    def current_duck_ms(self, *, now: float | None = None) -> float:
+        duration_ms = self.duck_ms
+        if self.ducked and self.duck_started_at is not None:
+            timestamp = time.monotonic() if now is None else float(now)
+            duration_ms += max(0.0, (timestamp - self.duck_started_at) * 1000)
+        return round(duration_ms, 1)
 
     def mark_sentence_complete(self, sentence_id: int) -> None:
         sentence = self.sentences.get(sentence_id)
@@ -375,9 +481,21 @@ def _record_voice_latency(
     silence_used_ms: float | None = None,
     bargein: bool = False,
     bargein_ms: float | None = None,
+    duck_ms: float | None = None,
+    bargein_decision: str | None = None,
+    speaker_score: float | None = None,
+    speaker_ms: float | None = None,
+    speaker_decision: str | None = None,
+    address_rejected: bool = False,
 ) -> dict:
     model, stage = _voice_backend_details(orch)
     timing_detail = voice_timing.snapshot()
+    if address_rejected:
+        stage = "address_rejected"
+        timing_detail["llm_calls"] = [
+            call for call in timing_detail.get("llm_calls", [])
+            if call.get("error") != "CancelledError"
+        ]
     if partial_runs is not None:
         timing_detail["partial_runs"] = max(0, int(partial_runs))
     if partial_skip_reasons is not None:
@@ -400,6 +518,12 @@ def _record_voice_latency(
         "silence_used_ms": silence_used_ms,
         "bargein": bool(bargein),
         "bargein_ms": bargein_ms,
+        "duck_ms": duck_ms,
+        "bargein_decision": bargein_decision,
+        "speaker_score": speaker_score,
+        "speaker_ms": speaker_ms,
+        "speaker_decision": speaker_decision,
+        "address_rejected": bool(address_rejected),
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
         "model": model,
         "stage": stage,
@@ -490,6 +614,18 @@ _VOICE_ECHO_FILLER_WORDS = frozenset({
     "äh", "ähm", "hm", "hmm", "also", "bitte", "mal", "kurz", "eben",
     "schnell", "gern", "gerne", "vielleicht",
 })
+
+
+def _is_stop_reflex(text: str) -> bool:
+    """Erkennt kurze Stoppwörter auch in einem noch unvollständigen Transkript."""
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold().strip()
+    if re.search(r"(?<!\w)(?:stopp|stop|halt)(?!\w)", normalized):
+        return True
+    if re.search(r"(?<!\w)sei\s+still(?!\w)", normalized):
+        return True
+    return bool(re.match(
+        r"^(?:(?:mantis|mann|man|bitte)[\s,.:;-]+)*warte(?!\w)", normalized,
+    ))
 
 
 def _is_recent_tts_echo(
@@ -591,7 +727,8 @@ async def sende_streaming_antwort(
 
     async def send_audio_chunk(
         audio: bytes, *, answer: bool = False, sentence: str | None = None,
-        sentence_id: int | None = None,
+        sentence_id: int | None = None, echo_text: str | None = None,
+        duration_ms: float | None = None,
     ) -> None:
         nonlocal sequence, first_tts_block_ms, first_answer_audio_ms
         if output_gate is not None:
@@ -601,8 +738,8 @@ async def sende_streaming_antwort(
         if answer and first_answer_audio_ms is None:
             first_answer_audio_ms = round((time.perf_counter() - started_at) * 1000, 1)
         block_id = playback.register_block(
-            sequence, audio,
-            text=sentence if answer else None,
+            sequence, audio, duration_ms=duration_ms,
+            text=sentence if answer else echo_text,
             sentence_id=sentence_id if answer else None,
         )
         await websocket.send_json({
@@ -819,7 +956,10 @@ async def sende_streaming_antwort(
             if pending_filler is not None:
                 selected = pending_filler
                 pending_filler = None
-                await send_audio_chunk(selected.audio)
+                await send_audio_chunk(
+                    selected.audio, echo_text=selected.text,
+                    duration_ms=selected.duration_ms,
+                )
                 if turn_state is not None:
                     turn_state.audio_emitted = True
                 filler_ms = selected.duration_ms
@@ -999,6 +1139,24 @@ async def sende_streaming_antwort(
                     ),
                     bargein=playback.interrupted,
                     bargein_ms=playback.bargein_ms,
+                    duck_ms=playback.current_duck_ms(),
+                    bargein_decision=playback.bargein_decision,
+                    speaker_score=(
+                        address_metrics.get("speaker_score")
+                        if address_metrics is not None else None
+                    ),
+                    speaker_ms=(
+                        address_metrics.get("speaker_ms")
+                        if address_metrics is not None else None
+                    ),
+                    speaker_decision=(
+                        address_metrics.get("speaker_decision")
+                        if address_metrics is not None else None
+                    ),
+                    address_rejected=bool(
+                        address_metrics.get("address_rejected", False)
+                        if address_metrics is not None else False
+                    ),
                 )
             finally:
                 try:
@@ -1015,6 +1173,151 @@ async def sende_streaming_antwort(
 
 def build_router(orch=None) -> APIRouter:
     router = APIRouter()
+    enrollment_sessions: dict[UUID, _SpeakerEnrollmentSession] = {}
+    enrollment_sessions_lock = asyncio.Lock()
+
+    async def get_enrollment_session(
+        session_id: UUID, *, create: bool,
+    ) -> _SpeakerEnrollmentSession | None:
+        async with enrollment_sessions_lock:
+            now = time.monotonic()
+            expired = [
+                key for key, session in enrollment_sessions.items()
+                if now - session.updated_at > SPEAKER_ENROLL_SESSION_TTL_SECONDS
+            ]
+            for key in expired:
+                enrollment_sessions.pop(key, None)
+
+            session = enrollment_sessions.get(session_id)
+            if session is None and create:
+                if len(enrollment_sessions) >= SPEAKER_ENROLL_MAX_SESSIONS:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Zu viele aktive Sprecher-Einlernsitzungen",
+                    )
+                session = _SpeakerEnrollmentSession()
+                enrollment_sessions[session_id] = session
+            return session
+
+    async def discard_enrollment_session(
+        session_id: UUID, session: _SpeakerEnrollmentSession,
+    ) -> None:
+        # Ein fehlgeschlagener Clip verwirft die ganze Sitzung; der Client
+        # beginnt danach ohnehin mit einer neuen ID, sonst blockieren Reste
+        # bis zum Ablauf die Sitzungsgrenze.
+        async with session.lock:
+            async with enrollment_sessions_lock:
+                if enrollment_sessions.get(session_id) is session:
+                    enrollment_sessions.pop(session_id, None)
+
+    @router.get("/api/voice/speaker")
+    async def speaker_status():
+        from core.speaker import get_speaker_verifier
+
+        try:
+            return await get_speaker_verifier().status()
+        except Exception as exc:
+            log.exception("Sprecherprofilstatus konnte nicht geladen werden")
+            raise HTTPException(
+                status_code=503, detail="Sprecherprofil ist nicht verfügbar",
+            ) from exc
+
+    @router.post("/api/voice/speaker/enroll/clip")
+    async def speaker_enroll_clip(request: Request, session_id: UUID):
+        session = await get_enrollment_session(session_id, create=True)
+        assert session is not None
+
+        try:
+            async with session.lock:
+                async with enrollment_sessions_lock:
+                    if enrollment_sessions.get(session_id) is not session:
+                        raise HTTPException(
+                            status_code=404, detail="Einlernsitzung ist abgelaufen",
+                        )
+                    session.updated_at = time.monotonic()
+                    if len(session.clips) >= SPEAKER_ENROLL_MAX_CLIPS:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                f"Maximal {SPEAKER_ENROLL_MAX_CLIPS} Clips pro Sitzung erlaubt"
+                            ),
+                        )
+                    remaining_bytes = SPEAKER_ENROLL_MAX_BYTES - session.total_bytes
+                    if remaining_bytes <= 0:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Sprecher-Upload darf insgesamt höchstens 4 MB groß sein",
+                        )
+
+                payload = await _read_bounded_request_body(
+                    request, max_bytes=remaining_bytes,
+                )
+                duration = _wav_duration_seconds(payload)
+                if duration <= 0:
+                    raise ValueError("Ungültige WAV-Datei")
+                if session.total_seconds + duration > SPEAKER_ENROLL_MAX_SECONDS:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "Sprecher-Upload darf insgesamt höchstens "
+                            "90 Sekunden Audio enthalten"
+                        ),
+                    )
+                session.clips.append(payload)
+                session.total_bytes += len(payload)
+                session.total_seconds += duration
+                session.updated_at = time.monotonic()
+                return {"clips": len(session.clips)}
+        except HTTPException:
+            await discard_enrollment_session(session_id, session)
+            raise
+        except ValueError as exc:
+            await discard_enrollment_session(session_id, session)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/api/voice/speaker/enroll/finish")
+    async def speaker_enroll_finish(session_id: UUID):
+        session = await get_enrollment_session(session_id, create=False)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Einlernsitzung nicht gefunden")
+
+        async with session.lock:
+            async with enrollment_sessions_lock:
+                if enrollment_sessions.get(session_id) is not session:
+                    raise HTTPException(
+                        status_code=404, detail="Einlernsitzung ist abgelaufen",
+                    )
+                enrollment_sessions.pop(session_id, None)
+                payloads = list(session.clips)
+        if not payloads:
+            raise HTTPException(status_code=400, detail="Keine Audio-Dateien hochgeladen")
+
+        from core.speaker import get_speaker_verifier
+
+        try:
+            return await get_speaker_verifier().enroll_wavs(payloads)
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            log.exception("Sprecherprofil konnte nicht eingelernt werden")
+            raise HTTPException(
+                status_code=503, detail="Sprecherprofil konnte nicht eingelernt werden",
+            ) from exc
+
+    @router.delete("/api/voice/speaker")
+    async def speaker_reset():
+        from core.speaker import get_speaker_verifier
+
+        try:
+            await get_speaker_verifier().reset()
+        except Exception as exc:
+            log.exception("Sprecherprofil konnte nicht zurückgesetzt werden")
+            raise HTTPException(
+                status_code=503, detail="Sprecherprofil konnte nicht zurückgesetzt werden",
+            ) from exc
+        return {"enrolled": False}
 
     @router.post("/api/voice/segment")
     async def voice_segment(audio: UploadFile = File(...)):
@@ -1027,10 +1330,25 @@ def build_router(orch=None) -> APIRouter:
         reply = None
         audio_b64 = None
         timing_token = None
+        speaker_verifier = None
+        speaker_profile_active = False
+        if bool(getattr(config, "VOICE_SPEAKER_VERIFY", True)):
+            try:
+                from core.speaker import get_speaker_verifier
+
+                speaker_verifier = get_speaker_verifier()
+                speaker_profile_active = await speaker_verifier.has_profile()
+            except Exception as exc:
+                log.warning(
+                    "Sprecherprofil konnte für HTTP-Voice nicht geladen werden (%s)",
+                    type(exc).__name__,
+                )
+                speaker_profile_active = True
         try:
             suffix = Path(audio.filename or "segment.wav").suffix or ".wav"
+            payload = await audio.read()
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-                tmp.write(await audio.read())
+                tmp.write(payload)
                 tmp.flush()
                 stt_started = time.perf_counter()
                 text, wakeword_hint = await transcribe_audio_with_hint(
@@ -1038,7 +1356,27 @@ def build_router(orch=None) -> APIRouter:
                 )
                 stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
 
-            if text:
+            speaker_accepted = True
+            if speaker_profile_active:
+                speaker_accepted = False
+                if speaker_verifier is not None:
+                    try:
+                        import numpy as np
+                        from core.speaker import decode_wav
+
+                        samples, _sample_rate = decode_wav(payload)
+                        pcm_audio = np.clip(
+                            np.rint(samples * 32768.0), -32768, 32767,
+                        ).astype("<i2").tobytes()
+                        verification = await speaker_verifier.verify_pcm(pcm_audio)
+                        speaker_accepted = verification.decision == "accepted"
+                    except Exception as exc:
+                        log.warning(
+                            "HTTP-Voice-Sprecherprüfung fehlgeschlagen (%s)",
+                            type(exc).__name__,
+                        )
+
+            if text and speaker_accepted:
                 address_started = time.perf_counter()
                 addressed = await is_addressed_to_mantis(
                     text, wakeword_hint=wakeword_hint,
@@ -1085,6 +1423,52 @@ def build_router(orch=None) -> APIRouter:
     async def voice_stream(websocket: WebSocket):
         await websocket.accept()
 
+        speaker_verifier = None
+        speaker_profile_active = False
+        speaker_profile_lookup_task: asyncio.Task | None = None
+        speaker_last_profile_check = 0.0
+        speaker_verify_enabled = bool(getattr(config, "VOICE_SPEAKER_VERIFY", True))
+        if speaker_verify_enabled:
+            try:
+                from core.speaker import get_speaker_verifier
+
+                speaker_verifier = get_speaker_verifier()
+                speaker_profile_active = await speaker_verifier.has_profile()
+                speaker_last_profile_check = time.monotonic()
+            except Exception as exc:
+                log.warning(
+                    "Sprecherprofil konnte für Voice-WS nicht geladen werden (%s)",
+                    type(exc).__name__,
+                )
+                speaker_profile_active = True
+        speaker_progress_contexts: dict[int, dict] = {}
+
+        async def refresh_speaker_profile() -> None:
+            nonlocal speaker_profile_active, speaker_last_profile_check
+            if not speaker_verify_enabled or speaker_verifier is None:
+                return
+            speaker_last_profile_check = time.monotonic()
+            try:
+                speaker_profile_active = await speaker_verifier.has_profile()
+            except Exception as exc:
+                log.debug("Sprecherprofil-Refresh fehlgeschlagen (%s)", type(exc).__name__)
+                speaker_profile_active = True
+
+        def schedule_speaker_profile_refresh() -> None:
+            nonlocal speaker_profile_lookup_task, speaker_last_profile_check
+            if (
+                not speaker_verify_enabled or speaker_verifier is None
+                or speaker_profile_active
+                or time.monotonic() - speaker_last_profile_check < 1.0
+            ):
+                return
+            if speaker_profile_lookup_task is not None and not speaker_profile_lookup_task.done():
+                return
+            speaker_last_profile_check = time.monotonic()
+            speaker_profile_lookup_task = asyncio.get_running_loop().create_task(
+                refresh_speaker_profile(), name="voice-speaker-profile-refresh",
+            )
+
         from core.vad import SileroVAD, VadSegmenter
 
         vad_model = SileroVAD(Path(__file__).parent.parent.parent / "data" / "vad" / "silero_vad.onnx")
@@ -1109,6 +1493,7 @@ def build_router(orch=None) -> APIRouter:
         audio_streaming = False
         supports_playback_progress = False
         active_playback: _PlaybackTurn | None = None
+        ducked_playback: _PlaybackTurn | None = None
         active_response_task: asyncio.Task | None = None
         background_response_tasks: set[asyncio.Task] = set()
         background_address_tasks: set[asyncio.Task] = set()
@@ -1182,26 +1567,169 @@ def build_router(orch=None) -> APIRouter:
             recent_tts_turns.extend(retained_turns)
             return echo_texts
 
-        async def stop_for_bargein(detected_at: float) -> None:
+        async def duck_for_bargein(detected_at: float) -> None:
+            nonlocal ducked_playback
             playback = active_playback
+            if playback is None or not playback.start_duck(now=detected_at):
+                return
+            playback.bargein_decision = None
+            ducked_playback = playback
+            await send_socket.send_json({"type": "duck_playback"})
+
+        async def unduck_playback(
+            *, decision: str = "ignored", playback: _PlaybackTurn | None = None,
+        ) -> None:
+            nonlocal ducked_playback
+            playback = playback or ducked_playback or active_playback
+            if playback is None or not playback.ducked:
+                return
+            playback.finish_duck(now=time.monotonic(), decision=decision)
+            if ducked_playback is playback:
+                ducked_playback = None
+            await send_socket.send_json({"type": "unduck_playback"})
+
+        async def stop_for_bargein(
+            detected_at: float, *, decision: str | None = None,
+            playback: _PlaybackTurn | None = None,
+        ) -> None:
+            nonlocal ducked_playback
+            playback = playback or active_playback
             if (
-                playback is None or not playback.playback_active
+                playback is None or playback is not active_playback
+                or not playback.playback_active
                 or playback.interrupted
             ):
                 return
+            stopped_at = time.monotonic()
             playback.interrupted = True
             if not playback.progress_reported:
                 playback.estimate_progress()
             conversation_window.mark_active(
                 playback.assistant_text or conversation_window.address_context(),
             )
-            playback.bargein_ms = round(
-                max(0.0, (time.monotonic() - detected_at) * 1000), 1,
-            )
+            started_at = playback.bargein_started_at or detected_at
+            playback.bargein_ms = round(max(0.0, (stopped_at - started_at) * 1000), 1)
+            was_ducked = playback.ducked
+            playback.finish_duck(now=stopped_at, decision=decision)
+            if ducked_playback is playback:
+                ducked_playback = None
             _detach_active_response()
             await send_socket.send_json({
                 "type": "stop_playback", "turn_id": playback.turn_id,
             })
+            if was_ducked:
+                await send_socket.send_json({"type": "unduck_playback"})
+
+        async def _score_bargein_prefix(
+            audio: bytes, playback: _PlaybackTurn, context: dict, *, final: bool,
+            sequence: int,
+        ) -> None:
+            try:
+                score_result = await speaker_verifier.score_pcm(audio)
+                score = score_result.score
+                context["speaker_ms"] = round(
+                    float(context.get("speaker_ms", 0.0)) + score_result.elapsed_ms,
+                    1,
+                )
+                if sequence <= int(context.get("decision_sequence", 0)):
+                    return
+                context["decision_sequence"] = sequence
+                context["score"] = score
+                threshold = float(getattr(config, "VOICE_SPEAKER_THRESHOLD", 0.35))
+                accepted = score is not None and score >= threshold
+                if final:
+                    context["decision"] = (
+                        "early_accept" if accepted and context.get("decision") == "early_accept"
+                        else "accepted" if accepted else "rejected"
+                    )
+                    if accepted:
+                        await stop_for_bargein(
+                            time.monotonic(), decision="speaker_accepted",
+                            playback=playback,
+                        )
+                    else:
+                        if active_playback is playback:
+                            await unduck_playback(
+                                decision="speaker_rejected", playback=playback,
+                            )
+                elif accepted:
+                    context["decision"] = "early_accept"
+                    await stop_for_bargein(
+                        time.monotonic(), decision="speaker_early_accept",
+                        playback=playback,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Barge-in-Sprecherprüfung fehlgeschlagen (%s)", type(exc).__name__)
+                if final and sequence > int(context.get("decision_sequence", 0)):
+                    context["decision_sequence"] = sequence
+                    context["decision"] = "rejected"
+                    if active_playback is playback:
+                        await unduck_playback(
+                            decision="speaker_rejected", playback=playback,
+                        )
+
+        def handle_speech_progress(audio: bytes, speech_ms: float, generation: int) -> None:
+            if not speaker_verify_enabled or speaker_verifier is None:
+                return
+            if not speaker_profile_active:
+                schedule_speaker_profile_refresh()
+                return
+            playback = active_playback
+            if playback is None or not playback.playback_active:
+                return
+            context = speaker_progress_contexts.setdefault(
+                generation,
+                {
+                    "tasks": [], "score": None, "speaker_ms": 0.0,
+                    "decision": None, "next_sequence": 0, "decision_sequence": 0,
+                },
+            )
+            context["playback"] = playback
+            if speech_ms >= 600 and not context.get("early_started"):
+                prefix = bytes(audio[:int(0.6 * 16_000 * 2)])
+                if len(prefix) >= 16_000:
+                    context["early_started"] = True
+                    context["next_sequence"] += 1
+                    sequence = context["next_sequence"]
+                    task = asyncio.get_running_loop().create_task(
+                        _score_bargein_prefix(
+                            prefix, playback, context, final=False,
+                            sequence=sequence,
+                        ),
+                        name="voice-speaker-bargein-early",
+                    )
+                    context["tasks"].append(task)
+            if speech_ms >= 1_000 and not context.get("final_started"):
+                prefix = bytes(audio[:16_000 * 2])
+                if len(prefix) >= 16_000:
+                    context["final_started"] = True
+                    context["next_sequence"] += 1
+                    sequence = context["next_sequence"]
+                    task = asyncio.get_running_loop().create_task(
+                        _score_bargein_prefix(
+                            prefix, playback, context, final=True,
+                            sequence=sequence,
+                        ),
+                        name="voice-speaker-bargein-final",
+                    )
+                    context["tasks"].append(task)
+
+        def handle_voice_partial(partial: str) -> None:
+            if prework_cache is not None and not speaker_profile_active:
+                prework_cache.offer(partial)
+            playback = active_playback
+            if (
+                not speaker_profile_active
+                and
+                playback is not None and playback.playback_active
+                and _is_stop_reflex(partial)
+            ):
+                asyncio.get_running_loop().create_task(
+                    stop_for_bargein(time.monotonic(), decision="stop_word"),
+                    name="voice-stop-reflex-bargein",
+                )
 
         def conversation_active() -> bool:
             return active_playback is not None or conversation_window.is_active()
@@ -1213,11 +1741,12 @@ def build_router(orch=None) -> APIRouter:
             partial_transcriber=transcribe_pcm_partial,
             partial_executor_available=partial_stt_executor_available,
             partial_interval_ms=config.VOICE_PARTIAL_STT_MS,
-            on_partial=prework_cache.offer if prework_cache is not None else None,
+            on_partial=lambda partial: handle_voice_partial(partial),
             bargein_active_fn=lambda: (
                 active_playback is not None and active_playback.playback_active
             ),
-            on_bargein=stop_for_bargein,
+            on_bargein=duck_for_bargein,
+            on_speech_progress=handle_speech_progress,
         )
 
         async def run_streaming_response(
@@ -1257,6 +1786,13 @@ def build_router(orch=None) -> APIRouter:
             except Exception as e:
                 log.error("Voice-Antworttask fehlgeschlagen: %s", e)
             finally:
+                if playback.ducked:
+                    try:
+                        await unduck_playback(
+                            decision="ignored", playback=playback,
+                        )
+                    except (WebSocketDisconnect, RuntimeError):
+                        log.debug("Voice-Playback konnte nicht zurückgesetzt werden")
                 if active_playback is playback and (
                     playback.interrupted or playback.complete or playback.timed_out
                     or not supports_playback_progress
@@ -1271,16 +1807,121 @@ def build_router(orch=None) -> APIRouter:
                     active_response_task = None
 
         async def process_voice_result(result: dict) -> None:
-            nonlocal active_playback, active_response_task
+            nonlocal active_playback, active_response_task, speaker_profile_active
+            await refresh_speaker_profile()
             raw_text = str(result.get("raw_text") or result.get("text") or "").strip()
+            generation = result.pop("segment_generation", None)
+            speaker_context = speaker_progress_contexts.pop(generation, {})
+            tasks = tuple(speaker_context.get("tasks", ()))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            pcm_audio = result.pop("pcm_audio", b"")
+            result.pop("speech_pcm_audio", None)
+            speaker_pcm_audio = result.pop("stt_pcm_audio", b"") or pcm_audio
+            result["speaker_score"] = None
+            result["speaker_ms"] = round(
+                float(speaker_context.get("speaker_ms", 0.0)), 1,
+            )
+            result["speaker_decision"] = "no_profile"
+            if speaker_profile_active:
+                verification = None
+                if speaker_verifier is None:
+                    result["speaker_decision"] = "rejected"
+                else:
+                    try:
+                        verification = await speaker_verifier.verify_pcm(speaker_pcm_audio)
+                        result["speaker_score"] = verification.score
+                        result["speaker_ms"] = round(
+                            verification.elapsed_ms
+                            + float(speaker_context.get("speaker_ms", 0.0)),
+                            1,
+                        )
+                        result["speaker_decision"] = (
+                            "early_accept"
+                            if verification.decision == "accepted"
+                            and speaker_context.get("decision") == "early_accept"
+                            else verification.decision
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "Finale Sprecherprüfung fehlgeschlagen (%s)", type(exc).__name__,
+                        )
+                        result["speaker_decision"] = "rejected"
+
+                if result["speaker_decision"] == "rejected":
+                    await _cancel_pending_address_tasks()
+                    rejected_playback = speaker_context.get("playback")
+                    if rejected_playback is None and result.get("bargein"):
+                        rejected_playback = ducked_playback
+                    if rejected_playback is not None:
+                        await unduck_playback(
+                            decision="speaker_rejected", playback=rejected_playback,
+                        )
+                    if prework_cache is not None:
+                        prework_cache.clear()
+                    _record_voice_latency(
+                        orch,
+                        result.get("turn_started_at", time.perf_counter()),
+                        stt_ms=result.get("stt_ms"),
+                        partial_runs=result.get("partial_runs", 0),
+                        partial_skip_reasons=result.get("partial_skip_reasons"),
+                        turn_model_p=result.get("turn_model_p"),
+                        turn_model_ms=result.get("turn_model_ms"),
+                        turn_decision=result.get("turn_decision"),
+                        silence_used_ms=result.get("silence_used_ms"),
+                        speaker_score=result.get("speaker_score"),
+                        speaker_ms=result.get("speaker_ms"),
+                        speaker_decision="rejected",
+                    )
+                    return
+
+                if (
+                    speaker_verifier is not None
+                    and result.get("speaker_score") is not None
+                    and result["speaker_score"] >= float(
+                        getattr(config, "VOICE_SPEAKER_LEARN_MIN", 0.6),
+                    )
+                ):
+                    try:
+                        await speaker_verifier.maybe_learn(
+                            speaker_pcm_audio,
+                            result["speaker_score"],
+                            acoustic_wakeword=bool(result.get("wakeword_triggered")),
+                            bargein=bool(result.get("bargein")),
+                            overlapping=bool(result.get("overlapping")),
+                            embedding=verification.embedding,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "Sprecher-Mitlernen fehlgeschlagen (%s)", type(exc).__name__,
+                        )
+            # Raw PCM is held only through verification/optional embedding learning.
+            del pcm_audio
+            del speaker_pcm_audio
             # Echo-Texte stammen vom Empfangszeitpunkt (Einreihen), nicht von der
             # Abarbeitung: langsame Adress-Checks davor dürfen das Fenster nicht schließen.
             echo_texts = list(result.pop("_echo_texts", ()))
             echo_texts.extend(_recent_tts_echo_texts(time.monotonic()))
             if _is_recent_tts_echo(raw_text, echo_texts):
                 log.debug("Voice-Transkript als Echo der letzten TTS-Blöcke verworfen")
+                await unduck_playback(decision="ignored")
                 if prework_cache is not None:
                     prework_cache.clear()
+                _record_voice_latency(
+                    orch,
+                    result.get("turn_started_at", time.perf_counter()),
+                    stt_ms=result.get("stt_ms"),
+                    address_check_mode="tts_echo",
+                    partial_runs=result.get("partial_runs", 0),
+                    partial_skip_reasons=result.get("partial_skip_reasons"),
+                    turn_model_p=result.get("turn_model_p"),
+                    turn_model_ms=result.get("turn_model_ms"),
+                    turn_decision=result.get("turn_decision"),
+                    silence_used_ms=result.get("silence_used_ms"),
+                    speaker_score=result.get("speaker_score"),
+                    speaker_ms=result.get("speaker_ms"),
+                    speaker_decision=result.get("speaker_decision"),
+                )
                 return
 
             # Eine neuere Äußerung ersetzt einen noch ungeklärten spekulativen Turn.
@@ -1290,6 +1931,7 @@ def build_router(orch=None) -> APIRouter:
             conversation_context = conversation_window.address_context()
             command = fast_commands.match_voice(raw_text)
             is_local_reflex = command is not None and command.tool == "voice_reflex"
+            stop_reflex = _is_stop_reflex(raw_text)
             playback_or_window_active = (
                 active_playback is not None and active_playback.playback_active
             ) or conversation_window.is_active()
@@ -1297,7 +1939,9 @@ def build_router(orch=None) -> APIRouter:
             window_reflex = is_local_reflex and playback_or_window_active
             immediate = wakeword_triggered or window_reflex
             address_mode = "wakeword" if wakeword_triggered else (
-                "window" if window_reflex else "speculative"
+                "window" if window_reflex else (
+                    "stop_word" if stop_reflex else "speculative"
+                )
             )
             result["address_check_mode"] = address_mode
             result["address_check_ms"] = None
@@ -1349,13 +1993,22 @@ def build_router(orch=None) -> APIRouter:
                     address_kwargs["wakeword_hint"] = True
                 return await is_addressed_to_mantis(raw_text, **address_kwargs)
 
-            if address_mode == "window" and command is not None and command.label == "stopp":
-                if active_playback is not None and active_playback.playback_active:
-                    await stop_for_bargein(time.monotonic())
+            if stop_reflex and active_playback is not None and active_playback.playback_active:
+                await stop_for_bargein(
+                    active_playback.bargein_started_at or time.monotonic(),
+                    decision="stop_word",
+                )
 
             if immediate:
                 if active_playback is not None and active_playback.playback_active:
-                    await stop_for_bargein(time.monotonic())
+                    decision = (
+                        "wakeword" if wakeword_triggered else
+                        "stop_word" if stop_reflex else "address"
+                    )
+                    await stop_for_bargein(
+                        active_playback.bargein_started_at or time.monotonic(),
+                        decision=decision,
+                    )
                 _detach_active_response()
                 active_playback = None
 
@@ -1399,15 +2052,20 @@ def build_router(orch=None) -> APIRouter:
                     )
                     pending_address_tasks.discard(asyncio.current_task())
                     if not addressed:
+                        result["address_rejected"] = True
                         if not address_decision.done():
                             address_decision.set_result(False)
                         output_gate.reject()
+                        await unduck_playback(decision="ignored")
                         response_task.cancel()
                         await asyncio.gather(response_task, return_exceptions=True)
                         return
 
                     if active_playback is not None and active_playback.playback_active:
-                        await stop_for_bargein(time.monotonic())
+                        await stop_for_bargein(
+                            active_playback.bargein_started_at or time.monotonic(),
+                            decision="address",
+                        )
                     _detach_active_response()
                     active_playback = playback
                     playback_turns[playback.turn_id] = playback
@@ -1458,17 +2116,23 @@ def build_router(orch=None) -> APIRouter:
                     if not address_decision.done():
                         address_decision.set_result(bool(addressed))
                     if not addressed:
+                        result["address_rejected"] = True
                         output_gate.reject()
+                        await unduck_playback(decision="ignored")
                     _record_voice_latency(
                         orch, started_at, stt_ms=result.get("stt_ms"),
                         address_check_ms=result.get("address_check_ms"),
                         address_check_mode=address_mode, held_ms=output_gate.held_ms,
+                        address_rejected=not addressed,
                         partial_runs=result.get("partial_runs", 0),
                         partial_skip_reasons=result.get("partial_skip_reasons"),
                         turn_model_p=result.get("turn_model_p"),
                         turn_model_ms=result.get("turn_model_ms"),
                         turn_decision=result.get("turn_decision"),
                         silence_used_ms=result.get("silence_used_ms"),
+                        speaker_score=result.get("speaker_score"),
+                        speaker_ms=result.get("speaker_ms"),
+                        speaker_decision=result.get("speaker_decision"),
                     )
 
                 address_task = asyncio.create_task(
@@ -1520,14 +2184,19 @@ def build_router(orch=None) -> APIRouter:
                         )
                         pending_address_tasks.discard(asyncio.current_task())
                         if not addressed:
+                            result["address_rejected"] = True
                             if not address_decision.done():
                                 address_decision.set_result(False)
                             output_gate.reject()
+                            await unduck_playback(decision="ignored")
                             response_task.cancel()
                             await asyncio.gather(response_task, return_exceptions=True)
                             return
                         if active_playback is not None and active_playback.playback_active:
-                            await stop_for_bargein(time.monotonic())
+                            await stop_for_bargein(
+                                active_playback.bargein_started_at or time.monotonic(),
+                                decision="address",
+                            )
                         _detach_active_response()
                         active_playback = None
                         if not address_decision.done():
@@ -1553,12 +2222,16 @@ def build_router(orch=None) -> APIRouter:
                             address_check_ms=result.get("address_check_ms"),
                             address_check_mode=address_mode,
                             held_ms=output_gate.held_ms,
+                            address_rejected=bool(result.get("address_rejected", False)),
                             first_tts_block_ms=local_first_tts_block_ms,
                             first_answer_audio_ms=local_first_audio_ms,
                             turn_model_p=result.get("turn_model_p"),
                             turn_model_ms=result.get("turn_model_ms"),
                             turn_decision=result.get("turn_decision"),
                             silence_used_ms=result.get("silence_used_ms"),
+                            speaker_score=result.get("speaker_score"),
+                            speaker_ms=result.get("speaker_ms"),
+                            speaker_decision=result.get("speaker_decision"),
                         )
 
                 async def resolve_nonstream_address_safely() -> None:
@@ -1616,6 +2289,9 @@ def build_router(orch=None) -> APIRouter:
                         turn_model_ms=result.get("turn_model_ms"),
                         turn_decision=result.get("turn_decision"),
                         silence_used_ms=result.get("silence_used_ms"),
+                        speaker_score=result.get("speaker_score"),
+                        speaker_ms=result.get("speaker_ms"),
+                        speaker_decision=result.get("speaker_decision"),
                     )
                 finally:
                     if timing_token is not None:
@@ -1664,8 +2340,13 @@ def build_router(orch=None) -> APIRouter:
                                 finished=bool(control.get("finished", False)),
                                 skipped=bool(control.get("skipped", False)),
                             )
-                            if playback.complete and active_playback is playback:
-                                active_playback = None
+                            if playback.complete:
+                                if active_playback is playback:
+                                    active_playback = None
+                                if playback.ducked:
+                                    await unduck_playback(
+                                        decision="ignored", playback=playback,
+                                    )
                     elif control.get("type") == "playback_stopped":
                         playback = playback_turns.get(str(control.get("turn_id", "")))
                         if (
@@ -1691,6 +2372,10 @@ def build_router(orch=None) -> APIRouter:
                     turn_processor.cancel()
                 tasks_to_finish = set(background_response_tasks)
                 tasks_to_finish.update(background_address_tasks)
+                for context in speaker_progress_contexts.values():
+                    tasks_to_finish.update(context.get("tasks", ()))
+                if speaker_profile_lookup_task is not None:
+                    tasks_to_finish.add(speaker_profile_lookup_task)
                 if active_response_task is not None:
                     tasks_to_finish.add(active_response_task)
                 tasks_to_finish.add(turn_processor)

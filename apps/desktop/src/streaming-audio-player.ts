@@ -32,6 +32,8 @@ type PlaybackProgress = (
 
 export class StreamingAudioPlayer {
   private ctx: AudioContext | null = null;
+  private outputGain: GainNode | null = null;
+  private playbackGain = 1;
   private naechsterStart = 0;
   private wartend = new Map<number, WartenderBlock>();
   private naechsteSeq = 0;
@@ -54,6 +56,9 @@ export class StreamingAudioPlayer {
       // Wiedergabe ein hörbarer Qualitätsverlust. decodeAudioData resampelt selbst
       // auf die Rate dieses Contexts (üblicherweise 48 kHz).
       this.ctx = new AudioContext();
+      this.outputGain = this.ctx.createGain();
+      this.outputGain.gain.value = this.playbackGain;
+      this.outputGain.connect(this.ctx.destination);
     }
     if (this.ctx.state === 'suspended') void this.ctx.resume();
     return this.ctx;
@@ -110,7 +115,7 @@ export class StreamingAudioPlayer {
       const ctx = this.holeCtx();
       const quelle = ctx.createBufferSource();
       quelle.buffer = buffer;
-      quelle.connect(ctx.destination);
+      quelle.connect(this.outputGain ?? ctx.destination);
       const start = Math.max(ctx.currentTime, this.naechsterStart);
       quelle.start(start);
       this.naechsterStart = start + buffer.duration;
@@ -172,6 +177,22 @@ export class StreamingAudioPlayer {
     if (this.ctx) {
       void this.ctx.close().catch(() => {});
       this.ctx = null;
+      this.outputGain = null;
     }
+  }
+
+  /** Senkt die laufende Antwort ab, während Mantis den Nutzer zuhört. */
+  duck(): void {
+    this.setPlaybackGain(0.25);
+  }
+
+  /** Stellt nach einer ignorierten Äußerung die normale Lautstärke wieder her. */
+  unduck(): void {
+    this.setPlaybackGain(1);
+  }
+
+  private setPlaybackGain(value: number): void {
+    this.playbackGain = value;
+    if (this.outputGain) this.outputGain.gain.value = value;
   }
 }

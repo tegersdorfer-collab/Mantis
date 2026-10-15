@@ -153,6 +153,17 @@ class TestVadSegmenter:
         assert seg.current_speech_ms == 64
         assert seg.current_speech_rms == pytest.approx(((1000**2 + 3000**2) / 2) ** 0.5)
 
+    def test_exposes_speech_only_audio_without_preroll_or_silence(self):
+        seg = vad.VadSegmenter(FakeVAD([0.1, 0.9, 0.1, 0.9]), chunk_ms=32)
+        preroll = struct.pack("<512h", *([1] * 512))
+        first_speech = struct.pack("<512h", *([2] * 512))
+        silence = struct.pack("<512h", *([3] * 512))
+        second_speech = struct.pack("<512h", *([4] * 512))
+        for frame in (preroll, first_speech, silence, second_speech):
+            seg.process_chunk(frame)
+
+        assert seg.current_speech_audio == first_speech + second_speech
+
     def test_silence_threshold_uses_config_setting(self, monkeypatch):
         import config
 

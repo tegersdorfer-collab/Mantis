@@ -357,6 +357,15 @@ def test_voice_stop_reflex_is_exact():
     assert stop.args == {"response": "Okay."}
 
 
+@pytest.mark.parametrize("text", ["warte", "sei still"])
+def test_voice_stop_reflex_accepts_additional_stop_phrases(text):
+    command = match_voice(text)
+
+    assert command is not None
+    assert command.tool == "voice_reflex"
+    assert command.args == {"response": "Okay."}
+
+
 def test_voice_okay_is_a_no_side_effect_reflex():
     okay = match_voice("Okay.")
 

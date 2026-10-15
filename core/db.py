@@ -370,6 +370,17 @@ MIGRATIONS = [
         created_at  TIMESTAMPTZ DEFAULT NOW()
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS speaker_profile (
+        id          BIGSERIAL PRIMARY KEY,
+        embedding   DOUBLE PRECISION[] NOT NULL,
+        score       DOUBLE PRECISION,
+        source      TEXT NOT NULL,
+        learned_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CHECK (array_length(embedding, 1) = 192),
+        CHECK (score IS NULL OR (score >= -1 AND score <= 1))
+    );
+    """,
 
     # Tägliche Metrik-Snapshots (fürs Dashboard-Trending, schnell)
     """
