@@ -1033,7 +1033,9 @@ def build_router(orch=None) -> APIRouter:
                 tmp.write(await audio.read())
                 tmp.flush()
                 stt_started = time.perf_counter()
-                text, wakeword_hint = await transcribe_audio_with_hint(tmp.name)
+                text, wakeword_hint = await transcribe_audio_with_hint(
+                    tmp.name, wakeword_triggered=False,
+                )
                 stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
 
             if text:
