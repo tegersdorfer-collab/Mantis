@@ -31,6 +31,16 @@ def test_redacts_google_tts_key_from_error_text(monkeypatch):
     assert text.endswith("[REDACTED]")
 
 
+def test_redacts_gemini_api_key_from_error_text(monkeypatch):
+    synthetic_key = "gemini-synthetic-api-key"
+    monkeypatch.setattr(config, "GEMINI_API_KEY", synthetic_key, raising=False)
+
+    text = redact_error_text(f"Vertex rejected request with {synthetic_key}")
+
+    assert synthetic_key not in text
+    assert text.endswith("[REDACTED]")
+
+
 def test_redacts_elevenlabs_key_from_error_text(monkeypatch):
     synthetic_key = "elevenlabs-synthetic-test-key"
     monkeypatch.setattr(config, "ELEVENLABS_API_KEY", synthetic_key, raising=False)

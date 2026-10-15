@@ -186,10 +186,23 @@ class MantisSettings(BaseSettings):
     CHAT_CLOUD_FALLBACK_MODEL: str = ""
     CHAT_CLOUD_REASONING_EFFORT: str = "low"
     CHAT_CLOUD_TIMEOUT_S: float = 30.0
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-3-flash"
+    GEMINI_USD_PER_MTOK_IN: float = 0.30
+    GEMINI_USD_PER_MTOK_OUT: float = 2.50
+    CHAT_AGENT_CHAIN_ORDER: list[str] = Field(
+        default_factory=lambda: ["openrouter", "anthropic", "chatgpt-plan"],
+    )
     FAST_CHAIN_ORDER: list[str] = Field(
         default_factory=lambda: ["openrouter", "anthropic", "chatgpt-plan"],
     )
     VOICE_CHAIN_ORDER: list[str] = Field(
+        default_factory=lambda: ["openrouter", "anthropic", "chatgpt-plan"],
+    )
+    BACKGROUND_CHAIN_ORDER: list[str] = Field(
+        default_factory=lambda: ["openrouter", "anthropic", "chatgpt-plan"],
+    )
+    VISION_CHAIN_ORDER: list[str] = Field(
         default_factory=lambda: ["openrouter", "anthropic", "chatgpt-plan"],
     )
     CHAT_CHATGPT_PLAN_ENABLED: bool = True
@@ -360,14 +373,17 @@ class MantisSettings(BaseSettings):
             raise ValueError("VOICE_SILENCE_MS muss positiv sein")
         return value
 
-    @field_validator("FAST_CHAIN_ORDER", "VOICE_CHAIN_ORDER")
+    @field_validator(
+        "CHAT_AGENT_CHAIN_ORDER", "FAST_CHAIN_ORDER", "VOICE_CHAIN_ORDER",
+        "BACKGROUND_CHAIN_ORDER", "VISION_CHAIN_ORDER",
+    )
     @classmethod
     def valid_cloud_chain_order(cls, value: list[str]) -> list[str]:
-        allowed = {"openrouter", "anthropic", "chatgpt-plan"}
+        allowed = {"openrouter", "anthropic", "chatgpt-plan", "gemini"}
         normalized = [str(stage).strip().casefold() for stage in value]
         if not normalized or any(stage not in allowed for stage in normalized):
             raise ValueError(
-                "Cloud-Kettenreihenfolge darf nur openrouter, anthropic und chatgpt-plan enthalten"
+                "Cloud-Kettenreihenfolge darf nur openrouter, anthropic, chatgpt-plan und gemini enthalten"
             )
         if len(set(normalized)) != len(normalized):
             raise ValueError("Cloud-Kettenreihenfolge darf keine Stufe doppelt enthalten")
