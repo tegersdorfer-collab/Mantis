@@ -46,7 +46,7 @@ async def transcribe_pcm(pcm_audio: bytes) -> tuple[str, bool]:
             wav_file.setsampwidth(2)
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(pcm_audio)
-        return await transcribe_audio_with_hint(tmp.name, normalize_wakeword=False)
+        return await transcribe_audio_with_hint(tmp.name, wakeword_triggered=False)
 
 
 async def transcribe_pcm_partial(pcm_audio: bytes) -> tuple[str, bool] | None:
@@ -60,7 +60,7 @@ async def transcribe_pcm_partial(pcm_audio: bytes) -> tuple[str, bool] | None:
             wav_file.setframerate(SAMPLE_RATE)
             wav_file.writeframes(pcm_audio)
         return await transcribe_audio_partial_with_hint(
-            tmp.name, normalize_wakeword=False,
+            tmp.name, wakeword_triggered=False,
         )
 
 
@@ -779,6 +779,7 @@ class VoiceStreamSession:
         self._closed = True
         self._on_partial = None
         self._segment_generation += 1
+        self._cancel_smart_turn_task()
         warmup_task = self._smart_turn_warmup_task
         if warmup_task is not None and not warmup_task.done():
             warmup_task.cancel()

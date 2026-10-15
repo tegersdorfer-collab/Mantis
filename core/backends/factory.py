@@ -12,6 +12,7 @@ from core.auth.chatgpt import is_auth_configured
 from core.backends.chatgpt_plan import ChatGPTPlanBackend
 from core.backends.claude import ClaudeBackend
 from core.backends.fallback import FallbackBackend
+from core.backends.gemini import GeminiBackend
 from core.backends.llm_adapter import BackendLLMAdapter
 from core.backends.openrouter import OpenRouterBackend
 
@@ -52,7 +53,7 @@ def chatgpt_auth_is_configured(cfg) -> bool:
 
 
 def _cloud_backends(cfg, purpose: str, reasoning: str | None) -> list:
-    stage_groups = {"openrouter": [], "anthropic": [], "chatgpt-plan": []}
+    stage_groups = {"openrouter": [], "anthropic": [], "chatgpt-plan": [], "gemini": []}
     models = _openrouter_models(cfg)
     if purpose != "chat-agent":
         models = models[:1]
@@ -79,6 +80,15 @@ def _cloud_backends(cfg, purpose: str, reasoning: str | None) -> list:
     else:
         log.info("Anthropic-Stufe übersprungen (API-Key oder CHAT_ANTHROPIC_MODEL fehlt)")
 
+    gemini_model = str(getattr(cfg, "GEMINI_MODEL", "gemini-3-flash-preview") or "").strip()
+    gemini_key = str(getattr(cfg, "GEMINI_API_KEY", "") or "").strip()
+    if gemini_key and gemini_model:
+        stage_groups["gemini"].append(
+            GeminiBackend(model=gemini_model, api_key=gemini_key, purpose=purpose)
+        )
+    else:
+        log.info("Gemini-Stufe übersprungen (GEMINI_API_KEY oder GEMINI_MODEL fehlt)")
+
     plan_model = str(getattr(cfg, "CHAT_CHATGPT_PLAN_MODEL", "gpt-6-luna") or "").strip()
     auth_file = Path(str(getattr(cfg, "CHATGPT_AUTH_FILE", "~/.config/mantis/chatgpt_auth.json"))).expanduser()
     if not getattr(cfg, "CHAT_CHATGPT_PLAN_ENABLED", True):
@@ -92,7 +102,13 @@ def _cloud_backends(cfg, purpose: str, reasoning: str | None) -> list:
             ChatGPTPlanBackend(model=plan_model, auth_file=auth_file, purpose=purpose)
         )
 
-    order_setting = {"fast": "FAST_CHAIN_ORDER", "voice": "VOICE_CHAIN_ORDER"}.get(purpose)
+    order_setting = {
+        "chat-agent": "CHAT_AGENT_CHAIN_ORDER",
+        "fast": "FAST_CHAIN_ORDER",
+        "voice": "VOICE_CHAIN_ORDER",
+        "background": "BACKGROUND_CHAIN_ORDER",
+        "vision": "VISION_CHAIN_ORDER",
+    }.get(purpose)
     order = getattr(cfg, order_setting, DEFAULT_CLOUD_CHAIN_ORDER) if order_setting else DEFAULT_CLOUD_CHAIN_ORDER
     if isinstance(order, str):
         raise ValueError(f"{order_setting} muss eine Liste von Cloud-Stufen sein")
@@ -114,11 +130,11 @@ def cloud_chain(
     total_timeout: float | None = None,
     cfg=config,
 ) -> FallbackBackend:
-    """Baut OpenRouter → Anthropic → ChatGPT-Abo ohne lokale LLM-Stufe."""
+    """Baut die konfigurierte Cloud-Kette ohne lokale LLM-Stufe."""
     stages = _cloud_backends(cfg, purpose, reasoning)
     if not stages:
         raise CloudChainUnavailableError(
-            "Kein Cloud-LLM-Anbieter konfiguriert (OpenRouter, Anthropic oder ChatGPT-Abo)."
+            "Kein Cloud-LLM-Anbieter konfiguriert (OpenRouter, Anthropic, ChatGPT-Abo oder Gemini)."
         )
     if timeout is None:
         configured_stage_timeout = float(getattr(cfg, "CHAT_CLOUD_TIMEOUT_S", 30))

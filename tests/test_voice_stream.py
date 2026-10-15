@@ -164,6 +164,33 @@ def test_middle_smart_turn_score_keeps_the_partial_text_heuristic(monkeypatch):
     assert len(analyzer.audios) == 1
 
 
+def test_exact_incomplete_threshold_uses_heuristic_fallback(monkeypatch):
+    analyzer = _FakeTurnAnalyzer([0.3])
+    session, _segmenter = _smart_turn_session(analyzer, monkeypatch)
+    speech = b"\x10\x00" * 512
+    silence = b"\0\0" * 512
+
+    async def run():
+        for _ in range(12):
+            await session.handle_chunk(speech, muted=False)
+        result = None
+        for _ in range(40):
+            result = await session.handle_chunk(silence, muted=False)
+            await asyncio.sleep(0)
+            if result is not None:
+                break
+        await session.close()
+        return result
+
+    result = asyncio.run(run())
+
+    # The incomplete branch is strict (< 0.3), so p == 0.3 stays on the heuristic.
+    assert result is not None
+    assert result["turn_decision"] == "heuristic"
+    assert result["silence_used_ms"] == 800
+    assert len(analyzer.audios) == 1
+
+
 def test_smart_turn_error_falls_back_to_the_previous_silence_logic(monkeypatch, caplog):
     import config
 
@@ -383,6 +410,67 @@ def test_resumed_speech_cancels_a_running_smart_turn_check(monkeypatch):
     assert is_speaking is True
 
 
+def test_close_cancels_a_running_smart_turn_check_before_waiting_for_partial_cleanup(
+    monkeypatch,
+):
+    from core.smart_turn import SmartTurnPrediction
+
+    class BlockingAnalyzer:
+        ready = True
+
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def predict(self, _audio):
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return SmartTurnPrediction(0.9, 1.0)
+
+    analyzer = BlockingAnalyzer()
+    session, _segmenter = _smart_turn_session(analyzer, monkeypatch)
+    speech = b"\x10\x00" * 512
+    silence = b"\0\0" * 512
+    partial_cancelled = asyncio.Event()
+    release_partial_cleanup = asyncio.Event()
+
+    async def slow_partial_cleanup():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            partial_cancelled.set()
+            await release_partial_cleanup.wait()
+            raise
+
+    async def run():
+        for _ in range(12):
+            await session.handle_chunk(speech, muted=False)
+        for _ in range(20):
+            await session.handle_chunk(silence, muted=False)
+            if analyzer.started.is_set():
+                break
+            await asyncio.sleep(0)
+        assert analyzer.started.is_set()
+        smart_turn_task = session._smart_turn_task
+        session._partial_task = asyncio.create_task(slow_partial_cleanup())
+        await asyncio.sleep(0)
+        closing = asyncio.create_task(session.close())
+        try:
+            await partial_cancelled.wait()
+            await asyncio.sleep(0)
+            assert analyzer.cancelled.is_set()
+            assert smart_turn_task.cancelled()
+        finally:
+            release_partial_cleanup.set()
+            await closing
+
+    asyncio.run(run())
+
+
 def test_debounced_wakeword_crop_uses_first_positive_frame_end(monkeypatch):
     import struct
     import config
@@ -486,7 +574,7 @@ def test_stream_stt_keeps_raw_mantis_like_words_until_acoustic_confirmation(
 
     asyncio.run(wrapper(b"\0\0" * 512))
 
-    assert transcriber.await_args.kwargs["normalize_wakeword"] is False
+    assert transcriber.await_args.kwargs["wakeword_triggered"] is False
 
 
 @pytest.mark.parametrize("wakeword_hit", [True, False])
