@@ -5,6 +5,17 @@ from __future__ import annotations
 import math
 
 
+def is_timed_set(row: dict) -> bool:
+    """Zeitsatz: Dauer in Sekunden (duration_s), keine Wiederholungen."""
+    return row.get("duration_s") is not None and row.get("reps") is None
+
+
+def set_amount(row: dict) -> int:
+    """Leistung eines Satzes: Sekunden bei Zeitsätzen, sonst Wiederholungen."""
+    value = row.get("duration_s") if is_timed_set(row) else row.get("reps")
+    return int(value or 0)
+
+
 def _working_sets(rows: list[dict] | None) -> list[dict]:
     return sorted(
         (row for row in (rows or []) if not row.get("is_warmup")),
@@ -95,7 +106,8 @@ def recommend_next(
 
     low, high, start = _rep_bounds(metadata)
     count = max(1, int(set_count)) if set_count else len(current)
-    current_reps = [int(row.get("reps") or 0) for row in current[:count]]
+    timed = any(is_timed_set(row) for row in current)
+    current_reps = [set_amount(row) for row in current[:count]]
     current_reps.extend([None] * max(0, count - len(current_reps)))
     weight = current[0].get("weight_kg")
     target = [start] * count
@@ -142,7 +154,7 @@ def recommend_next(
             if not same_load(row):
                 continue
             try:
-                reps = int(row.get("reps") or 0)
+                reps = set_amount(row)
                 position = int(position)
             except (TypeError, ValueError):
                 continue
@@ -167,7 +179,8 @@ def recommend_next(
             else:
                 target = [high] * count
         else:
-            target = [min(high, max(low, reps + 1)) for reps in current_reps if reps is not None]
+            step_up = 5 if timed else 1  # Haltezeiten: +5 s statt +1
+            target = [min(high, max(low, reps + step_up)) for reps in current_reps if reps is not None]
             target.extend([start] * (count - len(target)))
 
     return {
@@ -208,7 +221,8 @@ def personal_records(
     old_e1rms = [value for value in old_e1rms if value is not None]
     for row in current:
         weight_value = row.get("weight_kg")
-        reps_value = int(row.get("reps") or 0)
+        timed = is_timed_set(row)
+        reps_value = set_amount(row)
         if weight_value is not None and float(weight_value) > 0:
             weight = float(weight_value)
             if old_weights and weight > max(old_weights):
@@ -218,13 +232,13 @@ def personal_records(
                 if old.get("reps") is not None and old.get("weight_kg") is not None
                 and math.isclose(float(old["weight_kg"]), weight, abs_tol=0.001)
             ]
-            if (max(comparable) if comparable else 0) < reps_value:
+            if not timed and (max(comparable) if comparable else 0) < reps_value:
                 reps_pr = True
-            if load_mode not in {"added", "bodyweight"}:
+            if not timed and load_mode not in {"added", "bodyweight"}:
                 estimate = estimate_1rm(weight, reps_value)
                 if estimate is not None and old_e1rms and estimate > max(old_e1rms):
                     e1rm_pr = True
-        elif load_mode in {"bodyweight", "added"}:
+        elif load_mode in {"bodyweight", "added"} and not timed:
             comparable = [
                 int(old["reps"]) for old in history
                 if old.get("reps") is not None and _is_unweighted(old.get("weight_kg"))

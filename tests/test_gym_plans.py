@@ -343,3 +343,83 @@ def test_seed_includes_time_based_exercises_with_seconds_target(plan_database):
         db.execute("DELETE FROM gym_plans WHERE name=%s", (name,))
         db.execute("DELETE FROM workout_sets WHERE exercise_id=%s", (hang_id,))
         db.execute("DELETE FROM exercises WHERE id=%s", (hang_id,))
+
+
+@pytest.mark.db
+def test_seed_resolves_equipment_variants_to_the_same_ids_as_the_import(plan_database, monkeypatch):
+    name = plan_database["name"]
+    base = f"{name} Zugvariante"
+    created = []
+    try:
+        barbell_id = db.insert_returning(
+            """INSERT INTO exercises (name,category,unit,equipment,load_mode,rep_min,rep_max)
+               VALUES (%s,'strength','reps','machine','external',6,10) RETURNING id""",
+            (base,),
+        )
+        dumbbell_id = db.insert_returning(
+            """INSERT INTO exercises (name,category,unit,equipment,load_mode,rep_min,rep_max)
+               VALUES (%s,'strength','reps','dumbbell','external',6,10) RETURNING id""",
+            (f"{base} (Dumbbell)",),
+        )
+        created.extend([barbell_id, dumbbell_id])
+        upper_b = db.query_one(
+            "SELECT id FROM workouts WHERE title LIKE %s ORDER BY date DESC LIMIT 1", (f"Upper B%{name}",)
+        )["id"]
+        for exercise_id, first_index in ((barbell_id, 10), (dumbbell_id, 20)):
+            for offset in range(2):
+                db.execute(
+                    """INSERT INTO workout_sets (workout_id,exercise_id,set_index,reps,weight_kg,is_warmup)
+                       VALUES (%s,%s,%s,8,20,FALSE)""",
+                    (upper_b, exercise_id, first_index + offset),
+                )
+        export = _export_text(name, [
+            ("Upper B", "2026-10-08", [(f"{base} · Dumbbell", 11), (f"{base} · Machine", 5)]),
+        ])
+        workouts = ap_text_import.parse_export(export)
+        rows = [dict(r) for r in db.query("SELECT id,name,equipment,unit,load_mode FROM exercises")]
+        from domains.gym.aliases import load_aliases
+        aliases = load_aliases()
+        import_ids = {
+            item.equipment: int(ap_text_import.resolve_exercise_row(item, aliases, rows)["id"])
+            for item in workouts[0].exercises
+        }
+        assert import_ids == {"Dumbbell": dumbbell_id, "Machine": barbell_id}
+
+        seen_rows = []
+        real_resolve = plans.resolve_exercise_row
+
+        def spy(item, alias_map, candidate_rows):
+            seen_rows.append({int(r["id"]): r for r in candidate_rows})
+            return real_resolve(item, alias_map, candidate_rows)
+
+        monkeypatch.setattr(plans, "resolve_exercise_row", spy)
+
+        preview = plans.preview_seed(name, ap_workouts=workouts)
+
+        for candidates in seen_rows:
+            assert candidates[dumbbell_id]["equipment"] == "dumbbell"
+            assert candidates[barbell_id]["equipment"] == "machine"
+            assert candidates[barbell_id]["load_mode"] == "external"
+        assert seen_rows
+        by_id = {item["exercise_id"]: item for item in preview["days"][3]["exercises"]}
+        assert (by_id[dumbbell_id]["rep_min"], by_id[dumbbell_id]["rep_max"]) == (11, 11)
+        assert (by_id[barbell_id]["rep_min"], by_id[barbell_id]["rep_max"]) == (5, 5)
+    finally:
+        db.execute("DELETE FROM workout_sets WHERE exercise_id=ANY(%s)", (created,))
+        db.execute("DELETE FROM exercises WHERE id=ANY(%s)", (created,))
+
+
+def test_ap_rep_targets_match_plan_name_by_title_suffix_only():
+    rows = {1: {"id": 1, "name": "Synthetic Curl", "equipment": None, "unit": "reps", "load_mode": "external"}}
+    export = (
+        '"Upper A · Day 2 · Week 7 · Plan 2";"2026-10-08 19:37 h";"1 hr"\n'
+        '"1. Synthetic Curl · 12 reps"\n#;KG;REPS\n1;50;8\n\n'
+        '"Upper A · Day 2 · Week 6 · Plan";"2026-10-01 19:37 h";"1 hr"\n'
+        '"1. Synthetic Curl · 6 reps"\n#;KG;REPS\n1;50;8\n'
+    )
+    workouts = ap_text_import.parse_export(export)
+    assert len(workouts) == 2
+
+    targets = plans._ap_rep_targets(None, workouts, "Plan", rows, {1: 1})
+
+    assert targets == {("Upper A", 1): 6}

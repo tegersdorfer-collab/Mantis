@@ -452,6 +452,10 @@ function renderLoggedRow(set) {
   </div>`;
 }
 
+function maxAmount(entry) {
+  return entry && entry.target_unit === "seconds" ? 600 : 100;
+}
+
 function repUnit(entry) {
   return entry && entry.target_unit === "seconds" ? "s" : "Wdh.";
 }
@@ -1324,7 +1328,8 @@ async function saveHistorySet() {
   if (!historyEditSet || selectedWorkoutId === null) return;
   const weight = parseDecimal(historyEditSet.weight_kg);
   const reps = Number(String(historyEditSet.reps).trim());
-  if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || !Number.isInteger(reps) || reps < 1 || reps > 100) {
+  // Zeitübungen erlauben bis 600 s; das genaue Limit je Übung prüft der Server.
+  if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || !Number.isInteger(reps) || reps < 1 || reps > 600) {
     notice = "Bitte prüfe Gewicht und Wiederholungen.";
     render();
     return;
@@ -1377,8 +1382,9 @@ async function logDraft(clientId) {
   if (!exercise || !draft) return;
   const weight = roundWeight(parseDecimal(draft.weight_kg));
   const reps = Number(String(draft.reps).trim());
-  if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || !Number.isInteger(reps) || reps < 1 || reps > 100) {
-    notice = "Gewicht muss über 0 und höchstens 500 kg liegen; Wiederholungen: 1 bis 100.";
+  const limit = maxAmount(exercise);
+  if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || !Number.isInteger(reps) || reps < 1 || reps > limit) {
+    notice = `Gewicht muss über 0 und höchstens 500 kg liegen; ${limit === 600 ? "Sekunden" : "Wiederholungen"}: 1 bis ${limit}.`;
     render();
     return;
   }
@@ -1496,7 +1502,7 @@ async function saveEdit() {
   if (!editingSet || String(editingSet.id).startsWith("pending:")) return;
   const weight = parseDecimal(editingSet.weight_kg);
   const reps = Number(String(editingSet.reps).trim());
-  if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || !Number.isInteger(reps) || reps < 1 || reps > 100) {
+  if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || !Number.isInteger(reps) || reps < 1 || reps > maxAmount(currentExercise())) {
     notice = "Bitte prüfe Gewicht und Wiederholungen.";
     render();
     return;

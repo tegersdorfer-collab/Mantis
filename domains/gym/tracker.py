@@ -10,6 +10,7 @@ import psycopg2
 from core import db
 from domains.gym import session
 from domains.gym.parser import ParsedLog, ParsedSet
+from domains.gym.progression import set_amount as session_amount
 
 
 EXERCISES: tuple[str, ...] = ("Squats", "Bench Press", "Deadlifts")
@@ -52,15 +53,40 @@ def _weight(value: float) -> float:
     return float(rounded)
 
 
-def _reps(value: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
-        raise TrackerError(400, "Wiederholungen müssen zwischen 1 und 100 liegen")
+MAX_REPS = 100
+MAX_SECONDS = 600
+
+
+def _reps(value: int, timed: bool = False) -> int:
+    """Wiederholungen (1-100) bzw. bei Zeitübungen Sekunden (1-600)."""
+    limit = MAX_SECONDS if timed else MAX_REPS
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= limit:
+        if timed:
+            raise TrackerError(400, f"Sekunden müssen zwischen 1 und {limit} liegen")
+        raise TrackerError(400, f"Wiederholungen müssen zwischen 1 und {limit} liegen")
     return value
+
+
+def _is_timed_name(name: str) -> bool:
+    """Zeitübung: Einheit 'min' (Haltezeiten); Sekunden landen in duration_s."""
+    row = db.query_one(
+        "SELECT 1 AS timed FROM exercises WHERE LOWER(name)=LOWER(%s) AND LOWER(COALESCE(unit,''))='min' LIMIT 1",
+        (name,),
+    )
+    return row is not None
+
+
+def _row_timed(row: dict) -> bool:
+    return row.get("duration_s") is not None and row.get("reps") is None
+
+
+def _row_amount(row: dict) -> int:
+    return int(row["duration_s"] if _row_timed(row) else row["reps"])
 
 
 def _set_row(client_id: str) -> dict | None:
     return db.query_one(
-        """SELECT ws.id, e.name AS exercise, ws.weight_kg, ws.reps,
+        """SELECT ws.id, e.name AS exercise, ws.weight_kg, ws.reps, ws.duration_s,
                   ws.set_index, ws.workout_id
            FROM workout_sets ws JOIN exercises e ON e.id=ws.exercise_id
            WHERE ws.client_id=%s""",
@@ -73,7 +99,7 @@ def _set_result(row: dict, *, duplicate: bool) -> dict:
         "id": int(row["id"]),
         "exercise": row["exercise"],
         "weight_kg": float(row["weight_kg"]) if row.get("weight_kg") is not None else None,
-        "reps": int(row["reps"]),
+        "reps": _row_amount(row),
         "set_index": int(row["set_index"]),
         "workout_id": int(row["workout_id"]),
         "duplicate": duplicate,
@@ -86,7 +112,8 @@ def log_set(
 ) -> dict:
     name = _exercise_name(exercise)
     weight = _weight(weight_kg)
-    count = _reps(reps)
+    timed = _is_timed_name(name)
+    count = _reps(reps, timed)
     if not isinstance(client_id, str) or not client_id.strip():
         raise TrackerError(400, "client_id fehlt")
 
@@ -98,7 +125,9 @@ def log_set(
         session.add_sets(
             ParsedLog(
                 exercise=name,
-                sets=(ParsedSet(weight, count),),
+                sets=(
+                    ParsedSet(weight, None, duration_s=count) if timed else ParsedSet(weight, count),
+                ),
                 known=True,
                 alias=name,
             ),
@@ -129,7 +158,7 @@ def _set_values(rows: list[dict]) -> list[dict]:
     return [
         {
             "weight_kg": float(row["weight_kg"]) if row.get("weight_kg") is not None else None,
-            "reps": int(row["reps"]),
+            "reps": session_amount(row),
         }
         for row in rows
     ]
@@ -154,7 +183,7 @@ def get_state(now: datetime | None = None) -> dict:
             ids = _exercise_ids(name)
             if ids:
                 logged = db.query(
-                    """SELECT ws.id, ws.client_id, ws.weight_kg, ws.reps, ws.set_index
+                    """SELECT ws.id, ws.client_id, ws.weight_kg, ws.reps, ws.duration_s, ws.set_index
                        FROM workout_sets ws
                        WHERE ws.workout_id=%s AND ws.exercise_id=ANY(%s)
                          AND COALESCE(ws.is_warmup,FALSE)=FALSE
@@ -170,7 +199,7 @@ def get_state(now: datetime | None = None) -> dict:
                     "id": int(row["id"]),
                     "client_id": row.get("client_id"),
                     "weight_kg": float(row["weight_kg"]) if row["weight_kg"] is not None else None,
-                    "reps": int(row["reps"]),
+                    "reps": _row_amount(row),
                     "set_index": int(row["set_index"]),
                 }
                 for row in logged
@@ -191,7 +220,7 @@ def get_state(now: datetime | None = None) -> dict:
 def _open_set_row(cur, set_id: int) -> dict | None:
     cur.execute(
         """SELECT ws.id, ws.workout_id, ws.exercise_id, ws.set_index,
-                  ws.weight_kg, ws.reps, w.ended_at, e.name AS exercise
+                  ws.weight_kg, ws.reps, ws.duration_s, e.unit, w.ended_at, e.name AS exercise
            FROM workout_sets ws JOIN workouts w ON w.id=ws.workout_id
            JOIN exercises e ON e.id=ws.exercise_id
            WHERE ws.id=%s FOR UPDATE OF ws, w""",
@@ -228,7 +257,6 @@ def update_set(
     if weight_kg is None and reps is None:
         raise TrackerError(400, "Keine Änderung angegeben")
     weight = _weight(weight_kg) if weight_kg is not None else None
-    count = _reps(reps) if reps is not None else None
     moment = session.local_now(now)
     session.open_session(now=moment)
     error = None
@@ -237,11 +265,17 @@ def update_set(
         session._lock_session(cur)
         row, error = _check_open_set(cur, set_id, moment)
         if row is not None and error is None:
+            timed = _row_timed(row) or str(row.get("unit") or "").casefold() == "min"
+            try:
+                count = _reps(reps, timed) if reps is not None else None
+            except TrackerError as exc:
+                error = (exc.status, exc.message)
+        if row is not None and error is None:
             weight = weight if weight is not None else row["weight_kg"]
-            count = count if count is not None else row["reps"]
+            count = count if count is not None else _row_amount(row)
             cur.execute(
-                "UPDATE workout_sets SET weight_kg=%s,reps=%s WHERE id=%s",
-                (weight, count, set_id),
+                "UPDATE workout_sets SET weight_kg=%s,reps=%s,duration_s=%s WHERE id=%s",
+                (weight, None if timed else count, count if timed else None, set_id),
             )
             cur.execute(
                 "UPDATE workouts SET last_activity_at=%s WHERE id=%s AND ended_at IS NULL",
@@ -302,7 +336,7 @@ def history(exercise: str, limit: int = 5) -> list[dict]:
                     "weight_kg": (
                         float(row["weight_kg"]) if row.get("weight_kg") is not None else None
                     ),
-                    "reps": int(row["reps"]),
+                    "reps": session_amount(row),
                 }
                 for row in item["sets"]
             ],

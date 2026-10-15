@@ -181,6 +181,11 @@ def _is_timed(source: dict, sets: list[dict]) -> bool:
     )
 
 
+def _title_plan_name(title: str | None) -> str:
+    """Planname am Titelende ('Upper A · Day 2 · Week 7 · <Planname>')."""
+    return str(title or "").rsplit("·", 1)[-1].strip().casefold()
+
+
 def _ap_rep_targets(cur, ap_workouts, plan_name: str, exercise_by_id, canonical_ids) -> dict:
     """Mappt AP-Exportziele ('x reps') je (Plantag, Übungs-ID); jüngstes Workout gewinnt."""
     if not ap_workouts:
@@ -189,9 +194,9 @@ def _ap_rep_targets(cur, ap_workouts, plan_name: str, exercise_by_id, canonical_
 
     aliases = load_aliases()
     rows = [dict(row) for row in exercise_by_id.values()]
-    wanted = plan_name.casefold()
     ordered = sorted(
-        (w for w in ap_workouts if wanted in w.title.casefold() and _day_from_title(w.title)),
+        (w for w in ap_workouts if _title_plan_name(w.title) == plan_name.strip().casefold()
+         and _day_from_title(w.title)),
         key=lambda w: w.started_at, reverse=True,
     )
     targets: dict[tuple[str, int], int] = {}
@@ -223,7 +228,8 @@ def _seed_data(cur, plan_name: str, ap_workouts: list[APWorkout] | None = None) 
 
     workout_ids = [row["id"] for row in current_workouts]
     cur.execute(
-        """SELECT e.id,e.name,e.category,e.unit,e.rep_min,e.rep_max
+        """SELECT e.id,e.name,e.category,e.unit,e.rep_min,e.rep_max,
+                  e.equipment,e.load_mode
            FROM exercises e"""
     )
     exercise_by_id = {int(row["id"]): dict(row) for row in cur.fetchall()}

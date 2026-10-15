@@ -1341,3 +1341,37 @@ test("Zielanzeige: Sekunden-Übungen zeigen 's', reine Ziele ohne Spanne", async
   await app.click("open-exercise", { exercise: "Bench Press" });
   assert.match(screen(), /Ziel 4 Wdh\./);
 });
+
+test("Sekunden-Übungen lassen bis 600 s zu, Wdh.-Übungen nur bis 100", async () => {
+  const state = {
+    session: { id: 1, started_at: "2026-10-14T10:00:00Z" },
+    exercises: [
+      { name: "Weighted Deadhang", rest_s: 180, rep_min: 30, rep_max: 40, target_unit: "seconds", prefill: [], logged: [] },
+      { name: "Bench Press", rest_s: 180, rep_min: 4, rep_max: 6, target_unit: "reps", prefill: [], logged: [] },
+    ],
+  };
+  const app = createFrontend({
+    fetch: async (url, options) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sets") {
+        const body = JSON.parse(options.body);
+        return response(200, { ...body, id: 5, set_index: 1 });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
+  await app.click("open-exercise", { exercise: "Bench Press" });
+  app.input(0, "weight_kg", "60");
+  app.input(0, "reps", "150");
+  await app.click("log-draft", { index: "0" });
+  assert.equal(app.calls.filter((call) => call.url === "/api/sets").length, 0);
+
+  await app.click("open-exercise", { exercise: "Weighted Deadhang" });
+  app.input(0, "weight_kg", "20");
+  app.input(0, "reps", "150");
+  await app.click("log-draft", { index: "0" });
+  assert.equal(app.calls.filter((call) => call.url === "/api/sets").length, 1);
+});

@@ -223,3 +223,16 @@ def test_warmup_does_not_shift_historic_positions():
     )
 
     assert suggestion["target_reps"] == [8, 8, 8]
+
+
+def test_timed_progression_works_in_seconds_and_skips_rep_and_e1rm_records():
+    meta = {"rep_min": 30, "rep_max": 60, "load_mode": "added"}
+    previous = [{"workout_id": 1, "set_index": 1, "weight_kg": 20, "reps": None, "duration_s": 40}]
+    current = [{"workout_id": 2, "set_index": 1, "weight_kg": 20, "reps": None, "duration_s": 45}]
+
+    result = recommend_next(current, previous, meta, set_count=1, historical_sets=previous)
+
+    assert result["target_reps"] == [50]
+    records = personal_records(current, previous, load_mode="added")
+    assert records == {"weight": False, "reps": False, "e1rm": False}
+    assert estimate_1rm(20, None) is None

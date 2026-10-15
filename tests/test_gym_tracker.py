@@ -221,3 +221,71 @@ def test_finish_summary_and_history(tracker_database):
         {"weight_kg": 140.0, "reps": 5},
         {"weight_kg": 140.0, "reps": 4},
     ]
+
+
+@pytest.fixture
+def hang(tracker_database):
+    name = f"Synthetic Deadhang {uuid4()}"
+    exercise_id = db.insert_returning(
+        """INSERT INTO exercises (name,category,unit,load_mode,rep_min,rep_max)
+           VALUES (%s,'strength','min','added',30,60) RETURNING id""",
+        (name,),
+    )
+    tracker_database.setdefault("new_exercises", []).append(exercise_id)
+    tracker_database["hang_id"] = exercise_id
+    tracker_database["hang_name"] = name
+    return tracker_database
+
+
+def _stored(client_id):
+    return db.query_one(
+        "SELECT reps,duration_s,weight_kg,exercise_id FROM workout_sets WHERE client_id=%s", (client_id,)
+    )
+
+
+def test_live_logged_timed_set_lands_in_duration_s_and_seed_still_sees_seconds(hang):
+    from domains.gym import plans
+
+    client_id = _client_id(hang)
+    saved = tracker.log_set(client_id, hang["hang_name"], 20, 120, now=NOW)
+
+    row = _stored(client_id)
+    assert row["reps"] is None and row["duration_s"] == 120
+    assert saved["reps"] == 120
+    source = db.query_one("SELECT id,unit FROM exercises WHERE id=%s", (hang["hang_id"],))
+    sets = db.query("SELECT duration_s,distance_km FROM workout_sets WHERE client_id=%s", (client_id,))
+    assert plans._is_timed(source, sets)
+    assert tracker.history(hang["hang_name"], limit=1)[0]["sets"] == [{"weight_kg": 20.0, "reps": 120}]
+    assert tracker.update_set(saved["id"], None, 150, now=NOW)["reps"] == 150
+    row = _stored(client_id)
+    assert row["reps"] is None and row["duration_s"] == 150
+
+
+def test_timed_sets_allow_up_to_600_seconds_and_reps_stay_capped(hang):
+    tracker.log_set(_client_id(hang), hang["hang_name"], 20, 600, now=NOW)
+    for exercise, value in ((hang["hang_name"], 601), (hang["hang_name"], 0), ("Squats", 101)):
+        with pytest.raises(tracker.TrackerError) as error:
+            tracker.log_set(str(uuid4()), exercise, 20, value, now=NOW)
+        assert error.value.status == 400
+    client_id = _client_id(hang)
+    tracker.log_set(client_id, "Squats", 100, 100, now=NOW)
+    row = _stored(client_id)
+    assert (row["reps"], row["duration_s"]) == (100, None)
+
+
+def test_timed_history_and_library_read_duration_s(hang):
+    from domains.gym import library
+
+    tracker.log_set(_client_id(hang), hang["hang_name"], 20, 45, now=NOW)
+    tracker.finish_session(now=NOW + timedelta(minutes=5))
+
+    detail = library.exercise_detail(hang["hang_id"])
+
+    assert detail["history"][0]["sets"][0]["reps"] == 45
+    assert detail["history"][0]["e1rm_kg"] is None
+    workout_id = detail["history"][0]["workout_id"]
+    set_id = detail["history"][0]["sets"][0]["id"]
+    assert library.workout_detail(workout_id)["sets"][0]["reps"] == 45
+    library.update_history_set(workout_id, set_id, None, 300)
+    row = db.query_one("SELECT reps,duration_s FROM workout_sets WHERE id=%s", (set_id,))
+    assert (row["reps"], row["duration_s"]) == (None, 300)
