@@ -115,6 +115,10 @@ def exercise_detail(exercise_id: int) -> dict:
            ORDER BY w.date,w.created_at,w.id,ws.set_index,ws.id""",
         (ids,),
     ) if ids else []
+    timed_exercise = (
+        str(exercise.get("unit") or "").casefold() == "min"
+        or any(progression.is_timed_set(row) for row in rows)
+    )
     by_workout: dict[int, dict] = {}
     ordered = []
     for row in rows:
@@ -132,9 +136,13 @@ def exercise_detail(exercise_id: int) -> dict:
         weight = float(row["weight_kg"]) if row.get("weight_kg") is not None else None
         timed = progression.is_timed_set(row)
         reps = progression.set_amount(row)
-        item = {"id": int(row["set_id"]), "set_index": int(row["set_index"]), "weight_kg": weight, "reps": reps}
+        item = {
+            "id": int(row["set_id"]), "set_index": int(row["set_index"]),
+            "weight_kg": weight, "reps": reps,
+            "unit": "seconds" if timed else "reps",
+        }
         by_workout[workout_id]["sets"].append(item)
-        estimate = None if timed else progression.estimate_1rm(weight, reps)
+        estimate = None if timed_exercise else progression.estimate_1rm(weight, reps)
         if estimate is not None and (by_workout[workout_id]["e1rm_kg"] is None
                                      or estimate > by_workout[workout_id]["e1rm_kg"]):
             by_workout[workout_id]["e1rm_kg"] = round(estimate, 2)
@@ -217,6 +225,7 @@ def workout_detail(workout_id: int) -> dict:
             "set_index": int(row["set_index"]),
             "weight_kg": weight,
             "reps": reps,
+            "unit": "seconds" if timed else "reps",
             "is_warmup": is_warmup,
         })
     workout.update({

@@ -172,6 +172,10 @@ function formatWeight(value) {
   return Number(value).toLocaleString("de-DE", { maximumFractionDigits: 2 });
 }
 
+function setUnitLabel(set) {
+  return set?.unit === "seconds" ? "s" : "Wdh.";
+}
+
 function inputWeight(value) {
   return value === null || value === undefined ? "" : String(value).replace(".", ",");
 }
@@ -607,12 +611,12 @@ function renderWorkoutDetail() {
     if (editing) {
       return `<div class="history-set editing"><strong>${escapeHtml(set.exercise)} · Satz ${set.set_index}</strong>
         <label>kg<input data-history-edit data-field="weight_kg" value="${escapeHtml(historyEditSet.weight_kg)}" inputmode="decimal"></label>
-        <label>Wdh.<input data-history-edit data-field="reps" value="${escapeHtml(historyEditSet.reps)}" inputmode="numeric"></label>
+        <label>${setUnitLabel(set)}<input data-history-edit data-field="reps" value="${escapeHtml(historyEditSet.reps)}" inputmode="numeric"></label>
         <button class="small-button" type="button" data-action="save-history-set">Speichern</button>
         <button class="small-button" type="button" data-action="cancel-history-edit">Abbrechen</button></div>`;
     }
     return `<div class="history-set"><span><strong>${escapeHtml(set.exercise)}</strong><small>${set.is_warmup ? "Aufwärmen · " : ""}Satz ${set.set_index}</small></span>
-      <span>${formatWeight(set.weight_kg)} kg × ${set.reps}</span>
+      <span>${formatWeight(set.weight_kg)} kg × ${set.reps} ${setUnitLabel(set)}</span>
       <button class="small-button" type="button" data-action="edit-history-set" data-set-id="${set.id}" aria-label="Satz bearbeiten">Bearbeiten</button>
       <button class="small-button" type="button" data-action="delete-history-set" data-set-id="${set.id}" aria-label="Satz löschen">Löschen</button></div>`;
   }).join("");
@@ -624,7 +628,10 @@ function renderWorkoutDetail() {
 }
 
 function renderE1rmChart(history, name) {
-  const points = [...(history ?? [])].filter((item) => Number.isFinite(Number(item.e1rm_kg))).reverse();
+  const points = [...(history ?? [])]
+    .filter((item) => item.e1rm_kg !== null && item.e1rm_kg !== undefined
+      && Number.isFinite(Number(item.e1rm_kg)))
+    .reverse();
   if (!points.length) return '<p class="quiet-copy">Für diese Übung gibt es noch keine gewichtete e1RM-Historie.</p>';
   const width = 320;
   const height = 150;
@@ -648,17 +655,20 @@ function renderE1rmChart(history, name) {
 function renderExerciseLibrary() {
   if (exerciseDetail) {
     const history = exerciseDetail.history ?? [];
+    const historyUnit = exerciseDetail.unit === "min"
+      || history.some((item) => item.sets?.some((set) => set.unit === "seconds"))
+      ? "s" : "Wdh.";
     const rows = history.map((item) => {
       const bestSet = item.best_set
-        ? `<small class="best-set">Bester Satz: ${formatWeight(item.best_set.weight_kg)} kg × ${item.best_set.reps}</small>`
+        ? `<small class="best-set">Bester Satz: ${formatWeight(item.best_set.weight_kg)} kg × ${item.best_set.reps} ${setUnitLabel(item.best_set)}</small>`
         : "";
       return `<article class="exercise-history-card"><div class="section-heading-row">
         <strong>${escapeHtml(formatDate(item.date))}</strong><span>${item.e1rm_kg === null ? "" : `${formatWeight(item.e1rm_kg)} kg e1RM`}</span></div>
-        ${bestSet}<p>${item.sets.map((set) => `${formatWeight(set.weight_kg)}×${set.reps}`).join(" · ")}</p></article>`;
+        ${bestSet}<p>${item.sets.map((set) => `${formatWeight(set.weight_kg)}×${set.reps} ${setUnitLabel(set)}`).join(" · ")}</p></article>`;
     }).join("");
     return `${renderBrand()}<button class="back-button" type="button" data-action="library-back">‹ Übungen</button>
       <h1>${escapeHtml(exerciseDetail.name)}</h1><p class="subhead">${escapeHtml(exerciseDetail.muscle || "Muskelgruppe nicht hinterlegt")}
-        ${exerciseDetail.equipment ? ` · ${escapeHtml(exerciseDetail.equipment)}` : ""} · ${exerciseDetail.rep_min}–${exerciseDetail.rep_max} Wdh.</p>
+        ${exerciseDetail.equipment ? ` · ${escapeHtml(exerciseDetail.equipment)}` : ""} · ${exerciseDetail.rep_min}–${exerciseDetail.rep_max} ${historyUnit}</p>
       <h2>Geschätztes 1RM</h2>${renderE1rmChart(history, exerciseDetail.name)}
       <h2 class="section-title-gap">Trainingsverlauf</h2>${rows || '<p class="quiet-copy">Noch keine Trainings für diese Übung.</p>'}`;
   }
@@ -1328,9 +1338,11 @@ async function saveHistorySet() {
   if (!historyEditSet || selectedWorkoutId === null) return;
   const weight = parseDecimal(historyEditSet.weight_kg);
   const reps = Number(String(historyEditSet.reps).trim());
-  // Zeitübungen erlauben bis 600 s; das genaue Limit je Übung prüft der Server.
-  if (!Number.isFinite(weight) || weight <= 0 || weight > 500 || !Number.isInteger(reps) || reps < 1 || reps > 600) {
-    notice = "Bitte prüfe Gewicht und Wiederholungen.";
+  const timed = historyEditSet.unit === "seconds";
+  const maxAmount = timed ? 600 : 100;
+  if (!Number.isFinite(weight) || weight <= 0 || weight > 500
+    || !Number.isInteger(reps) || reps < 1 || reps > maxAmount) {
+    notice = `Bitte prüfe Gewicht und ${timed ? "Sekunden" : "Wiederholungen"}.`;
     render();
     return;
   }
@@ -1761,7 +1773,10 @@ document.addEventListener("click", async (event) => {
   } else if (action === "edit-history-set") {
     const item = workoutDetail?.sets.find((entry) => entry.id === Number(button.dataset.setId));
     if (!item) return;
-    historyEditSet = { id: item.id, weight_kg: inputWeight(item.weight_kg), reps: String(item.reps) };
+    historyEditSet = {
+      id: item.id, weight_kg: inputWeight(item.weight_kg),
+      reps: String(item.reps), unit: item.unit,
+    };
     render();
   } else if (action === "save-history-set") {
     await saveHistorySet();

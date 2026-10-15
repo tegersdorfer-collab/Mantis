@@ -409,7 +409,10 @@ def _seconds_bounds(cur, workout_id: int, exercise_id: int) -> dict:
     )
     if not row or row.get("rep_min") is None or row.get("rep_max") is None:
         return {}
-    return {"rep_min": row["rep_min"], "rep_max": row["rep_max"]}
+    return {
+        "rep_min": row["rep_min"], "rep_max": row["rep_max"],
+        "target_unit": "seconds",
+    }
 
 
 def _exercise_state(cur, workout_id: int, exercise_id: int) -> dict:

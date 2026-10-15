@@ -96,3 +96,72 @@ def test_library_search_e1rm_and_workout_history(library_database):
     library.delete_workout(data["workout_id"])
     with pytest.raises(TrackerError):
         library.workout_detail(data["workout_id"])
+
+
+def test_time_unit_is_included_in_exercise_and_workout_history(monkeypatch):
+    exercise = {
+        "id": 18, "name": "Synthetic Deadhang", "unit": "min",
+        "rep_min": 30, "rep_max": 60, "muscle": "Rücken", "equipment": "bodyweight",
+    }
+    history_row = {
+        "workout_id": 23, "date": date(2026, 10, 1), "title": "Synthetic Upper A",
+        "created_at": datetime(2026, 10, 1, 17), "set_id": 41, "set_index": 1,
+        "weight_kg": 20, "reps": None, "duration_s": 45,
+    }
+    workout_row = {
+        "id": 41, "exercise_id": 18, "exercise": exercise["name"],
+        "muscle": "Rücken", "equipment": "bodyweight", "dumbbell_pair": False,
+        "load_mode": "external", "set_index": 1, "weight_kg": 20,
+        "reps": None, "duration_s": 45, "is_warmup": False,
+    }
+    monkeypatch.setattr(library, "_exercise_row", lambda _exercise_id: exercise.copy())
+    monkeypatch.setattr(library.plans, "_exercise_ids", lambda _exercise_id: [18])
+
+    def query(sql, _params=()):
+        if "FROM workouts w JOIN workout_sets ws" in sql:
+            return [history_row.copy()]
+        if "FROM workout_sets ws JOIN exercises e" in sql:
+            return [workout_row.copy()]
+        raise AssertionError(f"unexpected query: {sql}")
+
+    monkeypatch.setattr(library.db, "query", query)
+    monkeypatch.setattr(
+        library.db,
+        "query_one",
+        lambda *_args, **_kwargs: {
+            "id": 23, "date": date(2026, 10, 1), "title": "Synthetic Upper A",
+            "duration_min": 30,
+        },
+    )
+
+    exercise_history = library.exercise_detail(18)["history"][0]["sets"][0]
+    workout_history = library.workout_detail(23)["sets"][0]
+
+    assert exercise_history["unit"] == "seconds"
+    assert workout_history["unit"] == "seconds"
+
+
+def test_timed_exercise_does_not_show_e1rm_from_legacy_rep_history(monkeypatch):
+    exercise = {
+        "id": 18, "name": "Synthetic Deadhang", "unit": "min",
+        "rep_min": 30, "rep_max": 60,
+    }
+    rows = [
+        {
+            "workout_id": 22, "date": date(2026, 9, 1), "title": "Old imported workout",
+            "created_at": datetime(2026, 9, 1, 17), "set_id": 39, "set_index": 1,
+            "weight_kg": 20, "reps": 8, "duration_s": None,
+        },
+        {
+            "workout_id": 23, "date": date(2026, 10, 1), "title": "Timed workout",
+            "created_at": datetime(2026, 10, 1, 17), "set_id": 41, "set_index": 1,
+            "weight_kg": 20, "reps": None, "duration_s": 20,
+        },
+    ]
+    monkeypatch.setattr(library, "_exercise_row", lambda _exercise_id: exercise.copy())
+    monkeypatch.setattr(library.plans, "_exercise_ids", lambda _exercise_id: [18])
+    monkeypatch.setattr(library.db, "query", lambda *_args, **_kwargs: [row.copy() for row in rows])
+
+    detail = library.exercise_detail(18)
+
+    assert [item["e1rm_kg"] for item in detail["history"]] == [None, None]

@@ -282,10 +282,83 @@ def test_timed_history_and_library_read_duration_s(hang):
     detail = library.exercise_detail(hang["hang_id"])
 
     assert detail["history"][0]["sets"][0]["reps"] == 45
+    assert detail["history"][0]["sets"][0]["unit"] == "seconds"
     assert detail["history"][0]["e1rm_kg"] is None
     workout_id = detail["history"][0]["workout_id"]
     set_id = detail["history"][0]["sets"][0]["id"]
-    assert library.workout_detail(workout_id)["sets"][0]["reps"] == 45
+    workout_set = library.workout_detail(workout_id)["sets"][0]
+    assert workout_set["reps"] == 45
+    assert workout_set["unit"] == "seconds"
     library.update_history_set(workout_id, set_id, None, 300)
     row = db.query_one("SELECT reps,duration_s FROM workout_sets WHERE id=%s", (set_id,))
     assert (row["reps"], row["duration_s"]) == (None, 300)
+
+
+def test_tracker_prefers_session_target_unit_over_exercise_unit(monkeypatch):
+    name = "Synthetic plan-timed reps exercise"
+    stored = {}
+    observed = {}
+    exercise_units = {"unit": "reps", "target_unit": "seconds"}
+
+    def query_one(sql, _params=()):
+        if "FROM exercises e" in sql:
+            return exercise_units.copy()
+        if "WHERE ws.client_id=%s" in sql:
+            return stored.copy() if stored else None
+        raise AssertionError(f"unexpected query: {sql}")
+
+    def add_sets(parsed, **_kwargs):
+        saved_set = parsed.sets[0]
+        observed["parsed_set"] = saved_set
+        stored.update({
+            "id": 7, "exercise": name, "weight_kg": saved_set.weight_kg,
+            "reps": saved_set.reps, "duration_s": saved_set.duration_s,
+            "set_index": 1, "workout_id": 77,
+        })
+
+    class Cursor:
+        def __init__(self):
+            self.statements = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            self.statements.append((sql, params))
+
+    cursor = Cursor()
+    monkeypatch.setattr(tracker, "_exercise_name", lambda value: value)
+    monkeypatch.setattr(tracker.session, "open_session", lambda now=None: {"id": 77})
+    monkeypatch.setattr(tracker.session, "add_sets", add_sets)
+    monkeypatch.setattr(tracker.db, "query_one", query_one)
+    monkeypatch.setattr(tracker.db, "cursor", lambda: cursor)
+    monkeypatch.setattr(tracker.session, "_lock_session", lambda _cur: None)
+
+    saved = tracker.log_set("synthetic-client", name, 20, 120, now=NOW)
+
+    assert observed["parsed_set"].reps is None
+    assert observed["parsed_set"].duration_s == 120
+    assert saved["reps"] == 120
+
+    exercise_units.update(unit="min", target_unit="reps")
+    with pytest.raises(tracker.TrackerError) as error:
+        tracker.log_set("second-client", name, 20, 120, now=NOW)
+    assert error.value.status == 400
+
+    update_row = {
+        "id": 7, "workout_id": 77, "exercise_id": 1, "set_index": 1,
+        "weight_kg": 20.0, "reps": 8, "duration_s": None,
+        "unit": "reps", "target_unit": "seconds", "ended_at": None,
+        "exercise": name,
+    }
+    monkeypatch.setattr(
+        tracker, "_check_open_set", lambda *_args: (update_row, None),
+    )
+
+    updated = tracker.update_set(7, None, 150, now=NOW)
+
+    assert updated["reps"] == 150
+    assert cursor.statements[-2][1] == (20.0, None, 150, 7)

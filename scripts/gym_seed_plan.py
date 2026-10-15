@@ -19,6 +19,8 @@ def _print_plan(data: dict, *, dry_run: bool) -> None:
     print(f"{mode}\nPlan: {data['name']}\nStart: {data['start_date'].isoformat() if hasattr(data['start_date'], 'isoformat') else data['start_date']}")
     if data.get("start_reason"):
         print(f"Begründung: {data['start_reason']}")
+    for warning in data.get("warnings", []):
+        print(f"Warnung: {warning}")
     for day in data["days"]:
         exercises = day["exercises"]
         print(f"\n{day['name']} ({len(exercises)} Übungen)")

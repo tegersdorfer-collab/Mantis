@@ -219,7 +219,10 @@ def _seed_data(cur, plan_name: str, ap_workouts: list[APWorkout] | None = None) 
            WHERE type IN ('gym','strength') AND title ILIKE %s""",
         (f"%{plan_name}%",),
     )
-    all_workouts = [dict(row) for row in cur.fetchall()]
+    all_workouts = [
+        dict(row) for row in cur.fetchall()
+        if _title_plan_name(row.get("title")) == plan_name.strip().casefold()
+    ]
     valid_workouts = [row for row in all_workouts if _day_from_title(row.get("title"))]
     start = choose_plan_start_date(all_workouts, plan_name)
     current_workouts = [row for row in valid_workouts if _date_value(row.get("date")) >= start]
@@ -245,7 +248,7 @@ def _seed_data(cur, plan_name: str, ap_workouts: list[APWorkout] | None = None) 
         for exercise_id, row in exercise_by_id.items()
     }
     cur.execute(
-        """SELECT ws.id,ws.workout_id,ws.exercise_id,ws.set_index,
+        """SELECT ws.id,ws.workout_id,ws.exercise_id,ws.set_index,ws.reps,
                   ws.duration_s,ws.distance_km,
                   COALESCE(ws.is_warmup,FALSE) AS is_warmup
            FROM workout_sets ws WHERE ws.workout_id=ANY(%s)
@@ -261,6 +264,8 @@ def _seed_data(cur, plan_name: str, ap_workouts: list[APWorkout] | None = None) 
     counts_by_workout: dict[int, dict[int, int]] = {}
     ordered_exercises: dict[int, list[int]] = {}
     timed_ids: set[int] = set()
+    warnings: list[str] = []
+    warned_units: set[tuple[int, int]] = set()
     for workout in current_workouts:
         workout_id = int(workout["id"])
         day = _day_from_title(workout.get("title"))
@@ -277,18 +282,41 @@ def _seed_data(cur, plan_name: str, ap_workouts: list[APWorkout] | None = None) 
                 continue
             if str(source.get("category") or "strength").casefold() == "cardio":
                 continue
-            if str(source.get("unit") or "reps").casefold() != "reps":
-                workout_rows = [
-                    r for r in sets_by_workout.get(workout_id, [])
-                    if int(r["exercise_id"]) == source_id and not r["is_warmup"]
-                ]
-                if not _is_timed(source, workout_rows):
-                    continue
-                timed_ids.add(canonical_ids.get(source_id, source_id))
             exercise_id = canonical_ids.get(source_id, source_id)
             target = exercise_by_id.get(exercise_id)
             if not target:
                 continue
+            if str(target.get("category") or "strength").casefold() == "cardio":
+                continue
+            source_unit = str(source.get("unit") or "reps").casefold()
+            canonical_unit = str(target.get("unit") or "reps").casefold()
+            workout_rows = [
+                row for row in sets_by_workout.get(workout_id, [])
+                if int(row["exercise_id"]) == source_id and not row["is_warmup"]
+            ]
+            has_duration = any(
+                row.get("duration_s") is not None and row.get("distance_km") is None
+                for row in workout_rows
+            )
+            has_reps = any(row.get("reps") is not None for row in workout_rows)
+            if source_unit not in {"reps", "min"} and canonical_unit != "min" and not has_duration:
+                continue
+            timed = canonical_unit == "min" or has_duration
+            if timed:
+                timed_ids.add(exercise_id)
+            if (
+                source_unit != canonical_unit
+                or (canonical_unit == "min" and has_reps)
+                or (canonical_unit != "min" and has_duration)
+                or (has_duration and has_reps)
+            ) and (source_id, exercise_id) not in warned_units:
+                warnings.append(
+                    f"Einheit widersprüchlich für '{source['name']}' → '{target['name']}': "
+                    f"Quellübung '{source_unit}', kanonisch '{canonical_unit}', "
+                    f"Satzdaten {'mit Sekunden' if has_duration else 'ohne Sekunden'}; "
+                    f"Seed-Ziel ist {'seconds' if timed else 'reps'}."
+                )
+                warned_units.add((source_id, exercise_id))
             counts[exercise_id] = counts.get(exercise_id, 0) + 1
             if exercise_id not in exercise_order:
                 exercise_order.append(exercise_id)
@@ -325,8 +353,11 @@ def _seed_data(cur, plan_name: str, ap_workouts: list[APWorkout] | None = None) 
                     if not row["is_warmup"] and row.get("duration_s") is not None
                     and canonical_ids.get(int(row["exercise_id"]), int(row["exercise_id"])) == exercise_id
                 ]
-                low = max(5, int(round(median(durations) / 5.0)) * 5) if durations else 30
-                high = low + SECONDS_RANGE_WIDTH
+                low = min(
+                    MAX_SECONDS,
+                    max(5, int(round(median(durations) / 5.0)) * 5),
+                ) if durations else 30
+                high = min(MAX_SECONDS, low + SECONDS_RANGE_WIDTH)
             elif (day_name, exercise_id) in ap_targets:
                 # AP kennt genau ein Ziel: reines Ziel (min == max) statt erfundener Spanne.
                 low = high = ap_targets[(day_name, exercise_id)]
@@ -348,6 +379,7 @@ def _seed_data(cur, plan_name: str, ap_workouts: list[APWorkout] | None = None) 
         "name": plan_name,
         "start_date": start,
         "start_reason": _start_date_reason(all_workouts, plan_name, start),
+        "warnings": warnings,
         "days": days,
     }
 

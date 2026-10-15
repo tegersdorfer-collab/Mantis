@@ -226,7 +226,7 @@ def test_warmup_does_not_shift_historic_positions():
 
 
 def test_timed_progression_works_in_seconds_and_skips_rep_and_e1rm_records():
-    meta = {"rep_min": 30, "rep_max": 60, "load_mode": "added"}
+    meta = {"rep_min": 30, "rep_max": 60, "target_unit": "seconds", "load_mode": "added"}
     previous = [{"workout_id": 1, "set_index": 1, "weight_kg": 20, "reps": None, "duration_s": 40}]
     current = [{"workout_id": 2, "set_index": 1, "weight_kg": 20, "reps": None, "duration_s": 45}]
 
@@ -234,5 +234,37 @@ def test_timed_progression_works_in_seconds_and_skips_rep_and_e1rm_records():
 
     assert result["target_reps"] == [50]
     records = personal_records(current, previous, load_mode="added")
+    assert records == {"weight": False, "reps": False, "e1rm": False}
+
+
+def test_timed_progression_without_seconds_snapshot_uses_seconds_history_bounds():
+    previous = [{
+        "workout_id": 1, "set_index": 1, "weight_kg": 20,
+        "reps": None, "duration_s": 45,
+    }]
+    current = [{
+        "workout_id": 2, "set_index": 1, "weight_kg": 20,
+        "reps": None, "duration_s": 45,
+    }]
+
+    suggestion = recommend_next(
+        current, previous,
+        {"rep_min": 6, "rep_max": 10, "rep_start": 8, "equipment": "other"},
+    )
+
+    assert suggestion["target_reps"] == [50]
+
+
+def test_timed_sets_with_external_load_and_old_rep_history_make_no_prs():
+    current = [{
+        "workout_id": 2, "set_index": 1, "weight_kg": 25,
+        "reps": None, "duration_s": 20,
+    }]
+    old_rep_history = [{
+        "workout_id": 1, "set_index": 1, "weight_kg": 20, "reps": 8,
+    }]
+
+    records = personal_records(current, old_rep_history, load_mode="external")
+
     assert records == {"weight": False, "reps": False, "e1rm": False}
     assert estimate_1rm(20, None) is None

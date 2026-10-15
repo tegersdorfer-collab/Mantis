@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import math
+from statistics import median
+
+
+MAX_SECONDS = 600
 
 
 def is_timed_set(row: dict) -> bool:
@@ -32,6 +36,15 @@ def _rep_bounds(metadata: dict | None) -> tuple[int, int, int]:
     start = int(metadata.get("rep_start") or default_start)
     high = max(low, high)
     return low, high, min(high, max(low, start))
+
+
+def _timed_bounds(rows: list[dict]) -> tuple[int, int, int] | None:
+    """Leitet Sekundengrenzen aus der Dauer der letzten Sätze ab."""
+    amounts = [set_amount(row) for row in rows if is_timed_set(row) and set_amount(row) > 0]
+    if not amounts:
+        return None
+    center = min(MAX_SECONDS, max(1, int(round(median(amounts)))))
+    return max(1, center - 5), min(MAX_SECONDS, center + 5), center
 
 
 def _weight_step(metadata: dict | None) -> float | None:
@@ -104,16 +117,28 @@ def recommend_next(
     if not current:
         return {"weight_kg": None, "target_reps": [], "incremented": False}
 
-    low, high, start = _rep_bounds(metadata)
-    count = max(1, int(set_count)) if set_count else len(current)
+    metadata = metadata or {}
     timed = any(is_timed_set(row) for row in current)
+    history = _working_sets([*(historical_sets or []), *previous])
+    if timed:
+        history = [row for row in history if is_timed_set(row)]
+        if metadata.get("target_unit") == "seconds":
+            low, high, start = _rep_bounds(metadata)
+        else:
+            previous_timed = [row for row in previous if is_timed_set(row)]
+            bounds = _timed_bounds(previous_timed or history or current)
+            if bounds is None:
+                return {"weight_kg": current[0].get("weight_kg"), "target_reps": [], "incremented": False}
+            low, high, start = bounds
+    else:
+        low, high, start = _rep_bounds(metadata)
+    count = max(1, int(set_count)) if set_count else len(current)
     current_reps = [set_amount(row) for row in current[:count]]
     current_reps.extend([None] * max(0, count - len(current_reps)))
     weight = current[0].get("weight_kg")
     target = [start] * count
     incremented = False
 
-    history = _working_sets([*(historical_sets or []), *previous])
     if history:
         bodyweight_mode = _is_bodyweight_mode((metadata or {}).get("load_mode"))
 
@@ -220,8 +245,9 @@ def personal_records(
     old_e1rms = [estimate_1rm(row.get("weight_kg"), row.get("reps")) for row in history]
     old_e1rms = [value for value in old_e1rms if value is not None]
     for row in current:
+        if is_timed_set(row):
+            continue
         weight_value = row.get("weight_kg")
-        timed = is_timed_set(row)
         reps_value = set_amount(row)
         if weight_value is not None and float(weight_value) > 0:
             weight = float(weight_value)
@@ -232,13 +258,13 @@ def personal_records(
                 if old.get("reps") is not None and old.get("weight_kg") is not None
                 and math.isclose(float(old["weight_kg"]), weight, abs_tol=0.001)
             ]
-            if not timed and (max(comparable) if comparable else 0) < reps_value:
+            if (max(comparable) if comparable else 0) < reps_value:
                 reps_pr = True
-            if not timed and load_mode not in {"added", "bodyweight"}:
+            if load_mode not in {"added", "bodyweight"}:
                 estimate = estimate_1rm(weight, reps_value)
                 if estimate is not None and old_e1rms and estimate > max(old_e1rms):
                     e1rm_pr = True
-        elif load_mode in {"bodyweight", "added"} and not timed:
+        elif load_mode in {"bodyweight", "added"}:
             comparable = [
                 int(old["reps"]) for old in history
                 if old.get("reps") is not None and _is_unweighted(old.get("weight_kg"))

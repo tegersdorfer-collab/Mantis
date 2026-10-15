@@ -67,13 +67,27 @@ def _reps(value: int, timed: bool = False) -> int:
     return value
 
 
-def _is_timed_name(name: str) -> bool:
-    """Zeitübung: Einheit 'min' (Haltezeiten); Sekunden landen in duration_s."""
+def _is_timed_unit(row: dict | None) -> bool:
+    """Session-Snapshot ist maßgeblich; ohne Snapshot gilt die Übungseinheit."""
+    if not row:
+        return False
+    target_unit = row.get("target_unit")
+    if target_unit is not None:
+        return str(target_unit).casefold() == "seconds"
+    return str(row.get("unit") or "").casefold() == "min"
+
+
+def _is_timed_name(name: str, now: datetime | None = None) -> bool:
+    """Löst die Einheit aus Session-Snapshot oder Übungsmetadaten auf."""
+    opened = session.open_session(now=now)
     row = db.query_one(
-        "SELECT 1 AS timed FROM exercises WHERE LOWER(name)=LOWER(%s) AND LOWER(COALESCE(unit,''))='min' LIMIT 1",
-        (name,),
+        """SELECT e.unit,we.target_unit FROM exercises e
+           LEFT JOIN gym_workout_exercises we
+             ON we.exercise_id=e.id AND we.workout_id=%s
+           WHERE LOWER(e.name)=LOWER(%s) LIMIT 1""",
+        (opened["id"] if opened else None, name),
     )
-    return row is not None
+    return _is_timed_unit(row)
 
 
 def _row_timed(row: dict) -> bool:
@@ -112,7 +126,7 @@ def log_set(
 ) -> dict:
     name = _exercise_name(exercise)
     weight = _weight(weight_kg)
-    timed = _is_timed_name(name)
+    timed = _is_timed_name(name, now=now)
     count = _reps(reps, timed)
     if not isinstance(client_id, str) or not client_id.strip():
         raise TrackerError(400, "client_id fehlt")
@@ -220,9 +234,12 @@ def get_state(now: datetime | None = None) -> dict:
 def _open_set_row(cur, set_id: int) -> dict | None:
     cur.execute(
         """SELECT ws.id, ws.workout_id, ws.exercise_id, ws.set_index,
-                  ws.weight_kg, ws.reps, ws.duration_s, e.unit, w.ended_at, e.name AS exercise
+                  ws.weight_kg, ws.reps, ws.duration_s, e.unit,we.target_unit,
+                  w.ended_at,e.name AS exercise
            FROM workout_sets ws JOIN workouts w ON w.id=ws.workout_id
            JOIN exercises e ON e.id=ws.exercise_id
+           LEFT JOIN gym_workout_exercises we
+             ON we.workout_id=ws.workout_id AND we.exercise_id=ws.exercise_id
            WHERE ws.id=%s FOR UPDATE OF ws, w""",
         (set_id,),
     )
@@ -265,14 +282,17 @@ def update_set(
         session._lock_session(cur)
         row, error = _check_open_set(cur, set_id, moment)
         if row is not None and error is None:
-            timed = _row_timed(row) or str(row.get("unit") or "").casefold() == "min"
+            timed = _is_timed_unit(row)
             try:
                 count = _reps(reps, timed) if reps is not None else None
             except TrackerError as exc:
                 error = (exc.status, exc.message)
         if row is not None and error is None:
             weight = weight if weight is not None else row["weight_kg"]
-            count = count if count is not None else _row_amount(row)
+            if count is None:
+                count = row.get("duration_s") if timed else row.get("reps")
+                if count is None:
+                    count = _row_amount(row)
             cur.execute(
                 "UPDATE workout_sets SET weight_kg=%s,reps=%s,duration_s=%s WHERE id=%s",
                 (weight, None if timed else count, count if timed else None, set_id),

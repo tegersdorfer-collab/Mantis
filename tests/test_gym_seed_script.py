@@ -51,3 +51,21 @@ def test_gym_seed_script_passes_parsed_ap_export_to_preview(tmp_path, monkeypatc
     output = capsys.readouterr().out
     assert "3 Sätze · 4 Wdh." in output
     assert "2 Sätze · 30–40 s" in output
+
+
+def test_gym_seed_dry_run_prints_unit_conflicts(monkeypatch, capsys):
+    from scripts import gym_seed_plan
+
+    monkeypatch.setattr(
+        gym_seed_plan.plans,
+        "preview_seed",
+        lambda *_args, **_kwargs: {
+            "name": "Synthetic Plan", "start_date": "2026-10-15",
+            "warnings": ["Einheit von Alias und kanonischer Übung widerspricht sich."],
+            "days": [],
+        },
+    )
+
+    assert gym_seed_plan.main(["--dry-run", "--name", "Synthetic Plan"]) == 0
+
+    assert "Warnung: Einheit von Alias und kanonischer Übung widerspricht sich." in capsys.readouterr().out

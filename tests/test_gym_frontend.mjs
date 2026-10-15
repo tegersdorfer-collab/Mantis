@@ -170,6 +170,51 @@ const queuedSet = {
   reps: 10,
 };
 
+test("Zeitwerte im Trainingsverlauf werden als Sekunden angezeigt und bearbeitet", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      return response(200, {});
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
+  app.run(`
+    activeTab = "history";
+    selectedWorkoutId = 42;
+    workoutDetail = {
+      title: "Synthetic Deadhang", date: "2035-05-20", duration_min: 10,
+      set_count: 1, volume_kg: 0,
+      sets: [{ id: 7, exercise: "Synthetic Deadhang", set_index: 1,
+        weight_kg: 20, reps: 45, unit: "seconds", is_warmup: false }],
+    };
+    render();
+  `);
+
+  assert.match(app.elements.get("#screen").innerHTML, /20 kg × 45 s/);
+  await app.click("edit-history-set", { setId: "7" });
+  assert.match(app.elements.get("#screen").innerHTML, /<label>s<input data-history-edit/);
+  assert.doesNotMatch(app.elements.get("#screen").innerHTML, /Wdh\.<input data-history-edit/);
+  await app.run(`historyEditSet.reps = "601"; saveHistorySet()`);
+  assert.match(app.elements.get("#notice-host").innerHTML, /Sekunden/);
+  assert.equal(app.calls.some((call) => call.method === "PATCH"), false);
+
+  app.run(`
+    activeTab = "exercises";
+    exerciseDetail = {
+      name: "Synthetic Deadhang", muscle: "Rücken", equipment: "bodyweight",
+      unit: "min", rep_min: 30, rep_max: 60,
+      history: [{ date: "2035-05-20", e1rm_kg: null, best_set: null,
+        sets: [{ weight_kg: 20, reps: 45, unit: "seconds" }] }],
+    };
+    render();
+  `);
+
+  assert.match(app.elements.get("#screen").innerHTML, /20×45 s/);
+  assert.match(app.elements.get("#screen").innerHTML, /keine gewichtete e1RM-Historie/);
+  assert.doesNotMatch(app.elements.get("#screen").innerHTML, /<svg class="e1rm-chart"/);
+});
+
 test("401 und 403 lassen Queue-Sätze stehen und ein Login startet den Sync erneut", async () => {
   for (const authStatus of [401, 403]) {
     const state = makeState();
