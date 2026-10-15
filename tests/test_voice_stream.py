@@ -50,6 +50,138 @@ class TestVoiceStreamSession:
         result = asyncio.run(session.handle_chunk(b"\x00\x00", muted=True))
         assert result is None
 
+    def test_bargein_requires_sustained_speech_and_keeps_segment_for_final_stt(
+        self, monkeypatch,
+    ):
+        import core.voice_stream as vs
+        import config
+
+        class FakeClock:
+            now = 50.0
+
+            def __call__(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        class SpeechSegmenter:
+            is_speaking = False
+            current_chunk_is_speech = False
+            current_audio = b""
+            current_speech_ms = 0.0
+            current_speech_rms = 1200.0
+            finish_next = False
+
+            def process_chunk(self, frame):
+                if self.finish_next:
+                    self.finish_next = False
+                    self.is_speaking = False
+                    self.current_chunk_is_speech = False
+                    return SegmentEvent(
+                        audio=self.current_audio + frame,
+                        duration_ms=self.current_speech_ms + 32,
+                    )
+                self.is_speaking = True
+                self.current_chunk_is_speech = True
+                self.current_speech_ms += 32
+                self.current_audio += frame
+                return None
+
+        async def run():
+            clock = FakeClock()
+            interruptions = []
+            final_calls = []
+
+            async def on_bargein(detected_at):
+                interruptions.append(detected_at)
+
+            async def final_stt(audio):
+                final_calls.append(audio)
+                return "Und morgen?"
+
+            segmenter = SpeechSegmenter()
+            session = VoiceStreamSession(
+                vad_segmenter=segmenter,
+                wakeword_detector=MagicMock(),
+                conversation_active_fn=lambda: True,
+                partial_interval_ms=10_000,
+                partial_executor_available=lambda: False,
+                bargein_active_fn=lambda: True,
+                on_bargein=on_bargein,
+                clock=clock,
+            )
+            monkeypatch.setattr(vs, "transcribe_pcm", final_stt)
+
+            for _ in range(10):
+                await session.handle_chunk(vad_frame(), muted=False)
+                clock.advance(0.032)
+
+            assert interruptions == [pytest.approx(50.288)]
+            assert segmenter.current_speech_ms == 320
+            assert segmenter.current_audio == vad_frame() * 10
+
+            segmenter.finish_next = True
+            result = await session.handle_chunk(vad_frame(), muted=False)
+
+            assert result["text"] == "Und morgen?"
+            assert final_calls == [segmenter.current_audio + vad_frame()]
+            assert len(interruptions) == 1
+
+        monkeypatch.setattr(config, "VOICE_BARGEIN", True, raising=False)
+        monkeypatch.setattr(config, "VOICE_BARGEIN_MIN_SPEECH_MS", 300, raising=False)
+        monkeypatch.setattr(config, "VOICE_BARGEIN_MIN_RMS", 800, raising=False)
+        asyncio.run(run())
+
+    @pytest.mark.parametrize(
+        ("enabled", "speech_ms", "rms", "should_interrupt"),
+        [(True, 288, 1200, False), (True, 320, 799, False), (False, 320, 1200, False)],
+    )
+    def test_bargein_rejects_short_quiet_or_disabled_speech(
+        self, monkeypatch, enabled, speech_ms, rms, should_interrupt,
+    ):
+        import config
+
+        class SpeechSegmenter:
+            is_speaking = True
+            current_chunk_is_speech = True
+            current_audio = vad_frame()
+            current_speech_rms = rms
+            current_speech_ms = speech_ms
+
+            def process_chunk(self, _frame):
+                return None
+
+        interruptions = []
+
+        async def on_bargein(detected_at):
+            interruptions.append(detected_at)
+
+        monkeypatch.setattr(config, "VOICE_BARGEIN", enabled, raising=False)
+        monkeypatch.setattr(config, "VOICE_BARGEIN_MIN_SPEECH_MS", 300, raising=False)
+        monkeypatch.setattr(config, "VOICE_BARGEIN_MIN_RMS", 800, raising=False)
+        session = VoiceStreamSession(
+            vad_segmenter=SpeechSegmenter(),
+            wakeword_detector=MagicMock(),
+            conversation_active_fn=lambda: True,
+            partial_executor_available=lambda: False,
+            bargein_active_fn=lambda: True,
+            on_bargein=on_bargein,
+            clock=lambda: 7.0,
+        )
+        asyncio.run(session.handle_chunk(vad_frame(), muted=False))
+
+        assert bool(interruptions) is should_interrupt
+
+
+def test_voice_bargein_settings_default_and_validate():
+    from settings import MantisSettings
+
+    settings = MantisSettings(_env_file=None)
+    assert settings.VOICE_BARGEIN is True
+    assert settings.VOICE_BARGEIN_MIN_SPEECH_MS == 300
+    assert settings.VOICE_BARGEIN_MIN_RMS == 800
+
     def test_no_result_while_segment_incomplete(self):
         session = make_session(segment_events=[None], wake_hits=[False])
         result = asyncio.run(session.handle_chunk(vad_frame(), muted=False))

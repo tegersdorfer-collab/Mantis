@@ -4,6 +4,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asyncio
+import inspect
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -55,6 +56,46 @@ class TestDashboardRespondUiWiring:
                 # darf keine Exception nach außen werfen
                 response, trace = asyncio.run(handler.dashboard_respond("Wie war mein Schlaf?"))
                 assert response == "Du hast 7.2h geschlafen."
+
+    def test_voice_turn_can_defer_assistant_history_until_playback_finishes(
+        self, monkeypatch,
+    ):
+        handler = _make_handler()
+        assert "defer_finish" in inspect.signature(handler.dashboard_respond).parameters
+        handler._persist_msg = MagicMock()
+        handler._finish_turn = MagicMock()
+        monkeypatch.setattr("core.message_handler.fast_commands.match", lambda _text: None)
+        monkeypatch.setattr("core.message_handler.skill_request.match", lambda _text: None)
+        monkeypatch.setattr(
+            "core.message_handler.skills.T.select_tools_async",
+            AsyncMock(return_value=([], False)),
+        )
+
+        response = asyncio.run(handler.dashboard_respond(
+            "Wie wird das Wetter?", agent=handler.agent,
+            channel_name="voice", defer_finish=True,
+        ))
+
+        assert response[0] == "Du hast 7.2h geschlafen."
+        handler._persist_msg.assert_called_once_with(
+            "user", "Wie wird das Wetter?", channel="voice",
+        )
+        handler._finish_turn.assert_not_called()
+
+    def test_interrupted_voice_history_contains_only_spoken_text_and_marker(self):
+        handler = _make_handler()
+        assert callable(getattr(handler, "record_interrupted_voice_turn", None))
+        handler._persist_msg = MagicMock()
+
+        handler.record_interrupted_voice_turn("Heute wird es")
+
+        handler.kzg.add.assert_called_once_with(
+            "assistant", "Heute wird es [unterbrochen]",
+        )
+        handler._persist_msg.assert_called_once_with(
+            "assistant", "Heute wird es [unterbrochen]", channel="voice",
+            meta={"interrupted": True},
+        )
 
     def test_interaktiver_turn_hat_viertausend_token_budget(self, monkeypatch):
         handler = _make_handler()

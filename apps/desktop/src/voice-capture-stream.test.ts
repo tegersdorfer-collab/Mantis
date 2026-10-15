@@ -44,7 +44,7 @@ describe('startVoiceCaptureStream', () => {
     expect(onSegment).toHaveBeenCalledWith(payload);
   });
 
-  it('sends a mute=true control message while a reply plays', () => {
+  it('keeps the server VAD active while a reply plays', () => {
     FakeWebSocket.instances = [];
     const originalAudio = globalThis.Audio;
     // @ts-expect-error - Test-Double, kein vollständiges HTMLAudioElement nötig
@@ -66,14 +66,159 @@ describe('startVoiceCaptureStream', () => {
       const ws = FakeWebSocket.instances[0];
       const payload = { text: 'hallo', addressed: true, reply: 'hi', audio_b64: 'BASE64AUDIO' };
       ws.onmessage?.({ data: JSON.stringify(payload) });
-      // Seit dem Streaming-Umbau meldet der Client zuerst an, dass er Tonblöcke
-      // verarbeiten kann; danach folgt wie bisher die Stummschaltung.
       expect(ws.sent).toEqual([
-        JSON.stringify({ type: 'hello', audio: 'stream' }),
-        JSON.stringify({ type: 'mute', value: true }),
+        JSON.stringify({ type: 'hello', audio: 'stream', playback_progress: true }),
       ]);
     } finally {
       globalThis.Audio = originalAudio;
+    }
+  });
+
+  it('uses browser echo cancellation and keeps sending microphone frames during playback', async () => {
+    FakeWebSocket.instances = [];
+    const workletNode: {
+      current: { port: { onmessage: ((event: MessageEvent<ArrayBuffer>) => void) | null } } | null;
+    } = { current: null };
+    const getUserMedia = vi.fn(async (_constraints: MediaStreamConstraints) => ({
+      getTracks: () => [{ stop() {} }],
+    } as unknown as MediaStream));
+    const originalMediaDevices = navigator.mediaDevices;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: { getUserMedia }, configurable: true,
+    });
+    class CaptureContext {
+      audioWorklet = { addModule: async () => {} };
+      createMediaStreamSource() { return { connect() {} }; }
+      close() { return Promise.resolve(); }
+    }
+    class FakeWorkletNode {
+      port = { onmessage: null as ((event: MessageEvent<ArrayBuffer>) => void) | null };
+      constructor() { workletNode.current = this; }
+      connect() {}
+    }
+    const originalAudio = globalThis.Audio;
+    vi.stubGlobal('AudioContext', CaptureContext);
+    vi.stubGlobal('AudioWorkletNode', FakeWorkletNode);
+    // @ts-expect-error - schmaler Audio-Testdouble
+    globalThis.Audio = class {
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      play() { return new Promise<void>(() => {}); }
+      pause() {}
+    };
+    try {
+      const stop = startVoiceCaptureStream(
+        'http://localhost:7779', vi.fn(),
+        (url) => new FakeWebSocket(url) as unknown as WebSocket,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const ws = FakeWebSocket.instances[0];
+      expect(getUserMedia).toHaveBeenCalledWith({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+
+      ws.onmessage?.({ data: JSON.stringify({
+        text: 'Antwort', addressed: true, reply: 'Hallo.', audio_b64: 'BASE64',
+      }) });
+      workletNode.current?.port.onmessage?.({
+        data: new ArrayBuffer(8),
+      } as MessageEvent<ArrayBuffer>);
+
+      expect(ws.sent.some((item) => item instanceof ArrayBuffer)).toBe(true);
+      expect(ws.sent.map(String)).not.toContain(JSON.stringify({ type: 'mute', value: true }));
+      stop();
+    } finally {
+      globalThis.Audio = originalAudio;
+      vi.unstubAllGlobals();
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: originalMediaDevices, configurable: true,
+      });
+    }
+  });
+
+  it('stops all streamed sources and reports progress before acknowledging stop_playback', async () => {
+    FakeWebSocket.instances = [];
+    const originalMediaDevices = navigator.mediaDevices;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: {
+        getUserMedia: async () => ({
+          getTracks: () => [{ stop() {} }],
+        } as unknown as MediaStream),
+      }, configurable: true,
+    });
+    class FakeSource {
+      buffer: AudioBuffer | null = null;
+      onended: (() => void) | null = null;
+      startedAt = 0;
+      stopped = false;
+      connect() {}
+      start(at: number) { this.startedAt = at; }
+      stop() { this.stopped = true; }
+    }
+    class PlaybackContext {
+      static instances: PlaybackContext[] = [];
+      state = 'running';
+      currentTime = 0;
+      destination = {};
+      sources: FakeSource[] = [];
+      audioWorklet = { addModule: async () => {} };
+      constructor() { PlaybackContext.instances.push(this); }
+      createMediaStreamSource() { return { connect() {} }; }
+      createBufferSource() {
+        const source = new FakeSource();
+        this.sources.push(source);
+        return source as unknown as AudioBufferSourceNode;
+      }
+      decodeAudioData(_data: ArrayBuffer) {
+        return Promise.resolve({ duration: 1 } as AudioBuffer);
+      }
+      resume() { return Promise.resolve(); }
+      close() { return Promise.resolve(); }
+    }
+    class FakeWorkletNode {
+      port = { onmessage: null as ((event: MessageEvent<ArrayBuffer>) => void) | null };
+      constructor() {}
+      connect() {}
+    }
+    vi.stubGlobal('AudioContext', PlaybackContext);
+    vi.stubGlobal('AudioWorkletNode', FakeWorkletNode);
+    try {
+      const stop = startVoiceCaptureStream(
+        'http://localhost:7779', vi.fn(),
+        (url) => new FakeWebSocket(url) as unknown as WebSocket,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const ws = FakeWebSocket.instances[0];
+      ws.onmessage?.({ data: JSON.stringify({
+        type: 'audio_chunk', seq: 0, block_id: 'turn:0', b64: btoa('first'),
+      }) });
+      ws.onmessage?.({ data: JSON.stringify({
+        type: 'audio_chunk', seq: 1, block_id: 'turn:1', b64: btoa('second'),
+      }) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      PlaybackContext.instances[1].currentTime = 0.4;
+
+      ws.onmessage?.({ data: JSON.stringify({ type: 'stop_playback', turn_id: 'turn' }) });
+
+      const progress = ws.sent
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => JSON.parse(item) as Record<string, unknown>)
+        .filter((item) => item.type === 'playback_progress');
+      expect(PlaybackContext.instances[1].sources.map((source) => source.stopped))
+        .toEqual([true, true]);
+      expect(progress).toEqual([
+        { type: 'playback_progress', block_id: 'turn:0', played_ms: 400, finished: false },
+        { type: 'playback_progress', block_id: 'turn:1', played_ms: 0, finished: false },
+      ]);
+      expect(JSON.parse(ws.sent[ws.sent.length - 1] as string)).toEqual({
+        type: 'playback_stopped', turn_id: 'turn',
+      });
+      stop();
+    } finally {
+      vi.unstubAllGlobals();
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: originalMediaDevices, configurable: true,
+      });
     }
   });
 });

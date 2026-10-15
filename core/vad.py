@@ -451,6 +451,8 @@ class VadSegmenter:
         self._speaking = False
         self._silence_ms = 0.0
         self._speech_ms = 0.0
+        self._speech_energy_squared = 0
+        self._speech_sample_count = 0
         self._buffer: list[bytes] = []
         self._buffer_samples = 0
         self._preroll: list[bytes] = []
@@ -470,6 +472,18 @@ class VadSegmenter:
     @property
     def current_chunk_is_speech(self) -> bool:
         return self._current_chunk_is_speech
+
+    @property
+    def current_speech_ms(self) -> float:
+        """Laufzeit der aktuellen Äußerung ohne Vorlauf und Stille."""
+        return self._speech_ms
+
+    @property
+    def current_speech_rms(self) -> float:
+        """RMS-Pegel über die Sprachframes der aktuellen Äußerung."""
+        if not self._speech_sample_count:
+            return 0.0
+        return (self._speech_energy_squared / self._speech_sample_count) ** 0.5
 
     @property
     def last_speech_sample_index(self) -> int | None:
@@ -521,10 +535,15 @@ class VadSegmenter:
             if not self._speaking:
                 self._speaking = True
                 self._speech_ms = 0.0
+                self._speech_energy_squared = 0
+                self._speech_sample_count = 0
                 self._buffer = list(self._preroll)
                 self._buffer_samples = sum(len(chunk) // 2 for chunk in self._buffer)
                 self._last_speech_sample_index = None
             self._speech_ms += self._chunk_ms
+            samples = struct.unpack(f"<{len(pcm_chunk) // 2}h", pcm_chunk)
+            self._speech_energy_squared += sum(sample * sample for sample in samples)
+            self._speech_sample_count += len(samples)
             self._buffer.append(pcm_chunk)
             self._buffer_samples += len(pcm_chunk) // 2
             self._last_speech_sample_index = self._buffer_samples

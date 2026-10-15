@@ -19,6 +19,7 @@ class FakeSource {
 
 class FakeContext {
   static current: FakeContext | null = null;
+  static decodePromise: Promise<AudioBuffer> | null = null;
   state = 'running';
   currentTime = 0;
   destination = {};
@@ -37,6 +38,7 @@ class FakeContext {
   }
   decodeAudioData(_buf: ArrayBuffer): Promise<AudioBuffer> {
     const i = this.decodeCount++;
+    if (FakeContext.decodePromise) return FakeContext.decodePromise;
     if (this.fehlerBeiDecode.has(i)) return Promise.reject(new Error('kaputt'));
     return Promise.resolve({ duration: this.dauern[i] ?? 1 } as unknown as AudioBuffer);
   }
@@ -54,6 +56,7 @@ const b64 = (s: string) => btoa(s);  // jsdom bringt btoa/atob mit — kein @typ
 
 beforeEach(() => {
   FakeContext.current = null;
+  FakeContext.decodePromise = null;
   vi.stubGlobal('AudioContext', FakeContext);
 });
 afterEach(() => vi.unstubAllGlobals());
@@ -148,6 +151,44 @@ describe('StreamingAudioPlayer', () => {
     expect(ctx.gestartet[0].stopped).toBe(true);
     expect(fertig).toHaveBeenCalledTimes(1);
     expect(ctx.closed).toBe(true);
+  });
+
+  it('stop() meldet den Fortschritt laufender und vorgemerkter Quellen', async () => {
+    const fortschritt: Array<[string, number, boolean, boolean]> = [];
+    const p = new StreamingAudioPlayer(
+      () => {},
+      (blockId, gespieltMs, fertig, uebersprungen) => {
+        fortschritt.push([blockId, gespieltMs, fertig, uebersprungen]);
+      },
+    );
+    await p.push(0, b64('a'), 'turn:0');
+    await p.push(1, b64('b'), 'turn:1');
+    const ctx = FakeContext.current!;
+    ctx.currentTime = 0.4;
+
+    p.stop();
+
+    expect(ctx.gestartet.map((quelle) => quelle.stopped)).toEqual([true, true]);
+    expect(fortschritt).toEqual([
+      ['turn:0', 400, false, false],
+      ['turn:1', 0, false, false],
+    ]);
+  });
+
+  it('spielt einen Decode nicht mehr ein, wenn stop() vorher aufgerufen wurde', async () => {
+    let decodeFertig: ((value: AudioBuffer) => void) | undefined;
+    FakeContext.decodePromise = new Promise((resolve) => {
+      decodeFertig = resolve;
+    });
+    const p = new StreamingAudioPlayer(() => {});
+    const decoding = p.push(0, b64('spaet'));
+    const ctx = FakeContext.current!;
+
+    p.stop();
+    decodeFertig!({ duration: 1 } as AudioBuffer);
+    await decoding;
+
+    expect(ctx.gestartet).toHaveLength(0);
   });
 
   it('meldet fertig nur ein einziges Mal', async () => {

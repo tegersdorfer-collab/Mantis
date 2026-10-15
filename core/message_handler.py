@@ -688,6 +688,7 @@ class MessageHandler:
     async def dashboard_respond(
         self, text: str, stream_cb=None, agent=None, channel_name: str = "web",
         resume_idle_cb=None, prework: VoiceTurnPrework | None = None,
+        defer_finish: bool = False,
     ) -> tuple[str, list]:
         self._begin_user_turn()
         self._start_turn()
@@ -701,10 +702,23 @@ class MessageHandler:
             response, trace = await self._agent_turn(text, channel_name=channel_name,
                                                      stream_cb=stream_cb, agent=agent,
                                                      prework=prework)
-            self._finish_turn(text, response, trace, channel_name=channel_name, agent=agent)
+            if not defer_finish:
+                self._finish_turn(text, response, trace, channel_name=channel_name, agent=agent)
             return response, trace
         finally:
             self._release_active_turn(resume_idle_cb)
+
+    def record_interrupted_voice_turn(self, spoken_text: str) -> None:
+        """Persistiert ausschließlich den vom Client als gespielt gemeldeten Teil."""
+        spoken_text = str(spoken_text or "").strip()
+        if not spoken_text:
+            return
+        if not spoken_text.endswith("[unterbrochen]"):
+            spoken_text = f"{spoken_text} [unterbrochen]"
+        self.kzg.add("assistant", spoken_text)
+        self._persist_msg(
+            "assistant", spoken_text, channel="voice", meta={"interrupted": True},
+        )
 
     # ── Gemeinsamer Agent-Turn (Telegram + Dashboard) ─────────────────────────
 

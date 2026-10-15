@@ -11,11 +11,14 @@ import base64
 import asyncio
 import json
 import logging
+import math
 import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 
@@ -28,6 +31,140 @@ from core.stream_events import StreamEvent
 from core.tts import _first_early_stream_boundary, synthesize, synthesize_stream
 
 log = logging.getLogger("mantis.api")
+
+
+@dataclass(slots=True)
+class _PlaybackBlock:
+    block_id: str
+    sentence_id: int | None
+    text: str | None
+    duration_ms: float | None
+    played_ms: float = 0.0
+    finished: bool = False
+    skipped: bool = False
+
+
+@dataclass(slots=True)
+class _PlaybackSentence:
+    text: str
+    block_ids: list[str] = field(default_factory=list)
+    complete: bool = False
+
+
+class _PlaybackTurn:
+    """Fortschritt eines einzelnen Antwort-Audiostreams, nach Block-ID getrennt."""
+
+    def __init__(self):
+        self.turn_id = uuid4().hex
+        self.blocks: dict[str, _PlaybackBlock] = {}
+        self.sentences: dict[int, _PlaybackSentence] = {}
+        self.audio_end_count: int | None = None
+        self.interrupted = False
+        self.bargein_ms: float | None = None
+        self.changed = asyncio.Event()
+        self.stop_ack = asyncio.Event()
+
+    def register_block(
+        self, seq: int, audio: bytes, *, text: str | None = None,
+        sentence_id: int | None = None,
+    ) -> str:
+        block_id = f"{self.turn_id}:{seq}"
+        duration_ms = voice_fillers._ogg_opus_duration_ms(audio)
+        self.blocks[block_id] = _PlaybackBlock(
+            block_id, sentence_id, text, duration_ms,
+        )
+        if sentence_id is not None and text is not None:
+            sentence = self.sentences.setdefault(
+                sentence_id, _PlaybackSentence(text),
+            )
+            sentence.block_ids.append(block_id)
+        self.changed.set()
+        return block_id
+
+    def mark_sentence_complete(self, sentence_id: int) -> None:
+        sentence = self.sentences.get(sentence_id)
+        if sentence is not None:
+            sentence.complete = True
+            self.changed.set()
+
+    def record_progress(
+        self, block_id: str, played_ms: float, *, finished: bool = False,
+        skipped: bool = False,
+    ) -> bool:
+        block = self.blocks.get(str(block_id))
+        if block is None:
+            return False
+        try:
+            played = max(0.0, float(played_ms))
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(played):
+            return False
+        if block.duration_ms is not None:
+            played = min(played, block.duration_ms)
+        block.played_ms = max(block.played_ms, played)
+        block.skipped = block.skipped or bool(skipped)
+        block.finished = block.finished or bool(finished) or block.skipped or (
+            block.duration_ms is not None
+            and block.played_ms >= max(0.0, block.duration_ms - 35.0)
+        )
+        if block.finished and not block.skipped and block.duration_ms is not None:
+            block.played_ms = block.duration_ms
+        self.changed.set()
+        return True
+
+    def progress_ms_for(self, block_id: str) -> float | None:
+        block = self.blocks.get(str(block_id))
+        return block.played_ms if block is not None else None
+
+    @property
+    def playback_active(self) -> bool:
+        return any(not block.finished for block in self.blocks.values())
+
+    def mark_audio_end(self, count: int) -> None:
+        self.audio_end_count = max(0, int(count))
+        self.changed.set()
+
+    @property
+    def complete(self) -> bool:
+        if self.audio_end_count is None or len(self.blocks) < self.audio_end_count:
+            return False
+        return all(block.finished for block in self.blocks.values())
+
+    async def wait_until_complete(self) -> None:
+        while not self.complete:
+            self.changed.clear()
+            if self.complete:
+                return
+            await self.changed.wait()
+
+    def spoken_text(self) -> str:
+        parts: list[str] = []
+        for sentence in self.sentences.values():
+            blocks = [self.blocks[block_id] for block_id in sentence.block_ids]
+            if not blocks:
+                break
+            played_ms = sum(block.played_ms for block in blocks)
+            if played_ms <= 0:
+                break
+            if (
+                sentence.complete and all(block.finished for block in blocks)
+                and not any(block.skipped for block in blocks)
+            ):
+                parts.append(sentence.text)
+                continue
+
+            words = sentence.text.split()
+            known_duration = sum(
+                block.duration_ms or 0.0 for block in blocks
+            )
+            estimated_duration = max(known_duration, len(words) * 350.0, 1.0)
+            fraction = min(1.0, played_ms / estimated_duration)
+            spoken_words = max(0, min(len(words), int(len(words) * fraction)))
+            if spoken_words:
+                parts.append(" ".join(words[:spoken_words]))
+            break
+        return " ".join(parts).strip()
 
 
 def _voice_backend_details(orch) -> tuple[str, str]:
@@ -51,6 +188,8 @@ def _record_voice_latency(
     first_answer_audio_ms: float | None = None,
     filler: str | None = None,
     filler_ms: float | None = None,
+    bargein: bool = False,
+    bargein_ms: float | None = None,
 ) -> dict:
     model, stage = _voice_backend_details(orch)
     detail = {
@@ -61,6 +200,8 @@ def _record_voice_latency(
         "first_answer_audio_ms": first_answer_audio_ms,
         "filler": filler,
         "filler_ms": filler_ms,
+        "bargein": bool(bargein),
+        "bargein_ms": bargein_ms,
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
         "model": model,
         "stage": stage,
@@ -158,10 +299,13 @@ async def sende_streaming_antwort(
     partial_runs: int = 0,
     partial_as_final: bool = False,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    playback: _PlaybackTurn | None = None,
+    defer_history: bool = False,
 ) -> str | None:
     """Leitet fertige Antwortsätze parallel zur laufenden Cloud-Antwort an TTS."""
     if started_at is None:
         started_at = time.perf_counter()
+    playback = playback or _PlaybackTurn()
     first_token_ms = None
     first_tts_block_ms = None
     first_answer_audio_ms = None
@@ -172,12 +316,16 @@ async def sende_streaming_antwort(
     ack_done = not getattr(config, "VOICE_FILLERS_ENABLED", True)
     sequence = 0
     queue: asyncio.Queue[str | None] = asyncio.Queue()
-    audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+    audio_queue: asyncio.Queue[
+        tuple[str, int | None, str | None, bytes | None] | None
+    ] = asyncio.Queue()
     state_changed = asyncio.Event()
     attempts: dict[str, dict[str, str | bool]] = {}
     has_queued_sentence = False
     spoken_sentences: list[str] = []
-    response: list[tuple[str | None, Exception | None]] = []
+    response: list[tuple[str | None, list, Exception | None]] = []
+    response_trace: list = []
+    next_sentence_id = 0
     ack_task: asyncio.Task | None = None
 
     def request_filler(kind: str) -> None:
@@ -197,15 +345,24 @@ async def sende_streaming_antwort(
         pending_filler = selected
         state_changed.set()
 
-    async def send_audio_chunk(audio: bytes, *, answer: bool = False) -> None:
+    async def send_audio_chunk(
+        audio: bytes, *, answer: bool = False, sentence: str | None = None,
+        sentence_id: int | None = None,
+    ) -> None:
         nonlocal sequence, first_tts_block_ms, first_answer_audio_ms
         if first_tts_block_ms is None:
             first_tts_block_ms = round((time.perf_counter() - started_at) * 1000, 1)
         if answer and first_answer_audio_ms is None:
             first_answer_audio_ms = round((time.perf_counter() - started_at) * 1000, 1)
+        block_id = playback.register_block(
+            sequence, audio,
+            text=sentence if answer else None,
+            sentence_id=sentence_id if answer else None,
+        )
         await websocket.send_json({
             "type": "audio_chunk",
             "seq": sequence,
+            "block_id": block_id,
             "b64": base64.b64encode(audio).decode("ascii"),
         })
         sequence += 1
@@ -287,15 +444,16 @@ async def sende_streaming_antwort(
 
     async def produce_response() -> None:
         try:
-            if prework is None:
-                reply, trace = await orch.voice_respond(text, stream_cb=on_update)
-            else:
-                reply, trace = await orch.voice_respond(
-                    text, stream_cb=on_update, prework=prework,
-                )
+            respond_kwargs = {"stream_cb": on_update}
+            if prework is not None:
+                respond_kwargs["prework"] = prework
+            if defer_history:
+                respond_kwargs["defer_finish"] = True
+            reply, trace = await orch.voice_respond(text, **respond_kwargs)
             _mark_reflex(trace)
             reply = reply or ""
-            response.append((reply or None, None))
+            response_trace[:] = trace or []
+            response.append((reply or None, response_trace, None))
             await queue.join()
             spoken_text = _normalized_speech(" ".join(spoken_sentences))
             final_text = _normalized_speech(reply)
@@ -309,13 +467,13 @@ async def sende_streaming_antwort(
                 await queue_final_text(remainder)
             await queue.join()
         except Exception as exc:
-            response.append((None, exc))
+            response.append((None, [], exc))
             log.error("Voice-Cloud-Antwort fehlgeschlagen: %s", exc)
         finally:
             await queue.put(None)
 
     async def synthesize_sentences() -> None:
-        nonlocal response_audio_ready
+        nonlocal response_audio_ready, next_sentence_id
         try:
             while True:
                 sentence = await queue.get()
@@ -323,6 +481,8 @@ async def sende_streaming_antwort(
                 try:
                     if sentence is None:
                         return
+                    sentence_id = next_sentence_id
+                    next_sentence_id += 1
                     stream = synthesize_stream(sentence).__aiter__()
                     completed = False
                     has_audio = False
@@ -340,11 +500,12 @@ async def sende_streaming_antwort(
                                 response_audio_ready = True
                                 if ack_task is not None and not ack_task.done():
                                     ack_task.cancel()
-                            audio_queue.put_nowait(ogg)
+                            audio_queue.put_nowait(("audio", sentence_id, sentence, ogg))
                             state_changed.set()
                             has_audio = True
                     if completed and has_audio:
                         spoken_sentences.append(sentence)
+                        audio_queue.put_nowait(("sentence_end", sentence_id, sentence, None))
                 finally:
                     if stream is not None:
                         close = getattr(stream, "aclose", None)
@@ -362,7 +523,7 @@ async def sende_streaming_antwort(
         nonlocal pending_filler, filler_ms
         response_finished = False
         has_pending_audio = False
-        pending_audio: bytes | None = None
+        pending_audio: tuple[str, int | None, str | None, bytes | None] | None = None
         while True:
             if pending_filler is not None:
                 selected = pending_filler
@@ -378,16 +539,22 @@ async def sende_streaming_antwort(
                 except asyncio.QueueEmpty:
                     pass
             if has_pending_audio:
-                audio = pending_audio
+                item = pending_audio
                 has_pending_audio = False
                 pending_audio = None
-                if audio is None:
+                if item is None:
                     response_finished = True
                 elif pending_filler is not None:
-                    pending_audio = audio
+                    pending_audio = item
                     has_pending_audio = True
+                elif item[0] == "sentence_end":
+                    if item[1] is not None:
+                        playback.mark_sentence_complete(item[1])
                 else:
-                    await send_audio_chunk(audio, answer=True)
+                    await send_audio_chunk(
+                        item[3] or b"", answer=True,
+                        sentence=item[2], sentence_id=item[1],
+                    )
                 continue
 
             if response_finished and ack_done:
@@ -423,11 +590,12 @@ async def sende_streaming_antwort(
     sender = asyncio.create_task(send_audio())
     response_error = None
     reply = None
+    trace = []
     client_disconnected = False
     try:
         tasks = (responder, synthesizer, sender, ack_task)
         await asyncio.gather(*(task for task in tasks if task is not None))
-        reply, response_error = response[0]
+        reply, trace, response_error = response[0]
         await websocket.send_json({
             "text": text,
             "addressed": True,
@@ -455,8 +623,17 @@ async def sende_streaming_antwort(
             return_exceptions=True,
         )
         try:
-            if not client_disconnected:
+            if playback.interrupted and defer_history:
+                try:
+                    await asyncio.wait_for(playback.stop_ack.wait(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    pass
+                recorder = getattr(orch, "record_interrupted_voice_turn", None)
+                if callable(recorder):
+                    recorder(playback.spoken_text())
+            elif not client_disconnected:
                 await websocket.send_json({"type": "audio_end", "count": sequence})
+                playback.mark_audio_end(sequence)
         finally:
             try:
                 _record_voice_latency(
@@ -467,9 +644,16 @@ async def sende_streaming_antwort(
                     first_answer_audio_ms=first_answer_audio_ms,
                     filler=filler_kind,
                     filler_ms=filler_ms,
+                    bargein=playback.interrupted,
+                    bargein_ms=playback.bargein_ms,
                 )
             finally:
                 voice_timing.reset(timing_token)
+    if defer_history and not client_disconnected and response_error is None:
+        await playback.wait_until_complete()
+        finish = getattr(orch, "finish_voice_turn", None)
+        if callable(finish) and reply:
+            finish(text, reply, trace)
     if response_error is not None:
         raise response_error
     return reply
@@ -557,19 +741,87 @@ def build_router(orch=None) -> APIRouter:
             VoicePreworkCache(prepare_voice_turn)
             if callable(prepare_voice_turn) else None
         )
-        session = VoiceStreamSession(
-            vad_segmenter=segmenter,
-            wakeword_detector=wakeword_detector,
-            conversation_active_fn=_conversation_active,
-            on_partial=prework_cache.offer if prework_cache is not None else None,
-        )
-
         muted = False
         # Streaming der Antwort-Audio ist OPT-IN: Der Client meldet sich nach dem
         # Connect mit {"type":"hello","audio":"stream"}. Ohne das bleibt es beim
         # bisherigen Verhalten (ein audio_b64 im Ergebnis-JSON) — die iOS-Apps und
         # der POST-Endpoint /api/voice/segment kennen das neue Protokoll nicht.
         audio_streaming = False
+        supports_playback_progress = False
+        active_playback: _PlaybackTurn | None = None
+        active_response_task: asyncio.Task | None = None
+        send_lock = asyncio.Lock()
+
+        class SerializedWebSocket:
+            async def send_json(self, data):
+                async with send_lock:
+                    await websocket.send_json(data)
+
+        send_socket = SerializedWebSocket()
+
+        async def stop_for_bargein(detected_at: float) -> None:
+            nonlocal active_response_task
+            playback = active_playback
+            if (
+                playback is None or not playback.playback_active
+                or playback.interrupted
+            ):
+                return
+            playback.interrupted = True
+            mark_conversation_active()
+            await send_socket.send_json({
+                "type": "stop_playback", "turn_id": playback.turn_id,
+            })
+            playback.bargein_ms = round(
+                max(0.0, (time.monotonic() - detected_at) * 1000), 1,
+            )
+            if active_response_task is not None and not active_response_task.done():
+                active_response_task.cancel()
+
+        def conversation_active() -> bool:
+            return active_playback is not None or _conversation_active()
+
+        session = VoiceStreamSession(
+            vad_segmenter=segmenter,
+            wakeword_detector=wakeword_detector,
+            conversation_active_fn=conversation_active,
+            on_partial=prework_cache.offer if prework_cache is not None else None,
+            bargein_active_fn=lambda: (
+                active_playback is not None and active_playback.playback_active
+            ),
+            on_bargein=stop_for_bargein,
+        )
+
+        async def run_streaming_response(
+            result: dict, text: str, prework, playback: _PlaybackTurn,
+        ) -> None:
+            nonlocal active_response_task, active_playback
+            try:
+                await sende_streaming_antwort(
+                    send_socket, text, orch,
+                    stt_ms=result.get("stt_ms"),
+                    started_at=result.get("turn_started_at"),
+                    prework=prework,
+                    partial_runs=result.get("partial_runs", 0),
+                    partial_as_final=result.get("partial_as_final", False),
+                    playback=playback,
+                    defer_history=supports_playback_progress,
+                )
+            except asyncio.CancelledError:
+                raise
+            except (WebSocketDisconnect, RuntimeError) as e:
+                log.info("Voice-WebSocket beim Antwortversand getrennt: %s", e)
+            except Exception as e:
+                log.error("Voice-Antworttask fehlgeschlagen: %s", e)
+            finally:
+                if active_playback is playback and (
+                    playback.interrupted or playback.complete
+                    or not supports_playback_progress
+                ):
+                    active_playback = None
+                if active_response_task is asyncio.current_task():
+                    active_response_task = None
+
         try:
             while True:
                 message = await websocket.receive()
@@ -583,6 +835,28 @@ def build_router(orch=None) -> APIRouter:
                         muted = bool(control.get("value", True))
                     elif control.get("type") == "hello":
                         audio_streaming = control.get("audio") == "stream"
+                        supports_playback_progress = bool(
+                            control.get("playback_progress", False),
+                        )
+                    elif control.get("type") == "playback_progress":
+                        playback = active_playback
+                        if playback is not None:
+                            playback.record_progress(
+                                control.get("block_id", ""),
+                                control.get("played_ms", 0),
+                                finished=bool(control.get("finished", False)),
+                                skipped=bool(control.get("skipped", False)),
+                            )
+                            mark_conversation_active()
+                            if playback.complete:
+                                active_playback = None
+                    elif control.get("type") == "playback_stopped":
+                        playback = active_playback
+                        if (
+                            playback is not None
+                            and control.get("turn_id") == playback.turn_id
+                        ):
+                            playback.stop_ack.set()
                     continue
                 else:
                     continue
@@ -591,23 +865,22 @@ def build_router(orch=None) -> APIRouter:
                     continue
 
                 text = result["text"]
+                mark_conversation_active()
+                if active_response_task is not None:
+                    if not active_response_task.done():
+                        await asyncio.gather(active_response_task, return_exceptions=True)
+                    active_response_task = None
+                active_playback = None
                 prework = prework_cache.take_for(text) if prework_cache is not None else None
                 if prework_cache is not None:
                     prework_cache.clear()
                 if audio_streaming and orch is not None:
-                    try:
-                        await sende_streaming_antwort(
-                            websocket, text, orch,
-                            stt_ms=result.get("stt_ms"),
-                            started_at=result.get("turn_started_at"),
-                            prework=prework,
-                            partial_runs=result.get("partial_runs", 0),
-                            partial_as_final=result.get("partial_as_final", False),
-                        )
-                        mark_conversation_active()
-                    except (WebSocketDisconnect, RuntimeError) as e:
-                        log.info(f"Voice-WebSocket beim Antwortversand getrennt: {e}")
-                        break
+                    playback = _PlaybackTurn()
+                    active_playback = playback
+                    active_response_task = asyncio.create_task(
+                        run_streaming_response(result, text, prework, playback),
+                        name="voice-response-turn",
+                    )
                     continue
 
                 started_at = result.get("turn_started_at", time.perf_counter())
@@ -656,6 +929,10 @@ def build_router(orch=None) -> APIRouter:
             log.error(f"Voice-WebSocket-Handler abgebrochen: {e}")
         finally:
             try:
+                if active_response_task is not None and not active_response_task.done():
+                    active_response_task.cancel()
+                if active_response_task is not None:
+                    await asyncio.gather(active_response_task, return_exceptions=True)
                 await session.close()
             finally:
                 if prework_cache is not None:

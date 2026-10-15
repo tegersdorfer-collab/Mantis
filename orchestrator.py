@@ -202,12 +202,24 @@ class Orchestrator:
         """Bereitet Kontext und lokale Tool-Auswahl parallel zur Spracheingabe vor."""
         return await self.msg_handler.prepare_voice_turn(text)
 
-    async def voice_respond(self, text: str, stream_cb=None, prework=None) -> tuple[str, list]:
+    async def voice_respond(
+        self, text: str, stream_cb=None, prework=None, defer_finish: bool = False,
+    ) -> tuple[str, list]:
         """Wie dashboard_respond, aber über die Voice-Variante der Cloud-Kette."""
         return await self.msg_handler.dashboard_respond(
             text, stream_cb, agent=self.voice_agent, channel_name="voice",
             resume_idle_cb=self.idle_loop.resume, prework=prework,
+            defer_finish=defer_finish,
         )
+
+    def finish_voice_turn(self, text: str, reply: str, trace: list) -> None:
+        """Schreibt eine gestreamte Voice-Antwort nach bestätigtem Playback fest."""
+        self.msg_handler._finish_turn(
+            text, reply, trace, channel_name="voice", agent=self.voice_agent,
+        )
+
+    def record_interrupted_voice_turn(self, spoken_text: str) -> None:
+        self.msg_handler.record_interrupted_voice_turn(spoken_text)
 
     def lzg_embed(self, text: str) -> list[float]:
         """Synchroner Embedding-Wrapper für API-Endpoints.

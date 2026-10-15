@@ -14,22 +14,39 @@
  * 2. Kommt ein Block zu spät (Netz, langsame Synthese), liegt sein geplanter
  *    Startzeitpunkt in der Vergangenheit. `Math.max(currentTime, …)` fängt das
  *    ab — dann gibt es eine kurze Lücke statt gar keinen Ton.
- * 3. Das Mikrofon bleibt stummgeschaltet, bis der LETZTE Block zu Ende gespielt
- *    ist (nicht: bis er eingeplant ist). Sonst hört Mantis sich selbst und löst
- *    ein neues Segment aus.
+ * 3. Das Mikrofon bleibt während der Wiedergabe aktiv. Die Browser-
+ *    Echounterdrückung schützt die Server-VAD; beim Abbruch wird der
+ *    tatsächlich gespielte Fortschritt pro Block gemeldet.
  */
+type WartenderBlock = { blockId: string; buffer: AudioBuffer | null };
+type LaufendeQuelle = {
+  quelle: AudioBufferSourceNode;
+  seq: number;
+  blockId: string;
+  start: number;
+  duration: number;
+};
+type PlaybackProgress = (
+  blockId: string, playedMs: number, finished: boolean, skipped: boolean,
+) => void;
+
 export class StreamingAudioPlayer {
   private ctx: AudioContext | null = null;
   private naechsterStart = 0;
-  private wartend = new Map<number, AudioBuffer>();
+  private wartend = new Map<number, WartenderBlock>();
   private naechsteSeq = 0;
   private anzahlGesamt: number | null = null;
   private eingeplant = 0;
-  private laufendeQuellen: AudioBufferSourceNode[] = [];
+  private laufendeQuellen: LaufendeQuelle[] = [];
+  private empfangeneBloecke = new Map<number, string>();
+  private fortschrittGemeldet = new Set<number>();
   private fertigGemeldet = false;
 
   /** @param onFertig wird genau einmal gerufen, wenn der letzte Ton verklungen ist. */
-  constructor(private onFertig: () => void) {}
+  constructor(
+    private onFertig: () => void,
+    private onFortschritt: PlaybackProgress = () => {},
+  ) {}
 
   private holeCtx(): AudioContext {
     if (!this.ctx) {
@@ -42,18 +59,31 @@ export class StreamingAudioPlayer {
     return this.ctx;
   }
 
-  async push(seq: number, b64: string): Promise<void> {
+  private meldeFortschritt(
+    blockId: string, playedMs: number, finished: boolean, skipped: boolean,
+  ): void {
+    try {
+      this.onFortschritt(blockId, playedMs, finished, skipped);
+    } catch {
+      // Ein geschlossener WebSocket darf das Stoppen des Audio-Graphen nicht verhindern.
+    }
+  }
+
+  async push(seq: number, b64: string, blockId = String(seq)): Promise<void> {
     if (this.fertigGemeldet) return;
+    this.empfangeneBloecke.set(seq, blockId);
     try {
       const ctx = this.holeCtx();
       const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
       const buffer = await ctx.decodeAudioData(bytes.buffer as ArrayBuffer);
-      this.wartend.set(seq, buffer);
+      if (this.fertigGemeldet) return;
+      this.wartend.set(seq, { blockId, buffer });
       this.planeVerfuegbare();
     } catch {
+      if (this.fertigGemeldet) return;
       // Defekter Block: überspringen, sonst bliebe die Kette stehen und das
       // Mikrofon dauerhaft stumm.
-      this.wartend.set(seq, null as unknown as AudioBuffer);
+      this.wartend.set(seq, { blockId, buffer: null });
       this.planeVerfuegbare();
     }
   }
@@ -67,11 +97,15 @@ export class StreamingAudioPlayer {
 
   private planeVerfuegbare(): void {
     while (this.wartend.has(this.naechsteSeq)) {
-      const buffer = this.wartend.get(this.naechsteSeq)!;
+      const { blockId, buffer } = this.wartend.get(this.naechsteSeq)!;
       this.wartend.delete(this.naechsteSeq);
       this.naechsteSeq += 1;
       this.eingeplant += 1;
-      if (!buffer) continue; // übersprungener Block
+      if (!buffer) {
+        this.fortschrittGemeldet.add(this.naechsteSeq - 1);
+        this.meldeFortschritt(blockId, 0, true, true);
+        continue; // übersprungener Block
+      }
 
       const ctx = this.holeCtx();
       const quelle = ctx.createBufferSource();
@@ -80,9 +114,14 @@ export class StreamingAudioPlayer {
       const start = Math.max(ctx.currentTime, this.naechsterStart);
       quelle.start(start);
       this.naechsterStart = start + buffer.duration;
-      this.laufendeQuellen.push(quelle);
+      const playback: LaufendeQuelle = {
+        quelle, seq: this.naechsteSeq - 1, blockId, start, duration: buffer.duration,
+      };
+      this.laufendeQuellen.push(playback);
       quelle.onended = () => {
-        this.laufendeQuellen = this.laufendeQuellen.filter((q) => q !== quelle);
+        this.laufendeQuellen = this.laufendeQuellen.filter((q) => q !== playback);
+        this.fortschrittGemeldet.add(playback.seq);
+        this.meldeFortschritt(blockId, buffer.duration * 1000, true, false);
         this.pruefeFertig();
       };
     }
@@ -104,16 +143,31 @@ export class StreamingAudioPlayer {
 
   /** Bricht die Wiedergabe ab (z.B. weil eine neue Antwort beginnt). */
   stop(): void {
-    for (const q of this.laufendeQuellen) {
+    for (const playback of this.laufendeQuellen) {
       try {
-        q.onended = null;
-        q.stop();
+        playback.quelle.onended = null;
+        playback.quelle.stop();
       } catch {
         /* bereits beendet */
+      }
+      const playedMs = this.ctx
+        ? Math.min(
+          playback.duration,
+          Math.max(0, this.ctx.currentTime - playback.start),
+        ) * 1000
+        : 0;
+      this.fortschrittGemeldet.add(playback.seq);
+      this.meldeFortschritt(playback.blockId, playedMs, false, false);
+    }
+    for (const [seq, blockId] of this.empfangeneBloecke) {
+      if (!this.fortschrittGemeldet.has(seq)) {
+        this.meldeFortschritt(blockId, 0, false, false);
+        this.fortschrittGemeldet.add(seq);
       }
     }
     this.laufendeQuellen = [];
     this.wartend.clear();
+    this.empfangeneBloecke.clear();
     this.meldeFertig();
     if (this.ctx) {
       void this.ctx.close().catch(() => {});
