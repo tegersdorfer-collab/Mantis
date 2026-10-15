@@ -49,3 +49,9 @@ STT-Warmup, Tool-Auswahl parallel zum LLM, erster TTS-Block an Kommagrenze.
 ## Für jede Runde
 TDD gegen `mantis_test`, keine echten API-Aufrufe in Tests, Review Sol, Merge + Neustart
 (Freigabe Timo 14.10.), danach Live-Test durch Timo und Auswertung `voice_latency`.
+
+## Runde 5 – Vorausdenken (Ideen Timo 15.10., Start erst wenn Teil-STT live misst)
+Voraussetzung: Teil-STT läuft live (partial_runs > 0, partial_as_final greift), Adress-Check nicht mehr im kritischen Pfad.
+- **Punkte vorab beantworten:** Erkennt das mitlaufende Transkript einen Übergang („zweitens“, „zum zweiten Punkt“, „außerdem“, „nächste Frage“, „und dann noch“), wird der abgeschlossene Teil spekulativ an das LLM geschickt (nur Text, keine Tools). Bei Satzende spielt Antwort 1 sofort, während der Rest läuft. Verwerfen bei Rücknahme („vergiss den ersten Punkt“, „…aber nur wenn“) oder wenn Punkt 2 sich auf Punkt 1 bezieht (dann gemeinsam beantworten).
+- **Harmlose Befehle sofort ausführen:** „Mantis, mach das Licht an, ich hatte nen langen Tag …“ → nach abgeschlossener Befehlsklausel + Pause sofort ausführen, wenn: echtes Weckwort am Anfang, Klausel COMPLETE, Aktion auf Allowlist umkehrbarer Aktionen (Licht, Ventilator, Musik an/aus/lauter/leiser/Pause, Timer). Rücknahme im weiteren Satz („doch nicht“, „aber erst in …“) → rückgängig machen. Nie vorab: Nachrichten, Löschen, Termine, Käufe, Mails, alles Externe/Irreversible. Schlussantwort greift beides auf („Licht ist an. …“).
+- **Dringendes zuerst:** Ist eine Erinnerung fällig/dringend (z. B. „Kreatin nehmen“), liegt dafür vorab synthetisiertes Audio bereit (Hintergrund, sobald fällig). Beim nächsten Voice-Turn spielt Mantis es sofort als Einstieg statt eines Füllers („Kurz vorab: du musst noch dein Kreatin nehmen.“), dann folgt die eigentliche Antwort. Max. einmal pro Erinnerung, nur echte Fälligkeit, nie bei Barge-in/Reflex-Stopp; gilt als erledigt-gemeldet, nicht als erledigt.
