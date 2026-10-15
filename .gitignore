@@ -52,3 +52,4 @@ mlx_models/
 # oeffentlich — die Unterlagen bleiben lokal. Auswertung und Modellwahl stehen
 # in den Commit-Nachrichten, nicht hier.
 bench/nanbeige42/
+.venv-tts/
