@@ -425,7 +425,7 @@ def test_stt_runtime_estimate_uses_final_runs_but_not_warmup(monkeypatch, tmp_pa
     assert stt_runtime.estimate_stt_runtime_ms(1.0) < 550
 
 
-def test_idle_parakeet_keepwarm_runs_only_when_stt_executor_is_idle(monkeypatch):
+def test_idle_parakeet_keepwarm_never_runs_during_a_live_stt_lock(monkeypatch):
     import time
     from types import SimpleNamespace
 
@@ -435,17 +435,50 @@ def test_idle_parakeet_keepwarm_runs_only_when_stt_executor_is_idle(monkeypatch)
     monkeypatch.setattr(voice, "_parakeet_unavailable", False)
     monkeypatch.setattr(voice, "_whisper_lock", asyncio.Lock())
     monkeypatch.setattr(voice, "_parakeet_last_activity_at", time.monotonic() - 241)
+    monkeypatch.setattr(voice.config, "STT_ENGINE", "parakeet", raising=False)
+    monkeypatch.setattr(voice.config, "VOICE_STT_KEEPWARM_S", 240, raising=False)
+
+    stt_started = asyncio.Event()
+    finish_stt = asyncio.Event()
+
+    async def running_partial_stt(_path):
+        stt_started.set()
+        await finish_stt.wait()
+        return "Teil-STT läuft noch"
+
+    monkeypatch.setattr(voice, "_transcribe_parakeet", running_partial_stt)
 
     async def run():
         assert await voice.keepwarm_parakeet_once() is True
-        await voice._whisper_lock.acquire()
+        assert calls == ["warm"]
+        calls.clear()
+        monkeypatch.setattr(
+            voice, "_parakeet_last_activity_at", time.monotonic() - 241,
+        )
+
+        stt_task = asyncio.create_task(
+            voice.transcribe_audio_partial_with_hint("/tmp/voice-stt-is-busy.wav"),
+        )
+        warm_task = None
         try:
-            assert await voice.keepwarm_parakeet_once() is False
+            await stt_started.wait()
+            assert voice._whisper_lock.locked()
+
+            warm_task = asyncio.create_task(voice.keepwarm_parakeet_once())
+            await asyncio.sleep(0)
+            assert warm_task.done(), "Keep-warm muss den belegten STT-Pfad sofort überspringen"
+            assert await warm_task is False
+            assert calls == []
         finally:
-            voice._whisper_lock.release()
+            if warm_task is not None and not warm_task.done():
+                warm_task.cancel()
+                await asyncio.gather(warm_task, return_exceptions=True)
+            finish_stt.set()
+            await stt_task
+            assert not voice._whisper_lock.locked()
 
     asyncio.run(run())
-    assert calls == ["warm"]
+    assert calls == []
 
 
 def test_idle_parakeet_keepwarm_skips_recent_stt_activity(monkeypatch):

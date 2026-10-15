@@ -84,14 +84,3 @@ def test_voice_stt_keepwarm_defaults_to_four_minutes_and_can_be_disabled():
     assert MantisSettings(_env_file=None, VOICE_STT_KEEPWARM_S=0).VOICE_STT_KEEPWARM_S == 0
     with pytest.raises(ValidationError):
         MantisSettings(_env_file=None, VOICE_STT_KEEPWARM_S=-1)
-
-
-def test_voice_continuation_window_defaults_to_three_seconds():
-    from pydantic import ValidationError
-    import pytest
-
-    settings = MantisSettings(_env_file=None)
-
-    assert settings.VOICE_CONTINUATION_MS == 3000
-    with pytest.raises(ValidationError):
-        MantisSettings(_env_file=None, VOICE_CONTINUATION_MS=0)

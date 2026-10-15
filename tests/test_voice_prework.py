@@ -142,7 +142,9 @@ def test_agent_turn_reuses_matching_context_but_selects_tools_from_final_text(mo
 
     class KZG:
         def recent_messages(self, **kwargs):
-            return [{"role": "user", "content": "final"}]
+            return [{
+                "role": "user", "content": "Was steht heute an, bitte",
+            }]
 
     class Agent:
         backend = type("Backend", (), {"sends_full_tool_catalog": True})()

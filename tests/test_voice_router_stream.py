@@ -2236,264 +2236,6 @@ def test_live_websocket_router_reports_partial_stt_runs_and_skip_reasons(monkeyp
     }
 
 
-def test_incomplete_voice_segment_waits_and_merges_continuation(monkeypatch):
-    import config
-    import core.vad as vad
-    import core.wakeword as wakeword
-    import web.routers.voice as voice_router
-
-    response_texts = []
-    tool_side_effects = []
-    logged = []
-
-    class FakeSession:
-        def __init__(self, *, on_speech_started=None, **_kwargs):
-            self.on_speech_started = on_speech_started
-            self.segments = iter((
-                {
-                    "text": "Mantis erinnere mich an",
-                    "wakeword_triggered": True,
-                    "stt_ms": 12,
-                    "turn_started_at": time.perf_counter(),
-                },
-                {
-                    "text": "Den Müll morgen früh rausbringen.",
-                    "wakeword_triggered": False,
-                    "stt_ms": 10,
-                    "turn_started_at": time.perf_counter(),
-                },
-            ))
-
-        async def handle_chunk(self, chunk, muted=False):
-            if chunk == b"continuation" and self.on_speech_started is not None:
-                self.on_speech_started()
-            return next(self.segments, None)
-
-        async def close(self):
-            pass
-
-    class FakeWebSocket:
-        def __init__(self):
-            self.receives = 0
-            self.sent = []
-
-        async def accept(self):
-            pass
-
-        async def send_json(self, data):
-            self.sent.append(data)
-
-        async def receive(self):
-            self.receives += 1
-            if self.receives == 1:
-                return {"bytes": b"first"}
-            if self.receives == 2:
-                await asyncio.sleep(0.02)
-                assert response_texts == []
-                return {"bytes": b"continuation"}
-            if self.receives == 3:
-                await asyncio.sleep(0.1)
-                return {"type": "websocket.disconnect"}
-            raise AssertionError("Unerwartete WebSocket-Nachricht")
-
-    class FakeOrchestrator:
-        async def voice_respond(self, text, **_kwargs):
-            response_texts.append(text)
-            tool_side_effects.append("reminder")
-            return "Alles klar, ich erinnere dich.", [{"tool": "set_reminder"}]
-
-    async def fake_sende_antwort(*_args, **_kwargs):
-        return 1.0
-
-    async def forbidden_address_check(*_args, **_kwargs):
-        raise AssertionError("Der erste Turn hat bereits das Wakeword")
-
-    async def run():
-        monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
-        monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
-        monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
-        monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
-        monkeypatch.setattr(voice_router, "sende_antwort", fake_sende_antwort)
-        monkeypatch.setattr(voice_router, "is_addressed_to_mantis", forbidden_address_check)
-        monkeypatch.setattr(voice_router.db, "log_event", lambda *args: logged.append(args))
-        monkeypatch.setattr(config, "VOICE_CONTINUATION_MS", 1000, raising=False)
-        monkeypatch.setattr(config, "VOICE_FILLERS_ENABLED", False, raising=False)
-        endpoint = next(
-            route.endpoint for route in voice_router.build_router(FakeOrchestrator()).routes
-            if route.path == "/ws/voice/stream"
-        )
-        await asyncio.wait_for(endpoint(FakeWebSocket()), timeout=3)
-
-    asyncio.run(run())
-
-    merged_text = "Mantis erinnere mich an Den Müll morgen früh rausbringen."
-    assert response_texts == [merged_text]
-    assert tool_side_effects == ["reminder"]
-    latency_events = [args for args in logged if args[0] == "voice_latency"]
-    assert len(latency_events) == 1
-
-
-def test_completed_voice_turn_is_not_merged_with_later_tool_turn(monkeypatch):
-    import config
-    import core.vad as vad
-    import core.wakeword as wakeword
-    import web.routers.voice as voice_router
-
-    response_texts = []
-    first_text = "Mantis mach das Licht an"
-    second_text = "Mantis mach das Licht aus"
-
-    class FakeSession:
-        def __init__(self, *, on_speech_started=None, **_kwargs):
-            self.on_speech_started = on_speech_started
-            self.segments = iter((
-                {"text": first_text, "wakeword_triggered": True},
-                {"text": second_text, "wakeword_triggered": True},
-            ))
-
-        async def handle_chunk(self, _chunk, muted=False):
-            if self.on_speech_started is not None:
-                self.on_speech_started()
-            return next(self.segments, None)
-
-        async def close(self):
-            pass
-
-    class FakeWebSocket:
-        def __init__(self):
-            self.receives = 0
-
-        async def accept(self):
-            pass
-
-        async def send_json(self, _data):
-            pass
-
-        async def receive(self):
-            self.receives += 1
-            if self.receives == 1:
-                return {"bytes": b"first"}
-            if self.receives == 2:
-                await asyncio.sleep(0.02)
-                assert response_texts == [first_text]
-                return {"bytes": b"second"}
-            if self.receives == 3:
-                await asyncio.sleep(0.05)
-                return {"type": "websocket.disconnect"}
-            raise AssertionError("Unerwartete WebSocket-Nachricht")
-
-    class FakeOrchestrator:
-        async def voice_respond(self, text, **_kwargs):
-            response_texts.append(text)
-            return "Erledigt.", [{"tool": "set_light"}]
-
-    async def fake_sende_antwort(*_args, **_kwargs):
-        return 1.0
-
-    async def forbidden_address_check(*_args, **_kwargs):
-        raise AssertionError("Beide Turns haben das Wakeword")
-
-    async def run():
-        monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
-        monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
-        monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
-        monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
-        monkeypatch.setattr(voice_router, "sende_antwort", fake_sende_antwort)
-        monkeypatch.setattr(voice_router, "is_addressed_to_mantis", forbidden_address_check)
-        monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
-        monkeypatch.setattr(config, "VOICE_CONTINUATION_MS", 1000, raising=False)
-        monkeypatch.setattr(config, "VOICE_FILLERS_ENABLED", False, raising=False)
-        endpoint = next(
-            route.endpoint for route in voice_router.build_router(FakeOrchestrator()).routes
-            if route.path == "/ws/voice/stream"
-        )
-        await asyncio.wait_for(endpoint(FakeWebSocket()), timeout=3)
-
-    asyncio.run(run())
-
-    assert response_texts == [first_text, second_text]
-
-
-def test_incomplete_voice_turn_flushes_after_continuation_window(monkeypatch):
-    import config
-    import core.vad as vad
-    import core.wakeword as wakeword
-    import web.routers.voice as voice_router
-
-    response_times = []
-    ended_at = time.monotonic()
-
-    class FakeSession:
-        def __init__(self, **_kwargs):
-            self.first = True
-
-        async def handle_chunk(self, _chunk, muted=False):
-            if not self.first:
-                return None
-            self.first = False
-            return {
-                "text": "Mantis erinnere mich an",
-                "wakeword_triggered": True,
-                "turn_started_at": time.perf_counter(),
-                "segment_ended_at": ended_at,
-            }
-
-        async def close(self):
-            pass
-
-    class FakeWebSocket:
-        def __init__(self):
-            self.receives = 0
-
-        async def accept(self):
-            pass
-
-        async def send_json(self, _data):
-            pass
-
-        async def receive(self):
-            self.receives += 1
-            if self.receives == 1:
-                return {"bytes": b"first"}
-            await asyncio.wait_for(response_started.wait(), timeout=1)
-            return {"type": "websocket.disconnect"}
-
-    response_started = asyncio.Event()
-
-    class FakeOrchestrator:
-        async def voice_respond(self, _text, **_kwargs):
-            response_times.append(time.monotonic())
-            response_started.set()
-            return "Wann soll ich dich erinnern?", []
-
-    async def fake_sende_antwort(*_args, **_kwargs):
-        return 1.0
-
-    async def forbidden_address_check(*_args, **_kwargs):
-        raise AssertionError("Der Turn hat das Wakeword")
-
-    async def run():
-        monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
-        monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
-        monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
-        monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
-        monkeypatch.setattr(voice_router, "sende_antwort", fake_sende_antwort)
-        monkeypatch.setattr(voice_router, "is_addressed_to_mantis", forbidden_address_check)
-        monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
-        monkeypatch.setattr(config, "VOICE_CONTINUATION_MS", 60, raising=False)
-        monkeypatch.setattr(config, "VOICE_FILLERS_ENABLED", False, raising=False)
-        endpoint = next(
-            route.endpoint for route in voice_router.build_router(FakeOrchestrator()).routes
-            if route.path == "/ws/voice/stream"
-        )
-        await asyncio.wait_for(endpoint(FakeWebSocket()), timeout=3)
-
-    asyncio.run(run())
-
-    assert response_times
-    assert response_times[0] - ended_at >= 0.05
-
-
 def test_voice_latency_does_not_claim_reflex_prework_was_reused(monkeypatch):
     from core.voice_prework import VoiceTurnPrework
 
@@ -2533,7 +2275,453 @@ def test_voice_latency_does_not_claim_reflex_prework_was_reused(monkeypatch):
     assert detail["partial_runs"] == 1
     assert detail["partial_as_final"] is True
     assert detail["partial_reused"] is False
-    assert detail["saved_ms"] == 0
+
+
+def _pcm_frame(amplitude=0, sample_count=512):
+    import struct
+
+    return struct.pack(f"<{sample_count}h", *([amplitude] * sample_count))
+
+
+def _make_real_voice_orchestrator(monkeypatch, responses):
+    from types import SimpleNamespace
+
+    import core.message_handler as message_handler
+    from core.message_handler import MessageHandler
+    from memory.kzg import KZG
+
+    class Agent:
+        backend = SimpleNamespace(sends_full_tool_catalog=True)
+        model_name = "voice-test"
+
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, **kwargs):
+            messages = kwargs["messages"]
+            last = messages[-1]
+            content = last.get("content") if isinstance(last, dict) else last.content
+            text = next((item for item in responses if content.startswith(item)), content)
+            keyword_tools = list(kwargs.get("allowed_tools", ()))
+            keyword_force = bool(kwargs.get("force_tools", False))
+            if "tool_selection_task" in kwargs:
+                tools, force = await kwargs["tool_selection_task"]
+            else:
+                tools, force = keyword_tools, keyword_force
+            self.calls.append({
+                "text": text,
+                "keyword_tools": keyword_tools,
+                "keyword_force": keyword_force,
+                "tools": list(tools),
+                "force": bool(force),
+                "prework": kwargs.get("prework"),
+            })
+            gate = kwargs.get("execution_gate")
+            if gate is not None:
+                assert await gate()
+            reply, trace = responses[text]
+            return reply, trace
+
+    class PromptBuilder:
+        async def build(self, _text, **_kwargs):
+            return "Voice-Test-Kontext"
+
+    agent = Agent()
+    persisted = []
+    kzg = KZG(max_turns=40)
+    handler = MessageHandler(
+        kzg=kzg,
+        lzg=SimpleNamespace(save_kzg_turn=lambda *_args, **_kwargs: None),
+        agent=agent,
+        prompt_builder=PromptBuilder(),
+        channel=None,
+        proactive_tracker=None,
+        forgetting=None,
+        extractor=None,
+        bg_llm=None,
+        alphaprogression=SimpleNamespace(extract_link=lambda _text: None),
+        on_user_active=lambda: None,
+    )
+    handler._persist_msg = lambda role, content, channel="telegram", meta=None, **_kwargs: persisted.append(
+        (role, content, channel, meta or {}),
+    )
+
+    async def no_external_classification(_text):
+        return None
+
+    def discard_background_task(coro, _label):
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+
+    monkeypatch.setattr(message_handler, "_safe_task", discard_background_task)
+    monkeypatch.setattr(message_handler.fast_commands, "match", lambda _text: None)
+    monkeypatch.setattr(message_handler.fast_commands, "match_voice", lambda _text: None)
+    monkeypatch.setattr(message_handler.skill_request, "match", lambda _text: None)
+    monkeypatch.setattr(message_handler.skills.T, "_semantic_rank", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        message_handler.skills.T.decisions, "tool_categories", no_external_classification,
+    )
+
+    class Orchestrator:
+        voice_agent = agent
+        prepared_texts = []
+
+        async def prepare_voice_turn(self, text):
+            self.prepared_texts.append(text)
+            return await handler.prepare_voice_turn(text)
+
+        async def voice_respond(self, text, prework=None, execution_gate=None):
+            return await handler.dashboard_respond(
+                text,
+                agent=agent,
+                channel_name="voice",
+                prework=prework,
+                execution_gate=execution_gate,
+            )
+
+    return Orchestrator(), handler, agent, persisted
+
+
+def _install_real_voice_session_inputs(monkeypatch, partial_transcriber, final_transcriber):
+    import core.vad as vad
+    import core.voice_stream as voice_stream
+    import core.wakeword as wakeword
+    import web.routers.voice as voice_router
+
+    class VAD:
+        def speech_probability(self, frame):
+            return 0.9 if any(frame) else 0.0
+
+    class Wakeword:
+        def __init__(self, *_args, **_kwargs):
+            self.fired = False
+
+        def check(self, frame):
+            if any(frame) and not self.fired:
+                self.fired = True
+                return True
+            return False
+
+    monkeypatch.setattr(vad, "SileroVAD", lambda _path: VAD())
+    monkeypatch.setattr(wakeword, "WakeWordDetector", Wakeword)
+    monkeypatch.setattr(voice_stream, "transcribe_pcm", final_transcriber)
+    monkeypatch.setattr(voice_router, "transcribe_pcm_partial", partial_transcriber)
+    monkeypatch.setattr(voice_router, "partial_stt_executor_available", lambda: True)
+    monkeypatch.setattr(
+        voice_stream.stt_runtime, "estimate_stt_runtime_ms", lambda _seconds: 1,
+    )
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
+
+
+class _LiveVoiceWebSocket:
+    def __init__(self, actions):
+        self.actions = list(actions)
+        self.sent = []
+        self._response_count = 0
+        self._changed = asyncio.Event()
+
+    async def accept(self):
+        pass
+
+    async def send_json(self, data):
+        self.sent.append(data)
+        if "audio_b64" in data:
+            self._response_count += 1
+            self._changed.set()
+
+    async def _wait_for_responses(self, count):
+        while self._response_count < count:
+            self._changed.clear()
+            if self._response_count >= count:
+                return
+            await self._changed.wait()
+
+    async def receive(self):
+        while self.actions:
+            action = self.actions.pop(0)
+            if isinstance(action, tuple) and action[0] == "wait":
+                try:
+                    await asyncio.wait_for(
+                        self._wait_for_responses(action[1]), timeout=action[2],
+                    )
+                except TimeoutError:
+                    pass
+                continue
+            if callable(action):
+                action()
+                continue
+            if action is None:
+                return {"type": "websocket.disconnect"}
+            await asyncio.sleep(0.001)
+            return {"bytes": action}
+        return {"type": "websocket.disconnect"}
+
+
+def test_incomplete_voice_segment_is_processed_without_continuation_timer(monkeypatch):
+    import base64
+
+    import config
+    import web.routers.voice as voice_router
+
+    text = "Mantis erinnere mich an"
+    responses = {text: ("Worauf soll ich dich erinnern?", [])}
+    orchestrator, handler, agent, persisted = _make_real_voice_orchestrator(
+        monkeypatch, responses,
+    )
+    _install_real_voice_session_inputs(
+        monkeypatch,
+        partial_transcriber=lambda _audio: asyncio.sleep(0, result=(text, False)),
+        final_transcriber=lambda _audio: asyncio.sleep(0, result=(text, False)),
+    )
+    monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True, raising=False)
+    monkeypatch.setattr(config, "VOICE_SILENCE_SLOW_MS", 2000, raising=False)
+    monkeypatch.setattr(config, "VOICE_PARTIAL_STT_MS", 1, raising=False)
+    monkeypatch.setattr(config, "VOICE_PARTIAL_MAX_MS", 900, raising=False)
+    monkeypatch.setattr(config, "VOICE_FILLERS_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "VOICE_BARGEIN", False, raising=False)
+
+    async def synthesize(_text):
+        return b"voice-test-audio"
+
+    async def address_check(*_args, **_kwargs):
+        raise AssertionError("Der Segmentstart wurde durch Wakeword freigegeben")
+
+    monkeypatch.setattr(voice_router, "synthesize", synthesize)
+    monkeypatch.setattr(voice_router, "is_addressed_to_mantis", address_check)
+    actions = (
+        [_pcm_frame(0)] * 3
+        + [_pcm_frame(1200)] * 20
+        + [_pcm_frame(0)] * 70
+        + [("wait", 1, 0.25), None]
+    )
+    websocket = _LiveVoiceWebSocket(actions)
+    endpoint = next(
+        route.endpoint for route in voice_router.build_router(orchestrator).routes
+        if route.path == "/ws/voice/stream"
+    )
+
+    asyncio.run(asyncio.wait_for(endpoint(websocket), timeout=5))
+
+    audio_responses = [item for item in websocket.sent if "audio_b64" in item]
+    assert len(audio_responses) == 1
+    assert audio_responses[0]["text"] == text
+    assert audio_responses[0]["audio_b64"] == base64.b64encode(b"voice-test-audio").decode()
+    assert [call["text"] for call in agent.calls] == [text]
+    assert [(turn.role, turn.content) for turn in handler.kzg.get_turns()] == [
+        ("user", text), ("assistant", "Worauf soll ich dich erinnern?"),
+    ]
+    assert [(role, content) for role, content, _channel, _meta in persisted] == [
+        ("user", text), ("assistant", "Worauf soll ich dich erinnern?"),
+    ]
+
+
+def test_incomplete_voice_phrase_spans_1800ms_pause_in_one_real_segment(monkeypatch):
+    import base64
+
+    import config
+    import web.routers.voice as voice_router
+
+    incomplete = "Mantis erinnere mich an"
+    complete = "Mantis erinnere mich an den Müll morgen früh"
+    responses = {complete: ("Ich erinnere dich morgen früh.", [{"tool": "set_reminder"}])}
+    orchestrator, handler, agent, persisted = _make_real_voice_orchestrator(
+        monkeypatch, responses,
+    )
+    final_segments = []
+
+    async def partial_transcriber(audio):
+        if len(audio) > 50_000:
+            return None
+        return incomplete, False
+
+    async def final_transcriber(audio):
+        final_segments.append(audio)
+        return complete, False
+
+    _install_real_voice_session_inputs(monkeypatch, partial_transcriber, final_transcriber)
+    monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", True, raising=False)
+    monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800, raising=False)
+    monkeypatch.setattr(config, "VOICE_SILENCE_SLOW_MS", 2000, raising=False)
+    monkeypatch.setattr(config, "VOICE_PARTIAL_STT_MS", 1, raising=False)
+    monkeypatch.setattr(config, "VOICE_PARTIAL_MAX_MS", 600, raising=False)
+    monkeypatch.setattr(config, "VOICE_FILLERS_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "VOICE_BARGEIN", False, raising=False)
+
+    async def synthesize(_text):
+        return b"voice-test-audio"
+
+    async def address_check(*_args, **_kwargs):
+        raise AssertionError("Das Segment wurde vom Wakeword freigegeben")
+
+    monkeypatch.setattr(voice_router, "synthesize", synthesize)
+    monkeypatch.setattr(voice_router, "is_addressed_to_mantis", address_check)
+
+    def assert_pause_has_not_ended_segment():
+        assert final_segments == []
+        assert websocket._response_count == 0
+
+    # PCM in 8-ms worklet chunks: 225 silence chunks are genau 1,8 Sekunden.
+    actions = (
+        [_pcm_frame(0, 128)] * 3
+        + [_pcm_frame(1200, 128)] * 80
+        + [_pcm_frame(0, 128)] * 225
+        + [assert_pause_has_not_ended_segment]
+        + [_pcm_frame(1200, 128)] * 80
+        + [_pcm_frame(0, 128)] * 275
+        + [("wait", 1, 1.0), None]
+    )
+    websocket = _LiveVoiceWebSocket(actions)
+    endpoint = next(
+        route.endpoint for route in voice_router.build_router(orchestrator).routes
+        if route.path == "/ws/voice/stream"
+    )
+
+    asyncio.run(asyncio.wait_for(endpoint(websocket), timeout=8))
+
+    audio_responses = [item for item in websocket.sent if "audio_b64" in item]
+    assert len(final_segments) == 1
+    assert len(agent.calls) == 1
+    assert agent.calls[0]["text"] == complete
+    assert "set_reminder" in agent.calls[0]["tools"]
+    assert agent.calls[0]["force"] is True
+    assert len(audio_responses) == 1
+    assert audio_responses[0]["text"] == complete
+    assert audio_responses[0]["audio_b64"] == base64.b64encode(b"voice-test-audio").decode()
+    assert [(turn.role, turn.content) for turn in handler.kzg.get_turns()] == [
+        ("user", complete), ("assistant", "Ich erinnere dich morgen früh."),
+    ]
+    assert [(role, content) for role, content, _channel, _meta in persisted] == [
+        ("user", complete), ("assistant", "Ich erinnere dich morgen früh."),
+    ]
+
+
+def test_voice_router_limits_followup_tools_to_read_only_and_drops_old_action_context(
+    monkeypatch,
+):
+    import base64
+
+    import config
+    import core.voice_stream as voice_stream
+    import web.routers.voice as voice_router
+
+    texts = (
+        "Mantis, wie wird das Wetter morgen?",
+        "Und nächste Woche?",
+        "Wie wird das Wetter nächste Woche?",
+        "Morgen früh?",
+        "Lösche meine Aufgabe 42.",
+        "Erzähl mir einen Witz.",
+    )
+    amplitudes = dict(zip((1200, 1800, 2400, 3000, 3600, 4200), texts, strict=True))
+    responses = {
+        texts[0]: ("Morgen wird es mild.", [{"tool": "get_weather"}]),
+        texts[1]: ("Nächste Woche wird es kühler.", [{"tool": "get_weather"}]),
+        texts[2]: ("Nächste Woche bleibt es trocken.", [{"tool": "get_weather"}]),
+        texts[3]: ("Morgen früh bleibt es kühl.", [{"tool": "get_weather"}]),
+        texts[4]: ("Die Aufgabe wurde gelöscht.", []),
+        texts[5]: ("Warum ging der Computer zum Arzt? Wegen eines Virus.", []),
+    }
+    orchestrator, handler, agent, persisted = _make_real_voice_orchestrator(
+        monkeypatch, responses,
+    )
+
+    def text_for_audio(audio):
+        samples = memoryview(audio).cast("h")
+        marker = max((abs(sample) for sample in samples), default=0)
+        return amplitudes[marker]
+
+    async def partial_transcriber(audio):
+        return text_for_audio(audio), False
+
+    async def final_transcriber(audio):
+        return text_for_audio(audio), False
+
+    _install_real_voice_session_inputs(monkeypatch, partial_transcriber, final_transcriber)
+    monkeypatch.setattr(voice_stream.stt_runtime, "estimate_stt_runtime_ms", lambda _seconds: 1)
+    monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", False, raising=False)
+    monkeypatch.setattr(config, "VOICE_SILENCE_MS", 64, raising=False)
+    monkeypatch.setattr(config, "VOICE_PARTIAL_STT_MS", 1, raising=False)
+    monkeypatch.setattr(config, "VOICE_PARTIAL_MAX_MS", 1200, raising=False)
+    monkeypatch.setattr(config, "VOICE_FILLERS_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "VOICE_BARGEIN", False, raising=False)
+
+    async def synthesize(_text):
+        return b"voice-test-audio"
+
+    address_checks = []
+
+    async def address_check(text, **_kwargs):
+        address_checks.append(text)
+        return True
+
+    monkeypatch.setattr(voice_router, "synthesize", synthesize)
+    monkeypatch.setattr(voice_router, "is_addressed_to_mantis", address_check)
+
+    actions = [_pcm_frame(0)] * 3
+    for index, amplitude in enumerate(amplitudes):
+        actions.extend([_pcm_frame(amplitude)] * 20)
+        actions.extend([_pcm_frame(0)] * 4)
+        actions.append(("wait", index + 1, 1.0))
+    actions.append(None)
+    websocket = _LiveVoiceWebSocket(actions)
+    endpoint = next(
+        route.endpoint for route in voice_router.build_router(orchestrator).routes
+        if route.path == "/ws/voice/stream"
+    )
+
+    asyncio.run(asyncio.wait_for(endpoint(websocket), timeout=10))
+
+    assert len(agent.calls) == 6
+    weather_followup = agent.calls[1]
+    assert "get_weather" in weather_followup["keyword_tools"]
+    assert "get_weather" in weather_followup["tools"]
+    assert weather_followup["keyword_force"] is False
+    assert weather_followup["force"] is False
+    assert set(weather_followup["tools"]) <= {
+        "get_weather", "web_search", "brain_search",
+    }
+
+    time_followup = agent.calls[3]
+    assert "get_weather" in time_followup["keyword_tools"]
+    assert "get_weather" in time_followup["tools"]
+    assert time_followup["keyword_force"] is False
+    assert time_followup["force"] is False
+    assert set(time_followup["tools"]) <= {
+        "get_weather", "web_search", "brain_search",
+    }
+
+    delete_turn = agent.calls[4]
+    assert delete_turn["keyword_force"] is True
+    assert delete_turn["force"] is True
+    assert "set_reminder" in delete_turn["tools"]
+
+    joke_turn = agent.calls[5]
+    assert joke_turn["keyword_tools"] == []
+    assert joke_turn["keyword_force"] is False
+    assert joke_turn["tools"] == []
+    assert joke_turn["force"] is False
+    assert "set_reminder" not in joke_turn["tools"]
+    assert set(texts[1:]) <= set(orchestrator.prepared_texts)
+
+    audio_responses = [item for item in websocket.sent if "audio_b64" in item]
+    assert len(audio_responses) == 6
+    assert all(
+        item["audio_b64"] == base64.b64encode(b"voice-test-audio").decode()
+        for item in audio_responses
+    )
+    assert [item["text"] for item in audio_responses] == list(texts)
+    assert [(turn.role, turn.content) for turn in handler.kzg.get_turns()] == [
+        item
+        for text, (reply, _trace) in responses.items()
+        for item in (("user", text), ("assistant", reply))
+    ]
+    assert [(role, content) for role, content, _channel, _meta in persisted] == [
+        item
+        for text, (reply, _trace) in responses.items()
+        for item in (("user", text), ("assistant", reply))
+    ]
+    assert address_checks == list(texts[1:])
 
 
 def test_streaming_voice_turn_resets_timing_context(monkeypatch):

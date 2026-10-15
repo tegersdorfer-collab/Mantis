@@ -77,7 +77,6 @@ class VoiceStreamSession:
         ] | None | object = _DEFAULT_PARTIAL,
         partial_executor_available: Callable[[], bool] | None | object = _DEFAULT_PARTIAL,
         on_partial: Callable[[str], None] | None = None,
-        on_speech_started: Callable[[float], None] | None = None,
         partial_interval_ms: float | None = None,
         clock: Callable[[], float] | None = None,
         bargein_active_fn: Callable[[], bool] | None = None,
@@ -110,7 +109,6 @@ class VoiceStreamSession:
             self._partial_executor_available
         )
         self._on_partial = on_partial
-        self._on_speech_started = on_speech_started
         self._partial_interval_ms = float(
             config.VOICE_PARTIAL_STT_MS if partial_interval_ms is None else partial_interval_ms
         )
@@ -118,7 +116,6 @@ class VoiceStreamSession:
         self._bargein_active_fn = bargein_active_fn or (lambda: False)
         self._on_bargein = on_bargein
         self._bargein_notified = False
-        self._speech_onset_notified = False
         self._speech_started_at: float | None = None
         self._last_partial_at: float | None = None
         self._partial_task: asyncio.Task | None = None
@@ -135,7 +132,6 @@ class VoiceStreamSession:
     def _reset_segment_state(self) -> None:
         self._segment_generation += 1
         self._bargein_notified = False
-        self._speech_onset_notified = False
         self._speech_started_at = None
         self._last_partial_at = None
         self._partial_runs = 0
@@ -255,7 +251,6 @@ class VoiceStreamSession:
                 "wakeword_hint": bool(wakeword_hint),
                 "stt_ms": stt_ms,
                 "turn_started_at": turn_started_at,
-                "segment_ended_at": time.monotonic(),
                 "partial_runs": partial_runs,
                 "partial_skip_reasons": partial_skip_reasons,
                 "partial_text": partial_text,
@@ -314,13 +309,6 @@ class VoiceStreamSession:
         if not speaking or not current_chunk_is_speech:
             self._partial_skip_reasons["no_speech"] += 1
             return
-        if not self._speech_onset_notified:
-            self._speech_onset_notified = True
-            if self._on_speech_started is not None:
-                try:
-                    self._on_speech_started(self._clock())
-                except Exception as exc:
-                    log.debug("Voice-Speechstart-Callback fehlgeschlagen (%s)", type(exc).__name__)
         if self._partial_interval_ms <= 0:
             self._partial_skip_reasons["disabled"] += 1
             return

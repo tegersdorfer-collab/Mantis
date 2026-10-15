@@ -978,6 +978,7 @@ class TestVoiceStreamSession:
         asyncio.run(run())
 
     def test_partial_runtime_estimate_skips_a_run_over_configured_budget(self, monkeypatch):
+        import time
         import config
         import core.voice_stream as vs
         from core import voice
@@ -1016,6 +1017,9 @@ class TestVoiceStreamSession:
 
             monkeypatch.setattr(voice, "_parakeet_model", TimedParakeet())
             monkeypatch.setattr(voice, "_parakeet_unavailable", False)
+            monkeypatch.setattr(
+                voice, "_parakeet_last_activity_at", time.monotonic() - 30,
+            )
             monkeypatch.setattr(voice, "_whisper_lock", asyncio.Lock())
             monkeypatch.setattr(voice.time, "perf_counter", clock)
 
@@ -1144,9 +1148,10 @@ class TestVoiceStreamSession:
         assert partial_runs == 1
 
     def test_partial_runtime_estimate_is_shared_with_new_sessions(self, monkeypatch):
+        import time
         import config
         import core.voice_stream as vs
-        from core import voice
+        from core import stt_runtime, voice
 
         class FakeClock:
             now = 0.0
@@ -1171,17 +1176,23 @@ class TestVoiceStreamSession:
         async def run():
             monkeypatch.setattr(config, "VOICE_PARTIAL_MAX_MS", 600, raising=False)
             monkeypatch.setattr(config, "STT_ENGINE", "parakeet")
+            stt_runtime.record_stt_runtime(
+                1.0, stt_runtime.INITIAL_MS_PER_AUDIO_SECOND, replace_samples=True,
+            )
             clock = FakeClock()
             partial_calls = []
 
             class TimedParakeet:
                 def transcribe(self, audio_path):
                     partial_calls.append(audio_path)
-                    clock.advance(0.8)
+                    clock.advance(1.6)
                     return MagicMock(text="Teiltext")
 
             monkeypatch.setattr(voice, "_parakeet_model", TimedParakeet())
             monkeypatch.setattr(voice, "_parakeet_unavailable", False)
+            monkeypatch.setattr(
+                voice, "_parakeet_last_activity_at", time.monotonic() - 30,
+            )
             monkeypatch.setattr(voice, "_whisper_lock", asyncio.Lock())
             monkeypatch.setattr(voice.time, "perf_counter", clock)
 
@@ -1202,6 +1213,8 @@ class TestVoiceStreamSession:
             await first_session.handle_chunk(vad_frame(2), muted=False)
             assert first_session._partial_task is not None
             await first_session._partial_task
+            audio_seconds = 2 * len(vad_frame(1)) / (2 * 16_000)
+            assert stt_runtime.estimate_stt_runtime_ms(audio_seconds) > 600
 
             second_session = new_session()
             await second_session.handle_chunk(vad_frame(3), muted=False)
