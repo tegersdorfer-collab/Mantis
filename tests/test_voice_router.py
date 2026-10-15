@@ -76,6 +76,24 @@ class TestVoiceSegmentEndpoint:
         fake_orch.voice_respond.assert_not_called()
         mock_synth.assert_not_called()
 
+    def test_segment_endpoint_prueft_rohes_transkript_ohne_akustischen_wakeword_treffer(self):
+        raw = "Mantas, wie spät ist es?"
+        address_check = AsyncMock(return_value=False)
+        transcriber = AsyncMock(return_value=(raw, False))
+        with patch("web.routers.voice.transcribe_audio_with_hint", new=transcriber), \
+             patch("web.routers.voice.is_addressed_to_mantis", new=address_check):
+            response = _make_client().post(
+                "/api/voice/segment",
+                files={"audio": ("segment.wav", _fake_wav_bytes(), "audio/wav")},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["text"] == raw
+        assert response.json()["addressed"] is False
+        transcriber.assert_awaited_once()
+        assert transcriber.await_args.kwargs == {"wakeword_triggered": False}
+        address_check.assert_awaited_once_with(raw, wakeword_hint=False)
+
     def test_leeres_transkript_ueberspringt_alles(self):
         fake_orch = MagicMock()
         fake_orch.voice_respond = AsyncMock()

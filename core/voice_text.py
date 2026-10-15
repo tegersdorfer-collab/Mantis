@@ -16,7 +16,7 @@ _ABBREVIATION_BEFORE_PERIOD = re.compile(
 )
 _ACOUSTIC_WAKEWORD_PREFIX = re.compile(
     r"^\s*(?:meintest|mehr[\s-]+das|mertes|mantasy|bantas|mann[\s-]+das|"
-    r"mentiones|mendes|mandis|mentis|mantis)\b[\s,;:!?-]*(?P<rest>.*)$",
+    r"mentiones|mendes|mandis|mentis|mantas|mantis)\b[\s,;:!?-]*(?P<rest>.*)$",
     re.IGNORECASE,
 )
 
