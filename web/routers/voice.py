@@ -420,7 +420,7 @@ _VOICE_ECHO_FILLER_WORDS = frozenset({
 def _is_recent_tts_echo(
     text: str, echo_texts,
 ) -> bool:
-    """Erkennt nur nahezu wortgleiche, zusammenhängende TTS-Echos."""
+    """Erkennt nur wortgleiche, zusammenhängende TTS-Echos (nach Füllwort-Entfernung)."""
     def tokens(value: str) -> list[str]:
         normalized = unicodedata.normalize("NFKC", str(value)).casefold()
         return [
@@ -433,22 +433,11 @@ def _is_recent_tts_echo(
         return False
     if isinstance(echo_texts, str):
         echo_texts = [echo_texts]
-    max_mismatches = len(transcript_tokens) // 6
+    size = len(transcript_tokens)
     for spoken_text in echo_texts:
         spoken_tokens = tokens(spoken_text)
-        if len(spoken_tokens) < len(transcript_tokens):
-            continue
-        if not set(transcript_tokens).issubset(spoken_tokens):
-            continue
-        for start in range(len(spoken_tokens) - len(transcript_tokens) + 1):
-            mismatches = sum(
-                actual != expected
-                for actual, expected in zip(
-                    spoken_tokens[start:start + len(transcript_tokens)],
-                    transcript_tokens,
-                )
-            )
-            if mismatches <= max_mismatches:
+        for start in range(len(spoken_tokens) - size + 1):
+            if spoken_tokens[start:start + size] == transcript_tokens:
                 return True
     return False
 
@@ -1087,8 +1076,11 @@ def build_router(orch=None) -> APIRouter:
         async def process_voice_result(result: dict) -> None:
             nonlocal active_playback, active_response_task
             text = str(result.get("text") or "").strip()
-            now = time.monotonic()
-            if _is_recent_tts_echo(text, _recent_tts_echo_texts(now)):
+            # Echo-Texte stammen vom Empfangszeitpunkt (Einreihen), nicht von der
+            # Abarbeitung: langsame Adress-Checks davor dürfen das Fenster nicht schließen.
+            echo_texts = list(result.pop("_echo_texts", ()))
+            echo_texts.extend(_recent_tts_echo_texts(time.monotonic()))
+            if _is_recent_tts_echo(text, echo_texts):
                 log.debug("Voice-Transkript als Echo der letzten TTS-Blöcke verworfen")
                 if prework_cache is not None:
                     prework_cache.clear()
@@ -1231,6 +1223,7 @@ def build_router(orch=None) -> APIRouter:
 
                 if result is None:
                     continue
+                result["_echo_texts"] = _recent_tts_echo_texts(time.monotonic())
                 turn_results.put_nowait(result)
         except WebSocketDisconnect:
             log.info("Voice-WebSocket-Verbindung geschlossen")

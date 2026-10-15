@@ -244,3 +244,31 @@ def test_agent_turn_discards_prework_for_distant_final_text(monkeypatch):
 
     assert builds == ["Erinnere mich in drei Wochen an einen Termin"]
     assert "Kontext: Erinnere mich in drei Wochen" in agent.kwargs["system"]
+
+
+def test_reflex_fast_path_checks_interrupt_before_executing_tool(monkeypatch):
+    from core import fast_commands, message_handler
+
+    command = fast_commands.match_voice("Schalte das Licht aus")
+    assert command is not None and command.tool != "voice_reflex"
+    handler = object.__new__(message_handler.MessageHandler)
+    executed = []
+
+    async def fake_execute(tool, args):
+        executed.append(tool)
+        return "ok"
+
+    monkeypatch.setattr(message_handler.skills.T, "execute", fake_execute)
+
+    async def run(interrupted):
+        return await handler._agent_turn(
+            "Schalte das Licht aus", channel_name="voice", agent=object(),
+            interrupt_check=lambda: interrupted,
+        )
+
+    with __import__("pytest").raises(asyncio.CancelledError):
+        asyncio.run(run(True))
+    assert executed == []
+    result, trace = asyncio.run(run(False))
+    assert executed == [command.tool]
+    assert trace[0]["reflex"] is True

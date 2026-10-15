@@ -275,11 +275,22 @@ def test_recent_tts_echo_requires_content_words_and_near_contiguous_order():
     assert voice_router._is_recent_tts_echo(
         "alpha bravo charlie delta echo foxtrot",
         ["alpha bravo xray delta echo foxtrot charlie"],
+    ) is False
+
+
+def test_recent_tts_echo_rejects_counter_command_with_one_differing_word():
+    import web.routers.voice as voice_router
+
+    spoken = ["Ich schalte das Licht im Wohnzimmer an und im Flur aus."]
+    assert voice_router._is_recent_tts_echo(
+        "Schalte das Licht im Wohnzimmer aus", spoken,
+    ) is False
+    assert voice_router._is_recent_tts_echo(
+        "Schalte das Licht im Wohnzimmer an", spoken,
     ) is True
     assert voice_router._is_recent_tts_echo(
-        "alpha bravo charlie delta echo",
-        ["alpha bravo xray delta echo charlie"],
-    ) is False
+        "und im Flur aus", spoken,
+    ) is True
 
 
 def test_tts_echo_window_uses_playback_progress_instead_of_send_age():
