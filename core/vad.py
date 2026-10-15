@@ -186,6 +186,7 @@ _EIN_COMMAND_VERBS = frozenset({"schalte", "schalt", "stell", "stelle", "trag", 
 # Nur Akkusativ-Artikel: 'dem/der Kunden ein …' leitet ein weiteres Objekt ein.
 _EIN_ACCUSATIVE_DETERMINERS = frozenset({
     "das", "den", "die", "mein", "meine", "meinen", "dein", "deine", "deinen",
+    "ein", "eine", "einen", "unser", "unsere", "unseren", "dieses", "diese", "diesen",
 })
 _EIN_BLOCKERS = frozenset({
     "mir", "dir", "uns", "euch", "ihm", "ihr", "heute",
