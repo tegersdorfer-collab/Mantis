@@ -114,3 +114,13 @@ Timo: „alles in die Cloud außer Embeddings“, Datenschutz vorerst egal, Spra
 
 ### 2026-10-14 – TTS: Cartesia Nico live
 Blind-Hörtest (5 Stimmen × 6 Mantis-Sätze mit englischen Wörtern): Timo wählt D = Cartesia Sonic 3.6 „Nico – Friendly Agent“, Platz 2 ElevenLabs v4 Turbo „Eric“ (Free-Plan nur Standardstimmen). Gemessen ~0,16 s bis erstes Byte. Merge 7ca9e18: TTS_ENGINE=cartesia Standard, Kokoro/Piper nur lazy als Fallback (Fehler, leeres/ungültiges Audio; 401/402/429 → 30 min Pause). Kosten in llm_usage (provider cartesia, 65 USD/1M Zeichen, Setting TTS_CARTESIA_USD_PER_MILLION_CHARS). STT bleibt Parakeet (Recherche: nichts klar Besseres für DE+EN). Offen: Timo testet Voice; danach Ollama-LLMs löschen.
+
+### 2026-10-15 – Voice menschlicher: Runden 0–4 live, TTS-Ersatzkette
+Spec `docs/specs/2026-10-14-voice-menschlich.md` komplett umgesetzt (jede Runde Sol/Opus-Review, mehrere Fix-Runden):
+- R0–2 (158063e): Parakeet-Warmup, Tool-Auswahl parallel, Kommagrenze; Füller (Nico, gecacht); Lagebild im Prompt + Reflexe. Live-Messung 15.10. 00:48: STT 0,34–0,56 s, Füller 0,8 s, erstes Antwort-Token ~1,5 s.
+- Livefixes: Weckwort-Fehlerkennungen („Mann das“) vor Reflexen, Lagebild nur bei exakten Daten, kein Recall bei „ja“, Feld first_answer_audio_ms.
+- R3 (84bcebe): Teil-STT während des Sprechens + Vorarbeit, Teiltext als Final wenn er alles abdeckt, adaptives Satzende COMPLETE 450 / INCOMPLETE 1200 / UNKNOWN 800 ms (Heuristik core/vad.py, konservativ).
+- TTS-Ersatzkette (3b4c506): Cartesia Nico → ElevenLabs Chris → Google Chirp3 Charon → lokal; Quota-Cooldown 1 h, Retry derselben Stimme vor Wechsel. Timo bleibt bei Nico (Blindtests: Nico klar vorn; Google, ElevenLabs-Standardstimmen, lokal Qwen3-TTS/Marvis/OmniVoice schwächer). Cartesia-Free 20k Zeichen/Monat; Pro 5 $ offen.
+- R4 (2f091d9): Barge-in – stop_playback sofort bei Sprache, unterbrechendes Segment durchläuft Adress-Check + Echo-Filter (exakte Teilfolge der eigenen TTS), Verlauf nur Gehörtes + [unterbrochen]. Desktop-App neu gebaut (/Applications/Mantis.app, alte im Scratchpad).
+- Ollama-LLMs gelöscht (nur qwen3-embedding), +22 GB.
+Offen: Timo testet R3/R4 live (ins Wort fallen? Unterbrechen? Echo?), dann voice_latency auswerten; „Mantas“ wird im STT-Pfad noch zu „Mantis“ normalisiert (P3); Google-Guthaben 264 € bis 14.01.2027 → Gemini Flash als Hintergrund-Kette prüfen; Klon-Hörtest (Qwen3-TTS-Klon von Nico/Thorsten) wartet auf Timos Urteil.
