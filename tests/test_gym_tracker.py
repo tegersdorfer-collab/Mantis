@@ -362,3 +362,24 @@ def test_tracker_prefers_session_target_unit_over_exercise_unit(monkeypatch):
 
     assert updated["reps"] == 150
     assert cursor.statements[-2][1] == (20.0, None, 150, 7)
+
+
+def test_adhoc_added_timed_exercise_logs_seconds_in_duration_s(hang):
+    from domains.gym import plans
+
+    first = _client_id(hang)
+    tracker.log_set(first, "Squats", 100, 5, now=NOW)
+    workout_id = db.query_one(
+        "SELECT w.id FROM workouts w JOIN workout_sets s ON s.workout_id=w.id WHERE s.client_id=%s",
+        (first,),
+    )["id"]
+    entry = plans.add_session_exercise(workout_id, hang["hang_id"])
+    assert entry["target_unit"] == "seconds"
+
+    client_id = _client_id(hang)
+    saved = tracker.log_set(client_id, hang["hang_name"], 20, 120, now=NOW)
+    row = _stored(client_id)
+    assert (row["reps"], row["duration_s"]) == (None, 120)
+    tracker.update_set(saved["id"], None, 150, now=NOW)
+    row = _stored(client_id)
+    assert (row["reps"], row["duration_s"]) == (None, 150)

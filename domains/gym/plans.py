@@ -920,23 +920,28 @@ def _open_workout(workout_id: int) -> dict:
 def add_session_exercise(workout_id: int, exercise_id: int) -> dict:
     _open_workout(workout_id)
     exercise = db.query_one(
-        "SELECT id,name,muscle,equipment,rep_min,rep_max FROM exercises WHERE id=%s",
+        "SELECT id,name,muscle,equipment,unit,rep_min,rep_max FROM exercises WHERE id=%s",
         (exercise_id,),
     )
     if not exercise:
         raise TrackerError(404, "Übung nicht gefunden")
+    target_unit = "seconds" if exercise.get("unit") == "min" else "reps"
     next_order = db.query_one(
         "SELECT COALESCE(MAX(sort_order),-1)+1 AS next FROM gym_workout_exercises WHERE workout_id=%s",
         (workout_id,),
     )["next"]
-    low = int(exercise.get("rep_min") or 6)
-    high = max(low, int(exercise.get("rep_max") or 10))
+    if target_unit == "seconds":
+        # Wdh.-Defaults der Übung passen nicht zu Haltezeiten.
+        low, high = 30, 40
+    else:
+        low = int(exercise.get("rep_min") or 6)
+        high = max(low, int(exercise.get("rep_max") or 10))
     try:
         db.execute(
             """INSERT INTO gym_workout_exercises
-                 (workout_id,exercise_id,sort_order,target_sets,rep_min,rep_max,rest_s)
-               VALUES (%s,%s,%s,3,%s,%s,%s)""",
-            (workout_id, exercise_id, next_order, low, high, DEFAULT_REST_SECONDS),
+                 (workout_id,exercise_id,sort_order,target_sets,rep_min,rep_max,rest_s,target_unit)
+               VALUES (%s,%s,%s,3,%s,%s,%s,%s)""",
+            (workout_id, exercise_id, next_order, low, high, DEFAULT_REST_SECONDS, target_unit),
         )
     except Exception as error:
         if "unique" in str(error).lower():
@@ -944,7 +949,7 @@ def add_session_exercise(workout_id: int, exercise_id: int) -> dict:
         raise
     entry = {
         **exercise, "exercise_id": exercise_id, "sort_order": next_order,
-        "target_sets": 3, "rep_min": low, "rep_max": high,
+        "target_sets": 3, "rep_min": low, "rep_max": high, "target_unit": target_unit,
         "rest_s": DEFAULT_REST_SECONDS, "session_exercise_id": 0,
     }
     return _session_entry_state(entry, workout_id)
