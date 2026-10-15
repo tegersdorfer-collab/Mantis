@@ -30,10 +30,18 @@ _last_used_text: str | None = None
 
 
 def _tts_identity() -> tuple[str, str]:
-    engine = str(tts._engine())
+    engine = str((tts._engine_chain() or [tts._engine()])[0])
     if engine == "cartesia":
         voice = str(getattr(config, "TTS_CARTESIA_VOICE", ""))
-    elif engine == "kokoro":
+    elif engine == "elevenlabs":
+        voice = str(getattr(config, "TTS_ELEVENLABS_VOICE", ""))
+    elif engine == "google":
+        voice = str(getattr(config, "TTS_GOOGLE_VOICE", ""))
+    elif engine == "kokoro" or (
+        engine == "local"
+        and not tts._kokoro_unavailable
+        and all(path.exists() for path in tts._kokoro_paths())
+    ):
         voice = str(getattr(config, "TTS_KOKORO_VOICE", ""))
     else:
         try:
@@ -128,6 +136,9 @@ async def preload_voice_fillers() -> None:
                 audio = await tts.synthesize_filler(text)
                 if not audio:
                     continue
+                # Ein lokaler Hauptprovider kann beim Laden von Kokoro auf Piper
+                # umschalten. Den Cache danach unter der tatsächlich aktiven Stimme ablegen.
+                path = cache_path(text)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 temporary_path = path.with_name(f"{path.name}.tmp")
                 temporary_path.write_bytes(audio)
