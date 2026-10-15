@@ -429,6 +429,7 @@ class SegmentEvent:
     duration_ms: float
     last_speech_sample_index: int | None = None
     silence_ms: float = 0.0
+    speech_audio: bytes = b""
 
 
 class VadSegmenter:
@@ -456,6 +457,7 @@ class VadSegmenter:
         self._speech_sample_count = 0
         self._buffer: list[bytes] = []
         self._buffer_samples = 0
+        self._speech_buffer: list[bytes] = []
         self._preroll: list[bytes] = []
         self._partial_transcript = ""
         self._partial_transcript_sample_index: int | None = None
@@ -470,6 +472,11 @@ class VadSegmenter:
     @property
     def current_audio(self) -> bytes:
         return b"".join(self._buffer)
+
+    @property
+    def current_speech_audio(self) -> bytes:
+        """Gibt nur erkannte Sprachframes ohne VAD-Preroll und Stille zurück."""
+        return b"".join(self._speech_buffer)
 
     @property
     def current_chunk_is_speech(self) -> bool:
@@ -555,6 +562,7 @@ class VadSegmenter:
                 self._speech_ms = 0.0
                 self._speech_energy_squared = 0
                 self._speech_sample_count = 0
+                self._speech_buffer = []
                 self._buffer = list(self._preroll)
                 self._buffer_samples = sum(len(chunk) // 2 for chunk in self._buffer)
                 self._last_speech_sample_index = None
@@ -562,6 +570,7 @@ class VadSegmenter:
             samples = struct.unpack(f"<{len(pcm_chunk) // 2}h", pcm_chunk)
             self._speech_energy_squared += sum(sample * sample for sample in samples)
             self._speech_sample_count += len(samples)
+            self._speech_buffer.append(pcm_chunk)
             self._buffer.append(pcm_chunk)
             self._buffer_samples += len(pcm_chunk) // 2
             self._last_speech_sample_index = self._buffer_samples
@@ -573,9 +582,11 @@ class VadSegmenter:
                 self._speaking = False
                 total_ms = self._speech_ms + self._silence_ms
                 segment = b"".join(self._buffer)
+                speech_segment = b"".join(self._speech_buffer)
                 last_speech_sample_index = self._last_speech_sample_index
                 self._buffer = []
                 self._buffer_samples = 0
+                self._speech_buffer = []
                 self._partial_transcript = ""
                 self._partial_transcript_sample_index = None
                 self._last_speech_sample_index = None
@@ -586,6 +597,7 @@ class VadSegmenter:
                         duration_ms=total_ms,
                         last_speech_sample_index=last_speech_sample_index,
                         silence_ms=self._silence_ms,
+                        speech_audio=speech_segment,
                     )
                 return None
 

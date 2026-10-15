@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import base64
 import io
 import wave
+import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 
 from fastapi import FastAPI
@@ -15,13 +16,18 @@ from fastapi.testclient import TestClient
 from web.routers.voice import build_router
 
 
+@pytest.fixture(autouse=True)
+def _disable_speaker_verification_for_legacy_cases(monkeypatch):
+    monkeypatch.setattr("config.VOICE_SPEAKER_VERIFY", False)
+
+
 def _make_client(orch=None) -> TestClient:
     app = FastAPI()
     app.include_router(build_router(orch))
     return TestClient(app)
 
 
-def _fake_wav_bytes() -> bytes:
+def _fake_wav_bytes(seconds: float = 1.0) -> bytes:
     """Erzeugt eine winzige, gültige (stille) WAV-Datei — reicht für den
     Upload-Pfad-Test, ohne echtes Audio-Material zu brauchen."""
     buf = io.BytesIO()
@@ -29,7 +35,7 @@ def _fake_wav_bytes() -> bytes:
         f.setnchannels(1)
         f.setsampwidth(2)
         f.setframerate(16000)
-        f.writeframes(b"\x00\x00" * 1600)  # 0.1s Stille
+        f.writeframes(b"\xe8\x03" * int(16000 * seconds))
     return buf.getvalue()
 
 
@@ -73,6 +79,42 @@ class TestVoiceSegmentEndpoint:
         assert body["addressed"] is False
         assert body["reply"] is None
         assert body["audio_b64"] is None
+        fake_orch.voice_respond.assert_not_called()
+        mock_synth.assert_not_called()
+
+    def test_http_segment_rejects_foreign_speaker_before_agent(self, monkeypatch):
+        import numpy as np
+
+        monkeypatch.setattr("config.VOICE_SPEAKER_VERIFY", True)
+        fake_orch = MagicMock()
+        fake_orch.voice_respond = AsyncMock()
+        verified_audio = []
+
+        class FakeSpeakerVerifier:
+            async def has_profile(self):
+                return True
+
+            async def verify_pcm(self, pcm_audio):
+                verified_audio.append(pcm_audio)
+                return type(
+                    "Verification", (),
+                    {"decision": "rejected", "score": 0.1, "embedding": np.ones(192)},
+                )()
+
+        with patch("core.speaker.get_speaker_verifier", return_value=FakeSpeakerVerifier()), \
+             patch("web.routers.voice.transcribe_audio_with_hint", new=AsyncMock(return_value=("Wie war mein Schlaf?", False))), \
+             patch("web.routers.voice.is_addressed_to_mantis", new=AsyncMock(return_value=True)) as address_check, \
+             patch("web.routers.voice.synthesize", new=AsyncMock()) as mock_synth:
+            response = _make_client(fake_orch).post(
+                "/api/voice/segment",
+                files={"audio": ("segment.wav", _fake_wav_bytes(), "audio/wav")},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["addressed"] is False
+        assert response.json()["reply"] is None
+        assert verified_audio == [b"\xe8\x03" * 16_000]
+        address_check.assert_not_called()
         fake_orch.voice_respond.assert_not_called()
         mock_synth.assert_not_called()
 

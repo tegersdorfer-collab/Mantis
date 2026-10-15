@@ -23,6 +23,10 @@ class FakeContext {
   state = 'running';
   currentTime = 0;
   destination = {};
+  gainNode = {
+    gain: { value: 1 },
+    connect() {},
+  };
   gestartet: FakeSource[] = [];
   closed = false;
   /** Dauer je dekodiertem Block, in Reihenfolge der decodeAudioData-Aufrufe. */
@@ -35,6 +39,9 @@ class FakeContext {
   }
   createBufferSource() {
     return new FakeSource() as unknown as AudioBufferSourceNode;
+  }
+  createGain() {
+    return this.gainNode as unknown as GainNode;
   }
   decodeAudioData(_buf: ArrayBuffer): Promise<AudioBuffer> {
     const i = this.decodeCount++;
@@ -109,6 +116,18 @@ describe('StreamingAudioPlayer', () => {
     const p = new StreamingAudioPlayer(fertig);
     p.markiereEnde(0); // TTS fehlgeschlagen — Mikrofon darf nicht stumm bleiben
     expect(fertig).toHaveBeenCalledTimes(1);
+  });
+
+  it('senkt die Lautstärke beim Ducking auf 25 Prozent und stellt sie wieder her', async () => {
+    const p = new StreamingAudioPlayer(() => {});
+    await p.push(0, b64('a'));
+    const ctx = FakeContext.current!;
+
+    p.duck();
+    expect(ctx.gainNode.gain.value).toBe(0.25);
+
+    p.unduck();
+    expect(ctx.gainNode.gain.value).toBe(1);
   });
 
   it('überspringt einen defekten Block statt hängenzubleiben', async () => {

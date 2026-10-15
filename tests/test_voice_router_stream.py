@@ -18,6 +18,13 @@ from web.routers.voice import build_router, sende_antwort, sende_streaming_antwo
 from fastapi import FastAPI
 
 
+@pytest.fixture(autouse=True)
+def _legacy_voice_stream_without_speaker_profile(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "VOICE_SPEAKER_VERIFY", False, raising=False)
+
+
 def make_client():
     app = FastAPI()
     app.include_router(build_router(orch=None))
@@ -778,12 +785,14 @@ def test_websocket_bargein_stops_playback_cancels_old_turn_and_accepts_followup(
     audio_sent = asyncio.Event()
     second_audio_sent = asyncio.Event()
     stop_sent = asyncio.Event()
+    duck_sent = asyncio.Event()
     old_cancelled = asyncio.Event()
     new_turn_started = asyncio.Event()
     new_turn_finished = asyncio.Event()
     logged = []
     interrupted = []
     clock = lambda: time.monotonic()
+    address_checks = []
 
     class FakeSession:
         def __init__(self, **kwargs):
@@ -804,6 +813,7 @@ def test_websocket_bargein_stops_playback_cancels_old_turn_and_accepts_followup(
                 return {
                     "text": "Und morgen?", "stt_ms": 4.0,
                     "turn_started_at": time.perf_counter(),
+                    "wakeword_triggered": True,
                 }
             return None
 
@@ -824,8 +834,10 @@ def test_websocket_bargein_stops_playback_cancels_old_turn_and_accepts_followup(
                 audio_sent.set()
                 if sum(item.get("type") == "audio_chunk" for item in self.sent) > 1:
                     second_audio_sent.set()
-            if data.get("type") == "stop_playback":
+            elif data.get("type") == "stop_playback":
                 stop_sent.set()
+            elif data.get("type") == "duck_playback":
+                duck_sent.set()
 
         async def receive(self):
             self.receive_index += 1
@@ -839,19 +851,20 @@ def test_websocket_bargein_stops_playback_cancels_old_turn_and_accepts_followup(
                 await asyncio.wait_for(audio_sent.wait(), timeout=1)
                 return {"bytes": b"bargein"}
             if self.receive_index == 4:
+                await asyncio.wait_for(duck_sent.wait(), timeout=1)
+                return {"bytes": b"final"}
+            if self.receive_index == 5:
                 await asyncio.wait_for(stop_sent.wait(), timeout=1)
                 block = next(item for item in self.sent if item.get("type") == "audio_chunk")
                 return {"text": json.dumps({
                     "type": "playback_progress", "block_id": block["block_id"],
                         "played_ms": 600,
                 })}
-            if self.receive_index == 5:
+            if self.receive_index == 6:
                 stop = next(item for item in self.sent if item.get("type") == "stop_playback")
                 return {"text": json.dumps({
                     "type": "playback_stopped", "turn_id": stop["turn_id"],
                 })}
-            if self.receive_index == 6:
-                return {"bytes": b"final"}
             if self.receive_index == 7:
                 await asyncio.wait_for(second_audio_sent.wait(), timeout=1)
                 chunks = [item for item in self.sent if item.get("type") == "audio_chunk"]
@@ -898,6 +911,7 @@ def test_websocket_bargein_stops_playback_cancels_old_turn_and_accepts_followup(
         yield _fake_opus(1000)
 
     async def addressed(_text, *, conversation_context=None):
+        address_checks.append(_text)
         return True
 
     monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
@@ -920,12 +934,15 @@ def test_websocket_bargein_stops_playback_cancels_old_turn_and_accepts_followup(
     assert stop_sent.is_set()
     assert old_cancelled.is_set()
     assert orchestrator.calls == [
-        ("Mantis, erzähl etwas.", True), ("Und morgen?", True),
+        ("Mantis, erzähl etwas.", True), ("Mantis, Und morgen?", True),
     ]
     assert interrupted == ["Erster"]
+    assert address_checks == ["Mantis, erzähl etwas."]
     assert any(item.get("type") == "stop_playback" for item in websocket.sent)
     old_latency = next(event[2] for event in logged if event[2].get("bargein") is True)
     assert old_latency["bargein_ms"] >= 0
+    assert old_latency["duck_ms"] >= 0
+    assert old_latency["bargein_decision"] == "wakeword"
 
 
 @pytest.mark.parametrize(
@@ -952,11 +969,14 @@ def test_bargein_segment_requires_non_echo_and_address_check(
 
     first_audio_sent = asyncio.Event()
     first_stop_sent = asyncio.Event()
+    duck_sent = asyncio.Event()
+    unduck_sent = asyncio.Event()
     second_audio_end_sent = asyncio.Event()
     second_turn_finished = asyncio.Event()
     second_address_check_finished = asyncio.Event()
     unexpected_tool_started = asyncio.Event()
     address_checks = []
+    logged = []
     prefixed_echo = transcript == "Mantis, das Licht aus" and reply == "das Licht aus."
     expect_address_check = not (
         (transcript == "Licht aus" and reply == "Licht aus.") or prefixed_echo
@@ -1004,6 +1024,10 @@ def test_bargein_segment_requires_non_echo_and_address_check(
                     second_audio_end_sent.set()
             elif data.get("type") == "stop_playback":
                 first_stop_sent.set()
+            elif data.get("type") == "duck_playback":
+                duck_sent.set()
+            elif data.get("type") == "unduck_playback":
+                unduck_sent.set()
 
         async def receive(self):
             self.receive_index += 1
@@ -1017,15 +1041,18 @@ def test_bargein_segment_requires_non_echo_and_address_check(
                 await asyncio.wait_for(first_audio_sent.wait(), timeout=1)
                 return {"bytes": b"bargein"}
             if self.receive_index == 4:
-                await asyncio.wait_for(first_stop_sent.wait(), timeout=1)
+                await asyncio.wait_for(duck_sent.wait(), timeout=1)
                 return {"bytes": b"final"}
             if self.receive_index == 5:
-                stop = next(item for item in self.sent if item.get("type") == "stop_playback")
-                return {"text": json.dumps({
-                    "type": "playback_stopped", "turn_id": stop["turn_id"],
-                })}
-            if prefixed_echo and not forwarded and self.receive_index == 6:
-                await asyncio.sleep(0.05)
+                if forwarded:
+                    await asyncio.wait_for(first_stop_sent.wait(), timeout=1)
+                    stop = next(item for item in self.sent if item.get("type") == "stop_playback")
+                    return {"text": json.dumps({
+                        "type": "playback_stopped", "turn_id": stop["turn_id"],
+                    })}
+                if expect_address_check:
+                    await asyncio.wait_for(second_address_check_finished.wait(), timeout=1)
+                await asyncio.wait_for(unduck_sent.wait(), timeout=1)
                 return {"type": "websocket.disconnect"}
             if forwarded and self.receive_index == 6:
                 await asyncio.wait_for(second_audio_end_sent.wait(), timeout=1)
@@ -1036,9 +1063,7 @@ def test_bargein_segment_requires_non_echo_and_address_check(
                 })}
             if forwarded and self.receive_index == 7:
                 await asyncio.wait_for(second_turn_finished.wait(), timeout=1)
-            elif not forwarded and self.receive_index == 6 and expect_address_check:
-                await asyncio.wait_for(second_address_check_finished.wait(), timeout=1)
-            elif not forwarded and self.receive_index != 6:
+            elif not forwarded:
                 raise AssertionError("unerwartete zusätzliche WebSocket-Nachricht")
             return {"type": "websocket.disconnect"}
 
@@ -1080,7 +1105,7 @@ def test_bargein_segment_requires_non_echo_and_address_check(
     monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
     monkeypatch.setattr(voice_router, "synthesize_stream", fake_tts)
-    monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *args: logged.append(args))
     monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", False)
     orchestrator = FakeOrchestrator()
     websocket = FakeWebSocket()
@@ -1100,6 +1125,17 @@ def test_bargein_segment_requires_non_echo_and_address_check(
         assert not unexpected_tool_started.is_set()
     elif not (transcript == "Licht aus" and reply == "Licht aus."):
         assert address_checks[-1] == (transcript, reply)
+    if not forwarded and expect_address_check:
+        rejected = [
+            event[2] for event in logged
+            if event[0] == "voice_latency" and event[2].get("address_rejected")
+        ]
+        assert rejected
+        assert rejected[-1]["stage"] == "address_rejected"
+        assert all(
+            call.get("error") != "CancelledError"
+            for call in rejected[-1]["llm_calls"]
+        )
 
 
 def test_receive_loop_does_not_wait_for_cancelled_response_before_control_messages(
@@ -1113,6 +1149,7 @@ def test_receive_loop_does_not_wait_for_cancelled_response_before_control_messag
     response_cancelled = asyncio.Event()
     release_cancelled_response = asyncio.Event()
     stop_sent = asyncio.Event()
+    duck_sent = asyncio.Event()
     second_response_started = asyncio.Event()
     first_block_id = []
 
@@ -1146,6 +1183,8 @@ def test_receive_loop_does_not_wait_for_cancelled_response_before_control_messag
                 await asyncio.sleep(0)
                 assert response_cancelled.is_set(), "stop_playback muss nach cancel gesendet werden"
                 stop_sent.set()
+            elif data.get("type") == "duck_playback":
+                duck_sent.set()
             self.sent.append(data)
 
         async def receive(self):
@@ -1160,15 +1199,21 @@ def test_receive_loop_does_not_wait_for_cancelled_response_before_control_messag
                 await asyncio.wait_for(response_started.wait(), timeout=1)
                 return {"bytes": b"bargein"}
             if self.receive_index == 4:
-                await asyncio.wait_for(stop_sent.wait(), timeout=1)
+                await asyncio.wait_for(duck_sent.wait(), timeout=1)
                 return {"bytes": b"final"}
             if self.receive_index == 5:
+                await asyncio.wait_for(stop_sent.wait(), timeout=1)
                 release_cancelled_response.set()
                 return {"text": json.dumps({
                     "type": "playback_progress", "block_id": first_block_id[0],
                     "played_ms": 400,
                 })}
             if self.receive_index == 6:
+                stop = next(item for item in self.sent if item.get("type") == "stop_playback")
+                return {"text": json.dumps({
+                    "type": "playback_stopped", "turn_id": stop["turn_id"],
+                })}
+            if self.receive_index == 7:
                 await asyncio.wait_for(second_response_started.wait(), timeout=1)
                 return {"type": "websocket.disconnect"}
             raise AssertionError("unerwartete zusätzliche WebSocket-Nachricht")
@@ -1222,7 +1267,7 @@ def test_receive_loop_does_not_wait_for_cancelled_response_before_control_messag
 
 
 @pytest.mark.parametrize("addressed", [True, False], ids=["addressed", "not-addressed"])
-def test_bargein_stops_before_address_check_and_receive_loop_stays_live(
+def test_bargein_ducks_until_address_check_and_receive_loop_stays_live(
     monkeypatch, addressed,
 ):
     import core.vad as vad
@@ -1232,6 +1277,8 @@ def test_bargein_stops_before_address_check_and_receive_loop_stays_live(
     first_audio_sent = asyncio.Event()
     response_cancelled = asyncio.Event()
     stop_sent = asyncio.Event()
+    duck_sent = asyncio.Event()
+    unduck_sent = asyncio.Event()
     address_started = asyncio.Event()
     address_finished = asyncio.Event()
     release_address_check = asyncio.Event()
@@ -1239,6 +1286,7 @@ def test_bargein_stops_before_address_check_and_receive_loop_stays_live(
     second_turn_started = asyncio.Event()
     allow_disconnect = asyncio.Event()
     response_texts = []
+    playbacks = []
     orchestrator_calls = []
     tool_runs = []
 
@@ -1274,6 +1322,10 @@ def test_bargein_stops_before_address_check_and_receive_loop_stays_live(
                 first_audio_sent.set()
             elif data.get("type") == "stop_playback":
                 stop_sent.set()
+            elif data.get("type") == "duck_playback":
+                duck_sent.set()
+            elif data.get("type") == "unduck_playback":
+                unduck_sent.set()
 
         async def receive(self):
             self.receive_index += 1
@@ -1287,17 +1339,12 @@ def test_bargein_stops_before_address_check_and_receive_loop_stays_live(
                 await asyncio.wait_for(first_audio_sent.wait(), timeout=1)
                 return {"bytes": b"bargein"}
             if self.receive_index == 4:
-                await asyncio.wait_for(stop_sent.wait(), timeout=1)
+                await asyncio.wait_for(duck_sent.wait(), timeout=1)
                 return {"bytes": b"final"}
             if self.receive_index == 5:
                 await asyncio.wait_for(address_started.wait(), timeout=1)
-                stop = next(item for item in self.sent if item.get("type") == "stop_playback")
-                return {"text": json.dumps({
-                    "type": "playback_stopped", "turn_id": stop["turn_id"],
-                })}
-            if self.receive_index == 6:
                 return {"bytes": b"probe"}
-            if self.receive_index == 7:
+            if self.receive_index == 6:
                 await asyncio.wait_for(allow_disconnect.wait(), timeout=1)
                 return {"type": "websocket.disconnect"}
             raise AssertionError("unerwartete zusätzliche WebSocket-Nachricht")
@@ -1324,6 +1371,7 @@ def test_bargein_stops_before_address_check_and_receive_loop_stays_live(
 
     async def streaming_response(websocket, text, _orch, *, playback, **kwargs):
         response_texts.append(text)
+        playbacks.append(playback)
         if len(response_texts) == 1:
             block_id = playback.register_block(
                 0, _fake_opus(1000), text="Antwort.", sentence_id=1,
@@ -1364,8 +1412,9 @@ def test_bargein_stops_before_address_check_and_receive_loop_stays_live(
             await asyncio.wait_for(probe_processed.wait(), timeout=1)
             assert address_started.is_set()
             assert not address_finished.is_set()
-            assert stop_sent.is_set()
-            assert response_cancelled.is_set()
+            assert duck_sent.is_set()
+            assert not stop_sent.is_set()
+            assert not response_cancelled.is_set()
             assert response_texts == ["Mantis, sag etwas.", "Schalte das Licht aus"]
             assert not second_turn_started.is_set()
             assert orchestrator_calls == []
@@ -1374,10 +1423,18 @@ def test_bargein_stops_before_address_check_and_receive_loop_stays_live(
             release_address_check.set()
             if addressed:
                 await asyncio.wait_for(second_turn_started.wait(), timeout=1)
+                assert stop_sent.is_set()
+                assert response_cancelled.is_set()
+                assert playbacks[0].bargein_decision == "address"
+                assert playbacks[0].duck_ms >= 0
                 assert response_texts == ["Mantis, sag etwas.", "Schalte das Licht aus"]
                 assert orchestrator_calls == ["Schalte das Licht aus"]
             else:
-                await asyncio.sleep(0.05)
+                await asyncio.wait_for(unduck_sent.wait(), timeout=1)
+                assert not stop_sent.is_set()
+                assert not response_cancelled.is_set()
+                assert playbacks[0].bargein_decision == "ignored"
+                assert playbacks[0].duck_ms >= 0
                 assert not second_turn_started.is_set()
                 assert response_texts == ["Mantis, sag etwas.", "Schalte das Licht aus"]
                 assert orchestrator_calls == []
@@ -1394,7 +1451,7 @@ def test_bargein_stops_before_address_check_and_receive_loop_stays_live(
     asyncio.run(run())
 
 
-def test_bargein_during_post_generation_playback_wait_records_estimated_text_and_latency(
+def test_unaddressed_speech_during_playback_is_ignored_and_records_duck_latency(
     monkeypatch,
 ):
     import core.vad as vad
@@ -1402,7 +1459,8 @@ def test_bargein_during_post_generation_playback_wait_records_estimated_text_and
     import web.routers.voice as voice_router
 
     audio_end_sent = asyncio.Event()
-    stop_sent = asyncio.Event()
+    duck_sent = asyncio.Event()
+    unduck_sent = asyncio.Event()
     interrupted_texts = []
     logged = []
 
@@ -1435,8 +1493,10 @@ def test_bargein_during_post_generation_playback_wait_records_estimated_text_and
             self.sent.append(data)
             if data.get("type") == "audio_end":
                 audio_end_sent.set()
-            elif data.get("type") == "stop_playback":
-                stop_sent.set()
+            elif data.get("type") == "duck_playback":
+                duck_sent.set()
+            elif data.get("type") == "unduck_playback":
+                unduck_sent.set()
 
         async def receive(self):
             self.receive_index += 1
@@ -1451,14 +1511,10 @@ def test_bargein_during_post_generation_playback_wait_records_estimated_text_and
                 await asyncio.sleep(1.05)
                 return {"bytes": b"bargein"}
             if self.receive_index == 4:
-                await asyncio.wait_for(stop_sent.wait(), timeout=1)
+                await asyncio.wait_for(duck_sent.wait(), timeout=1)
                 return {"bytes": b"final"}
             if self.receive_index == 5:
-                stop = next(item for item in self.sent if item.get("type") == "stop_playback")
-                return {"text": json.dumps({
-                    "type": "playback_stopped", "turn_id": stop["turn_id"],
-                })}
-            if self.receive_index == 6:
+                await asyncio.wait_for(unduck_sent.wait(), timeout=1)
                 return {"type": "websocket.disconnect"}
             raise AssertionError("unerwartete zusätzliche WebSocket-Nachricht")
 
@@ -1491,11 +1547,12 @@ def test_bargein_during_post_generation_playback_wait_records_estimated_text_and
 
     asyncio.run(asyncio.wait_for(endpoint(websocket), timeout=3))
 
-    assert interrupted_texts == ["Erster Satz."]
-    latency = next(event[2] for event in logged if event[2].get("bargein") is True)
-    assert latency["bargein"] is True
-    assert latency["bargein_ms"] is not None
-    assert latency["bargein_ms"] >= 0
+    assert interrupted_texts == []
+    latency = next(event[2] for event in logged if event[0] == "voice_latency")
+    assert latency["bargein"] is False
+    assert latency["bargein_decision"] == "ignored"
+    assert latency["duck_ms"] is not None
+    assert latency["duck_ms"] >= 0
 
 
 class FakeClock:
@@ -1800,6 +1857,706 @@ def test_tool_filler_is_suppressed_when_fallback_voice_is_selected(monkeypatch):
     assert chosen == []
     assert logged[0][2]["filler"] is None
     assert logged[0][2]["filler_ms"] is None
+
+
+def test_foreign_speaker_wakeword_is_rejected_before_address_or_tools(monkeypatch):
+    import core.vad as vad
+    import core.wakeword as wakeword
+    import web.routers.voice as voice_router
+
+    verification_finished = asyncio.Event()
+    address_checks = []
+    assistant_calls = []
+    logged = []
+
+    class FakeSpeakerVerifier:
+        async def has_profile(self):
+            return True
+
+        async def verify_pcm(self, audio):
+            assert audio == b"pcm-audio"
+            verification_finished.set()
+            return type(
+                "Verification", (),
+                {"score": 0.21, "elapsed_ms": 7.5, "decision": "rejected"},
+            )()
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def handle_chunk(self, _chunk, muted=False):
+            return {
+                "text": "Mantis, lösche alle Dateien",
+                "raw_text": "Mantis, lösche alle Dateien",
+                "wakeword_triggered": True,
+                "pcm_audio": b"pcm-audio",
+                "speech_pcm_audio": b"timo-only",
+                "stt_pcm_audio": b"pcm-audio",
+                "stt_ms": 2.0,
+                "turn_started_at": time.perf_counter(),
+            }
+
+        async def close(self):
+            pass
+
+    class FakeWebSocket:
+        async def accept(self):
+            pass
+
+        async def send_json(self, _data):
+            raise AssertionError("abgewiesener Sprecher darf keine Antwort senden")
+
+        async def receive(self):
+            if not hasattr(self, "received"):
+                self.received = True
+                return {"bytes": b"final"}
+            await asyncio.wait_for(verification_finished.wait(), timeout=1)
+            await asyncio.sleep(0.02)
+            return {"type": "websocket.disconnect"}
+
+    class FakeOrchestrator:
+        async def voice_respond(self, *args, **_kwargs):
+            assistant_calls.append(args)
+            raise AssertionError("abgewiesener Sprecher darf keine Tools starten")
+
+    async def address_check(*args, **_kwargs):
+        address_checks.append(args)
+        return True
+
+    monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
+    monkeypatch.setattr(voice_router, "is_addressed_to_mantis", address_check)
+    monkeypatch.setattr("core.speaker.get_speaker_verifier", FakeSpeakerVerifier)
+    monkeypatch.setattr("config.VOICE_SPEAKER_VERIFY", True)
+    monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
+    monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *args: logged.append(args))
+
+    endpoint = next(
+        route.endpoint for route in build_router(FakeOrchestrator()).routes
+        if route.path == "/ws/voice/stream"
+    )
+    asyncio.run(endpoint(FakeWebSocket()))
+
+    assert address_checks == []
+    assert assistant_calls == []
+    latency = next(event[2] for event in logged if event[0] == "voice_latency")
+    assert latency["speaker_score"] == 0.21
+    assert latency["speaker_ms"] == 7.5
+    assert latency["speaker_decision"] == "rejected"
+
+
+@pytest.mark.parametrize(
+    ("score", "expected_control"),
+    [(0.7, "stop_playback"), (0.2, "unduck_playback")],
+    ids=["early-owner-score-stops", "low-score-waits-then-unducks"],
+)
+def test_bargein_uses_early_and_one_second_speaker_scores(
+    monkeypatch, score, expected_control,
+):
+    import numpy as np
+    import core.vad as vad
+    import core.wakeword as wakeword
+    import web.routers.voice as voice_router
+
+    first_audio_sent = asyncio.Event()
+    expected_control_sent = asyncio.Event()
+    score_lengths = []
+
+    class FakeSpeakerVerifier:
+        async def has_profile(self):
+            return True
+
+        async def verify_pcm(self, _audio):
+            return type(
+                "Verification", (),
+                {"score": 0.8, "elapsed_ms": 1.0, "decision": "accepted", "embedding": np.ones(192)},
+            )()
+
+        async def maybe_learn(self, *_args, **_kwargs):
+            return False
+
+        async def score_pcm(self, audio):
+            score_lengths.append(len(audio))
+            return type(
+                "Score", (),
+                {"score": score, "elapsed_ms": 2.0, "enrolled": True},
+            )()
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.callbacks = kwargs
+
+        async def handle_chunk(self, chunk, muted=False):
+            if chunk == b"initial":
+                return {
+                    "text": "Mantis, sag etwas.", "raw_text": "Mantis, sag etwas.",
+                    "wakeword_triggered": True, "pcm_audio": b"\0\0" * 16_000,
+                    "speech_pcm_audio": b"\0\0" * 16_000, "stt_ms": 1.0,
+                }
+            if chunk == b"bargein":
+                await self.callbacks["on_bargein"](time.monotonic())
+                self.callbacks["on_speech_progress"](b"\0\0" * 9_600, 600, 0)
+                self.callbacks["on_speech_progress"](b"\0\0" * 16_000, 1_000, 0)
+            return None
+
+        async def close(self):
+            pass
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent = []
+            self.index = 0
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, data):
+            self.sent.append(data)
+            if data.get("type") == "audio_chunk":
+                first_audio_sent.set()
+            if data.get("type") == expected_control:
+                expected_control_sent.set()
+
+        async def receive(self):
+            self.index += 1
+            if self.index == 1:
+                return {"text": json.dumps({"type": "hello", "audio": "stream"})}
+            if self.index == 2:
+                return {"bytes": b"initial"}
+            if self.index == 3:
+                await asyncio.wait_for(first_audio_sent.wait(), timeout=1)
+                return {"bytes": b"bargein"}
+            if self.index == 4:
+                await asyncio.wait_for(expected_control_sent.wait(), timeout=1)
+                return {"type": "websocket.disconnect"}
+            raise AssertionError("unerwartete zusätzliche WebSocket-Nachricht")
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, **_kwargs):
+            return "Antwort.", []
+
+        def record_interrupted_voice_turn(self, _text):
+            pass
+
+    async def streaming_response(websocket, _text, _orch, *, playback, **_kwargs):
+        block_id = playback.register_block(
+            0, _fake_opus(1000), text="Antwort.", sentence_id=1, duration_ms=10_000,
+        )
+        playback.mark_block_sent(block_id)
+        await websocket.send_json({"type": "audio_chunk", "block_id": block_id, "b64": ""})
+        await asyncio.Future()
+
+    monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
+    monkeypatch.setattr(voice_router, "sende_streaming_antwort", streaming_response)
+    monkeypatch.setattr("core.speaker.get_speaker_verifier", FakeSpeakerVerifier)
+    monkeypatch.setattr("config.VOICE_SPEAKER_VERIFY", True)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", False)
+    monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
+    monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
+
+    endpoint = next(
+        route.endpoint for route in build_router(FakeOrchestrator()).routes
+        if route.path == "/ws/voice/stream"
+    )
+    asyncio.run(asyncio.wait_for(endpoint(FakeWebSocket()), timeout=2))
+
+    assert score_lengths == [19_200, 32_000]
+
+
+def test_early_owner_accept_stops_playback_then_runs_address_checked_turn(monkeypatch):
+    import numpy as np
+    import core.vad as vad
+    import core.wakeword as wakeword
+    import web.routers.voice as voice_router
+
+    first_audio_sent = asyncio.Event()
+    stop_sent = asyncio.Event()
+    address_started = asyncio.Event()
+    release_address = asyncio.Event()
+    next_audio_sent = asyncio.Event()
+    disconnect = asyncio.Event()
+    address_checks = []
+    agent_calls = []
+
+    class FakeSpeakerVerifier:
+        async def has_profile(self):
+            return True
+
+        async def score_pcm(self, _audio):
+            return type(
+                "Score", (), {"score": 0.9, "elapsed_ms": 1.0, "enrolled": True},
+            )()
+
+        async def verify_pcm(self, _audio):
+            return type(
+                "Verification", (),
+                {"score": 0.9, "elapsed_ms": 1.0, "decision": "accepted", "embedding": np.ones(192)},
+            )()
+
+        async def maybe_learn(self, _audio, _score, **kwargs):
+            assert kwargs["bargein"] is True
+            return False
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.callbacks = kwargs
+
+        async def handle_chunk(self, chunk, muted=False):
+            if chunk == b"initial":
+                return {
+                    "text": "Mantis, sag etwas.", "raw_text": "Mantis, sag etwas.",
+                    "wakeword_triggered": True, "pcm_audio": b"initial-pcm",
+                    "stt_pcm_audio": b"initial-pcm", "stt_ms": 1.0,
+                }
+            if chunk == b"bargein":
+                await self.callbacks["on_bargein"](time.monotonic())
+                self.callbacks["on_speech_progress"](b"\0\0" * 9_600, 600, 0)
+                self.callbacks["on_speech_progress"](b"\0\0" * 16_000, 1000, 0)
+                return None
+            if chunk == b"turn":
+                return {
+                    "text": "Erzähl mir einen kurzen Witz.",
+                    "raw_text": "Erzähl mir einen kurzen Witz.",
+                    "wakeword_triggered": False, "bargein": True,
+                    "overlapping": True, "segment_generation": 0,
+                    "pcm_audio": b"turn-pcm", "stt_pcm_audio": b"turn-pcm",
+                    "stt_ms": 1.0,
+                }
+            return None
+
+        async def close(self):
+            pass
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent = []
+            self.index = 0
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, data):
+            self.sent.append(data)
+            if data.get("type") == "audio_chunk":
+                if data.get("turn_id") == "Mantis, sag etwas.":
+                    first_audio_sent.set()
+                else:
+                    next_audio_sent.set()
+            elif data.get("type") == "stop_playback":
+                stop_sent.set()
+
+        async def receive(self):
+            self.index += 1
+            if self.index == 1:
+                return {"text": json.dumps({
+                    "type": "hello", "audio": "stream", "playback_progress": True,
+                })}
+            if self.index == 2:
+                return {"bytes": b"initial"}
+            if self.index == 3:
+                await asyncio.wait_for(first_audio_sent.wait(), timeout=1)
+                return {"bytes": b"bargein"}
+            if self.index == 4:
+                await asyncio.wait_for(stop_sent.wait(), timeout=1)
+                return {"bytes": b"turn"}
+            if self.index == 5:
+                await asyncio.wait_for(address_started.wait(), timeout=1)
+                await disconnect.wait()
+                return {"type": "websocket.disconnect"}
+            raise AssertionError("unerwartete zusätzliche WebSocket-Nachricht")
+
+    class FakeOrchestrator:
+        async def voice_respond(self, text, **kwargs):
+            gate = kwargs.get("execution_gate")
+            if gate is not None and not await gate():
+                raise asyncio.CancelledError
+            agent_calls.append(text)
+            return "Ein Witz.", []
+
+        def record_interrupted_voice_turn(self, _text):
+            pass
+
+    async def address_check(text, **_kwargs):
+        address_checks.append(text)
+        address_started.set()
+        await release_address.wait()
+        return True
+
+    async def streaming_response(websocket, text, orch, *, playback, execution_gate=None, **_kwargs):
+        await orch.voice_respond(
+            text,
+            **({"execution_gate": execution_gate} if execution_gate else {}),
+        )
+        block_id = playback.register_block(
+            0, _fake_opus(1000), text="Antwort.", sentence_id=1,
+        )
+        playback.mark_block_sent(block_id)
+        await websocket.send_json({
+            "type": "audio_chunk", "turn_id": text,
+            "block_id": block_id, "b64": "",
+        })
+        if text == "Mantis, sag etwas.":
+            await asyncio.Future()
+        return "Antwort."
+
+    monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
+    monkeypatch.setattr(voice_router, "is_addressed_to_mantis", address_check)
+    monkeypatch.setattr(voice_router, "sende_streaming_antwort", streaming_response)
+    monkeypatch.setattr("core.speaker.get_speaker_verifier", FakeSpeakerVerifier)
+    monkeypatch.setattr("config.VOICE_SPEAKER_VERIFY", True)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", False)
+    monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
+    monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
+
+    endpoint = next(
+        route.endpoint for route in build_router(FakeOrchestrator()).routes
+        if route.path == "/ws/voice/stream"
+    )
+
+    async def run():
+        websocket = FakeWebSocket()
+        endpoint_task = asyncio.create_task(endpoint(websocket))
+        try:
+            await asyncio.wait_for(address_started.wait(), timeout=2)
+            assert address_checks == ["Erzähl mir einen kurzen Witz."]
+            assert stop_sent.is_set()
+            assert agent_calls == ["Mantis, sag etwas."]
+            release_address.set()
+            await asyncio.wait_for(next_audio_sent.wait(), timeout=1)
+            assert agent_calls == [
+                "Mantis, sag etwas.", "Erzähl mir einen kurzen Witz.",
+            ]
+            controls = [item["type"] for item in websocket.sent]
+            assert controls.count("stop_playback") == 1
+            assert controls.count("unduck_playback") == 1
+            assert controls.index("stop_playback") < controls.index("unduck_playback")
+            disconnect.set()
+            await asyncio.wait_for(endpoint_task, timeout=1)
+        finally:
+            release_address.set()
+            disconnect.set()
+            if not endpoint_task.done():
+                endpoint_task.cancel()
+            await asyncio.gather(endpoint_task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_late_early_score_cannot_override_newer_one_second_rejection(monkeypatch):
+    import numpy as np
+    import core.vad as vad
+    import core.wakeword as wakeword
+    import web.routers.voice as voice_router
+
+    first_audio_sent = asyncio.Event()
+    unduck_sent = asyncio.Event()
+    early_released = asyncio.Event()
+    early_finished = asyncio.Event()
+    final_scored = asyncio.Event()
+    verification_finished = asyncio.Event()
+    disconnect = asyncio.Event()
+    address_checks = []
+
+    class FakeSpeakerVerifier:
+        async def has_profile(self):
+            return True
+
+        async def score_pcm(self, audio):
+            if len(audio) == 19_200:
+                await early_released.wait()
+                early_finished.set()
+                score = 0.9
+            else:
+                final_scored.set()
+                score = 0.1
+            return type(
+                "Score", (),
+                {"score": score, "elapsed_ms": 1.0, "enrolled": True},
+            )()
+
+        async def verify_pcm(self, audio):
+            if audio == b"initial":
+                return type(
+                    "Verification", (),
+                    {"score": 0.9, "elapsed_ms": 1.0, "decision": "accepted", "embedding": np.ones(192)},
+                )()
+            verification_finished.set()
+            return type(
+                "Verification", (),
+                {"score": 0.1, "elapsed_ms": 1.0, "decision": "rejected", "embedding": np.ones(192)},
+            )()
+
+        async def maybe_learn(self, *_args, **_kwargs):
+            return False
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.callbacks = kwargs
+
+        async def handle_chunk(self, chunk, muted=False):
+            if chunk == b"initial":
+                return {
+                    "text": "Mantis, sag etwas.", "raw_text": "Mantis, sag etwas.",
+                    "wakeword_triggered": True, "pcm_audio": b"initial",
+                    "stt_pcm_audio": b"initial", "stt_ms": 1.0,
+                }
+            if chunk == b"bargein":
+                await self.callbacks["on_bargein"](time.monotonic())
+                self.callbacks["on_speech_progress"](b"\0\0" * 9_600, 600, 0)
+                self.callbacks["on_speech_progress"](b"\0\0" * 16_000, 1000, 0)
+                return None
+            if chunk == b"final":
+                return {
+                    "text": "Wie wird das Wetter morgen?",
+                    "raw_text": "Wie wird das Wetter morgen?",
+                    "wakeword_triggered": False, "bargein": True,
+                    "overlapping": True, "segment_generation": 0,
+                    "pcm_audio": b"final", "stt_pcm_audio": b"final",
+                    "stt_ms": 1.0,
+                }
+            return None
+
+        async def close(self):
+            pass
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent = []
+            self.index = 0
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, data):
+            self.sent.append(data)
+            if data.get("type") == "audio_chunk":
+                first_audio_sent.set()
+            elif data.get("type") == "unduck_playback":
+                unduck_sent.set()
+
+        async def receive(self):
+            self.index += 1
+            if self.index == 1:
+                return {"text": json.dumps({
+                    "type": "hello", "audio": "stream", "playback_progress": True,
+                })}
+            if self.index == 2:
+                return {"bytes": b"initial"}
+            if self.index == 3:
+                await asyncio.wait_for(first_audio_sent.wait(), timeout=1)
+                return {"bytes": b"bargein"}
+            if self.index == 4:
+                return {"bytes": b"final"}
+            if self.index == 5:
+                await disconnect.wait()
+                return {"type": "websocket.disconnect"}
+            raise AssertionError("unerwartete zusätzliche WebSocket-Nachricht")
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, **_kwargs):
+            return "Antwort.", []
+
+        def record_interrupted_voice_turn(self, _text):
+            pass
+
+    async def address_check(*args, **_kwargs):
+        address_checks.append(args)
+        return True
+
+    async def streaming_response(websocket, _text, _orch, *, playback, **_kwargs):
+        block_id = playback.register_block(
+            0, _fake_opus(1000), text="Antwort.", sentence_id=1,
+        )
+        playback.mark_block_sent(block_id)
+        await websocket.send_json({
+            "type": "audio_chunk", "block_id": block_id, "b64": "",
+        })
+        await asyncio.Future()
+
+    monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
+    monkeypatch.setattr(voice_router, "is_addressed_to_mantis", address_check)
+    monkeypatch.setattr(voice_router, "sende_streaming_antwort", streaming_response)
+    monkeypatch.setattr("core.speaker.get_speaker_verifier", FakeSpeakerVerifier)
+    monkeypatch.setattr("config.VOICE_SPEAKER_VERIFY", True)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", False)
+    monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
+    monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
+
+    endpoint = next(
+        route.endpoint for route in build_router(FakeOrchestrator()).routes
+        if route.path == "/ws/voice/stream"
+    )
+    websocket = FakeWebSocket()
+
+    async def run():
+        endpoint_task = asyncio.create_task(endpoint(websocket))
+        try:
+            await asyncio.wait_for(final_scored.wait(), timeout=1)
+            await asyncio.wait_for(unduck_sent.wait(), timeout=1)
+            early_released.set()
+            await asyncio.wait_for(early_finished.wait(), timeout=1)
+            await asyncio.wait_for(verification_finished.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert [item["type"] for item in websocket.sent].count("unduck_playback") == 1
+            assert not any(item["type"] == "stop_playback" for item in websocket.sent)
+            assert address_checks == []
+            disconnect.set()
+            await asyncio.wait_for(endpoint_task, timeout=1)
+        finally:
+            early_released.set()
+            disconnect.set()
+            if not endpoint_task.done():
+                endpoint_task.cancel()
+            await asyncio.gather(endpoint_task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("termination", ["timeout", "complete", "cancelled"])
+def test_playback_lifecycle_sends_unduck_when_bargein_duck_is_active(
+    monkeypatch, termination,
+):
+    import core.vad as vad
+    import core.wakeword as wakeword
+    import web.routers.voice as voice_router
+
+    audio_sent = asyncio.Event()
+    duck_sent = asyncio.Event()
+    unduck_sent = asyncio.Event()
+    disconnect = asyncio.Event()
+    block_ids = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.callbacks = kwargs
+
+        async def handle_chunk(self, chunk, muted=False):
+            if chunk == b"initial":
+                return {
+                    "text": "Mantis, sag etwas.", "raw_text": "Mantis, sag etwas.",
+                    "wakeword_triggered": True, "pcm_audio": b"initial",
+                    "stt_pcm_audio": b"initial", "stt_ms": 1.0,
+                }
+            if chunk == b"bargein":
+                await self.callbacks["on_bargein"](time.monotonic())
+            return None
+
+        async def close(self):
+            pass
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent = []
+            self.index = 0
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, data):
+            self.sent.append(data)
+            if data.get("type") == "audio_chunk":
+                audio_sent.set()
+            elif data.get("type") == "duck_playback":
+                duck_sent.set()
+            elif data.get("type") == "unduck_playback":
+                unduck_sent.set()
+
+        async def receive(self):
+            self.index += 1
+            if self.index == 1:
+                return {"text": json.dumps({
+                    "type": "hello", "audio": "stream", "playback_progress": True,
+                })}
+            if self.index == 2:
+                return {"bytes": b"initial"}
+            if self.index == 3:
+                await asyncio.wait_for(audio_sent.wait(), timeout=1)
+                return {"bytes": b"bargein"}
+            if self.index == 4:
+                if termination == "complete":
+                    await asyncio.wait_for(duck_sent.wait(), timeout=1)
+                    return {"text": json.dumps({
+                        "type": "playback_progress", "block_id": block_ids[0],
+                        "played_ms": 1000, "finished": True,
+                    })}
+                await disconnect.wait()
+                return {"type": "websocket.disconnect"}
+            raise AssertionError("unerwartete zusätzliche WebSocket-Nachricht")
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, **_kwargs):
+            return "Antwort.", []
+
+    async def streaming_response(websocket, _text, _orch, *, playback, **_kwargs):
+        block_id = playback.register_block(
+            0, _fake_opus(1000), text="Antwort.", sentence_id=1, duration_ms=1000,
+        )
+        block_ids.append(block_id)
+        playback.mark_block_sent(block_id)
+        await websocket.send_json({
+            "type": "audio_chunk", "block_id": block_id, "b64": "",
+        })
+        await websocket.send_json({"type": "audio_end", "count": 1})
+        playback.mark_audio_end(1)
+        if termination == "cancelled":
+            await duck_sent.wait()
+            raise asyncio.CancelledError
+        try:
+            await playback.wait_until_complete()
+        except TimeoutError:
+            if termination != "timeout":
+                raise
+
+    async def force_timeout(playback):
+        await duck_sent.wait()
+        playback.timed_out = True
+        raise TimeoutError
+
+    monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
+    monkeypatch.setattr(voice_router, "sende_streaming_antwort", streaming_response)
+    if termination == "timeout":
+        monkeypatch.setattr(voice_router._PlaybackTurn, "wait_until_complete", force_timeout)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", False)
+    monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
+    monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
+
+    endpoint = next(
+        route.endpoint for route in build_router(FakeOrchestrator()).routes
+        if route.path == "/ws/voice/stream"
+    )
+    websocket = FakeWebSocket()
+
+    async def run():
+        endpoint_task = asyncio.create_task(endpoint(websocket))
+        try:
+            try:
+                await asyncio.wait_for(unduck_sent.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                raise AssertionError(
+                    f"erwartetes unduck_playback fehlt; gesendet: "
+                    f"{[item['type'] for item in websocket.sent]}"
+                )
+            assert any(item["type"] == "duck_playback" for item in websocket.sent)
+            assert [item["type"] for item in websocket.sent].count("unduck_playback") == 1
+            disconnect.set()
+            await asyncio.wait_for(endpoint_task, timeout=1)
+        finally:
+            disconnect.set()
+            if not endpoint_task.done():
+                endpoint_task.cancel()
+            await asyncio.gather(endpoint_task, return_exceptions=True)
+
+    asyncio.run(run())
 
 
 def test_ready_answer_audio_suppresses_ack_filler(monkeypatch):
@@ -2128,6 +2885,205 @@ def test_voice_latency_event_includes_smart_turn_decision_fields(monkeypatch):
     assert detail["turn_model_ms"] == 13.4
     assert detail["turn_decision"] == "model_complete"
     assert detail["silence_used_ms"] == 288
+
+
+def test_address_rejected_latency_does_not_look_like_backend_failure(monkeypatch):
+    import web.routers.voice as voice_router
+    from core import voice_timing
+
+    logged = []
+
+    class FallbackBackend:
+        model_name = "unknown"
+        last_used_backend = None
+
+    class FakeOrchestrator:
+        voice_agent = type("Agent", (), {"backend": FallbackBackend()})()
+
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *args: logged.append(args))
+    token = voice_timing.start()
+    try:
+        timing = voice_timing.current()
+        timing.llm_calls.append({"error": "CancelledError", "ms_total": 12.0})
+        voice_router._record_voice_latency(
+            FakeOrchestrator(), time.perf_counter(), stt_ms=1.0,
+            address_rejected=True,
+        )
+    finally:
+        voice_timing.reset(token)
+
+    detail = logged[0][2]
+    assert detail["address_rejected"] is True
+    assert detail["stage"] == "address_rejected"
+    assert detail["llm_calls"] == []
+
+
+@pytest.mark.parametrize("text", [
+    "stopp", "Halt, bitte", "stop", "warte kurz", "sei still",
+    "Ich sage jetzt Stopp.",
+])
+def test_stop_reflex_is_recognized_even_in_partial_text(text):
+    import web.routers.voice as voice_router
+
+    assert voice_router._is_stop_reflex(text) is True
+
+
+@pytest.mark.parametrize("text", ["Stoppuhr", "ich warte noch", "Stillstand"])
+def test_stop_reflex_does_not_match_inside_unrelated_words(text):
+    import web.routers.voice as voice_router
+
+    assert voice_router._is_stop_reflex(text) is False
+
+
+def test_stop_reflex_in_partial_text_stops_before_final_segment(monkeypatch):
+    import core.vad as vad
+    import core.wakeword as wakeword
+    import web.routers.voice as voice_router
+
+    audio_sent = asyncio.Event()
+    stop_sent = asyncio.Event()
+    response_cancelled = asyncio.Event()
+    second_response_finished = asyncio.Event()
+    checks = []
+    response_texts = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.callbacks = kwargs
+
+        async def handle_chunk(self, chunk, muted=False):
+            if chunk == b"initial":
+                return {"text": "Mantis, erzähl etwas.", "stt_ms": 1.0}
+            if chunk == b"bargein":
+                await self.callbacks["on_bargein"](time.monotonic())
+                self.callbacks["on_partial"]("sei")
+                self.callbacks["on_partial"]("sei still")
+                await asyncio.sleep(0)
+                return None
+            if chunk == b"final":
+                return {"text": "sei still", "stt_ms": 1.0}
+            return None
+
+        async def close(self):
+            pass
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent = []
+            self.receive_index = 0
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, data):
+            self.sent.append(data)
+            if data.get("type") == "audio_chunk":
+                audio_sent.set()
+            elif data.get("type") == "stop_playback":
+                stop_sent.set()
+
+        async def receive(self):
+            self.receive_index += 1
+            if self.receive_index == 1:
+                return {"text": json.dumps({"type": "hello", "audio": "stream"})}
+            if self.receive_index == 2:
+                return {"bytes": b"initial"}
+            if self.receive_index == 3:
+                await asyncio.wait_for(audio_sent.wait(), timeout=1)
+                return {"bytes": b"bargein"}
+            if self.receive_index == 4:
+                await asyncio.wait_for(stop_sent.wait(), timeout=1)
+                return {"bytes": b"final"}
+            if self.receive_index == 5:
+                await asyncio.wait_for(second_response_finished.wait(), timeout=1)
+                return {"type": "websocket.disconnect"}
+            raise AssertionError("unerwartete zusätzliche WebSocket-Nachricht")
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, **_kwargs):
+            return "Okay.", []
+
+    async def address_check(text, *, conversation_context=None):
+        checks.append(text)
+        return True
+
+    async def streaming_response(websocket, text, _orch, *, playback, **_kwargs):
+        response_texts.append(text)
+        if len(response_texts) == 1:
+            block_id = playback.register_block(
+                0, _fake_opus(1000), text="Antwort.", sentence_id=1,
+            )
+            playback.mark_block_sent(block_id)
+            await websocket.send_json({"type": "audio_chunk", "block_id": block_id})
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                response_cancelled.set()
+                raise
+        second_response_finished.set()
+        return "Okay."
+
+    monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
+    monkeypatch.setattr(voice_router, "is_addressed_to_mantis", address_check)
+    monkeypatch.setattr(voice_router, "sende_streaming_antwort", streaming_response)
+    monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
+    monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(wakeword, "WakeWordDetector", lambda _path: object())
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", False)
+    websocket = FakeWebSocket()
+    endpoint = next(
+        route.endpoint for route in voice_router.build_router(FakeOrchestrator()).routes
+        if route.path == "/ws/voice/stream"
+    )
+
+    asyncio.run(asyncio.wait_for(endpoint(websocket), timeout=3))
+
+    assert response_cancelled.is_set()
+    assert "sei still" in response_texts
+    assert checks == ["Mantis, erzähl etwas."]
+    assert any(item.get("type") == "duck_playback" for item in websocket.sent)
+    assert any(item.get("type") == "stop_playback" for item in websocket.sent)
+
+
+def test_cached_filler_is_an_echo_with_its_playback_duration(monkeypatch):
+    import web.routers.voice as voice_router
+    from core.voice_fillers import VoiceFiller
+
+    playback = voice_router._PlaybackTurn()
+    filler_requested = asyncio.Event()
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            await asyncio.wait_for(filler_requested.wait(), timeout=0.5)
+            return "Antwort.", []
+
+    async def fake_tts(_sentence, **_kwargs):
+        yield _fake_opus(700)
+
+    filler = VoiceFiller("ack", "Moment.", _fake_opus(350), 350.0)
+    def choose_filler(_kind):
+        filler_requested.set()
+        return filler
+
+    monkeypatch.setattr(voice_router, "synthesize_stream", fake_tts)
+    monkeypatch.setattr(voice_router.voice_fillers, "choose_cached_filler", choose_filler)
+    monkeypatch.setattr(voice_router.tts, "_tts_turn_can_use_filler", lambda _state: True)
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 0)
+
+    asyncio.run(sende_streaming_antwort(
+        FakeWebSocket(), "Mantis, sag etwas", FakeOrchestrator(),
+        playback=playback,
+    ))
+
+    filler_block = next(block for block in playback.blocks.values() if block.text == "Moment.")
+    assert filler_block.duration_ms == 350.0
+    echo_text = playback.echo_window_text(now=filler_block.sent_at + 0.2)
+    assert "Moment." in echo_text
+    assert voice_router._is_recent_tts_echo("Moment.", echo_text)
+    assert "Moment." not in playback.echo_window_text(now=filler_block.sent_at + 2.36)
 
 
 def test_voice_latency_records_partial_reuse_and_saved_context_time(monkeypatch):

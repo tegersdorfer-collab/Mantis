@@ -13,6 +13,7 @@ import { initSkilltreeOverlay, widgetHtml as skilltreeWidgetHtml } from './skill
 import { initKnowledgeGraphOverlay } from './knowledge-graph-overlay';
 import { initChatInput } from './chat-input';
 import { initSettingsPanel } from './settings-panel';
+import { initSpeakerEnrollmentPanel } from './speaker-enrollment';
 import { subscribeStatus } from './status-stream';
 import { renderAlert } from './alert-overlay';
 import { appendToLog } from './conversation-log';
@@ -430,7 +431,29 @@ export async function initVoiceCapture(
   }
 }
 
-initVoiceCapture(getBaseUrl(), renderVoiceStatus);
+let voiceCaptureEnabled = true;
+let stopVoiceCapture: (() => void) | null = null;
+let voiceCaptureStartPending = false;
+
+function ensureVoiceCapture(): void {
+  if (!voiceCaptureEnabled || stopVoiceCapture || voiceCaptureStartPending) return;
+  voiceCaptureStartPending = true;
+  void initVoiceCapture(getBaseUrl(), renderVoiceStatus).then((stop) => {
+    if (voiceCaptureEnabled) stopVoiceCapture = stop;
+    else stop();
+  }).finally(() => { voiceCaptureStartPending = false; });
+}
+
+document.addEventListener('speaker-enrollment-opened', () => {
+  voiceCaptureEnabled = false;
+  stopVoiceCapture?.();
+  stopVoiceCapture = null;
+});
+document.addEventListener('speaker-enrollment-closed', () => {
+  voiceCaptureEnabled = true;
+  ensureVoiceCapture();
+});
+ensureVoiceCapture();
 // Overlays zuerst — sie registrieren sich, bevor nav-overlay die Registry liest.
 initHealthOverlay(getBaseUrl());
 initKnowledgeGraphOverlay(getBaseUrl());
@@ -457,6 +480,7 @@ function renderChatReply(reply: string, userText: string): void {
 
 initChatInput(getBaseUrl(), renderChatReply);
 initSettingsPanel();
+initSpeakerEnrollmentPanel();
 
 function initHudChrome(): void {
   const particleCanvas = document.getElementById('hud-particles') as HTMLCanvasElement | null;

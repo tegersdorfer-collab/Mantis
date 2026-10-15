@@ -18,6 +18,19 @@ export function startVoiceCaptureStream(
   const ws = wsFactory(wsUrlFor(baseUrl));
   let currentReplyAudio: HTMLAudioElement | null = null;
   let player: StreamingAudioPlayer | null = null;
+  let playbackDucked = false;
+
+  function duckPlayback(): void {
+    playbackDucked = true;
+    player?.duck();
+    if (currentReplyAudio) currentReplyAudio.volume = 0.25;
+  }
+
+  function unduckPlayback(): void {
+    playbackDucked = false;
+    player?.unduck();
+    if (currentReplyAudio) currentReplyAudio.volume = 1;
+  }
 
   function sendProgress(
     blockId: string, playedMs: number, finished: boolean, skipped: boolean,
@@ -38,6 +51,7 @@ export function startVoiceCaptureStream(
         currentReplyAudio.onerror = null;
       }
       const audio = new Audio(`data:audio/ogg;base64,${audioB64}`);
+      audio.volume = playbackDucked ? 0.25 : 1;
       currentReplyAudio = audio;
       audio.play().catch(() => {});
     } catch { /* nicht verfügbare Audioausgabe ignorieren */ }
@@ -45,9 +59,13 @@ export function startVoiceCaptureStream(
 
   function startStreamingPlayback(): StreamingAudioPlayer {
     player?.stop();
-    player = new StreamingAudioPlayer(() => {
+    const nextPlayer = new StreamingAudioPlayer(() => {
+      if (player !== nextPlayer) return;
       player = null;
+      playbackDucked = false;
     }, sendProgress);
+    player = nextPlayer;
+    if (playbackDucked) player.duck();
     return player;
   }
 
@@ -55,10 +73,20 @@ export function startVoiceCaptureStream(
     try {
       const msg = JSON.parse(ev.data) as Record<string, unknown>;
 
+      if (msg.type === 'duck_playback') {
+        duckPlayback();
+        return;
+      }
+      if (msg.type === 'unduck_playback') {
+        unduckPlayback();
+        return;
+      }
       if (msg.type === 'stop_playback') {
+        playbackDucked = false;
         player?.stop();
         player = null;
         if (currentReplyAudio) {
+          currentReplyAudio.volume = 1;
           currentReplyAudio.pause();
           currentReplyAudio.onended = null;
           currentReplyAudio.onerror = null;
@@ -136,6 +164,7 @@ export function startVoiceCaptureStream(
 
   return () => {
     stopped = true;
+    playbackDucked = false;
     player?.stop();
     player = null;
     if (currentReplyAudio) {

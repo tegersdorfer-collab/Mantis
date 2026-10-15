@@ -10,6 +10,7 @@ export function initSettingsPanel(): void {
       <label for="settings-api-token">Zugangsschlüssel (DASHBOARD_TOKEN)</label>
       <input type="password" id="settings-api-token" autocomplete="off" />
       <button type="submit">Speichern</button>
+      <button id="settings-speaker-enrollment" type="button">Stimme einlernen</button>
       <div class="settings-hint">Enter zum Speichern &amp; Neuladen · Escape zum Abbrechen</div>
     </form>
   `;
@@ -18,6 +19,9 @@ export function initSettingsPanel(): void {
   const form = panel.querySelector<HTMLFormElement>('#settings-form')!;
   const input = panel.querySelector<HTMLInputElement>('#settings-base-url')!;
   const tokenInput = panel.querySelector<HTMLInputElement>('#settings-api-token')!;
+  const speakerButton = panel.querySelector<HTMLButtonElement>(
+    '#settings-speaker-enrollment',
+  )!;
   input.addEventListener('input', () => { tokenInput.value = ''; });
 
   function close(): void {
@@ -41,6 +45,11 @@ export function initSettingsPanel(): void {
       close();
       location.reload();
     }
+  });
+
+  speakerButton.addEventListener('click', () => {
+    close();
+    document.dispatchEvent(new Event('open-speaker-enrollment'));
   });
 
   document.addEventListener('keydown', (e) => {
