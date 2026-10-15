@@ -137,6 +137,18 @@ class TestSendeAntwort:
         assert ws.gesendet == [{"text": "nicht adressiert", "addressed": True,
                                 "reply": None, "audio_b64": None}]
 
+    def test_bargein_history_uses_played_words_of_incomplete_sentence(self):
+        from web.routers.voice import _PlaybackTurn
+
+        playback = _PlaybackTurn()
+        block_id = playback.register_block(
+            0, b"audio", text="Das ist ein unvollständiger Satz.", sentence_id=0,
+        )
+        playback.mark_block_sent(block_id, sent_at=100.0)
+        playback.record_progress(block_id, 700.0, now=100.7)
+
+        assert playback.assistant_text == "Das ist"
+
 
 def test_live_voice_stream_synthesizes_first_sentence_before_llm_finishes(monkeypatch):
     timeline = []
@@ -384,6 +396,77 @@ def test_streamed_voice_defers_history_until_all_playback_progress_arrives(monke
         )]
 
     asyncio.run(run())
+
+
+def test_incomplete_synthesis_records_only_played_prefix_and_skips_full_reply(
+    monkeypatch,
+):
+    from core.tts import TTSSynthesisIncompleteError
+    import web.routers.voice as voice_router
+
+    prefix = "Der erste Teil dieses Satzes endet hier,"
+    reply = f"{prefix} und der Rest wird nicht gesprochen."
+    audio_end_sent = asyncio.Event()
+    recorded = []
+    committed = []
+    tts_calls = []
+
+    class WebSocket(FakeWebSocket):
+        async def send_json(self, data):
+            await super().send_json(data)
+            if data.get("type") == "audio_end":
+                audio_end_sent.set()
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None, **_kwargs):
+            await stream_cb(attempt_start("tts-incomplete"))
+            await stream_cb(delta("tts-incomplete", reply))
+            await stream_cb(attempt_end("tts-incomplete", final=True))
+            return reply, [{"tool": "weather"}]
+
+        def record_aborted_voice_turn(self, spoken_text):
+            recorded.append(spoken_text)
+
+        def finish_voice_turn(self, text, full_reply, trace):
+            committed.append((text, full_reply, trace))
+
+    async def broken_tts(sentence, **_kwargs):
+        tts_calls.append(sentence)
+        yield _fake_opus(1000)
+        raise TTSSynthesisIncompleteError(
+            "zweiter TTS-Teil fehlt", synthesized_text=prefix,
+        )
+
+    monkeypatch.setattr("web.routers.voice.synthesize_stream", broken_tts)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", False)
+
+    async def run():
+        websocket = WebSocket()
+        playback = voice_router._PlaybackTurn()
+        task = asyncio.create_task(sende_streaming_antwort(
+            websocket, "Mantis, erzähl etwas", FakeOrchestrator(),
+            playback=playback, defer_history=True,
+        ))
+        await asyncio.wait_for(audio_end_sent.wait(), timeout=1)
+        chunks = [
+            item for item in websocket.gesendet
+            if item.get("type") == "audio_chunk"
+        ]
+        for chunk in chunks:
+            playback.record_progress(
+                chunk["block_id"], 1000, finished=True,
+            )
+        await task
+        return len(chunks), playback
+
+    chunk_count, playback = asyncio.run(run())
+
+    assert chunk_count == 1
+    assert tts_calls == [prefix]
+    assert playback.sentences[0].complete is False
+    assert recorded == [prefix]
+    assert committed == []
 
 
 def test_websocket_bargein_stops_playback_cancels_old_turn_and_accepts_followup(

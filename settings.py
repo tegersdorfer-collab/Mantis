@@ -8,9 +8,67 @@ Verwendung:
 """
 from __future__ import annotations
 import json
+from pathlib import Path
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_DEFAULT_TTS_KLON_PRONUNCIATIONS = {
+    "Mantis": "Mäntis",
+    "Branch": "Bräntsch",
+    "Branches": "Bräntsches",
+    "Deployment": "Diploiment",
+    "Deployments": "Diploiments",
+    "Meeting": "Mieting",
+    "Meetings": "Mietings",
+    "Update": "Apdejt",
+    "Updates": "Apdejts",
+    "Server": "Sörwer",
+    "Servers": "Sörwers",
+    "Merge": "Mördsch",
+    "Merges": "Mördschs",
+    "gemerged": "gemördscht",
+    "Merging": "Mördsching",
+    "Commit": "Kommitt",
+    "Commits": "Kommitts",
+    "committed": "kommittet",
+    "Timer": "Teimer",
+    "Timers": "Teimers",
+    "Playlist": "Pleylist",
+    "Playlists": "Pleylists",
+    "Spotify": "Spottifei",
+    "Discord": "Diskord",
+    "Feature": "Fietscher",
+    "Features": "Fietschers",
+    "Bug": "Bagg",
+    "Bugs": "Baggs",
+}
+
+
+def _tts_klon_repo_root() -> Path:
+    """Nutzt im Git-Worktree lokale TTS-Assets des Hauptcheckouts."""
+    repo_root = Path(__file__).resolve().parent
+    git_file = repo_root / ".git"
+    if not git_file.is_file():
+        return repo_root
+    try:
+        gitdir_line = git_file.read_text(encoding="utf-8").strip()
+        if not gitdir_line.startswith("gitdir:"):
+            return repo_root
+        git_dir = Path(gitdir_line.partition(":")[2].strip())
+        if not git_dir.is_absolute():
+            git_dir = (repo_root / git_dir).resolve()
+        common_git_dir = git_dir.parent.parent
+        main_checkout = common_git_dir.parent
+        if (main_checkout / ".venv-tts" / "bin" / "python").is_file():
+            return main_checkout
+    except (OSError, IndexError):
+        pass
+    return repo_root
+
+
+_TTS_KLON_REPO_ROOT = _tts_klon_repo_root()
 
 
 class MantisSettings(BaseSettings):
@@ -71,13 +129,22 @@ class MantisSettings(BaseSettings):
     #   whisper turbo   ... 22 %, 1,06 s/Clip
     # Ganze Sätze transkribieren alle drei fehlerfrei; der Unterschied liegt bei
     # kurzen Äußerungen und Eigennamen — genau dem Voice-Alltag.
-    # TTS: Cloud-Ersatzkette; lokal bleiben Kokoro/Piper als letzte Provider.
+    # TTS: Cartesia, isolierter MLX-Klon und Cloud-/Kokoro-/Piper-Fallbacks.
     TTS_ENGINE: str = "cartesia"
     TTS_ENGINE_CHAIN: list[str] = Field(
-        default_factory=lambda: ["cartesia", "elevenlabs", "google", "local"],
+        default_factory=lambda: ["cartesia", "klon", "elevenlabs", "google", "local"],
     )
     TTS_QUOTA_COOLDOWN_S: float = 3600.0
     TTS_KOKORO_VOICE: str = "dm_martin"
+    TTS_KLON_PYTHON: str = str(_TTS_KLON_REPO_ROOT / ".venv-tts" / "bin" / "python")
+    TTS_KLON_REF_DIR: str = str(_TTS_KLON_REPO_ROOT / "data" / "voice_clone")
+    TTS_KLON_IDLE_S: float = Field(default=600.0, gt=0)
+    TTS_KLON_START_TIMEOUT_S: float = Field(default=20.0, gt=0)
+    TTS_KLON_FIRST_CHUNK_TIMEOUT_S: float = Field(default=3.0, gt=0)
+    TTS_KLON_CHUNK_TIMEOUT_S: float = Field(default=3.0, gt=0)
+    TTS_KLON_PRONUNCIATIONS: dict[str, str] = Field(
+        default_factory=lambda: dict(_DEFAULT_TTS_KLON_PRONUNCIATIONS),
+    )
     CARTESIA_API_KEY: str = ""
     TTS_CARTESIA_MODEL: str = "sonic-3.6"
     TTS_CARTESIA_VOICE: str = "afa425cf-5489-4a09-8a3f-d3cb1f82150d"
@@ -336,6 +403,21 @@ class MantisSettings(BaseSettings):
             return defaults
         if not isinstance(value, dict):
             raise ValueError("TTS_CARTESIA_PRONUNCIATIONS muss ein JSON-Objekt sein")
+        return {**defaults, **value}
+
+    @field_validator("TTS_KLON_PRONUNCIATIONS", mode="before")
+    @classmethod
+    def merge_klon_pronunciations(cls, value):
+        defaults = _DEFAULT_TTS_KLON_PRONUNCIATIONS
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("TTS_KLON_PRONUNCIATIONS muss gültiges JSON sein") from exc
+        if value is None:
+            return dict(defaults)
+        if not isinstance(value, dict):
+            raise ValueError("TTS_KLON_PRONUNCIATIONS muss ein JSON-Objekt sein")
         return {**defaults, **value}
 
     @field_validator("OWNER_NAME")

@@ -1213,9 +1213,12 @@ class TestElevenLabs:
         async def collect():
             _state, token = tts._start_tts_turn()
             try:
-                chunks = []
-                for sentence in ("Erster Satz.", "Zweiter Satz.", "Dritter Satz."):
-                    chunks.extend([chunk async for chunk in tts.synthesize_stream(sentence)])
+                chunks = [
+                    chunk async for chunk in tts.synthesize_stream("Erster Satz.")
+                ]
+                for sentence in ("Zweiter Satz.", "Dritter Satz."):
+                    with pytest.raises(tts.TTSSynthesisIncompleteError):
+                        [chunk async for chunk in tts.synthesize_stream(sentence)]
                 return chunks
             finally:
                 tts._end_tts_turn(token)
@@ -1318,7 +1321,7 @@ class TestElevenLabs:
         )
         monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN_EXPLICIT", False, raising=False)
 
-        assert tts._engine_chain() == ["google", "cartesia", "elevenlabs", "local"]
+        assert tts._engine_chain() == ["google", "cartesia", "klon", "elevenlabs", "local"]
 
     def test_filler_synthesis_never_uses_a_fallback_voice(self, elevenlabs_engine, monkeypatch):
         monkeypatch.setattr(tts.config, "GOOGLE_TTS_API_KEY", "google-key", raising=False)

@@ -97,6 +97,21 @@ class TestDashboardRespondUiWiring:
             meta={"interrupted": True},
         )
 
+    def test_aborted_voice_history_contains_only_spoken_text_and_marker(self):
+        handler = _make_handler()
+        assert callable(getattr(handler, "record_aborted_voice_turn", None))
+        handler._persist_msg = MagicMock()
+
+        handler.record_aborted_voice_turn("Der erste Teil")
+
+        handler.kzg.add.assert_called_once_with(
+            "assistant", "Der erste Teil [abgebrochen]",
+        )
+        handler._persist_msg.assert_called_once_with(
+            "assistant", "Der erste Teil [abgebrochen]", channel="voice",
+            meta={"interrupted": True},
+        )
+
     def test_interaktiver_turn_hat_viertausend_token_budget(self, monkeypatch):
         handler = _make_handler()
 

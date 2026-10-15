@@ -711,11 +711,18 @@ class MessageHandler:
 
     def record_interrupted_voice_turn(self, spoken_text: str) -> None:
         """Persistiert ausschließlich den vom Client als gespielt gemeldeten Teil."""
+        self._record_voice_prefix(spoken_text, "[unterbrochen]")
+
+    def record_aborted_voice_turn(self, spoken_text: str) -> None:
+        """Persistiert den gehörten Präfix, wenn die Synthese vorzeitig scheiterte."""
+        self._record_voice_prefix(spoken_text, "[abgebrochen]")
+
+    def _record_voice_prefix(self, spoken_text: str, marker: str) -> None:
         spoken_text = str(spoken_text or "").strip()
         if not spoken_text:
             return
-        if not spoken_text.endswith("[unterbrochen]"):
-            spoken_text = f"{spoken_text} [unterbrochen]"
+        if not spoken_text.endswith(marker):
+            spoken_text = f"{spoken_text} {marker}"
         self.kzg.add("assistant", spoken_text)
         self._persist_msg(
             "assistant", spoken_text, channel="voice", meta={"interrupted": True},

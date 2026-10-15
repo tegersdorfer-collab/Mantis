@@ -122,10 +122,18 @@ Drei fokussierte Apps gegen dieselbe FastAPI (`:7779`), erreichbar über Tailsca
 | Backend | FastAPI + uvicorn |
 | Frontend | Vanilla JS PWA (Chart.js, vis.js, marked.js, globe.gl, Leaflet) |
 | iOS-Apps | 3 × SwiftUI — BodyOS / BrainOS / FlowOS |
-| Kommunikation | python-telegram-bot · Voice (Parakeet lokal + TTS-Kette Cartesia/ElevenLabs/Google/Kokoro/Piper) · Cloud-Bildanalyse |
+| Kommunikation | python-telegram-bot · Voice (Parakeet lokal + TTS-Kette Cartesia/Klon/ElevenLabs/Google/Kokoro/Piper) · Cloud-Bildanalyse |
 | Health-Import | Swift-App → HealthKit Background Delivery → HTTP Push |
 | Prozess-Management | launchd + KeepAlive (Auto-Restart nach Crash) |
 | CI | GitHub Actions (ruff lint + pytest, Python 3.14) |
+
+Der Klon-Fallback läuft in einem eigenen Worker mit `TTS_KLON_PYTHON` (standardmäßig
+`.venv-tts/bin/python`) und lädt mlx-audio nicht in Mantis’ Python-Umgebung. Die
+Sprecherreferenz liegt standardmäßig in `data/voice_clone`; `TTS_KLON_REF_DIR` kann den
+Pfad ändern. Der Prozess bleibt bis zu 600 Sekunden warm und beendet sich dann, um seinen
+Modellspeicher freizugeben. Modellstart und Audio-Streaming sind begrenzt durch
+`TTS_KLON_START_TIMEOUT_S` (20 s), `TTS_KLON_FIRST_CHUNK_TIMEOUT_S` (3 s) und
+`TTS_KLON_CHUNK_TIMEOUT_S` (3 s); bei Überschreitung wird der Worker beendet.
 
 Werkzeugauswahl, Sprecher-Adressierung und Memory-Prüfungen laufen über die gemeinsame Cloud-Kette. Das optionale Forge-Vorgate bleibt über `JEV_FORGE_GATE_ENABLED` und `JEV_ENABLED` abschaltbar und nutzt dieselbe schnelle Cloud-Variante. Die Fragen und Schwellenwerte stehen in `core/decisions.py`; `JEV_LOG_PATH` behält das bisherige JevKit-Logformat für Auswertungen bei.
 
