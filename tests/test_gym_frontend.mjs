@@ -22,7 +22,7 @@ async function waitFor(predicate) {
   return predicate();
 }
 
-function makeState({ session = { id: 1, started_at: "2026-10-14T10:00:00Z" }, logged = [], prefill = [] } = {}) {
+function makeState({ session = { id: 1, started_at: "2026-10-14T10:00:00Z" }, logged = [], prefill = [], home } = {}) {
   return {
     session,
     exercises: ["Squats", "Bench Press", "Deadlifts"].map((name) => ({
@@ -31,6 +31,7 @@ function makeState({ session = { id: 1, started_at: "2026-10-14T10:00:00Z" }, lo
       prefill: name === "Squats" ? prefill : [],
       logged: name === "Squats" ? logged : [],
     })),
+    ...(home ? { home } : {}),
   };
 }
 
@@ -44,6 +45,7 @@ function createFrontend({
   const documentListeners = new Map();
   const windowListeners = new Map();
   const draftInputs = [];
+  const vibrations = [];
   const screen = {
     _innerHTML: "",
     get innerHTML() { return this._innerHTML; },
@@ -77,6 +79,7 @@ function createFrontend({
     ["#timer-host", { innerHTML: "" }],
     ["#sync-host", { innerHTML: "" }],
     ["#notice-host", { innerHTML: "" }],
+    ["#tab-bar", { innerHTML: "", hidden: false }],
   ]);
   let reloads = 0;
   let intervalId = 0;
@@ -92,7 +95,7 @@ function createFrontend({
       confirm: () => true,
       addEventListener: (name, callback) => windowListeners.set(name, callback),
     },
-    navigator: {},
+    navigator: { vibrate: (pattern) => vibrations.push(pattern) },
     localStorage: {
       getItem(key) {
         if (failGetItem(key)) throw new Error("storage unavailable");
@@ -111,7 +114,7 @@ function createFrontend({
     },
     FormData: class {
       constructor(form) { this.form = form; }
-      get(key) { return key === "token" ? this.form.token : null; }
+      get(key) { return key === "token" ? this.form.token : (this.form[key] ?? null); }
     },
     URLSearchParams,
     crypto: { randomUUID: () => `vm-generated-client-id-${++generatedClientIdSequence}` },
@@ -127,6 +130,7 @@ function createFrontend({
     storage,
     windowListeners,
     get reloads() { return reloads; },
+    vibrations,
     click(action, data = {}) {
       const dataset = { action, ...data };
       if (action === "log-draft" && data.index !== undefined) {
@@ -1346,7 +1350,7 @@ test("Tabwechsel aus der Trainingszusammenfassung öffnet den gewählten Bereich
 
   await app.click("tab", { tab: "history" });
 
-  assert.match(app.elements.get("#screen").innerHTML, /Noch keine abgeschlossenen Trainings/);
+  assert.match(app.elements.get("#screen").innerHTML, /No completed workouts yet/);
 });
 
 test("offene Session zeigt auch ohne aktiven Plan oben Fortsetzen", async () => {
@@ -1419,4 +1423,286 @@ test("Sekunden-Übungen lassen bis 600 s zu, Wdh.-Übungen nur bis 100", async (
   app.input(0, "reps", "150");
   await app.click("log-draft", { index: "0" });
   assert.equal(app.calls.filter((call) => call.url === "/api/sets").length, 1);
+});
+
+test("Start zeigt die Wochenleiste, Plantage und vier Navigation-Icons ohne Text", async () => {
+  const home = {
+    active_plan: {
+      id: 7,
+      name: "Lower A",
+      active: true,
+      days: [{ id: 8, name: "Lower A", exercises: [{ name: "Squats" }, { name: "Leg Press" }] }],
+    },
+    week_number: 8,
+    week_days: [
+      { date: "2035-06-11", label: "Mon", trained: true, today: false },
+      { date: "2035-06-12", label: "Tue", trained: false, today: true },
+    ],
+    next_day: { id: 8, name: "Lower A" },
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ home }));
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Lower A")), true);
+  const screen = app.elements.get("#screen").innerHTML;
+  const tabs = app.elements.get("#tab-bar").innerHTML;
+  assert.match(screen, /data-action="start-day" data-day-id="8"/);
+  assert.match(screen, /Week 8/);
+  assert.match(screen, /data-action="open-library"/);
+  assert.deepEqual([...tabs.matchAll(/data-tab="([^"]+)"/g)].map((item) => item[1]), [
+    "training", "history", "profile", "plans",
+  ]);
+  assert.doesNotMatch(tabs, /<strong>/);
+});
+
+test("Trainings-Sheet rechnet einen Satz als 10RM um und erlaubt ein anderes Ziel", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState({ prefill: [{ weight_kg: 60, reps: 8 }] }));
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes("class=\"exercise-list\"")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+
+  assert.match(screen(), /class="workout-sheet"/);
+  assert.match(screen(), /data-tenrm-value="57"/);
+  await app.click("edit-tenrm-target");
+  assert.match(screen(), /data-tenrm-target/);
+  app.run("tenRmTarget = 8; render();");
+  assert.match(screen(), /data-tenrm-value="60"/);
+  assert.match(screen(), /data-tenrm-target/);
+});
+
+test("Zeitübungen im Trainings-Sheet zeigen SECS und keine 10RM-Spalte", async () => {
+  const state = {
+    session: { id: 1, title: "Lower A", started_at: "2026-10-14T10:00:00Z" },
+    exercises: [{
+      name: "Weighted Deadhang", rest_s: 180, rep_min: 30, rep_max: 40,
+      target_unit: "seconds", prefill: [{ weight_kg: 20, reps: 34 }], logged: [],
+    }],
+    home: { active_plan: { name: "Lower A", days: [] }, week_days: [] },
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  assert.equal(await waitFor(() => screen().includes("class=\"exercise-list\"")), true);
+  await app.click("open-exercise", { exercise: "Weighted Deadhang" });
+
+  assert.match(screen(), />SECS</);
+  assert.doesNotMatch(screen(), /10RM/);
+});
+
+test("gültiges Abhaken gibt ein kurzes Vibrationssignal aus", async () => {
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, makeState({ prefill: [{ weight_kg: 40, reps: 8 }] }));
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sets") {
+        return response(200, { id: 91, weight_kg: 40, reps: 8, set_index: 1 });
+      }
+      throw new Error(`Unexpected request: ${url} ${options.method || "GET"}`);
+    },
+  });
+
+  assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("class=\"exercise-list\"")), true);
+  await app.click("open-exercise", { exercise: "Squats" });
+  await app.click("log-draft", { index: "0" });
+
+  assert.deepEqual(app.vibrations, [12]);
+});
+
+test("Verlauf zeigt Wochenchart, Zeitfilter und Trainingskacheln", async () => {
+  const workouts = [{
+    id: 8, title: "Upper A", date: "2035-06-12", duration_min: 42, set_count: 12,
+    exercise_count: 4, volume_kg: 5800,
+    exercises: [{ id: 1, name: "Bench Press", muscle: "Chest" }, { id: 2, name: "Cable Row", muscle: "Back" }, { id: 3, name: "Press", muscle: "Shoulders" }],
+  }];
+  const overview = {
+    workout_count: 1, streak_weeks: 1,
+    weekly: [{ week_start: "2035-06-11", workout_count: 1, volume_kg: 5800 }],
+    latest_measurement: null,
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url === "/api/workouts?limit=50") return response(200, workouts);
+      if (url.startsWith("/api/overview?weeks=")) return response(200, overview);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  await app.click("tab", { tab: "history" });
+  assert.match(screen(), /<h1>Training<\/h1>/);
+  assert.match(screen(), /1 workout/);
+  assert.match(screen(), /class="week-chart"/);
+  assert.match(screen(), /Tue, Jun 12/);
+  assert.match(screen(), /\+1/);
+  await app.click("set-chart-metric", { metric: "volume" });
+  assert.match(screen(), /aria-label="Weekly volume chart"/);
+  await app.click("set-overview-weeks", { weeks: "12" });
+  assert.ok(app.calls.some((call) => call.url === "/api/overview?weeks=12"));
+});
+
+test("Profil zeigt Streak, Messwerte und speichert einen synthetischen Eintrag", async () => {
+  const overview = {
+    workout_count: 28, streak_weeks: 4, weekly: [],
+    latest_measurement: { date: "2035-06-12", weight_kg: 72.5, body_fat: 18.2 },
+  };
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url.startsWith("/api/overview?")) return response(200, overview);
+      if (url === "/api/measurements") return response(200, overview.latest_measurement);
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  await app.click("tab", { tab: "profile" });
+  assert.match(screen(), /28/);
+  assert.match(screen(), /4w/);
+  assert.match(screen(), /72,5 kg/);
+  assert.match(screen(), /18,2%/);
+  await app.click("toggle-measurement-form");
+  assert.match(screen(), /id="new-measurement-form"/);
+  await app.documentListeners.get("submit")({
+    target: { id: "new-measurement-form", weight_kg: "73.1", body_fat: "17.9", date: "2035-06-13" },
+    preventDefault() {},
+  });
+  const request = app.calls.find((call) => call.url === "/api/measurements");
+  assert.equal(request.method, "POST");
+  assert.deepEqual(JSON.parse(request.body), { weight_kg: 73.1, body_fat: 17.9, date: "2035-06-13" });
+});
+
+test("Übungsdetail hebt zugeordnete Muskeln hervor und speichert Instructions", async () => {
+  const app = createFrontend({
+    fetch: async (url) => {
+      if (url === "/api/state") return response(200, makeState());
+      if (url === "/api/exercises/77") return response(200, {
+        id: 77, name: "Synthetic Press", muscle: "Chest and triceps", equipment: "barbell",
+        category: "strength", rep_min: 6, rep_max: 10, instructions: "Keep the wrists straight.", history: [],
+      });
+      throw new Error(`Unexpected request: ${url}`);
+    },
+  });
+  const screenElement = app.elements.get("#screen");
+  await waitFor(() => screenElement.innerHTML.includes('class="exercise-list"'));
+  app.run(`activeTab="exercises"; exerciseDirectory=[{id:78,name:"Other",muscle:"Chest"}]; exerciseDetail={
+    id:77,name:"Synthetic Press",muscle:"Chest and triceps",equipment:"barbell",category:"strength",
+    rep_min:6,rep_max:10,instructions:"Keep the wrists straight.",history:[]};
+    exerciseInstructionsDraft="Keep the wrists straight."; render();`);
+
+  assert.match(screenElement.innerHTML, /data-muscle="chest" d="[^"]+"\>.*?<\/path>/);
+  assert.match(screenElement.innerHTML, /class="muscle-region is-highlighted" data-muscle="chest"/);
+  for (const muscle of ["shoulders", "biceps", "triceps", "forearms", "abs", "quads", "hams", "glutes", "calves", "lats", "traps", "lower back", "neck"]) {
+    assert.match(screenElement.innerHTML, new RegExp(`data-muscle="${muscle}"`));
+  }
+  await app.click("exercise-detail-tab", { detailTab: "instructions" });
+  assert.match(screenElement.innerHTML, /Keep the wrists straight\./);
+  screenElement.querySelector = () => ({ value: "Pause at the bottom." });
+  await app.click("save-exercise-instructions");
+  const update = app.calls.find((call) => call.url === "/api/exercises/77");
+  assert.equal(update.method, "PATCH");
+  assert.deepEqual(JSON.parse(update.body), { instructions: "Pause at the bottom." });
+});
+
+test("Session-Übung kann über den Picker ersetzt werden", async () => {
+  const state = makeState();
+  state.exercises[0].session_exercise_id = 101;
+  state.exercises[0].sort_order = 0;
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url === "/api/history?exercise=Synthetic+Cable+Row&limit=5") return response(200, []);
+      if (url === "/api/exercises") return response(200, [{ id: 55, name: "Synthetic Cable Row", muscle: "Back" }]);
+      if (url === "/api/sessions/1/exercises/101" && options.method === "PATCH") {
+        assert.deepEqual(JSON.parse(options.body), { exercise_id: 55 });
+        state.exercises[0].name = "Synthetic Cable Row";
+        state.exercises[0].exercise_id = 55;
+        return response(200, state.exercises[0]);
+      }
+      throw new Error(`Unexpected request: ${url} ${options.method || "GET"}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  await app.click("open-exercise", { exercise: "Squats" });
+  assert.match(screen(), /data-action="open-session-exercise-picker"/);
+  await app.click("open-exercise-menu");
+  await app.click("replace-session-exercise");
+  await app.click("pick-exercise", { kind: "replace", exerciseId: "55" });
+  assert.ok(app.calls.some((call) => call.url === "/api/sessions/1/exercises/101" && call.method === "PATCH"));
+  assert.match(screen(), /Synthetic Cable Row/);
+});
+
+test("Rep-Ziel einer Session-Übung lässt sich speichern", async () => {
+  const state = makeState();
+  state.exercises[0].session_exercise_id = 101;
+  state.exercises[0].sort_order = 0;
+  state.exercises[0].rep_min = 6;
+  state.exercises[0].rep_max = 10;
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url.startsWith("/api/history?")) return response(200, []);
+      if (url === "/api/sessions/1/exercises/101" && options.method === "PATCH") {
+        return response(200, { ...state.exercises[0], rep_min: 8, rep_max: 12 });
+      }
+      throw new Error(`Unexpected request: ${url} ${options.method || "GET"}`);
+    },
+  });
+  const screenElement = app.elements.get("#screen");
+
+  await waitFor(() => screenElement.innerHTML.includes('class="exercise-list"'));
+  await app.click("open-exercise", { exercise: "Squats" });
+  await app.click("edit-rep-target");
+  assert.match(screenElement.innerHTML, /data-rep-target="rep_min"/);
+  screenElement.querySelector = (selector) => ({ value: selector.includes("rep_min") ? "8" : "12" });
+  await app.click("save-session-target");
+  const update = app.calls.find((call) => call.url === "/api/sessions/1/exercises/101");
+  assert.equal(update.method, "PATCH");
+  assert.deepEqual(JSON.parse(update.body), { rep_min: 8, rep_max: 12 });
+  assert.doesNotMatch(screenElement.innerHTML, /data-rep-target=/);
+});
+
+test("Session-Übung kann ohne gespeicherte Sätze entfernt werden", async () => {
+  const state = makeState();
+  state.exercises[0].session_exercise_id = 101;
+  state.exercises[0].sort_order = 0;
+  const app = createFrontend({
+    fetch: async (url, options = {}) => {
+      if (url === "/api/state") return response(200, state);
+      if (url === "/api/sessions/1/exercises/101" && options.method === "DELETE") {
+        state.exercises = [];
+        return response(204, null);
+      }
+      throw new Error(`Unexpected request: ${url} ${options.method || "GET"}`);
+    },
+  });
+  const screen = () => app.elements.get("#screen").innerHTML;
+
+  await waitFor(() => screen().includes('class="exercise-list"'));
+  await app.click("open-exercise", { exercise: "Squats" });
+  await app.click("open-exercise-menu");
+  await app.click("remove-session-exercise");
+  assert.ok(app.calls.some((call) => call.url === "/api/sessions/1/exercises/101" && call.method === "DELETE"));
+  assert.doesNotMatch(screen(), /class="workout-sheet"/);
 });

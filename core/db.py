@@ -812,6 +812,7 @@ MIGRATIONS = [
 
 MIGRATIONS.extend([
     # Gym-Tracker v2: eigener Trainingsplan, getrennt von der importierten Historie.
+    "ALTER TABLE exercises ADD COLUMN IF NOT EXISTS instructions TEXT;",
     """
     CREATE TABLE IF NOT EXISTS gym_plans (
         id          SERIAL PRIMARY KEY,
@@ -859,6 +860,7 @@ MIGRATIONS.extend([
         rest_s      INT NOT NULL DEFAULT 180,
         note        TEXT NOT NULL DEFAULT '',
         skipped     BOOLEAN NOT NULL DEFAULT FALSE,
+        removed     BOOLEAN NOT NULL DEFAULT FALSE,
         UNIQUE (workout_id, exercise_id)
     );
     """,
@@ -867,6 +869,7 @@ MIGRATIONS.extend([
     # Inline-CHECK mit IF NOT EXISTS: kein zweiter Constraint bei erneutem Lauf.
     "ALTER TABLE gym_plan_exercises ADD COLUMN IF NOT EXISTS target_unit TEXT NOT NULL DEFAULT 'reps' CHECK (target_unit IN ('reps','seconds'));",
     "ALTER TABLE gym_workout_exercises ADD COLUMN IF NOT EXISTS target_unit TEXT NOT NULL DEFAULT 'reps' CHECK (target_unit IN ('reps','seconds'));",
+    "ALTER TABLE gym_workout_exercises ADD COLUMN IF NOT EXISTS removed BOOLEAN NOT NULL DEFAULT FALSE;",
 ])
 
 

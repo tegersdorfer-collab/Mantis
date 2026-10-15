@@ -19,13 +19,25 @@ def _date_text(value) -> str | None:
 def _exercise_row(exercise_id: int) -> dict:
     row = db.query_one(
         """SELECT id,name,category,muscle,unit,exercise_type,equipment,rep_min,
-                  rep_max,weight_increment_kg,dumbbell_pair
+                  rep_max,weight_increment_kg,dumbbell_pair,instructions
            FROM exercises WHERE id=%s""",
         (exercise_id,),
     )
     if not row:
         raise TrackerError(404, "Übung nicht gefunden")
     return row
+
+
+def update_instructions(exercise_id: int, instructions: str) -> dict:
+    """Speichert die persönlichen Hinweise einer Übung."""
+    if not isinstance(instructions, str) or len(instructions) > 3000:
+        raise TrackerError(400, "Hinweise dürfen höchstens 3000 Zeichen enthalten")
+    if db.execute(
+        "UPDATE exercises SET instructions=%s WHERE id=%s",
+        (instructions.strip(), exercise_id),
+    ) == 0:
+        raise TrackerError(404, "Übung nicht gefunden")
+    return _exercise_row(exercise_id)
 
 
 def list_exercises(query: str = "", muscle: str | None = None) -> list[dict]:
@@ -161,6 +173,7 @@ def workout_list(limit: int = 50) -> list[dict]:
     rows = db.query(
         """SELECT w.id,w.date,w.title,w.duration_min,w.created_at,w.ended_at,
                   COUNT(ws.id) FILTER (WHERE COALESCE(ws.is_warmup,FALSE)=FALSE) AS set_count,
+                  COUNT(DISTINCT e.id) AS exercise_count,
                   COALESCE(SUM(CASE WHEN COALESCE(ws.is_warmup,FALSE)=FALSE
                                     AND COALESCE(e.load_mode,'external')<>'bodyweight'
                                     AND ws.weight_kg>0 AND ws.reps>0
@@ -175,6 +188,25 @@ def workout_list(limit: int = 50) -> list[dict]:
            GROUP BY w.id ORDER BY w.date DESC,w.created_at DESC,w.id DESC LIMIT %s""",
         (limit,),
     )
+    workout_ids = [int(row["id"]) for row in rows]
+    previews_by_workout: dict[int, list[dict]] = {workout_id: [] for workout_id in workout_ids}
+    if workout_ids:
+        previews = db.query(
+            """SELECT ws.workout_id,e.id,e.name,e.muscle,MIN(ws.set_index) AS first_set
+               FROM workout_sets ws JOIN exercises e ON e.id=ws.exercise_id
+               WHERE ws.workout_id=ANY(%s)
+               GROUP BY ws.workout_id,e.id,e.name,e.muscle
+               ORDER BY ws.workout_id,first_set,e.id""",
+            (workout_ids,),
+        )
+        for preview in previews:
+            items = previews_by_workout[int(preview["workout_id"])]
+            if len(items) < 3:
+                items.append({
+                    "id": int(preview["id"]),
+                    "name": preview["name"],
+                    "muscle": preview.get("muscle"),
+                })
     return [
         {
             **row,
@@ -183,7 +215,9 @@ def workout_list(limit: int = 50) -> list[dict]:
             "title": row.get("title") or "Training",
             "duration_min": int(row.get("duration_min") or 0),
             "set_count": int(row.get("set_count") or 0),
+            "exercise_count": int(row.get("exercise_count") or 0),
             "volume_kg": round(float(row.get("volume_kg") or 0), 2),
+            "exercises": previews_by_workout[int(row["id"])],
         }
         for row in rows
     ]

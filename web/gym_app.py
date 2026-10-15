@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date as Date
 import hashlib
 import hmac
 from pathlib import Path
@@ -10,10 +11,10 @@ import time
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import config
-from domains.gym import library, plans, tracker
+from domains.gym import library, overview, plans, tracker
 
 
 COOKIE = "mantis_gym"
@@ -88,6 +89,16 @@ class ExerciseBody(BaseModel):
     rep_max: int = 10
 
 
+class ExercisePatch(BaseModel):
+    instructions: str = Field(max_length=3000)
+
+
+class MeasurementBody(BaseModel):
+    weight_kg: float | None = Field(default=None, ge=20, le=500)
+    body_fat: float | None = Field(default=None, ge=0, le=100)
+    date: Date | None = None
+
+
 class SessionStartBody(BaseModel):
     day_id: int | None = None
 
@@ -100,6 +111,11 @@ class SessionExercisePatch(BaseModel):
     sort_order: int | None = None
     note: str | None = None
     skipped: bool | None = None
+    exercise_id: int | None = None
+    target_sets: int | None = None
+    rep_min: int | None = None
+    rep_max: int | None = None
+    rest_s: int | None = None
 
 
 def _token_ok(value: str) -> bool:
@@ -245,6 +261,19 @@ def create_gym_app() -> FastAPI:
         current["home"] = await asyncio.to_thread(plans.home_state)
         return current
 
+    @api.get("/overview")
+    async def overview_data(weeks: int = 4):
+        return await asyncio.to_thread(overview.dashboard, weeks=weeks)
+
+    @api.post("/measurements")
+    async def save_measurement(body: MeasurementBody):
+        return await asyncio.to_thread(
+            overview.save_measurement,
+            body.weight_kg,
+            body.body_fat,
+            date_=body.date,
+        )
+
     @api.post("/sessions/start")
     async def start_session(body: SessionStartBody):
         if body.day_id is not None:
@@ -267,6 +296,11 @@ def create_gym_app() -> FastAPI:
             entry_id,
             **body.model_dump(exclude_unset=True),
         )
+
+    @api.delete("/sessions/{workout_id}/exercises/{entry_id}", status_code=204)
+    async def remove_session_exercise(workout_id: int, entry_id: int):
+        await asyncio.to_thread(plans.remove_session_exercise, workout_id, entry_id)
+        return Response(status_code=204)
 
     @api.get("/plans")
     async def list_plans():
@@ -354,6 +388,12 @@ def create_gym_app() -> FastAPI:
     @api.get("/exercises/{exercise_id}")
     async def exercise_detail(exercise_id: int):
         return await asyncio.to_thread(library.exercise_detail, exercise_id)
+
+    @api.patch("/exercises/{exercise_id}")
+    async def update_exercise(exercise_id: int, body: ExercisePatch):
+        return await asyncio.to_thread(
+            library.update_instructions, exercise_id, body.instructions
+        )
 
     @api.get("/workouts")
     async def workout_list(limit: int = 50):

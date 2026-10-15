@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from core import db
-from domains.gym import ap_text_import, plans, session
+from domains.gym import ap_text_import, plans, session, tracker
 from domains.gym.aliases import normalize_alias
 
 
@@ -294,6 +294,52 @@ def test_plan_session_snapshots_day_and_reorders_session_exercises(plan_database
 
     reordered = plans.session_exercises(started["id"], started["title"])
     assert [item["exercise_id"] for item in reordered] == [alias_id, canonical_id]
+
+
+@pytest.mark.db
+def test_open_session_exercise_can_be_replaced_retargeted_and_removed(plan_database):
+    moment = datetime.now(ZoneInfo("Europe/Berlin"))
+    plan = plans.create_plan(f"Synthetic session {uuid4()}", date.today())
+    plan_database["created_plans"].append(plan["id"])
+    day = plans.add_day(plan["id"], "Lower A")
+    canonical_id = plan_database["exercise_ids"][f"{plan_database['name']} Canonical"]
+    replacement_id = plan_database["exercise_ids"][f"{plan_database['name']} Cardio"]
+    plans.add_exercise(day["id"], canonical_id)
+    plans.activate_plan(plan["id"])
+    started = plans.start_plan_session(day["id"], moment)
+    plan_database["workouts"].append(started["id"])
+    entry = plans.session_exercises(started["id"], started["title"])[0]
+
+    updated = plans.update_session_exercise(
+        started["id"], entry["session_exercise_id"],
+        exercise_id=replacement_id, target_sets=4, rep_min=8, rep_max=12, rest_s=120,
+    )
+    assert updated["exercise_id"] == replacement_id
+    assert (updated["target_sets"], updated["rep_min"], updated["rep_max"], updated["rest_s"]) == (4, 8, 12, 120)
+    plans.remove_session_exercise(started["id"], entry["session_exercise_id"])
+    assert plans.session_exercises(started["id"], started["title"]) == []
+    restored = plans.add_session_exercise(started["id"], replacement_id)
+    assert restored["session_exercise_id"] == entry["session_exercise_id"]
+    assert restored["exercise_id"] == replacement_id
+
+
+@pytest.mark.db
+def test_session_exercise_with_logged_sets_cannot_be_replaced_or_removed(plan_database):
+    moment = datetime.now(ZoneInfo("Europe/Berlin"))
+    started = plans.start_free_session(moment)
+    plan_database["workouts"].append(started["id"])
+    exercise_name = f"{plan_database['name']} Canonical"
+    exercise_id = plan_database["exercise_ids"][exercise_name]
+    entry = plans.add_session_exercise(started["id"], exercise_id)
+    tracker.log_set(f"synthetic-{uuid4()}", exercise_name, 50, 8, now=moment)
+
+    with pytest.raises(tracker.TrackerError, match="gespeicherten Sätzen"):
+        plans.update_session_exercise(
+            started["id"], entry["session_exercise_id"],
+            exercise_id=plan_database["exercise_ids"][f"{plan_database['name']} Cardio"],
+        )
+    with pytest.raises(tracker.TrackerError, match="gespeicherten Sätzen"):
+        plans.remove_session_exercise(started["id"], entry["session_exercise_id"])
 
 
 def _export_text(name, rows):
