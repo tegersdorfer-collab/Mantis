@@ -333,7 +333,7 @@ def match_voice(text: str, *, now: datetime | None = None) -> FastCommand | None
     command = match(text)
     if command is not None:
         return command
-    if phrase in {"stopp", "stop", "abbrechen", "halt"}:
+    if phrase in {"stopp", "stop", "abbrechen", "halt", "warte", "sei still"}:
         return _as_voice_reflex("Okay.", "stopp")
     if phrase in {"okay", "ok"}:
         return _as_voice_reflex("Okay.", "okay")

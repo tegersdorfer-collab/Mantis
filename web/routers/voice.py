@@ -74,6 +74,11 @@ class _PlaybackTurn:
         self.audio_end_count: int | None = None
         self.interrupted = False
         self.bargein_ms: float | None = None
+        self.bargein_decision: str | None = None
+        self.bargein_started_at: float | None = None
+        self.duck_started_at: float | None = None
+        self.duck_ms = 0.0
+        self.ducked = False
         self.progress_reported = False
         self.timed_out = False
         self._first_block_sent_at: float | None = None
@@ -83,10 +88,11 @@ class _PlaybackTurn:
 
     def register_block(
         self, seq: int, audio: bytes, *, text: str | None = None,
-        sentence_id: int | None = None,
+        sentence_id: int | None = None, duration_ms: float | None = None,
     ) -> str:
         block_id = f"{self.turn_id}:{seq}"
-        duration_ms = voice_fillers._ogg_opus_duration_ms(audio)
+        if duration_ms is None:
+            duration_ms = voice_fillers._ogg_opus_duration_ms(audio)
         self.blocks[block_id] = _PlaybackBlock(
             block_id, sentence_id, text, duration_ms,
         )
@@ -97,6 +103,40 @@ class _PlaybackTurn:
             sentence.block_ids.append(block_id)
         self.changed.set()
         return block_id
+
+    def start_duck(self, *, now: float | None = None) -> bool:
+        if self.ducked or self.interrupted or not self.playback_active:
+            return False
+        timestamp = time.monotonic() if now is None else float(now)
+        self.ducked = True
+        self.duck_started_at = timestamp
+        if self.bargein_started_at is None:
+            self.bargein_started_at = timestamp
+        return True
+
+    def finish_duck(
+        self, *, now: float | None = None, decision: str | None = None,
+    ) -> float:
+        if self.ducked and self.duck_started_at is not None:
+            timestamp = time.monotonic() if now is None else float(now)
+            duration_ms = max(0.0, (timestamp - self.duck_started_at) * 1000)
+            self.duck_ms = round(self.duck_ms + duration_ms, 1)
+        else:
+            duration_ms = 0.0
+        self.ducked = False
+        self.duck_started_at = None
+        if decision is not None:
+            self.bargein_decision = decision
+        if decision == "ignored":
+            self.bargein_started_at = None
+        return duration_ms
+
+    def current_duck_ms(self, *, now: float | None = None) -> float:
+        duration_ms = self.duck_ms
+        if self.ducked and self.duck_started_at is not None:
+            timestamp = time.monotonic() if now is None else float(now)
+            duration_ms += max(0.0, (timestamp - self.duck_started_at) * 1000)
+        return round(duration_ms, 1)
 
     def mark_sentence_complete(self, sentence_id: int) -> None:
         sentence = self.sentences.get(sentence_id)
@@ -375,9 +415,18 @@ def _record_voice_latency(
     silence_used_ms: float | None = None,
     bargein: bool = False,
     bargein_ms: float | None = None,
+    duck_ms: float | None = None,
+    bargein_decision: str | None = None,
+    address_rejected: bool = False,
 ) -> dict:
     model, stage = _voice_backend_details(orch)
     timing_detail = voice_timing.snapshot()
+    if address_rejected:
+        stage = "address_rejected"
+        timing_detail["llm_calls"] = [
+            call for call in timing_detail.get("llm_calls", [])
+            if call.get("error") != "CancelledError"
+        ]
     if partial_runs is not None:
         timing_detail["partial_runs"] = max(0, int(partial_runs))
     if partial_skip_reasons is not None:
@@ -400,6 +449,9 @@ def _record_voice_latency(
         "silence_used_ms": silence_used_ms,
         "bargein": bool(bargein),
         "bargein_ms": bargein_ms,
+        "duck_ms": duck_ms,
+        "bargein_decision": bargein_decision,
+        "address_rejected": bool(address_rejected),
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
         "model": model,
         "stage": stage,
@@ -490,6 +542,18 @@ _VOICE_ECHO_FILLER_WORDS = frozenset({
     "äh", "ähm", "hm", "hmm", "also", "bitte", "mal", "kurz", "eben",
     "schnell", "gern", "gerne", "vielleicht",
 })
+
+
+def _is_stop_reflex(text: str) -> bool:
+    """Erkennt kurze Stoppwörter auch in einem noch unvollständigen Transkript."""
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold().strip()
+    if re.search(r"(?<!\w)(?:stopp|stop|halt)(?!\w)", normalized):
+        return True
+    if re.search(r"(?<!\w)sei\s+still(?!\w)", normalized):
+        return True
+    return bool(re.match(
+        r"^(?:(?:mantis|mann|man|bitte)[\s,.:;-]+)*warte(?!\w)", normalized,
+    ))
 
 
 def _is_recent_tts_echo(
@@ -591,7 +655,8 @@ async def sende_streaming_antwort(
 
     async def send_audio_chunk(
         audio: bytes, *, answer: bool = False, sentence: str | None = None,
-        sentence_id: int | None = None,
+        sentence_id: int | None = None, echo_text: str | None = None,
+        duration_ms: float | None = None,
     ) -> None:
         nonlocal sequence, first_tts_block_ms, first_answer_audio_ms
         if output_gate is not None:
@@ -601,8 +666,8 @@ async def sende_streaming_antwort(
         if answer and first_answer_audio_ms is None:
             first_answer_audio_ms = round((time.perf_counter() - started_at) * 1000, 1)
         block_id = playback.register_block(
-            sequence, audio,
-            text=sentence if answer else None,
+            sequence, audio, duration_ms=duration_ms,
+            text=sentence if answer else echo_text,
             sentence_id=sentence_id if answer else None,
         )
         await websocket.send_json({
@@ -819,7 +884,10 @@ async def sende_streaming_antwort(
             if pending_filler is not None:
                 selected = pending_filler
                 pending_filler = None
-                await send_audio_chunk(selected.audio)
+                await send_audio_chunk(
+                    selected.audio, echo_text=selected.text,
+                    duration_ms=selected.duration_ms,
+                )
                 if turn_state is not None:
                     turn_state.audio_emitted = True
                 filler_ms = selected.duration_ms
@@ -999,6 +1067,12 @@ async def sende_streaming_antwort(
                     ),
                     bargein=playback.interrupted,
                     bargein_ms=playback.bargein_ms,
+                    duck_ms=playback.current_duck_ms(),
+                    bargein_decision=playback.bargein_decision,
+                    address_rejected=bool(
+                        address_metrics.get("address_rejected", False)
+                        if address_metrics is not None else False
+                    ),
                 )
             finally:
                 try:
@@ -1109,6 +1183,7 @@ def build_router(orch=None) -> APIRouter:
         audio_streaming = False
         supports_playback_progress = False
         active_playback: _PlaybackTurn | None = None
+        ducked_playback: _PlaybackTurn | None = None
         active_response_task: asyncio.Task | None = None
         background_response_tasks: set[asyncio.Task] = set()
         background_address_tasks: set[asyncio.Task] = set()
@@ -1182,26 +1257,66 @@ def build_router(orch=None) -> APIRouter:
             recent_tts_turns.extend(retained_turns)
             return echo_texts
 
-        async def stop_for_bargein(detected_at: float) -> None:
+        async def duck_for_bargein(detected_at: float) -> None:
+            nonlocal ducked_playback
+            playback = active_playback
+            if playback is None or not playback.start_duck(now=detected_at):
+                return
+            playback.bargein_decision = None
+            ducked_playback = playback
+            await send_socket.send_json({"type": "duck_playback"})
+
+        async def unduck_playback(
+            *, decision: str = "ignored", playback: _PlaybackTurn | None = None,
+        ) -> None:
+            nonlocal ducked_playback
+            playback = playback or ducked_playback or active_playback
+            if playback is None or not playback.ducked:
+                return
+            playback.finish_duck(now=time.monotonic(), decision=decision)
+            if ducked_playback is playback:
+                ducked_playback = None
+            await send_socket.send_json({"type": "unduck_playback"})
+
+        async def stop_for_bargein(
+            detected_at: float, *, decision: str | None = None,
+        ) -> None:
+            nonlocal ducked_playback
             playback = active_playback
             if (
                 playback is None or not playback.playback_active
                 or playback.interrupted
             ):
                 return
+            stopped_at = time.monotonic()
             playback.interrupted = True
             if not playback.progress_reported:
                 playback.estimate_progress()
             conversation_window.mark_active(
                 playback.assistant_text or conversation_window.address_context(),
             )
-            playback.bargein_ms = round(
-                max(0.0, (time.monotonic() - detected_at) * 1000), 1,
-            )
+            started_at = playback.bargein_started_at or detected_at
+            playback.bargein_ms = round(max(0.0, (stopped_at - started_at) * 1000), 1)
+            playback.finish_duck(now=stopped_at, decision=decision)
+            if ducked_playback is playback:
+                ducked_playback = None
             _detach_active_response()
             await send_socket.send_json({
                 "type": "stop_playback", "turn_id": playback.turn_id,
             })
+
+        def handle_voice_partial(partial: str) -> None:
+            if prework_cache is not None:
+                prework_cache.offer(partial)
+            playback = active_playback
+            if (
+                playback is not None and playback.playback_active
+                and _is_stop_reflex(partial)
+            ):
+                asyncio.get_running_loop().create_task(
+                    stop_for_bargein(time.monotonic(), decision="stop_word"),
+                    name="voice-stop-reflex-bargein",
+                )
 
         def conversation_active() -> bool:
             return active_playback is not None or conversation_window.is_active()
@@ -1213,11 +1328,11 @@ def build_router(orch=None) -> APIRouter:
             partial_transcriber=transcribe_pcm_partial,
             partial_executor_available=partial_stt_executor_available,
             partial_interval_ms=config.VOICE_PARTIAL_STT_MS,
-            on_partial=prework_cache.offer if prework_cache is not None else None,
+            on_partial=lambda partial: handle_voice_partial(partial),
             bargein_active_fn=lambda: (
                 active_playback is not None and active_playback.playback_active
             ),
-            on_bargein=stop_for_bargein,
+            on_bargein=duck_for_bargein,
         )
 
         async def run_streaming_response(
@@ -1279,6 +1394,7 @@ def build_router(orch=None) -> APIRouter:
             echo_texts.extend(_recent_tts_echo_texts(time.monotonic()))
             if _is_recent_tts_echo(raw_text, echo_texts):
                 log.debug("Voice-Transkript als Echo der letzten TTS-Blöcke verworfen")
+                await unduck_playback(decision="ignored")
                 if prework_cache is not None:
                     prework_cache.clear()
                 return
@@ -1290,6 +1406,7 @@ def build_router(orch=None) -> APIRouter:
             conversation_context = conversation_window.address_context()
             command = fast_commands.match_voice(raw_text)
             is_local_reflex = command is not None and command.tool == "voice_reflex"
+            stop_reflex = _is_stop_reflex(raw_text)
             playback_or_window_active = (
                 active_playback is not None and active_playback.playback_active
             ) or conversation_window.is_active()
@@ -1297,7 +1414,9 @@ def build_router(orch=None) -> APIRouter:
             window_reflex = is_local_reflex and playback_or_window_active
             immediate = wakeword_triggered or window_reflex
             address_mode = "wakeword" if wakeword_triggered else (
-                "window" if window_reflex else "speculative"
+                "window" if window_reflex else (
+                    "stop_word" if stop_reflex else "speculative"
+                )
             )
             result["address_check_mode"] = address_mode
             result["address_check_ms"] = None
@@ -1349,13 +1468,22 @@ def build_router(orch=None) -> APIRouter:
                     address_kwargs["wakeword_hint"] = True
                 return await is_addressed_to_mantis(raw_text, **address_kwargs)
 
-            if address_mode == "window" and command is not None and command.label == "stopp":
-                if active_playback is not None and active_playback.playback_active:
-                    await stop_for_bargein(time.monotonic())
+            if stop_reflex and active_playback is not None and active_playback.playback_active:
+                await stop_for_bargein(
+                    active_playback.bargein_started_at or time.monotonic(),
+                    decision="stop_word",
+                )
 
             if immediate:
                 if active_playback is not None and active_playback.playback_active:
-                    await stop_for_bargein(time.monotonic())
+                    decision = (
+                        "wakeword" if wakeword_triggered else
+                        "stop_word" if stop_reflex else "address"
+                    )
+                    await stop_for_bargein(
+                        active_playback.bargein_started_at or time.monotonic(),
+                        decision=decision,
+                    )
                 _detach_active_response()
                 active_playback = None
 
@@ -1399,15 +1527,20 @@ def build_router(orch=None) -> APIRouter:
                     )
                     pending_address_tasks.discard(asyncio.current_task())
                     if not addressed:
+                        result["address_rejected"] = True
                         if not address_decision.done():
                             address_decision.set_result(False)
                         output_gate.reject()
+                        await unduck_playback(decision="ignored")
                         response_task.cancel()
                         await asyncio.gather(response_task, return_exceptions=True)
                         return
 
                     if active_playback is not None and active_playback.playback_active:
-                        await stop_for_bargein(time.monotonic())
+                        await stop_for_bargein(
+                            active_playback.bargein_started_at or time.monotonic(),
+                            decision="address",
+                        )
                     _detach_active_response()
                     active_playback = playback
                     playback_turns[playback.turn_id] = playback
@@ -1458,11 +1591,14 @@ def build_router(orch=None) -> APIRouter:
                     if not address_decision.done():
                         address_decision.set_result(bool(addressed))
                     if not addressed:
+                        result["address_rejected"] = True
                         output_gate.reject()
+                        await unduck_playback(decision="ignored")
                     _record_voice_latency(
                         orch, started_at, stt_ms=result.get("stt_ms"),
                         address_check_ms=result.get("address_check_ms"),
                         address_check_mode=address_mode, held_ms=output_gate.held_ms,
+                        address_rejected=not addressed,
                         partial_runs=result.get("partial_runs", 0),
                         partial_skip_reasons=result.get("partial_skip_reasons"),
                         turn_model_p=result.get("turn_model_p"),
@@ -1520,14 +1656,19 @@ def build_router(orch=None) -> APIRouter:
                         )
                         pending_address_tasks.discard(asyncio.current_task())
                         if not addressed:
+                            result["address_rejected"] = True
                             if not address_decision.done():
                                 address_decision.set_result(False)
                             output_gate.reject()
+                            await unduck_playback(decision="ignored")
                             response_task.cancel()
                             await asyncio.gather(response_task, return_exceptions=True)
                             return
                         if active_playback is not None and active_playback.playback_active:
-                            await stop_for_bargein(time.monotonic())
+                            await stop_for_bargein(
+                                active_playback.bargein_started_at or time.monotonic(),
+                                decision="address",
+                            )
                         _detach_active_response()
                         active_playback = None
                         if not address_decision.done():
@@ -1553,6 +1694,7 @@ def build_router(orch=None) -> APIRouter:
                             address_check_ms=result.get("address_check_ms"),
                             address_check_mode=address_mode,
                             held_ms=output_gate.held_ms,
+                            address_rejected=bool(result.get("address_rejected", False)),
                             first_tts_block_ms=local_first_tts_block_ms,
                             first_answer_audio_ms=local_first_audio_ms,
                             turn_model_p=result.get("turn_model_p"),
@@ -1664,8 +1806,13 @@ def build_router(orch=None) -> APIRouter:
                                 finished=bool(control.get("finished", False)),
                                 skipped=bool(control.get("skipped", False)),
                             )
-                            if playback.complete and active_playback is playback:
-                                active_playback = None
+                            if playback.complete:
+                                if active_playback is playback:
+                                    active_playback = None
+                                if playback.ducked:
+                                    await unduck_playback(
+                                        decision="ignored", playback=playback,
+                                    )
                     elif control.get("type") == "playback_stopped":
                         playback = playback_turns.get(str(control.get("turn_id", "")))
                         if (

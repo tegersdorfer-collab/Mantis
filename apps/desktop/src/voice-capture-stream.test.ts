@@ -160,6 +160,7 @@ describe('startVoiceCaptureStream', () => {
       state = 'running';
       currentTime = 0;
       destination = {};
+      output = { gain: { value: 1 }, connect() {} };
       sources: FakeSource[] = [];
       audioWorklet = { addModule: async () => {} };
       constructor() { PlaybackContext.instances.push(this); }
@@ -169,6 +170,7 @@ describe('startVoiceCaptureStream', () => {
         this.sources.push(source);
         return source as unknown as AudioBufferSourceNode;
       }
+      createGain() { return this.output as unknown as GainNode; }
       decodeAudioData(_data: ArrayBuffer) {
         return Promise.resolve({ duration: 1 } as AudioBuffer);
       }
@@ -197,6 +199,11 @@ describe('startVoiceCaptureStream', () => {
       }) });
       await new Promise((resolve) => setTimeout(resolve, 0));
       PlaybackContext.instances[1].currentTime = 0.4;
+
+      ws.onmessage?.({ data: JSON.stringify({ type: 'duck_playback' }) });
+      expect(PlaybackContext.instances[1].output.gain.value).toBe(0.25);
+      ws.onmessage?.({ data: JSON.stringify({ type: 'unduck_playback' }) });
+      expect(PlaybackContext.instances[1].output.gain.value).toBe(1);
 
       ws.onmessage?.({ data: JSON.stringify({ type: 'stop_playback', turn_id: 'turn' }) });
 
