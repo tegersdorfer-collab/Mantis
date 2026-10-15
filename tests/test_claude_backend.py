@@ -22,6 +22,33 @@ def test_anthropic_model_allowlist_defaults_to_haiku_55(monkeypatch):
     assert settings.CLAUDE_CHAT_MODEL == "claude-haiku-5-5"
 
 
+def test_voice_backend_keeps_anthropic_http_pool_warm_across_long_idle(monkeypatch):
+    import config
+    import core.backends.claude as claude_backend
+
+    captured = {}
+
+    class FakeAnthropicClient:
+        def __init__(self, *, api_key, http_client):
+            captured["api_key"] = api_key
+            captured["http_client"] = http_client
+
+    monkeypatch.setattr(config, "ANTHROPIC_ALLOWED_MODELS", ["claude-haiku-5-5"])
+    monkeypatch.setattr(config, "CLAUDE_CHAT_MODEL", "claude-haiku-5-5")
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(claude_backend.anthropic, "AsyncAnthropic", FakeAnthropicClient)
+
+    ClaudeBackend()
+    http_client = captured["http_client"]
+    try:
+        pool = http_client._transport._pool
+        assert pool._keepalive_expiry >= 7200
+        assert pool._max_keepalive_connections > 0
+        assert captured["api_key"] == "test-key"
+    finally:
+        asyncio.run(http_client.aclose())
+
+
 @pytest.mark.parametrize("provider", [ClaudeBackend, ClaudeProvider])
 def test_anthropic_constructors_reject_models_outside_allowlist(monkeypatch, provider):
     import config

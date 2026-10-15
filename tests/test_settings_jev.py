@@ -61,13 +61,26 @@ def test_adaptive_voice_settings_have_expected_defaults_and_require_positive_int
 
     assert s.VOICE_ADAPTIVE_SILENCE is True
     assert s.VOICE_SILENCE_FAST_MS == 450
-    assert s.VOICE_SILENCE_SLOW_MS == 1200
+    assert s.VOICE_SILENCE_SLOW_MS == 2000
     assert s.VOICE_PARTIAL_STT_MS == 700
     assert s.VOICE_PARTIAL_MAX_MS == 900
     assert s.VOICE_PARTIAL_STALE_MS == 400
+    assert MantisSettings(_env_file=None, VOICE_PARTIAL_STT_MS=0).VOICE_PARTIAL_STT_MS == 0
     with pytest.raises(ValidationError):
-        MantisSettings(_env_file=None, VOICE_PARTIAL_STT_MS=0)
+        MantisSettings(_env_file=None, VOICE_PARTIAL_STT_MS=-1)
     with pytest.raises(ValidationError):
         MantisSettings(_env_file=None, VOICE_PARTIAL_STALE_MS=0)
     with pytest.raises(ValidationError):
         MantisSettings(_env_file=None, VOICE_PARTIAL_MAX_MS=0)
+
+
+def test_voice_stt_keepwarm_defaults_to_four_minutes_and_can_be_disabled():
+    from pydantic import ValidationError
+    import pytest
+
+    settings = MantisSettings(_env_file=None)
+
+    assert settings.VOICE_STT_KEEPWARM_S == 240
+    assert MantisSettings(_env_file=None, VOICE_STT_KEEPWARM_S=0).VOICE_STT_KEEPWARM_S == 0
+    with pytest.raises(ValidationError):
+        MantisSettings(_env_file=None, VOICE_STT_KEEPWARM_S=-1)

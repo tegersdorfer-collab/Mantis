@@ -107,6 +107,13 @@ class FakeVAD:
 
 
 class TestVadSegmenter:
+    def test_incomplete_utterance_uses_two_second_silence_default(self):
+        segmenter = vad.VadSegmenter(FakeVAD([]), chunk_ms=32)
+        segmenter.set_partial_transcript("Mantis erinnere mich an")
+        segmenter._last_speech_sample_index = 0
+
+        assert segmenter._silence_threshold_ms() == 2000
+
     def test_tracks_current_speech_duration_and_energy_only_for_speech_frames(self):
         seg = vad.VadSegmenter(FakeVAD([0.9, 0.9, 0.1]), chunk_ms=32)
         leise = struct.pack("<512h", *([1000] * 512))

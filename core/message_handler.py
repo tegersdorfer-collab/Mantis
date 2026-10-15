@@ -100,6 +100,37 @@ _INBOX_DELETE_REPLY = re.compile(
     re.IGNORECASE,
 )
 _INBOX_DELETE_CONFIRMATION_TTL = 5 * 60
+_VOICE_CONTEXT_READ_ONLY_TOOLS = frozenset({
+    "get_weather", "web_search", "brain_search", "get_calendar", "list_tasks",
+    "list_habits", "get_health", "get_health_scores", "nutrition_today",
+    "recent_workouts", "list_goals",
+})
+_VOICE_FOLLOWUP_PREFIXES = (
+    "was ist mit", "wie sieht es mit", "und wie", "was ist nächste",
+    "und nächste", "und nächster", "und nächstes", "und nächsten",
+    "und nächstem", "und kommende", "und kommender", "und kommenden",
+    "und", "was ist nächste",
+)
+_VOICE_FOLLOWUP_VERB_RE = re.compile(
+    r"\b(?:erzähl\w*|erzaehl\w*|lösch\w*|loesch\w*|entfern\w*|"
+    r"erstell\w*|erinner\w*|merk\w*|setze?\w*|mach\w*|gib\w*|"
+    r"zeige?\w*|such\w*|spiel\w*|schreib\w*|schick\w*|leg\w*|"
+    r"trag\w*|öffne?\w*|oeffne?\w*|lies\w*|hol\w*|bring\w*|"
+    r"nimm\w*|stell\w*|frag\w*|sag\w*|ist|sind|war\w*|wird|werden|"
+    r"hat|haben|habe|kann|könn\w*|koenn\w*|will|wollen|möcht\w*|"
+    r"moecht\w*|soll\w*|muss\w*|geht|gibt|liegt|kostet)\b",
+    re.IGNORECASE,
+)
+_VOICE_TIME_FOLLOWUP_RE = re.compile(
+    r"\b(?:heute|morgen|übermorgen|nachher|später)"
+    r"(?:\s+(?:früh|vormittag|mittag|nachmittag|abend|nacht))?\b"
+    r"|\b(?:nächste[nrsm]?|kommende[nrsm]?)\s+(?:woche|monat|jahr)\b"
+    r"|\b(?:am\s+)?(?:montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonntag|wochenende)\b"
+    r"|\b(?:um\s+\d{1,2}(?::\d{2})?(?:\s*uhr)?|\d{1,2}:\d{2}|\d{1,2}\s+uhr)\b"
+    r"|\b(?:am\s+)?\d{1,2}\.\s*(?:januar|februar|märz|april|mai|juni|juli|"
+    r"august|september|oktober|november|dezember)\b",
+    re.IGNORECASE,
+)
 
 
 def _keyword_tool_selection(text: str) -> tuple[list[str], bool]:
@@ -123,6 +154,107 @@ def _same_normalized_transcript(left: str, right: str) -> bool:
     return (
         partial_text_matches_final(left, right)
         and partial_text_matches_final(right, left)
+    )
+
+
+def _is_short_voice_followup(text: str) -> bool:
+    """Erkennt kurze, verblose Rückfragen, für die vorheriger Kontext helfen darf."""
+    value = re.sub(
+        r"^\s*mantis\b[\s,;:.!?—-]*", "", str(text or ""), flags=re.IGNORECASE,
+    ).casefold().strip()
+    value = re.sub(r"[?!.,;:]+$", "", value).strip()
+    words = re.findall(r"[^\W_]+", value, flags=re.UNICODE)
+    if not words or len(words) > 6:
+        return False
+
+    for prefix in _VOICE_FOLLOWUP_PREFIXES:
+        if value == prefix or value.startswith(prefix + " "):
+            tail = value[len(prefix):].strip()
+            if tail and not _VOICE_FOLLOWUP_VERB_RE.search(tail):
+                return True
+
+    if _VOICE_FOLLOWUP_VERB_RE.search(value):
+        return False
+    return _VOICE_TIME_FOLLOWUP_RE.search(value) is not None
+
+
+def _latest_user_text(kzg, current_text: str = "") -> str:
+    recent_messages = getattr(kzg, "recent_messages", None)
+    if not callable(recent_messages):
+        return ""
+    try:
+        messages = recent_messages(max_tokens=3000)
+    except Exception:
+        return ""
+    current_normalized = " ".join(str(current_text or "").casefold().split())
+    previous_user_text = ""
+    for message in reversed(messages):
+        if isinstance(message, dict):
+            role = message.get("role")
+            content = message.get("content")
+        else:
+            role = getattr(message, "role", None)
+            content = getattr(message, "content", None)
+        if role == "user" and isinstance(content, str) and content.strip():
+            candidate = content.strip()
+            if " ".join(candidate.casefold().split()) != current_normalized:
+                previous_user_text = candidate
+                break
+    return previous_user_text
+
+
+def _tool_selection_context(kzg, text: str) -> tuple[str, bool, bool]:
+    """Liefert Auswahltext sowie Kennzeichen, ob und wofür Kontext genutzt wird."""
+    previous_user_text = _latest_user_text(kzg, text)
+    if not previous_user_text:
+        return text, False, False
+    if _is_short_voice_followup(text):
+        return f"{previous_user_text}\n{text}", True, True
+    return text, False, True
+
+
+def _has_direct_voice_tool_intent(text: str) -> bool:
+    """Prüft, ob der aktuelle Satz selbst ein konkretes Toolziel erkennen lässt."""
+    try:
+        if skills.T.is_action(text):
+            return True
+        lower = str(text or "").casefold()
+        for keywords in skills.T._CATEGORY_KEYWORDS.values():
+            for keyword in keywords:
+                value = str(keyword).strip().casefold()
+                if value and re.search(rf"(?<!\w){re.escape(value)}\w*", lower):
+                    return True
+    except Exception:
+        pass
+    return bool(re.search(
+        r"\d\s*(?:[+*/×÷]|[-−]|plus\b|mal\b|geteilt\s+durch\b)\s*\d",
+        str(text or ""),
+        re.IGNORECASE,
+    ))
+
+
+def _apply_voice_tool_context_policy(
+    text: str, names, force: bool, *, inherited_context: bool,
+    has_previous_user: bool,
+) -> tuple[list[str], bool]:
+    if inherited_context:
+        read_only = dict.fromkeys(
+            name for name in names if name in _VOICE_CONTEXT_READ_ONLY_TOOLS
+        )
+        return list(read_only), False
+    # Ohne geerbten Kontext ist die Auswahl allein aus dem aktuellen Satz entstanden.
+    return list(names), bool(force)
+
+
+def _voice_keyword_tool_selection(
+    text: str, selection_text: str, *, inherited_context: bool,
+    has_previous_user: bool,
+) -> tuple[list[str], bool]:
+    names, force = _keyword_tool_selection(selection_text)
+    return _apply_voice_tool_context_policy(
+        text, names, force,
+        inherited_context=inherited_context,
+        has_previous_user=has_previous_user,
     )
 
 
@@ -687,7 +819,14 @@ class MessageHandler:
     async def prepare_voice_turn(self, text: str) -> VoiceTurnPrework:
         """Baut Voice-Kontext und lokale Tool-Vorauswahl ohne Cloud-Klassifikation."""
         started = time.perf_counter()
-        keyword_tools, force_tools = _keyword_tool_selection(text)
+        selection_text, inherited_context, has_previous_user = _tool_selection_context(
+            getattr(self, "kzg", None), text,
+        )
+        keyword_tools, force_tools = _voice_keyword_tool_selection(
+            text, selection_text,
+            inherited_context=inherited_context,
+            has_previous_user=has_previous_user,
+        )
         system = await self.prompt_builder.build(text, speculative=True)
         return VoiceTurnPrework(
             text=text,
@@ -819,6 +958,12 @@ class MessageHandler:
             voice_turn and prework is not None
             and partial_text_matches_final(prework.text, text)
         )
+        if voice_turn:
+            selection_text, inherited_context, has_previous_user = (
+                _tool_selection_context(getattr(self, "kzg", None), text)
+            )
+        else:
+            selection_text, inherited_context, has_previous_user = text, False, False
 
         async def build_context():
             if execution_gate is not None:
@@ -937,22 +1082,37 @@ class MessageHandler:
 
         def _keyword_selection():
             if prework_matches and _same_normalized_transcript(prework.text, text):
-                return list(prework.keyword_tools), prework.force_tools
-            # Tool-Freigaben für geänderte Teiltexte werden immer aus dem finalen
-            # Transkript neu berechnet. Die asynchrone Klassifikation darunter
-            # erhält ebenfalls ausschließlich den finalen Text.
-            return _keyword_tool_selection(text)
+                names, force = list(prework.keyword_tools), prework.force_tools
+            else:
+                # Tool-Freigaben für geänderte Teiltexte werden immer aus dem finalen
+                # Transkript neu berechnet. Die asynchrone Klassifikation darunter
+                # erhält ebenfalls ausschließlich den finalen Text.
+                names, force = _keyword_tool_selection(selection_text)
+            if voice_turn:
+                return _apply_voice_tool_context_policy(
+                    text, names, force,
+                    inherited_context=inherited_context,
+                    has_previous_user=has_previous_user,
+                )
+            return names, force
 
         async def _timed_select():
             with voice_timing.phase("tool_select_ms"):
                 try:
-                    return await skills.T.select_tools_async(text)
+                    names, force = await skills.T.select_tools_async(selection_text)
                 except Exception as exc:
                     log.warning(
                         "Tool-Auswahl fehlgeschlagen (%s) — nutze Keyword-Auswahl",
                         type(exc).__name__,
                     )
                     return _keyword_selection()
+                if voice_turn:
+                    return _apply_voice_tool_context_policy(
+                        text, names, force,
+                        inherited_context=inherited_context,
+                        has_previous_user=has_previous_user,
+                    )
+                return names, force
 
         tool_selection_task = None
         supports_full_catalog = (

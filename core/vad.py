@@ -522,7 +522,7 @@ class VadSegmenter:
                 return int(getattr(config, "VOICE_SILENCE_FAST_MS", 450))
             return base
         if status is UtteranceStatus.INCOMPLETE:
-            return int(getattr(config, "VOICE_SILENCE_SLOW_MS", 1200))
+            return int(getattr(config, "VOICE_SILENCE_SLOW_MS", 2000))
         return base
 
     def process_chunk(self, pcm_chunk: bytes) -> SegmentEvent | None:

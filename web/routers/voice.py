@@ -33,7 +33,9 @@ from core.voice import (
 )
 from core import fast_commands
 from core.voice_prework import VoicePreworkCache
-from core.voice_stream import VoiceStreamSession
+from core.voice_stream import (
+    VoiceStreamSession, partial_stt_executor_available, transcribe_pcm_partial,
+)
 from core.stream_events import StreamEvent
 from core.tts import _first_early_stream_boundary, synthesize, synthesize_stream
 
@@ -359,6 +361,8 @@ def _record_voice_latency(
     address_check_ms: float | None = None,
     address_check_mode: str | None = None,
     held_ms: float | None = None,
+    partial_runs: int | None = None,
+    partial_skip_reasons: dict | None = None,
     first_token_ms: float | None = None,
     first_tts_block_ms: float | None = None,
     first_answer_audio_ms: float | None = None,
@@ -368,6 +372,13 @@ def _record_voice_latency(
     bargein_ms: float | None = None,
 ) -> dict:
     model, stage = _voice_backend_details(orch)
+    timing_detail = voice_timing.snapshot()
+    if partial_runs is not None:
+        timing_detail["partial_runs"] = max(0, int(partial_runs))
+    if partial_skip_reasons is not None:
+        timing_detail["partial_skip_reasons"] = voice_timing.partial_skip_snapshot(
+            partial_skip_reasons,
+        )
     detail = {
         "stt_ms": stt_ms,
         "address_check_ms": address_check_ms,
@@ -383,7 +394,7 @@ def _record_voice_latency(
         "total_ms": round((time.perf_counter() - started_at) * 1000, 1),
         "model": model,
         "stage": stage,
-        **voice_timing.snapshot(),
+        **timing_detail,
     }
     log.info("voice_latency %s", detail)
     db.log_event("voice_latency", "Voice-Turn", detail)
@@ -510,6 +521,7 @@ async def sende_streaming_antwort(
     started_at: float | None = None,
     prework=None,
     partial_runs: int = 0,
+    partial_skip_reasons: dict | None = None,
     partial_as_final: bool = False,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     playback: _PlaybackTurn | None = None,
@@ -858,6 +870,7 @@ async def sende_streaming_antwort(
     turn_state, turn_token = tts._start_tts_turn()
     timing = voice_timing.current()
     timing.partial_runs = max(0, int(partial_runs))
+    voice_timing.set_partial_skip_reasons(partial_skip_reasons)
     timing.partial_as_final = bool(partial_as_final)
     if getattr(config, "VOICE_FILLERS_ENABLED", True):
         ack_task = asyncio.create_task(send_ack_after_delay(), name="voice-filler-ack-delay")
@@ -1077,6 +1090,7 @@ def build_router(orch=None) -> APIRouter:
         recent_tts_turns: deque[_PlaybackTurn] = deque()
         conversation_window = VoiceConversationWindow()
         send_lock = asyncio.Lock()
+        turn_results: asyncio.Queue[dict] = asyncio.Queue()
 
         class SerializedWebSocket:
             async def send_json(self, data):
@@ -1169,6 +1183,9 @@ def build_router(orch=None) -> APIRouter:
             vad_segmenter=segmenter,
             wakeword_detector=wakeword_detector,
             conversation_active_fn=conversation_active,
+            partial_transcriber=transcribe_pcm_partial,
+            partial_executor_available=partial_stt_executor_available,
+            partial_interval_ms=config.VOICE_PARTIAL_STT_MS,
             on_partial=prework_cache.offer if prework_cache is not None else None,
             bargein_active_fn=lambda: (
                 active_playback is not None and active_playback.playback_active
@@ -1192,6 +1209,7 @@ def build_router(orch=None) -> APIRouter:
                     started_at=result.get("turn_started_at"),
                     prework=prework,
                     partial_runs=result.get("partial_runs", 0),
+                    partial_skip_reasons=result.get("partial_skip_reasons"),
                     partial_as_final=result.get("partial_as_final", False),
                     playback=playback,
                     execution_gate=execution_gate,
@@ -1414,6 +1432,8 @@ def build_router(orch=None) -> APIRouter:
                         orch, started_at, stt_ms=result.get("stt_ms"),
                         address_check_ms=result.get("address_check_ms"),
                         address_check_mode=address_mode, held_ms=output_gate.held_ms,
+                        partial_runs=result.get("partial_runs", 0),
+                        partial_skip_reasons=result.get("partial_skip_reasons"),
                     )
 
                 address_task = asyncio.create_task(
@@ -1434,6 +1454,9 @@ def build_router(orch=None) -> APIRouter:
                 timing_token = voice_timing.start()
                 timing = voice_timing.current()
                 timing.partial_runs = max(0, int(result.get("partial_runs", 0)))
+                voice_timing.set_partial_skip_reasons(
+                    result.get("partial_skip_reasons"),
+                )
                 timing.partial_as_final = bool(result.get("partial_as_final", False))
                 response_task = asyncio.create_task(
                     call_voice_response(), name="voice-speculative-response",
@@ -1525,6 +1548,9 @@ def build_router(orch=None) -> APIRouter:
                     timing_token = voice_timing.start()
                     timing = voice_timing.current()
                     timing.partial_runs = max(0, int(result.get("partial_runs", 0)))
+                    voice_timing.set_partial_skip_reasons(
+                        result.get("partial_skip_reasons"),
+                    )
                     timing.partial_as_final = bool(result.get("partial_as_final", False))
                     reply, trace = await call_voice_response()
                     _mark_reflex(trace)
@@ -1551,8 +1577,6 @@ def build_router(orch=None) -> APIRouter:
                 finally:
                     if timing_token is not None:
                         voice_timing.reset(timing_token)
-
-        turn_results: asyncio.Queue[dict] = asyncio.Queue()
 
         async def process_turn_results() -> None:
             while True:

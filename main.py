@@ -196,6 +196,10 @@ async def main():
     preload_task = schedule_parakeet_preload()
     if preload_task is not None:
         orchestrator._bg_tasks.append(preload_task)
+    from core.voice import schedule_parakeet_keepwarm
+    keepwarm_task = schedule_parakeet_keepwarm(preload_task)
+    if keepwarm_task is not None:
+        orchestrator._bg_tasks.append(keepwarm_task)
     from core.voice_fillers import schedule_voice_fillers_preload
     fillers_task = schedule_voice_fillers_preload(preload_task)
     if fillers_task is not None:
