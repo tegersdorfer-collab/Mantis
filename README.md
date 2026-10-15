@@ -20,7 +20,7 @@ Mantis ist ein Eigenprojekt, das ich vollständig allein konzipiert, entwickelt 
 | Agent-Tools | Tool-Registry mit semantischem Routing und geprüften Ausführungsrechten |
 | Tests | 1.100+ Python-Tests und 130+ Desktop-Tests; externe Dienste in Tests ersetzt |
 | Laufzeit | 24/7 auf MacBook Air M4 via launchd |
-| LLM-Backends | OpenRouter → Anthropic API (Haiku 5.5) → ChatGPT-Abo · Ollama lokal nur für Embeddings |
+| LLM-Backends | Standard: OpenRouter → Anthropic API (Haiku 5.5) → ChatGPT-Abo · Gemini über Vertex AI optional per `*_CHAIN_ORDER` · Ollama lokal nur für Embeddings |
 | DB | PostgreSQL 16 + pgvector (Vektorsuche) |
 | iOS-Apps | 3 SwiftUI-Apps gegen dieselbe FastAPI |
 
@@ -30,9 +30,9 @@ Mantis ist ein Eigenprojekt, das ich vollständig allein konzipiert, entwickelt 
 
 ### Agent-Kern
 - **ReAct-Loop** mit Tool-Registry, mehrstufiger Ausführung und sequenziellen Tool-Aufrufen; erlaubte Tools werden bei jedem Aufruf geprüft
-- **LLM-Backends**: Chat und Hintergrundaufgaben über OpenRouter, Anthropic Haiku 5.5 und ChatGPT-Abo; Ollama bleibt nur für lokale Embeddings
+- **LLM-Backends**: Chat und Hintergrundaufgaben standardmäßig über OpenRouter, Anthropic Haiku 5.5 und ChatGPT-Abo; Gemini über Vertex AI lässt sich per `*_CHAIN_ORDER` ergänzen. Ollama bleibt nur für lokale Embeddings
 - **Subagent-Delegation**: `delegate_task` startet Kind-Agenten mit eigenem Gesprächskontext und eingeschränkten Tools; bis zu drei gleichzeitige Delegationen, keine rekursive Delegation. Die Agents teilen denselben Prozess
-- **LLM-Fallback**: OpenRouter → Anthropic → ChatGPT-Abo, mit Timeout und Cooldown je Cloud-Stufe
+- **LLM-Fallback**: Die Standardreihenfolge bleibt OpenRouter → Anthropic → ChatGPT-Abo; konfigurierbare Cloud-Stufen nutzen Timeout und Cooldown je Anbieter
 - **Token-Streaming** an Telegram + Dashboard (SSE)
 
 ### Gedächtnis-Architektur
@@ -117,7 +117,7 @@ Drei fokussierte Apps gegen dieselbe FastAPI (`:7779`), erreichbar über Tailsca
 | Schicht | Technologie |
 |---------|------------|
 | Sprache | Python 3.14 (asyncio) · Swift (SwiftUI) · JavaScript |
-| LLM | OpenRouter → Anthropic API → ChatGPT-Abo · lokale Ollama-Embeddings (`qwen3-embedding:0.6b`) |
+| LLM | Standard: OpenRouter → Anthropic API → ChatGPT-Abo · Gemini über Vertex AI optional per `*_CHAIN_ORDER` · lokale Ollama-Embeddings (`qwen3-embedding:0.6b`) |
 | DB | PostgreSQL 16 + pgvector |
 | Backend | FastAPI + uvicorn |
 | Frontend | Vanilla JS PWA (Chart.js, vis.js, marked.js, globe.gl, Leaflet) |

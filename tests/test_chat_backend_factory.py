@@ -62,6 +62,10 @@ def _cfg(**overrides):
         "CHAT_CHATGPT_PLAN_MODEL": "gpt-6-luna",
         "CHATGPT_AUTH_FILE": "/tmp/mantis-chatgpt-auth-test.json",
         "CHATGPT_AUTH_CALLBACK_PORT": 1456,
+        "GEMINI_API_KEY": "",
+        "GEMINI_MODEL": "gemini-3-flash-preview",
+        "GEMINI_USD_PER_MTOK_IN": 0.30,
+        "GEMINI_USD_PER_MTOK_OUT": 2.50,
         "BG_CHAT_TASKS_USE_CLOUD": True,
         "ANTHROPIC_API_KEY": "anthropic-test-key",
         "CLAUDE_CHAT_MODEL": "claude-haiku-test",
@@ -97,9 +101,16 @@ def _install_fake_backends(monkeypatch):
         created.append(("chatgpt", backend))
         return backend
 
+    def gemini(model=None, api_key=None, purpose="chat-agent"):
+        backend = FakeBackend("Gemini", model or "gemini-3-flash")
+        backend.kwargs = {"api_key": api_key, "purpose": purpose}
+        created.append(("gemini", backend))
+        return backend
+
     monkeypatch.setattr(factory, "OpenRouterBackend", openrouter)
     monkeypatch.setattr(factory, "ClaudeBackend", claude)
     monkeypatch.setattr(factory, "ChatGPTPlanBackend", chatgpt)
+    monkeypatch.setattr(factory, "GeminiBackend", gemini)
     monkeypatch.setattr(factory, "chatgpt_auth_is_configured", lambda cfg: False)
     return created
 
@@ -112,6 +123,13 @@ def test_chat_cloud_settings_have_benchmarked_defaults(monkeypatch):
         "CHAT_CLOUD_TIMEOUT_S",
         "FAST_CHAIN_ORDER",
         "VOICE_CHAIN_ORDER",
+        "CHAT_AGENT_CHAIN_ORDER",
+        "BACKGROUND_CHAIN_ORDER",
+        "VISION_CHAIN_ORDER",
+        "GEMINI_API_KEY",
+        "GEMINI_MODEL",
+        "GEMINI_USD_PER_MTOK_IN",
+        "GEMINI_USD_PER_MTOK_OUT",
         "CHAT_ANTHROPIC_MODEL",
         "CHAT_CHATGPT_PLAN_ENABLED",
         "CHAT_CHATGPT_PLAN_MODEL",
@@ -128,6 +146,13 @@ def test_chat_cloud_settings_have_benchmarked_defaults(monkeypatch):
     assert settings.CHAT_CLOUD_TIMEOUT_S == 30
     assert settings.FAST_CHAIN_ORDER == ["openrouter", "anthropic", "chatgpt-plan"]
     assert settings.VOICE_CHAIN_ORDER == ["openrouter", "anthropic", "chatgpt-plan"]
+    assert settings.CHAT_AGENT_CHAIN_ORDER == ["openrouter", "anthropic", "chatgpt-plan"]
+    assert settings.BACKGROUND_CHAIN_ORDER == ["openrouter", "anthropic", "chatgpt-plan"]
+    assert settings.VISION_CHAIN_ORDER == ["openrouter", "anthropic", "chatgpt-plan"]
+    assert settings.GEMINI_API_KEY == ""
+    assert settings.GEMINI_MODEL == "gemini-3-flash-preview"
+    assert settings.GEMINI_USD_PER_MTOK_IN == 0.30
+    assert settings.GEMINI_USD_PER_MTOK_OUT == 2.50
     assert settings.CHAT_ANTHROPIC_MODEL == "claude-haiku-5-5"
     assert settings.CHAT_CHATGPT_PLAN_ENABLED is True
     assert settings.CHAT_CHATGPT_PLAN_MODEL == "gpt-6-luna"
@@ -171,6 +196,77 @@ def test_fast_and_voice_chain_orders_accept_provider_stage_lists(monkeypatch):
 
     assert settings.FAST_CHAIN_ORDER == ["anthropic", "openrouter", "chatgpt-plan"]
     assert settings.VOICE_CHAIN_ORDER == ["chatgpt-plan", "anthropic"]
+
+
+def test_gemini_settings_and_all_chain_orders_can_be_set_from_environment(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-model-from-env")
+    monkeypatch.setenv("GEMINI_USD_PER_MTOK_IN", "0.75")
+    monkeypatch.setenv("GEMINI_USD_PER_MTOK_OUT", "3.25")
+    monkeypatch.setenv("CHAT_AGENT_CHAIN_ORDER", '["gemini", "anthropic"]')
+    monkeypatch.setenv("BACKGROUND_CHAIN_ORDER", '["gemini"]')
+    monkeypatch.setenv("VISION_CHAIN_ORDER", '["openrouter", "gemini"]')
+
+    settings = MantisSettings(_env_file=None)
+
+    assert settings.GEMINI_API_KEY == "gemini-test-key"
+    assert settings.GEMINI_MODEL == "gemini-model-from-env"
+    assert settings.GEMINI_USD_PER_MTOK_IN == 0.75
+    assert settings.GEMINI_USD_PER_MTOK_OUT == 3.25
+    assert settings.CHAT_AGENT_CHAIN_ORDER == ["gemini", "anthropic"]
+    assert settings.BACKGROUND_CHAIN_ORDER == ["gemini"]
+    assert settings.VISION_CHAIN_ORDER == ["openrouter", "gemini"]
+
+
+def test_gemini_is_only_added_when_key_and_chain_order_enable_it(monkeypatch):
+    import core.backends.factory as factory
+
+    created = _install_fake_backends(monkeypatch)
+    monkeypatch.setattr(factory, "chatgpt_auth_is_configured", lambda _cfg: False)
+
+    backend = cloud_chain(
+        "background",
+        cfg=_cfg(
+            OPENROUTER_API_KEY="",
+            ANTHROPIC_API_KEY="",
+            CHAT_CHATGPT_PLAN_ENABLED=False,
+            GEMINI_API_KEY="gemini-test-key",
+            GEMINI_MODEL="gemini-test-model",
+            BACKGROUND_CHAIN_ORDER=["gemini"],
+        ),
+    )
+
+    assert backend.backend_chain == ("gemini-test-model",)
+    assert [(kind, stage.kwargs) for kind, stage in created] == [
+        ("gemini", {"api_key": "gemini-test-key", "purpose": "background"}),
+    ]
+
+
+def test_gemini_key_does_not_change_default_chat_chain(monkeypatch):
+    _install_fake_backends(monkeypatch)
+
+    backend = build_chat_backend(_cfg(GEMINI_API_KEY="gemini-test-key"))
+
+    assert "gemini-3-flash" not in backend.backend_chain
+
+
+def test_gemini_without_key_is_skipped(monkeypatch):
+    import core.backends.factory as factory
+
+    _install_fake_backends(monkeypatch)
+    monkeypatch.setattr(factory, "chatgpt_auth_is_configured", lambda _cfg: False)
+
+    with pytest.raises(CloudChainUnavailableError):
+        cloud_chain(
+            "vision",
+            cfg=_cfg(
+                OPENROUTER_API_KEY="",
+                ANTHROPIC_API_KEY="",
+                CHAT_CHATGPT_PLAN_ENABLED=False,
+                GEMINI_API_KEY="",
+                VISION_CHAIN_ORDER=["gemini"],
+            ),
+        )
 
 
 def test_custom_fast_chain_order_reorders_provider_stages(monkeypatch):
