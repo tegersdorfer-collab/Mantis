@@ -16,6 +16,7 @@ import math
 import re
 import tempfile
 import time
+import unicodedata
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -45,6 +46,7 @@ class _PlaybackBlock:
     finished: bool = False
     skipped: bool = False
     sent_at: float | None = None
+    playback_end_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -67,6 +69,7 @@ class _PlaybackTurn:
         self.progress_reported = False
         self.timed_out = False
         self._first_block_sent_at: float | None = None
+        self._playback_started_at: float | None = None
         self.changed = asyncio.Event()
         self.stop_ack = asyncio.Event()
 
@@ -101,6 +104,8 @@ class _PlaybackTurn:
         block.sent_at = timestamp
         if self._first_block_sent_at is None:
             self._first_block_sent_at = timestamp
+        if self._playback_started_at is None:
+            self._playback_started_at = timestamp
         self.changed.set()
         return True
 
@@ -128,10 +133,11 @@ class _PlaybackTurn:
 
     def estimate_progress(self, *, now: float | None = None) -> None:
         """Schätzt ohne Clientmeldungen, wie viele gesendete Blöcke bereits liefen."""
-        if self._first_block_sent_at is None:
+        playback_started_at = self._playback_started_at or self._first_block_sent_at
+        if playback_started_at is None:
             return
         current = time.monotonic() if now is None else float(now)
-        elapsed_ms = max(0.0, (current - self._first_block_sent_at) * 1000.0)
+        elapsed_ms = max(0.0, (current - playback_started_at) * 1000.0)
         offset_ms = 0.0
         for block in self.blocks.values():
             if block.sent_at is None:
@@ -142,12 +148,16 @@ class _PlaybackTurn:
             if played_ms >= max(0.0, duration_ms - 35.0):
                 block.finished = True
                 block.played_ms = duration_ms
+                if block.playback_end_at is None:
+                    block.playback_end_at = playback_started_at + (
+                        offset_ms + duration_ms
+                    ) / 1000.0
             offset_ms += duration_ms
         self.changed.set()
 
     def record_progress(
         self, block_id: str, played_ms: float, *, finished: bool = False,
-        skipped: bool = False,
+        skipped: bool = False, now: float | None = None,
     ) -> bool:
         block = self.blocks.get(str(block_id))
         if block is None:
@@ -158,9 +168,18 @@ class _PlaybackTurn:
             return False
         if not math.isfinite(played):
             return False
+        current = time.monotonic() if now is None else float(now)
         self.progress_reported = True
         if block.duration_ms is not None:
             played = min(played, block.duration_ms)
+        offset_ms = 0.0
+        for previous in self.blocks.values():
+            if previous is block:
+                break
+            if previous.sent_at is not None:
+                offset_ms += self._duration_for(previous)
+        if block.sent_at is not None:
+            self._playback_started_at = current - (offset_ms + played) / 1000.0
         block.played_ms = max(block.played_ms, played)
         block.skipped = block.skipped or bool(skipped)
         block.finished = block.finished or bool(finished) or block.skipped or (
@@ -169,8 +188,45 @@ class _PlaybackTurn:
         )
         if block.finished and not block.skipped and block.duration_ms is not None:
             block.played_ms = block.duration_ms
+        if block.finished:
+            block.playback_end_at = current
         self.changed.set()
         return True
+
+    def echo_window_text(
+        self, *, now: float | None = None, window_s: float = 2.0,
+    ) -> str:
+        """Text gesendeter Blöcke, die noch laufen oder höchstens zwei Sekunden liefen."""
+        playback_started_at = self._playback_started_at or self._first_block_sent_at
+        if playback_started_at is None:
+            return ""
+        current = time.monotonic() if now is None else float(now)
+        cursor = playback_started_at
+        included_sentences: set[int] = set()
+        texts: list[str] = []
+        for block in self.blocks.values():
+            if block.sent_at is None:
+                continue
+            block_start = max(cursor, block.sent_at)
+            estimated_end = block.playback_end_at or (
+                block_start + self._duration_for(block) / 1000.0
+            )
+            cursor = estimated_end
+            if block.skipped:
+                continue
+            pending = not block.finished and estimated_end > current
+            recently_played = 0.0 <= current - estimated_end < window_s
+            if not (pending or recently_played) or not block.text:
+                continue
+            if block.sentence_id is not None:
+                if block.sentence_id in included_sentences:
+                    continue
+                included_sentences.add(block.sentence_id)
+                sentence = self.sentences.get(block.sentence_id)
+                texts.append(sentence.text if sentence is not None else block.text)
+            elif block.text not in texts:
+                texts.append(block.text)
+        return " ".join(texts).strip()
 
     def progress_ms_for(self, block_id: str) -> float | None:
         block = self.blocks.get(str(block_id))
@@ -355,24 +411,45 @@ def _normalized_speech(text: str) -> str:
 
 
 _VOICE_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_VOICE_ECHO_FILLER_WORDS = frozenset({
+    "äh", "ähm", "hm", "hmm", "also", "bitte", "mal", "kurz", "eben",
+    "schnell", "gern", "gerne", "vielleicht",
+})
 
 
 def _is_recent_tts_echo(
-    text: str, sent_blocks, *, now: float | None = None,
+    text: str, echo_texts,
 ) -> bool:
-    """Erkennt ein Transkript mit mindestens 60 % Token-Treffern in 5 s altem TTS."""
-    transcript_tokens = set(_VOICE_TOKEN_RE.findall(str(text).casefold()))
+    """Erkennt nur nahezu wortgleiche, zusammenhängende TTS-Echos."""
+    def tokens(value: str) -> list[str]:
+        normalized = unicodedata.normalize("NFKC", str(value)).casefold()
+        return [
+            token for token in _VOICE_TOKEN_RE.findall(normalized)
+            if token not in _VOICE_ECHO_FILLER_WORDS
+        ]
+
+    transcript_tokens = tokens(text)
     if not transcript_tokens:
         return False
-    current = time.monotonic() if now is None else float(now)
-    for sent_at, spoken_text in sent_blocks:
-        age = current - float(sent_at)
-        if not 0.0 <= age <= 5.0:
+    if isinstance(echo_texts, str):
+        echo_texts = [echo_texts]
+    max_mismatches = len(transcript_tokens) // 6
+    for spoken_text in echo_texts:
+        spoken_tokens = tokens(spoken_text)
+        if len(spoken_tokens) < len(transcript_tokens):
             continue
-        spoken_tokens = set(_VOICE_TOKEN_RE.findall(str(spoken_text).casefold()))
-        overlap = len(transcript_tokens & spoken_tokens) / len(transcript_tokens)
-        if overlap >= 0.6:
-            return True
+        if not set(transcript_tokens).issubset(spoken_tokens):
+            continue
+        for start in range(len(spoken_tokens) - len(transcript_tokens) + 1):
+            mismatches = sum(
+                actual != expected
+                for actual, expected in zip(
+                    spoken_tokens[start:start + len(transcript_tokens)],
+                    transcript_tokens,
+                )
+            )
+            if mismatches <= max_mismatches:
+                return True
     return False
 
 
@@ -881,7 +958,7 @@ def build_router(orch=None) -> APIRouter:
         active_response_task: asyncio.Task | None = None
         background_response_tasks: set[asyncio.Task] = set()
         playback_turns: dict[str, _PlaybackTurn] = {}
-        recent_tts_blocks: deque[tuple[float, str]] = deque()
+        recent_tts_turns: deque[_PlaybackTurn] = deque()
         conversation_window = VoiceConversationWindow()
         send_lock = asyncio.Lock()
 
@@ -910,12 +987,26 @@ def build_router(orch=None) -> APIRouter:
             background_response_tasks.add(task)
             task.add_done_callback(_response_task_done)
 
-        def _remember_tts_text(text: str, sent_at: float) -> None:
-            cutoff = sent_at - 5.0
-            while recent_tts_blocks and recent_tts_blocks[0][0] < cutoff:
-                recent_tts_blocks.popleft()
-            recent_tts_blocks.append((sent_at, text))
+        def _remember_tts_text(text: str, _sent_at: float) -> None:
             conversation_window.mark_active(text)
+
+        def _recent_tts_echo_texts(now: float) -> list[str]:
+            echo_texts: list[str] = []
+            retained_turns: deque[_PlaybackTurn] = deque()
+            for playback in recent_tts_turns:
+                echo_text = playback.echo_window_text(now=now)
+                if echo_text:
+                    echo_texts.append(echo_text)
+                    retained_turns.append(playback)
+                elif (
+                    playback is active_playback
+                    or not playback.complete and not playback.interrupted
+                    and not playback.timed_out
+                ):
+                    retained_turns.append(playback)
+            recent_tts_turns.clear()
+            recent_tts_turns.extend(retained_turns)
+            return echo_texts
 
         async def stop_for_bargein(detected_at: float) -> None:
             playback = active_playback
@@ -993,6 +1084,111 @@ def build_router(orch=None) -> APIRouter:
                 if active_response_task is asyncio.current_task():
                     active_response_task = None
 
+        async def process_voice_result(result: dict) -> None:
+            nonlocal active_playback, active_response_task
+            text = str(result.get("text") or "").strip()
+            now = time.monotonic()
+            if _is_recent_tts_echo(text, _recent_tts_echo_texts(now)):
+                log.debug("Voice-Transkript als Echo der letzten TTS-Blöcke verworfen")
+                if prework_cache is not None:
+                    prework_cache.clear()
+                return
+
+            address_started = time.perf_counter()
+            conversation_context = conversation_window.address_context()
+
+            async def check_address() -> bool:
+                if conversation_context:
+                    return await is_addressed_to_mantis(
+                        text, conversation_context=conversation_context,
+                    )
+                return await is_addressed_to_mantis(text)
+
+            address_task = asyncio.create_task(
+                check_address(), name="voice-address-check",
+            )
+            addressed = await address_task
+            result["address_check_ms"] = round(
+                (time.perf_counter() - address_started) * 1000, 1,
+            )
+            if not addressed:
+                if prework_cache is not None:
+                    prework_cache.clear()
+                return
+
+            if active_playback is not None and active_playback.playback_active:
+                await stop_for_bargein(time.monotonic())
+            _detach_active_response()
+            active_playback = None
+            prework = prework_cache.take_for(text) if prework_cache is not None else None
+            if prework_cache is not None:
+                prework_cache.clear()
+            if audio_streaming and orch is not None:
+                playback = _PlaybackTurn()
+                active_playback = playback
+                playback_turns[playback.turn_id] = playback
+                recent_tts_turns.append(playback)
+                active_response_task = asyncio.create_task(
+                    run_streaming_response(result, text, prework, playback),
+                    name="voice-response-turn",
+                )
+                return
+
+            started_at = result.get("turn_started_at", time.perf_counter())
+            first_tts_block_ms = None
+            first_answer_audio_ms = None
+            reply = None
+            timing_token = None
+            try:
+                if orch is not None:
+                    timing_token = voice_timing.start()
+                    timing = voice_timing.current()
+                    timing.partial_runs = max(0, int(result.get("partial_runs", 0)))
+                    timing.partial_as_final = bool(result.get("partial_as_final", False))
+                    if prework is None:
+                        reply, trace = await orch.voice_respond(text)
+                    else:
+                        reply, trace = await orch.voice_respond(text, prework=prework)
+                    _mark_reflex(trace)
+                    conversation_window.mark_active(reply)
+                first_answer_audio_ms = await sende_antwort(
+                    websocket, text, reply, audio_streaming, started_at=started_at,
+                )
+                first_tts_block_ms = (
+                    round((time.perf_counter() - started_at) * 1000, 1)
+                    if reply and not audio_streaming else None
+                )
+            except (WebSocketDisconnect, RuntimeError) as exc:
+                log.info("Voice-WebSocket beim Antwortversand getrennt: %s", exc)
+            finally:
+                try:
+                    _record_voice_latency(
+                        orch, started_at, stt_ms=result.get("stt_ms"),
+                        first_tts_block_ms=first_tts_block_ms,
+                        first_answer_audio_ms=first_answer_audio_ms,
+                    )
+                finally:
+                    if timing_token is not None:
+                        voice_timing.reset(timing_token)
+
+        turn_results: asyncio.Queue[dict] = asyncio.Queue()
+
+        async def process_turn_results() -> None:
+            while True:
+                result = await turn_results.get()
+                try:
+                    await process_voice_result(result)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error("Voice-Turn konnte nicht verarbeitet werden: %s", exc)
+                finally:
+                    turn_results.task_done()
+
+        turn_processor = asyncio.create_task(
+            process_turn_results(), name="voice-turn-processor",
+        )
+
         try:
             while True:
                 message = await websocket.receive()
@@ -1035,97 +1231,19 @@ def build_router(orch=None) -> APIRouter:
 
                 if result is None:
                     continue
-
-                text = str(result.get("text") or "").strip()
-                if _is_recent_tts_echo(
-                    text, recent_tts_blocks, now=time.monotonic(),
-                ):
-                    log.debug("Voice-Transkript als Echo der letzten TTS-Blöcke verworfen")
-                    if prework_cache is not None:
-                        prework_cache.clear()
-                    continue
-                address_started = time.perf_counter()
-                conversation_context = conversation_window.address_context()
-                if conversation_context:
-                    addressed = await is_addressed_to_mantis(
-                        text, conversation_context=conversation_context,
-                    )
-                else:
-                    addressed = await is_addressed_to_mantis(text)
-                result["address_check_ms"] = round(
-                    (time.perf_counter() - address_started) * 1000, 1,
-                )
-                if not addressed:
-                    if prework_cache is not None:
-                        prework_cache.clear()
-                    continue
-
-                if active_playback is not None and active_playback.playback_active:
-                    await stop_for_bargein(time.monotonic())
-                _detach_active_response()
-                active_playback = None
-                prework = prework_cache.take_for(text) if prework_cache is not None else None
-                if prework_cache is not None:
-                    prework_cache.clear()
-                if audio_streaming and orch is not None:
-                    playback = _PlaybackTurn()
-                    active_playback = playback
-                    playback_turns[playback.turn_id] = playback
-                    active_response_task = asyncio.create_task(
-                        run_streaming_response(result, text, prework, playback),
-                        name="voice-response-turn",
-                    )
-                    continue
-
-                started_at = result.get("turn_started_at", time.perf_counter())
-                first_tts_block_ms = None
-                first_answer_audio_ms = None
-                reply = None
-                timing_token = None
-                try:
-                    if orch is not None:
-                        timing_token = voice_timing.start()
-                        timing = voice_timing.current()
-                        timing.partial_runs = max(0, int(result.get("partial_runs", 0)))
-                        timing.partial_as_final = bool(result.get("partial_as_final", False))
-                        if prework is None:
-                            reply, trace = await orch.voice_respond(text)
-                        else:
-                            reply, trace = await orch.voice_respond(text, prework=prework)
-                        _mark_reflex(trace)
-                        conversation_window.mark_active(reply)
-                    first_answer_audio_ms = await sende_antwort(
-                        websocket, text, reply, audio_streaming, started_at=started_at,
-                    )
-                    first_tts_block_ms = (
-                        round((time.perf_counter() - started_at) * 1000, 1)
-                        if reply and not audio_streaming else None
-                    )
-                except (WebSocketDisconnect, RuntimeError) as e:
-                    # Client kann zwischen Antwortberechnung und send_json getrennt haben —
-                    # Starlette meldet das je nach ASGI-Server als WebSocketDisconnect oder
-                    # RuntimeError statt es beim nächsten receive() zu werfen.
-                    log.info(f"Voice-WebSocket beim Antwortversand getrennt: {e}")
-                    break
-                finally:
-                    try:
-                        _record_voice_latency(
-                            orch, started_at, stt_ms=result.get("stt_ms"),
-                            first_tts_block_ms=first_tts_block_ms,
-                            first_answer_audio_ms=first_answer_audio_ms,
-                        )
-                    finally:
-                        if timing_token is not None:
-                            voice_timing.reset(timing_token)
+                turn_results.put_nowait(result)
         except WebSocketDisconnect:
             log.info("Voice-WebSocket-Verbindung geschlossen")
         except Exception as e:
             log.error(f"Voice-WebSocket-Handler abgebrochen: {e}")
         finally:
             try:
+                if not turn_processor.done():
+                    turn_processor.cancel()
                 tasks_to_finish = set(background_response_tasks)
                 if active_response_task is not None:
                     tasks_to_finish.add(active_response_task)
+                tasks_to_finish.add(turn_processor)
                 for task in tasks_to_finish:
                     if not task.done():
                         task.cancel()
