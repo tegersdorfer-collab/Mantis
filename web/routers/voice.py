@@ -26,7 +26,7 @@ from uuid import uuid4
 from fastapi import APIRouter, UploadFile, File, WebSocket, WebSocketDisconnect
 
 import config
-from core import db, voice_fillers, voice_timing
+from core import db, tts, voice_fillers, voice_timing
 from core.voice import VoiceConversationWindow, transcribe_audio, is_addressed_to_mantis
 from core.voice_prework import VoicePreworkCache
 from core.voice_stream import VoiceStreamSession
@@ -485,6 +485,8 @@ async def sende_streaming_antwort(
     response_trace: list = []
     next_sentence_id = 0
     ack_task: asyncio.Task | None = None
+    turn_state: tts.TTSTurnState | None = None
+    turn_token = None
 
     def request_filler(kind: str) -> None:
         nonlocal filler_kind, pending_filler
@@ -495,6 +497,8 @@ async def sende_streaming_antwort(
             or response_audio_ready
             or (timing is not None and timing.reflex)
         ):
+            return
+        if turn_state is None or not tts._tts_turn_can_use_filler(turn_state):
             return
         selected = voice_fillers.choose_cached_filler(kind)
         if selected is None:
@@ -704,6 +708,8 @@ async def sende_streaming_antwort(
                 selected = pending_filler
                 pending_filler = None
                 await send_audio_chunk(selected.audio)
+                if turn_state is not None:
+                    turn_state.audio_emitted = True
                 filler_ms = selected.duration_ms
                 continue
 
@@ -755,6 +761,7 @@ async def sende_streaming_antwort(
                 await asyncio.gather(*wait_tasks, return_exceptions=True)
 
     timing_token = voice_timing.start()
+    turn_state, turn_token = tts._start_tts_turn()
     timing = voice_timing.current()
     timing.partial_runs = max(0, int(partial_runs))
     timing.partial_as_final = bool(partial_as_final)
@@ -847,7 +854,11 @@ async def sende_streaming_antwort(
                     bargein_ms=playback.bargein_ms,
                 )
             finally:
-                voice_timing.reset(timing_token)
+                try:
+                    if turn_token is not None:
+                        tts._end_tts_turn(turn_token)
+                finally:
+                    voice_timing.reset(timing_token)
     if cancelled_during_playback_wait:
         raise asyncio.CancelledError
     if response_error is not None:

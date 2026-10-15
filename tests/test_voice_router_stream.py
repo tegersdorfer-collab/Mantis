@@ -7,6 +7,7 @@ import inspect
 import json
 import time
 
+import httpx
 from fastapi.testclient import TestClient
 from unittest.mock import patch
 from starlette.websockets import WebSocketDisconnect
@@ -1101,48 +1102,43 @@ class FakeClock:
             await asyncio.sleep(0)
 
 
-def test_ack_filler_uses_fake_clock_precedes_answer_and_is_not_text(monkeypatch):
-    from core.voice_fillers import VoiceFiller
+def test_ack_filler_is_suppressed_for_fallback_voice(monkeypatch):
+    from core import tts
 
     clock = FakeClock()
     release_answer = asyncio.Event()
-    filler_send_started = asyncio.Event()
-    release_filler_send = asyncio.Event()
     answer_tts_started = asyncio.Event()
+    release_answer_tts = asyncio.Event()
     logged = []
-    filler_audio = _fake_opus()
     chosen = []
-
-    class FillerWebSocket(FakeWebSocket):
-        async def send_json(self, data):
-            await super().send_json(data)
-            if data.get("type") == "audio_chunk" and base64.b64decode(data["b64"]) == filler_audio:
-                filler_send_started.set()
-                await release_filler_send.wait()
 
     class FakeOrchestrator:
         async def voice_respond(self, _text, stream_cb=None):
+            tts._active_tts_turn.get().engine = "google"
             await stream_cb(attempt_start("ack-turn"))
+            await stream_cb(delta("ack-turn", "Das ist die Antwort. "))
             await release_answer.wait()
             await stream_cb(tool_start("ack-turn"))
-            await stream_cb(delta("ack-turn", "Das ist die Antwort."))
             await stream_cb(attempt_end("ack-turn", final=True))
             return "Das ist die Antwort.", []
 
     async def fake_tts(_sentence, **_kwargs):
         answer_tts_started.set()
+        await release_answer_tts.wait()
         yield b"answer-audio"
 
     def choose(kind):
         chosen.append(kind)
-        return VoiceFiller(kind, "Mhm.", filler_audio, 1000.0)
+        raise AssertionError("Fallback-Stimme darf keinen Hauptstimmen-Füller auswählen")
 
     monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
     monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
     monkeypatch.setattr("core.voice_fillers.choose_cached_filler", choose)
     monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
     monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 800)
-    ws = FillerWebSocket()
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN", ["cartesia", "google", "local"])
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN_EXPLICIT", True)
+    ws = FakeWebSocket()
 
     async def run():
         task = asyncio.create_task(sende_streaming_antwort(
@@ -1150,50 +1146,213 @@ def test_ack_filler_uses_fake_clock_precedes_answer_and_is_not_text(monkeypatch)
         ))
         await clock.sleep_started.wait()
         assert clock.requested_delays[0] == pytest.approx(0.8, abs=0.01)
-        clock.advance_event.set()
-        await filler_send_started.wait()
-        release_answer.set()
         await answer_tts_started.wait()
-        release_filler_send.set()
+        clock.advance_event.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        release_answer_tts.set()
+        release_answer.set()
         await task
 
     asyncio.run(run())
 
     chunks = [message for message in ws.gesendet if message.get("type") == "audio_chunk"]
-    assert [message["seq"] for message in chunks] == [0, 1]
-    assert [base64.b64decode(message["b64"]) for message in chunks] == [
-        filler_audio, b"answer-audio",
-    ]
-    assert chosen == ["ack"]
+    assert [message["seq"] for message in chunks] == [0]
+    assert [base64.b64decode(message["b64"]) for message in chunks] == [b"answer-audio"]
+    assert chosen == []
     assert ws.gesendet[-2]["reply"] == "Das ist die Antwort."
-    assert "Mhm." not in ws.gesendet[-2]["reply"]
-    assert logged[0][2]["filler"] == "ack"
-    assert logged[0][2]["filler_ms"] == 1000.0
-    assert logged[0][2]["first_tts_block_ms"] is not None
-    # Zeitwerte sind auf 0,1 ms gerundet; die Chunk-Reihenfolge oben prüft den Ablauf.
-    assert logged[0][2]["first_answer_audio_ms"] >= logged[0][2]["first_tts_block_ms"]
+    assert logged[0][2]["filler"] is None
+    assert logged[0][2]["filler_ms"] is None
+    assert logged[0][2]["first_answer_audio_ms"] is not None
 
 
-def test_tool_filler_is_queued_before_answer_and_only_one_filler_is_used(monkeypatch):
+def test_ack_filler_uses_preselected_main_voice_before_answer_audio(monkeypatch):
+    from core import tts
     from core.voice_fillers import VoiceFiller
 
-    clock = FakeClock()
-    filler_audio = _fake_opus(600)
-    filler_sent = asyncio.Event()
-    logged = []
-    chosen = []
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN", ["cartesia", "google"], raising=False)
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+    monkeypatch.setattr("config.CARTESIA_API_KEY", "cartesia-test-key", raising=False)
+    monkeypatch.setattr("config.GOOGLE_TTS_API_KEY", "google-test-key", raising=False)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 0)
+    monkeypatch.setattr(tts, "_engine_paused_until", {})
+    monkeypatch.setattr(tts, "_cartesia_paused_until", 0.0)
+    monkeypatch.setattr(tts, "_google_tts_paused_until", 0.0)
+    selected = []
 
-    class FillerWebSocket(FakeWebSocket):
-        async def send_json(self, data):
-            await super().send_json(data)
-            if data.get("type") == "audio_chunk" and base64.b64decode(data["b64"]) == filler_audio:
-                filler_sent.set()
+    def choose(kind):
+        selected.append(kind)
+        return VoiceFiller(kind, "Mhm.", b"ack-audio", 350.0)
 
     class FakeOrchestrator:
         async def voice_respond(self, _text, stream_cb=None):
+            return "", []
+
+    monkeypatch.setattr("core.voice_fillers.choose_cached_filler", choose)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+    ws = FakeWebSocket()
+
+    asyncio.run(sende_streaming_antwort(ws, "Mantis?", FakeOrchestrator()))
+
+    chunks = [message for message in ws.gesendet if message.get("type") == "audio_chunk"]
+    assert [base64.b64decode(message["b64"]) for message in chunks] == [b"ack-audio"]
+    assert selected == ["ack"]
+
+
+def test_gesendeter_filler_bindet_tts_turn_fuer_retry(monkeypatch):
+    from core import tts
+    from core.voice_fillers import VoiceFiller
+
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN", ["cartesia", "google"], raising=False)
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+    monkeypatch.setattr("config.CARTESIA_API_KEY", "cartesia-test-key", raising=False)
+    monkeypatch.setattr("config.GOOGLE_TTS_API_KEY", "google-test-key", raising=False)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 0)
+    monkeypatch.setattr(tts, "_engine_paused_until", {})
+    monkeypatch.setattr(tts, "_engine_error_paused_until", {}, raising=False)
+    monkeypatch.setattr(tts, "_engine_quota_paused_until", {}, raising=False)
+    monkeypatch.setattr(tts, "_engine_pause_warned", set())
+    monkeypatch.setattr(tts, "_cartesia_paused_until", 0.0)
+    monkeypatch.setattr(tts, "_google_tts_paused_until", 0.0)
+    monkeypatch.setattr(tts, "_cartesia_pause_warned", False)
+    monkeypatch.setattr(tts, "_google_tts_pause_warned", False)
+    monkeypatch.setattr(tts, "_record_cartesia_usage", lambda _text: None)
+    monkeypatch.setattr(tts, "_record_google_tts_usage", lambda _text: None)
+    monkeypatch.setattr(tts, "_cartesia_wav_to_ogg", lambda _wav: b"OggS:cartesia")
+    monkeypatch.setattr(tts, "_ogg_opus_sample_count", lambda _audio: 4800)
+    monkeypatch.setattr(
+        "core.voice_fillers.choose_cached_filler",
+        lambda kind: VoiceFiller(kind, "Mhm.", b"filler-audio", 350.0),
+    )
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+    cartesia_calls = []
+    google_calls = []
+
+    async def cartesia(_text):
+        cartesia_calls.append(True)
+        if len(cartesia_calls) == 1:
+            raise httpx.ReadTimeout("kurzer Fehler")
+        return b"WAV:cartesia"
+
+    async def google(_text):
+        google_calls.append(True)
+        return b"OggS:google", False
+
+    monkeypatch.setattr(tts, "_cartesia_synthesize", cartesia)
+    monkeypatch.setattr(tts, "_google_tts_synthesize", google)
+
+    class FillerAwareWebSocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.filler_sent = asyncio.Event()
+
+        async def send_json(self, data):
+            await super().send_json(data)
+            if data.get("type") == "audio_chunk" and base64.b64decode(data["b64"]) == b"filler-audio":
+                self.filler_sent.set()
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            await ws.filler_sent.wait()
+            return "Antwort.", []
+
+    ws = FillerAwareWebSocket()
+    asyncio.run(sende_streaming_antwort(ws, "Mantis?", FakeOrchestrator()))
+
+    chunks = [
+        base64.b64decode(message["b64"])
+        for message in ws.gesendet
+        if message.get("type") == "audio_chunk"
+    ]
+    assert chunks == [b"filler-audio", b"OggS:cartesia"]
+    assert len(cartesia_calls) == 2
+    assert google_calls == []
+
+
+def test_tool_filler_uses_preselected_main_voice_before_answer_audio(monkeypatch):
+    from core import tts
+    from core.voice_fillers import VoiceFiller
+
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN", ["cartesia", "google"], raising=False)
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+    monkeypatch.setattr("config.CARTESIA_API_KEY", "cartesia-test-key", raising=False)
+    monkeypatch.setattr("config.GOOGLE_TTS_API_KEY", "google-test-key", raising=False)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 0)
+    monkeypatch.setattr(tts, "_engine_paused_until", {})
+    monkeypatch.setattr(tts, "_cartesia_paused_until", 0.0)
+    monkeypatch.setattr(tts, "_google_tts_paused_until", 0.0)
+    selected = []
+
+    def choose(kind):
+        selected.append(kind)
+        if kind == "ack":
+            return None
+        return VoiceFiller(kind, "Ich schau nach.", b"tool-audio", 500.0)
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            await stream_cb(tool_start("tool-only", "weather"))
+            return "", []
+
+    monkeypatch.setattr("core.voice_fillers.choose_cached_filler", choose)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+    ws = FakeWebSocket()
+
+    asyncio.run(sende_streaming_antwort(ws, "Wie wird das Wetter?", FakeOrchestrator()))
+
+    chunks = [message for message in ws.gesendet if message.get("type") == "audio_chunk"]
+    assert [base64.b64decode(message["b64"]) for message in chunks] == [b"tool-audio"]
+    assert "tool" in selected
+
+
+def test_main_voice_cooldown_preselects_fallback_and_suppresses_ack_filler(monkeypatch):
+    from core import tts
+
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN", ["cartesia", "google"], raising=False)
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+    monkeypatch.setattr("config.CARTESIA_API_KEY", "cartesia-test-key", raising=False)
+    monkeypatch.setattr("config.GOOGLE_TTS_API_KEY", "google-test-key", raising=False)
+    monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
+    monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 0)
+    monkeypatch.setattr(tts.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(tts, "_engine_paused_until", {"cartesia": 200.0})
+    monkeypatch.setattr(tts, "_cartesia_paused_until", 200.0)
+    monkeypatch.setattr(tts, "_google_tts_paused_until", 0.0)
+    preselected = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            preselected.append(tts._active_tts_turn.get().engine)
+            return "", []
+
+    def choose(_kind):
+        raise AssertionError("Bei vorausgewählter Ersatzstimme darf kein Füller laufen")
+
+    monkeypatch.setattr("core.voice_fillers.choose_cached_filler", choose)
+    monkeypatch.setattr("web.routers.voice.db.log_event", lambda *_args: None)
+    ws = FakeWebSocket()
+
+    asyncio.run(sende_streaming_antwort(ws, "Mantis?", FakeOrchestrator()))
+
+    assert preselected == ["google"]
+    assert not [message for message in ws.gesendet if message.get("type") == "audio_chunk"]
+
+
+def test_tool_filler_is_suppressed_when_fallback_voice_is_selected(monkeypatch):
+    from core import tts
+
+    clock = FakeClock()
+    logged = []
+    chosen = []
+
+    class FakeOrchestrator:
+        async def voice_respond(self, _text, stream_cb=None):
+            tts._active_tts_turn.get().engine = "google"
             await stream_cb(attempt_start("tool-turn"))
             await stream_cb(tool_start("tool-turn", "weather"))
-            await filler_sent.wait()
             await stream_cb(delta("tool-turn", "Es wird sonnig."))
             await stream_cb(attempt_end("tool-turn", final=True))
             return "Es wird sonnig.", []
@@ -1203,34 +1362,33 @@ def test_tool_filler_is_queued_before_answer_and_only_one_filler_is_used(monkeyp
 
     def choose(kind):
         chosen.append(kind)
-        return VoiceFiller(kind, "Ich schau kurz nach.", filler_audio, 600.0)
+        raise AssertionError("Fallback-Stimme darf keinen Hauptstimmen-Füller auswählen")
 
     monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
     monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
     monkeypatch.setattr("core.voice_fillers.choose_cached_filler", choose)
     monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
     monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 800)
-    ws = FillerWebSocket()
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN", ["cartesia", "google", "local"])
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN_EXPLICIT", True)
+    ws = FakeWebSocket()
 
     async def run():
         task = asyncio.create_task(sende_streaming_antwort(
             ws, "Wie wird das Wetter?", FakeOrchestrator(), sleep=clock.sleep,
         ))
         await clock.sleep_started.wait()
-        await filler_sent.wait()
         clock.advance_event.set()
         await task
 
     asyncio.run(run())
 
     chunks = [message for message in ws.gesendet if message.get("type") == "audio_chunk"]
-    assert [message["seq"] for message in chunks] == [0, 1]
-    assert [base64.b64decode(message["b64"]) for message in chunks] == [
-        filler_audio, b"answer-audio",
-    ]
-    assert chosen == ["tool"]
-    assert logged[0][2]["filler"] == "tool"
-    assert logged[0][2]["filler_ms"] == 600.0
+    assert [message["seq"] for message in chunks] == [0]
+    assert [base64.b64decode(message["b64"]) for message in chunks] == [b"answer-audio"]
+    assert chosen == []
+    assert logged[0][2]["filler"] is None
+    assert logged[0][2]["filler_ms"] is None
 
 
 def test_ready_answer_audio_suppresses_ack_filler(monkeypatch):
@@ -1960,24 +2118,16 @@ def test_turn_cancellation_cleans_up_audio_wait_helpers(monkeypatch):
 
 
 def test_ack_deadline_is_relative_to_turn_start_not_after_stt(monkeypatch):
-    from core.voice_fillers import VoiceFiller
+    from core import tts
 
     clock = FakeClock()
-    filler_audio = _fake_opus()
-    filler_sent = asyncio.Event()
     logged = []
     chosen = []
 
-    class FillerWebSocket(FakeWebSocket):
-        async def send_json(self, data):
-            await super().send_json(data)
-            if data.get("type") == "audio_chunk" and base64.b64decode(data["b64"]) == filler_audio:
-                filler_sent.set()
-
     class FakeOrchestrator:
         async def voice_respond(self, _text, stream_cb=None):
+            tts._active_tts_turn.get().engine = "google"
             await stream_cb(attempt_start("slow-stt-turn"))
-            await filler_sent.wait()
             await stream_cb(delta("slow-stt-turn", "Hier bin ich."))
             await stream_cb(attempt_end("slow-stt-turn", final=True))
             return "Hier bin ich.", []
@@ -1987,14 +2137,16 @@ def test_ack_deadline_is_relative_to_turn_start_not_after_stt(monkeypatch):
 
     def choose(kind):
         chosen.append(kind)
-        return VoiceFiller(kind, "Mhm.", filler_audio, 700.0)
+        raise AssertionError("Fallback-Stimme darf keinen Hauptstimmen-Füller auswählen")
 
     monkeypatch.setattr("web.routers.voice.synthesize_stream", fake_tts)
     monkeypatch.setattr("web.routers.voice.db.log_event", lambda *args: logged.append(args))
     monkeypatch.setattr("core.voice_fillers.choose_cached_filler", choose)
     monkeypatch.setattr("config.VOICE_FILLERS_ENABLED", True)
     monkeypatch.setattr("config.VOICE_FILLER_ACK_DELAY_MS", 800)
-    ws = FillerWebSocket()
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN", ["cartesia", "google", "local"])
+    monkeypatch.setattr("config.TTS_ENGINE_CHAIN_EXPLICIT", True)
+    ws = FakeWebSocket()
 
     async def run():
         task = asyncio.create_task(sende_streaming_antwort(
@@ -2008,8 +2160,8 @@ def test_ack_deadline_is_relative_to_turn_start_not_after_stt(monkeypatch):
 
     asyncio.run(run())
 
-    assert chosen == ["ack"]
-    assert logged[0][2]["filler"] == "ack"
+    assert chosen == []
+    assert logged[0][2]["filler"] is None
 
 
 def test_timer_and_first_tts_block_tie_gives_audio_priority(monkeypatch):

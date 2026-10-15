@@ -9,7 +9,7 @@ Verwendung:
 from __future__ import annotations
 import json
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -71,8 +71,12 @@ class MantisSettings(BaseSettings):
     #   whisper turbo   ... 22 %, 1,06 s/Clip
     # Ganze Sätze transkribieren alle drei fehlerfrei; der Unterschied liegt bei
     # kurzen Äußerungen und Eigennamen — genau dem Voice-Alltag.
-    # TTS: Cartesia Sonic 3.6; bei Fehlern fällt Mantis lokal auf Kokoro/Piper zurück.
+    # TTS: Cloud-Ersatzkette; lokal bleiben Kokoro/Piper als letzte Provider.
     TTS_ENGINE: str = "cartesia"
+    TTS_ENGINE_CHAIN: list[str] = Field(
+        default_factory=lambda: ["cartesia", "elevenlabs", "google", "local"],
+    )
+    TTS_QUOTA_COOLDOWN_S: float = 3600.0
     TTS_KOKORO_VOICE: str = "dm_martin"
     CARTESIA_API_KEY: str = ""
     TTS_CARTESIA_MODEL: str = "sonic-3.6"
@@ -81,6 +85,12 @@ class MantisSettings(BaseSettings):
     # Lautschreibung für Wörter, die die deutsche Stimme falsch ausspricht (Timo, 14.10.2026: Mantis englisch).
     TTS_CARTESIA_PRONUNCIATIONS: dict[str, str] = {"Mantis": "Mäntis"}
     TTS_CARTESIA_USD_PER_MILLION_CHARS: float = 65.0  # Pro-Überschuss, 1 Zeichen = 1 Credit
+    ELEVENLABS_API_KEY: SecretStr = SecretStr("")
+    TTS_ELEVENLABS_MODEL: str = "eleven_v4_turbo"
+    TTS_ELEVENLABS_VOICE: str = "iP95p4xoKVk53GoZ742B"
+    TTS_ELEVENLABS_USD_PER_MILLION_CHARS: float = 0.0
+    GOOGLE_TTS_API_KEY: SecretStr = SecretStr("")
+    TTS_GOOGLE_VOICE: str = "de-DE-Chirp3-HD-Charon"
     STT_ENGINE: str = "parakeet"
     STT_PARAKEET_MODEL: str = "mlx-community/parakeet-tdt-0.6b-v3"
     STT_PRELOAD: bool = True
