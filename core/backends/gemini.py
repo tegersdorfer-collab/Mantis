@@ -26,6 +26,21 @@ class _GeminiText(str):
         instance.gemini_parts = deepcopy(gemini_parts)
         return instance
 
+    def __getnewargs__(self):
+        return str(self), self.gemini_parts
+
+    def __reduce__(self):
+        return type(self), self.__getnewargs__()
+
+    def __deepcopy__(self, memo):
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+        copied = str.__new__(type(self), str(self))
+        memo[id(self)] = copied
+        copied.gemini_parts = deepcopy(self.gemini_parts, memo)
+        return copied
+
     def strip(self, chars=None):
         return type(self)(super().strip(chars), self.gemini_parts)
 
@@ -197,11 +212,20 @@ def _convert_schema(schema, root: dict, ref_stack: tuple[str, ...] = ()):
                 return {**resolved, **converted_siblings}
 
     converted = {}
+    type_variants = None
+    nullable_from_type = False
     for key in _SUPPORTED_SCHEMA_FIELDS:
         if key not in schema:
             continue
         value = schema[key]
-        if key == "properties" and isinstance(value, dict):
+        if key == "type" and isinstance(value, list):
+            non_null_types = [type_name for type_name in value if type_name != "null"]
+            nullable_from_type = "null" in value
+            if len(non_null_types) == 1:
+                converted[key] = deepcopy(non_null_types[0])
+            elif len(non_null_types) > 1:
+                type_variants = [{"type": deepcopy(type_name)} for type_name in non_null_types]
+        elif key == "properties" and isinstance(value, dict):
             converted[key] = {
                 name: _convert_schema(child, root, ref_stack)
                 for name, child in value.items()
@@ -212,6 +236,17 @@ def _convert_schema(schema, root: dict, ref_stack: tuple[str, ...] = ()):
             converted[key] = [_convert_schema(child, root, ref_stack) for child in value]
         else:
             converted[key] = deepcopy(value)
+
+    if type_variants:
+        existing_any_of = converted.get("anyOf")
+        if existing_any_of is not None:
+            type_variants = [
+                {**variant, "anyOf": existing_any_of}
+                for variant in type_variants
+            ]
+        converted["anyOf"] = type_variants
+    if nullable_from_type:
+        converted["nullable"] = True
 
     if "oneOf" in schema and isinstance(schema["oneOf"], list):
         branches = [_convert_schema(child, root, ref_stack) for child in schema["oneOf"]]

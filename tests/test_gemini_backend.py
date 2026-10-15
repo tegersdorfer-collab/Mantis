@@ -1,6 +1,8 @@
 """Vertex-Gemini-Backend: HTTP-Verhalten wird ausschließlich gemockt."""
 import asyncio
+import copy
 import json
+import pickle
 import time
 
 import httpx
@@ -228,6 +230,77 @@ def test_text_only_thought_signature_is_kept_for_the_next_request(streaming):
     assert text == "Antwort."
     assert calls == []
     assert followup["contents"][1] == {"role": "model", "parts": original_parts}
+
+
+def test_signed_gemini_text_survives_message_copy_and_voice_reminder():
+    from core.backends.gemini import _history_to_gemini
+    from core.message_handler import _messages_with_voice_reminder
+
+    original_parts = [{
+        "text": "Antwort.",
+        "thoughtSignature": "text-only-signature",
+        "metadata": {"nested": ["kept"]},
+    }]
+
+    def handler(_request):
+        return httpx.Response(200, json=_response(parts=original_parts))
+
+    text, calls = _call(
+        _backend(handler),
+        messages=[{"role": "user", "content": "Erkläre das."}],
+    )
+    messages = [
+        {"role": "user", "content": "Erkläre das."},
+        {"role": "assistant", "content": text},
+    ]
+
+    copied = copy.deepcopy(messages)
+    with_voice_reminder = _messages_with_voice_reminder(copied, "Erkläre das.")
+    _system, contents = _history_to_gemini(with_voice_reminder)
+
+    assert calls == []
+    assert contents[1] == {"role": "model", "parts": original_parts}
+
+
+def test_signed_gemini_text_pickle_round_trip_preserves_parts():
+    original_parts = [{
+        "text": "Antwort.",
+        "thoughtSignature": "text-only-signature",
+        "metadata": {"nested": ["kept"]},
+    }]
+
+    def handler(_request):
+        return httpx.Response(200, json=_response(parts=original_parts))
+
+    text, _calls = _call(
+        _backend(handler),
+        messages=[{"role": "user", "content": "Erkläre das."}],
+    )
+    restored = pickle.loads(pickle.dumps(text))
+
+    assert str(restored) == "Antwort."
+    assert restored.gemini_parts == original_parts
+    assert restored.gemini_parts is not text.gemini_parts
+    assert restored.gemini_parts[0]["metadata"] is not text.gemini_parts[0]["metadata"]
+
+
+@pytest.mark.parametrize(("json_type", "expected"), [
+    (["string", "null"], {"type": "string", "nullable": True}),
+    (["string"], {"type": "string"}),
+    (["string", "integer"], {"anyOf": [{"type": "string"}, {"type": "integer"}]}),
+    (["string", "integer", "null"], {
+        "anyOf": [{"type": "string"}, {"type": "integer"}], "nullable": True,
+    }),
+])
+def test_type_arrays_are_converted_to_gemini_nullable_and_any_of(json_type, expected):
+    from core.backends.gemini import _function_declarations
+
+    converted = _function_declarations([{
+        "name": "schema_probe",
+        "parameters": {"type": "object", "properties": {"value": {"type": json_type}}},
+    }])
+
+    assert converted[0]["parameters"]["properties"]["value"] == expected
 
 
 def test_forced_tool_call_uses_vertex_any_mode_and_returns_normalized_call():
