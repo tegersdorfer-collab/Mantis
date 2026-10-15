@@ -91,6 +91,33 @@ type SpeakerStatus = {
   last_learning: { learned_at: string | null; score: number | null; source: string }[];
 };
 
+type SpeakerEnrollmentResponse = SpeakerStatus & { detail?: string };
+
+export async function uploadSpeakerEnrollmentClips(
+  baseUrl: string,
+  clips: readonly Blob[],
+  fetchImpl: typeof fetch = authenticatedFetch,
+  sessionId = crypto.randomUUID(),
+): Promise<SpeakerStatus> {
+  const query = new URLSearchParams({ session_id: sessionId });
+  for (const clip of clips) {
+    const response = await fetchImpl(
+      `${baseUrl}/api/voice/speaker/enroll/clip?${query}`,
+      { method: 'POST', body: clip },
+    );
+    const payload = await response.json() as SpeakerEnrollmentResponse;
+    if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+  }
+
+  const response = await fetchImpl(
+    `${baseUrl}/api/voice/speaker/enroll/finish?${query}`,
+    { method: 'POST' },
+  );
+  const payload = await response.json() as SpeakerEnrollmentResponse;
+  if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+  return payload;
+}
+
 export function initSpeakerEnrollmentPanel(
   baseUrl = getBaseUrl(),
   fetchImpl: typeof fetch = authenticatedFetch,
@@ -264,18 +291,13 @@ export function initSpeakerEnrollmentPanel(
   });
 
   uploadButton.addEventListener('click', async () => {
-    const form = new FormData();
-    clips.forEach((clip, index) => {
-      if (clip) form.append('audio', clip, `satz-${index + 1}.wav`);
-    });
+    const recordings = clips.filter((clip): clip is Blob => Boolean(clip));
     uploadButton.disabled = true;
     actionStatus.textContent = 'Stimmprofil wird eingelernt …';
     try {
-      const response = await fetchImpl(`${baseUrl}/api/voice/speaker/enroll`, {
-        method: 'POST', body: form,
-      });
-      const payload = await response.json() as SpeakerStatus & { detail?: string };
-      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+      const payload = await uploadSpeakerEnrollmentClips(
+        baseUrl, recordings, fetchImpl,
+      );
       clips.fill(null);
       nextPrompt = 0;
       updatePrompts();

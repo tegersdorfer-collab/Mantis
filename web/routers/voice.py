@@ -23,10 +23,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import (
-    APIRouter, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect,
+    APIRouter, UploadFile, File, HTTPException, Request, WebSocket,
+    WebSocketDisconnect,
 )
 
 import config
@@ -46,10 +47,12 @@ from core.tts import _first_early_stream_boundary, synthesize, synthesize_stream
 
 log = logging.getLogger("mantis.api")
 
-SPEAKER_ENROLL_MAX_FILES = 12
+SPEAKER_ENROLL_MAX_CLIPS = 12
 SPEAKER_ENROLL_MAX_BYTES = 4 * 1024 * 1024
 SPEAKER_ENROLL_MAX_SECONDS = 90.0
-SPEAKER_ENROLL_READ_CHUNK_BYTES = 64 * 1024
+SPEAKER_ENROLL_UPLOAD_TIMEOUT_SECONDS = 30.0
+SPEAKER_ENROLL_SESSION_TTL_SECONDS = 10 * 60.0
+SPEAKER_ENROLL_MAX_SESSIONS = 8
 
 
 def _wav_duration_seconds(payload: bytes) -> float:
@@ -64,40 +67,46 @@ def _wav_duration_seconds(payload: bytes) -> float:
         raise ValueError("Ungültige WAV-Datei") from exc
 
 
-async def _read_bounded_uploads(uploads: list[UploadFile]) -> list[bytes]:
-    if len(uploads) > SPEAKER_ENROLL_MAX_FILES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Maximal {SPEAKER_ENROLL_MAX_FILES} Audio-Dateien erlaubt",
-        )
-    total_bytes = 0
-    total_seconds = 0.0
-    payloads = []
-    for upload in uploads:
-        parts = []
-        while True:
-            remaining = SPEAKER_ENROLL_MAX_BYTES - total_bytes
-            chunk = await upload.read(
-                min(SPEAKER_ENROLL_READ_CHUNK_BYTES, remaining + 1),
-            )
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            if total_bytes > SPEAKER_ENROLL_MAX_BYTES:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Sprecher-Upload darf insgesamt höchstens 4 MB groß sein",
-                )
-            parts.append(chunk)
-        payload = b"".join(parts)
-        total_seconds += _wav_duration_seconds(payload)
-        if total_seconds > SPEAKER_ENROLL_MAX_SECONDS:
+async def _read_bounded_request_body(
+    request: Request, *, max_bytes: int = SPEAKER_ENROLL_MAX_BYTES,
+) -> bytes:
+    """Liest einen Request-Body begrenzt direkt aus dem ASGI-Stream."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        declared_length = content_length.strip()
+        if not declared_length.isascii() or not declared_length.isdigit():
+            raise HTTPException(status_code=400, detail="Ungültiger Content-Length-Header")
+        if int(declared_length) > max_bytes:
             raise HTTPException(
                 status_code=413,
-                detail="Sprecher-Upload darf insgesamt höchstens 90 Sekunden Audio enthalten",
+                detail="Sprecher-Upload darf insgesamt höchstens 4 MB groß sein",
             )
-        payloads.append(payload)
-    return payloads
+
+    payload = bytearray()
+    try:
+        async with asyncio.timeout(SPEAKER_ENROLL_UPLOAD_TIMEOUT_SECONDS):
+            async for chunk in request.stream():
+                if len(payload) + len(chunk) > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Sprecher-Upload darf insgesamt höchstens 4 MB groß sein",
+                    )
+                payload.extend(chunk)
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=408,
+            detail="Sprecher-Upload dauerte zu lange",
+        ) from exc
+    return bytes(payload)
+
+
+@dataclass(slots=True)
+class _SpeakerEnrollmentSession:
+    clips: list[bytes] = field(default_factory=list)
+    total_bytes: int = 0
+    total_seconds: float = 0.0
+    updated_at: float = field(default_factory=time.monotonic)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @dataclass(slots=True)
@@ -1164,6 +1173,41 @@ async def sende_streaming_antwort(
 
 def build_router(orch=None) -> APIRouter:
     router = APIRouter()
+    enrollment_sessions: dict[UUID, _SpeakerEnrollmentSession] = {}
+    enrollment_sessions_lock = asyncio.Lock()
+
+    async def get_enrollment_session(
+        session_id: UUID, *, create: bool,
+    ) -> _SpeakerEnrollmentSession | None:
+        async with enrollment_sessions_lock:
+            now = time.monotonic()
+            expired = [
+                key for key, session in enrollment_sessions.items()
+                if now - session.updated_at > SPEAKER_ENROLL_SESSION_TTL_SECONDS
+            ]
+            for key in expired:
+                enrollment_sessions.pop(key, None)
+
+            session = enrollment_sessions.get(session_id)
+            if session is None and create:
+                if len(enrollment_sessions) >= SPEAKER_ENROLL_MAX_SESSIONS:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Zu viele aktive Sprecher-Einlernsitzungen",
+                    )
+                session = _SpeakerEnrollmentSession()
+                enrollment_sessions[session_id] = session
+            return session
+
+    async def discard_empty_enrollment_session(
+        session_id: UUID, session: _SpeakerEnrollmentSession,
+    ) -> None:
+        async with session.lock:
+            if session.clips:
+                return
+            async with enrollment_sessions_lock:
+                if enrollment_sessions.get(session_id) is session:
+                    enrollment_sessions.pop(session_id, None)
 
     @router.get("/api/voice/speaker")
     async def speaker_status():
@@ -1177,12 +1221,79 @@ def build_router(orch=None) -> APIRouter:
                 status_code=503, detail="Sprecherprofil ist nicht verfügbar",
             ) from exc
 
-    @router.post("/api/voice/speaker/enroll")
-    async def speaker_enroll(audio: list[UploadFile] = File(...)):
+    @router.post("/api/voice/speaker/enroll/clip")
+    async def speaker_enroll_clip(request: Request, session_id: UUID):
+        session = await get_enrollment_session(session_id, create=True)
+        assert session is not None
+
+        try:
+            async with session.lock:
+                async with enrollment_sessions_lock:
+                    if enrollment_sessions.get(session_id) is not session:
+                        raise HTTPException(
+                            status_code=404, detail="Einlernsitzung ist abgelaufen",
+                        )
+                    session.updated_at = time.monotonic()
+                    if len(session.clips) >= SPEAKER_ENROLL_MAX_CLIPS:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                f"Maximal {SPEAKER_ENROLL_MAX_CLIPS} Clips pro Sitzung erlaubt"
+                            ),
+                        )
+                    remaining_bytes = SPEAKER_ENROLL_MAX_BYTES - session.total_bytes
+                    if remaining_bytes <= 0:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Sprecher-Upload darf insgesamt höchstens 4 MB groß sein",
+                        )
+
+                payload = await _read_bounded_request_body(
+                    request, max_bytes=remaining_bytes,
+                )
+                duration = _wav_duration_seconds(payload)
+                if duration <= 0:
+                    raise ValueError("Ungültige WAV-Datei")
+                if session.total_seconds + duration > SPEAKER_ENROLL_MAX_SECONDS:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "Sprecher-Upload darf insgesamt höchstens "
+                            "90 Sekunden Audio enthalten"
+                        ),
+                    )
+                session.clips.append(payload)
+                session.total_bytes += len(payload)
+                session.total_seconds += duration
+                session.updated_at = time.monotonic()
+                return {"clips": len(session.clips)}
+        except HTTPException:
+            await discard_empty_enrollment_session(session_id, session)
+            raise
+        except ValueError as exc:
+            await discard_empty_enrollment_session(session_id, session)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/api/voice/speaker/enroll/finish")
+    async def speaker_enroll_finish(session_id: UUID):
+        session = await get_enrollment_session(session_id, create=False)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Einlernsitzung nicht gefunden")
+
+        async with session.lock:
+            async with enrollment_sessions_lock:
+                if enrollment_sessions.get(session_id) is not session:
+                    raise HTTPException(
+                        status_code=404, detail="Einlernsitzung ist abgelaufen",
+                    )
+                enrollment_sessions.pop(session_id, None)
+                payloads = list(session.clips)
+        if not payloads:
+            raise HTTPException(status_code=400, detail="Keine Audio-Dateien hochgeladen")
+
         from core.speaker import get_speaker_verifier
 
         try:
-            payloads = await _read_bounded_uploads(audio)
             return await get_speaker_verifier().enroll_wavs(payloads)
         except HTTPException:
             raise
@@ -1193,9 +1304,6 @@ def build_router(orch=None) -> APIRouter:
             raise HTTPException(
                 status_code=503, detail="Sprecherprofil konnte nicht eingelernt werden",
             ) from exc
-        finally:
-            for item in audio:
-                await item.close()
 
     @router.delete("/api/voice/speaker")
     async def speaker_reset():
