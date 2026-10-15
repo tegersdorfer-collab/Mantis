@@ -344,6 +344,8 @@ async def sende_streaming_antwort(
                 selected = pending_filler
                 pending_filler = None
                 await send_audio_chunk(selected.audio)
+                if turn_state is not None:
+                    turn_state.audio_emitted = True
                 filler_ms = selected.duration_ms
                 continue
 

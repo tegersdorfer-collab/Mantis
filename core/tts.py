@@ -75,6 +75,8 @@ _elevenlabs_pause_warned = False
 _google_tts_paused_until = 0.0
 _google_tts_pause_warned = False
 _engine_paused_until: dict[str, float] = {}
+_engine_error_paused_until: dict[str, float] = {}
+_engine_quota_paused_until: dict[str, float] = {}
 _engine_pause_warned: set[str] = set()
 _lock = asyncio.Lock()
 
@@ -147,10 +149,20 @@ def _engine_label(engine: str) -> str:
     }.get(engine, engine)
 
 
-def _engine_is_paused(engine: str) -> bool:
+def _engine_is_paused(engine: str, *, ignore_error_cooldown: bool = False) -> bool:
     compat_name = _pause_until_compat_name(engine)
     legacy_deadline = globals().get(compat_name, 0.0) if compat_name else 0.0
-    return time.monotonic() < max(_engine_paused_until.get(engine, 0.0), legacy_deadline)
+    deadline = max(_engine_paused_until.get(engine, 0.0), legacy_deadline)
+    now = time.monotonic()
+    if now >= deadline:
+        return False
+    if not ignore_error_cooldown:
+        return True
+    if now < _engine_quota_paused_until.get(engine, 0.0):
+        return True
+    # Nur ein von uns eindeutig als kurz markierter Fehler-Cooldown ist
+    # innerhalb eines bereits hörbaren Turns übersteuerbar.
+    return deadline > _engine_error_paused_until.get(engine, 0.0)
 
 
 def _cartesia_is_paused() -> bool:
@@ -248,6 +260,9 @@ def _active_voice_name() -> str:
 
 def is_available() -> bool:
     """True, wenn mindestens ein Provider der Ersatzkette einsatzbereit ist."""
+    state = _active_tts_turn.get()
+    if state is not None and _turn_bound_engine_available(state):
+        return True
     return any(_engine_available(engine) for engine in _engine_chain())
 
 
@@ -691,7 +706,10 @@ def _mp3_to_ogg(mp3_bytes: bytes) -> bytes:
             capture_output=True,
             check=True,
         )
-        return Path(ogg_path).read_bytes()
+        ogg = Path(ogg_path).read_bytes()
+        if _ogg_opus_sample_count(ogg) <= 0:
+            raise ValueError("ElevenLabs lieferte OGG ohne Samples")
+        return ogg
     finally:
         Path(mp3_path).unlink(missing_ok=True)
         Path(ogg_path).unlink(missing_ok=True)
@@ -889,7 +907,10 @@ def _pause_engine(engine: str, status: int | str, *, quota: bool) -> None:
         _engine_paused_until.get(engine, 0.0),
         globals().get(compat_name, 0.0) if compat_name else 0.0,
     )
-    deadline = max(previous_deadline, time.monotonic() + duration)
+    requested_deadline = time.monotonic() + duration
+    pause_deadlines = _engine_quota_paused_until if quota else _engine_error_paused_until
+    pause_deadlines[engine] = max(pause_deadlines.get(engine, 0.0), requested_deadline)
+    deadline = max(previous_deadline, requested_deadline)
     _engine_paused_until[engine] = deadline
     if compat_name:
         globals()[compat_name] = deadline
@@ -908,6 +929,25 @@ def _pause_engine(engine: str, status: int | str, *, quota: bool) -> None:
         }.get(engine)
         if compat_warn_name:
             globals()[compat_warn_name] = True
+
+
+def _clear_error_cooldown(engine: str) -> None:
+    """Hebt nur einen kurzen Fehler-Cooldown nach erfolgreicher Recovery auf."""
+    error_deadline = _engine_error_paused_until.pop(engine, 0.0)
+    if error_deadline <= 0:
+        return
+
+    compat_name = _pause_until_compat_name(engine)
+    current_deadline = max(
+        _engine_paused_until.get(engine, 0.0),
+        globals().get(compat_name, 0.0) if compat_name else 0.0,
+    )
+    quota_deadline = _engine_quota_paused_until.get(engine, 0.0)
+    # Erhalte eine längere, nicht als Fehler markierte Pause (insbesondere Quota).
+    deadline = max(quota_deadline, current_deadline if current_deadline > error_deadline else 0.0)
+    _engine_paused_until[engine] = deadline
+    if compat_name:
+        globals()[compat_name] = deadline
 
 
 def _has_provider_key(engine: str) -> bool:
@@ -948,6 +988,21 @@ def _turn_engine_available(engine: str) -> bool:
     return False
 
 
+def _turn_bound_engine_available(state: TTSTurnState) -> bool:
+    """Erlaubt einer hörbaren Turn-Bindung kurze Fehlerpausen zu übergehen."""
+    if not state.audio_emitted or state.engine is None or state.chain_position is None:
+        return False
+    chain = _engine_chain()
+    position = state.chain_position
+    if position >= len(chain) or chain[position] != state.engine:
+        return False
+    if state.engine in {"cartesia", "elevenlabs", "google"}:
+        return _has_provider_key(state.engine) and not _engine_is_paused(
+            state.engine, ignore_error_cooldown=True
+        )
+    return _turn_engine_available(state.engine)
+
+
 def _first_available_engine() -> tuple[str | None, int | None]:
     for position, engine in enumerate(_engine_chain()):
         if _turn_engine_available(engine):
@@ -960,10 +1015,12 @@ async def _synthesize_provider(
     text: str,
     speed: float,
     *,
-    ignore_paused: bool = False,
+    ignore_error_cooldown: bool = False,
 ) -> bytes | None:
     if engine in {"cartesia", "elevenlabs", "google"}:
-        if not _has_provider_key(engine) or (_engine_is_paused(engine) and not ignore_paused):
+        if not _has_provider_key(engine) or _engine_is_paused(
+            engine, ignore_error_cooldown=ignore_error_cooldown
+        ):
             return None
         try:
             if engine == "cartesia":
@@ -1092,20 +1149,28 @@ async def _synthesize_unlocked(
             engine,
             text,
             speed,
-            ignore_paused=retry_bound_engine,
+            ignore_error_cooldown=retry_bound_engine,
         )
+        if audio and retry_bound_engine:
+            _clear_error_cooldown(engine)
         if not audio and retry_bound_engine:
-            try:
-                audio = await asyncio.wait_for(
-                    _synthesize_provider(engine, text, speed, ignore_paused=True),
-                    timeout=max(0.01, float(_BOUND_ENGINE_RETRY_TIMEOUT_S)),
-                )
-            except TimeoutError:
-                _pause_engine(engine, "RetryTimeout", quota=False)
-                log.warning(
-                    "%s TTS-Retry nach bereits ausgegebenem Audio lief ins Timeout",
-                    _engine_label(engine),
-                )
+            quota_paused = time.monotonic() < _engine_quota_paused_until.get(engine, 0.0)
+            if not quota_paused:
+                try:
+                    audio = await asyncio.wait_for(
+                        _synthesize_provider(
+                            engine, text, speed, ignore_error_cooldown=True
+                        ),
+                        timeout=max(0.01, float(_BOUND_ENGINE_RETRY_TIMEOUT_S)),
+                    )
+                except TimeoutError:
+                    _pause_engine(engine, "RetryTimeout", quota=False)
+                    log.warning(
+                        "%s TTS-Retry nach bereits ausgegebenem Audio lief ins Timeout",
+                        _engine_label(engine),
+                    )
+                if audio:
+                    _clear_error_cooldown(engine)
             if not audio:
                 state.chain_position = offset + 1
         if audio:

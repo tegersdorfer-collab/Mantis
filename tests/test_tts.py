@@ -24,6 +24,8 @@ def _reset_engine_state(monkeypatch):
     monkeypatch.setattr(tts, "_cartesia_paused_until", 0.0, raising=False)
     monkeypatch.setattr(tts, "_cartesia_pause_warned", False, raising=False)
     monkeypatch.setattr(tts, "_engine_paused_until", {}, raising=False)
+    monkeypatch.setattr(tts, "_engine_error_paused_until", {}, raising=False)
+    monkeypatch.setattr(tts, "_engine_quota_paused_until", {}, raising=False)
     monkeypatch.setattr(tts, "_engine_pause_warned", set(), raising=False)
     monkeypatch.setattr(tts, "_google_tts_paused_until", 0.0, raising=False)
     monkeypatch.setattr(tts, "_elevenlabs_paused_until", 0.0, raising=False)
@@ -890,6 +892,30 @@ class TestElevenLabs:
         assert usage[0][1]["purpose"] == "tts"
         assert usage[0][1]["actual_cost"] == 0
 
+    def test_mp3_konvertierung_lehnt_leere_bytes_direkt_ab(self, monkeypatch):
+        from pathlib import Path
+
+        monkeypatch.setattr(
+            tts.subprocess,
+            "run",
+            lambda args, **_kwargs: Path(args[-1]).write_bytes(_fake_ogg_opus()),
+        )
+
+        with pytest.raises(ValueError, match="leeres MP3-Audio"):
+            tts._mp3_to_ogg(b"")
+
+    def test_mp3_konvertierung_lehnt_ogg_ohne_samples_direkt_ab(self, monkeypatch):
+        from pathlib import Path
+
+        monkeypatch.setattr(
+            tts.subprocess,
+            "run",
+            lambda args, **_kwargs: Path(args[-1]).write_bytes(_fake_ogg_opus(0)),
+        )
+
+        with pytest.raises(ValueError, match="ohne Samples"):
+            tts._mp3_to_ogg(b"MP3_OHNE_FRAMES")
+
     def test_mp3_konvertierung_ohne_opus_samples_nutzt_naechste_engine(
         self, elevenlabs_engine, monkeypatch
     ):
@@ -1002,6 +1028,115 @@ class TestElevenLabs:
         assert requested == ["cartesia", "cartesia", "cartesia", "google", "google"]
         assert retry_cancelled == [True]
         assert "Stimmwechsel im laufenden Turn: Cartesia → Google Cloud" in caplog.text
+
+    def test_gebundene_engine_bleibt_nach_erfolgreichem_retry_im_turn_nutzbar(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(tts.config, "TTS_ENGINE", "cartesia", raising=False)
+        monkeypatch.setattr(tts.config, "CARTESIA_API_KEY", "cartesia-key", raising=False)
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN", ["cartesia"], raising=False)
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+        monkeypatch.setattr(tts.time, "monotonic", lambda: 1000.0)
+        monkeypatch.setattr(tts, "_record_cartesia_usage", lambda _text: None)
+        calls = []
+
+        async def cartesia(_text):
+            calls.append(True)
+            if len(calls) == 2:
+                raise httpx.ReadTimeout("kurzer Fehler")
+            return b"WAV:cartesia"
+
+        monkeypatch.setattr(tts, "_cartesia_synthesize", cartesia)
+        monkeypatch.setattr(tts, "_cartesia_wav_to_ogg", lambda _wav: b"OGG:cartesia")
+
+        async def collect():
+            state, token = tts._start_tts_turn()
+            try:
+                chunks = []
+                for sentence in ("Erster Satz.", "Zweiter Satz.", "Dritter Satz."):
+                    chunks.extend([chunk async for chunk in tts.synthesize_stream(sentence)])
+                return chunks, state
+            finally:
+                tts._end_tts_turn(token)
+
+        chunks, state = asyncio.run(collect())
+
+        assert chunks == [b"OGG:cartesia"] * 3
+        assert len(calls) == 4
+        assert state.audio_emitted is True
+        assert tts._engine_is_paused("cartesia") is False
+
+    def test_gebundene_engine_uebergeht_nur_den_kurzen_fehler_cooldown(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN", ["cartesia"], raising=False)
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+        monkeypatch.setattr(tts.config, "CARTESIA_API_KEY", "cartesia-key", raising=False)
+        monkeypatch.setattr(tts.config, "TTS_QUOTA_COOLDOWN_S", 3600.0, raising=False)
+        monkeypatch.setattr(tts.time, "monotonic", lambda: 1000.0)
+        state = tts.TTSTurnState(engine="cartesia", chain_position=0, audio_emitted=True)
+        token = tts._active_tts_turn.set(state)
+        try:
+            tts._pause_engine("cartesia", "ReadTimeout", quota=False)
+            assert tts.is_available() is True
+            assert tts._cartesia_paused_until == 1060.0
+
+            tts._pause_engine("cartesia", 429, quota=True)
+            assert tts.is_available() is False
+            assert tts._cartesia_paused_until == 4600.0
+        finally:
+            tts._active_tts_turn.reset(token)
+
+    def test_gebundene_engine_wird_bei_quota_cooldown_nicht_erneut_aufgerufen(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(tts.config, "TTS_ENGINE", "cartesia", raising=False)
+        monkeypatch.setattr(tts.config, "CARTESIA_API_KEY", "cartesia-key", raising=False)
+        monkeypatch.setattr(tts.config, "GOOGLE_TTS_API_KEY", "google-key", raising=False)
+        monkeypatch.setattr(
+            tts.config, "TTS_ENGINE_CHAIN", ["cartesia", "google"], raising=False
+        )
+        monkeypatch.setattr(tts.config, "TTS_ENGINE_CHAIN_EXPLICIT", True, raising=False)
+        monkeypatch.setattr(tts.config, "TTS_QUOTA_COOLDOWN_S", 3600.0, raising=False)
+        monkeypatch.setattr(tts.time, "monotonic", lambda: 1000.0)
+        monkeypatch.setattr(tts, "_record_cartesia_usage", lambda _text: None)
+        monkeypatch.setattr(tts, "_record_google_tts_usage", lambda _text: None)
+        calls = []
+        google_audio = _fake_ogg_opus()
+        request = httpx.Request("POST", "https://cartesia.test")
+        quota_error = httpx.HTTPStatusError(
+            "quota exhausted",
+            request=request,
+            response=httpx.Response(429, request=request, text="quota exceeded"),
+        )
+
+        async def cartesia(_text):
+            calls.append("cartesia")
+            if calls.count("cartesia") == 2:
+                raise quota_error
+            return b"WAV:cartesia"
+
+        async def google(_text):
+            calls.append("google")
+            return google_audio, False
+
+        monkeypatch.setattr(tts, "_cartesia_synthesize", cartesia)
+        monkeypatch.setattr(tts, "_google_tts_synthesize", google)
+        monkeypatch.setattr(tts, "_cartesia_wav_to_ogg", lambda _wav: b"OGG:cartesia")
+
+        async def collect():
+            state, token = tts._start_tts_turn()
+            try:
+                chunks = []
+                for sentence in ("Erster Satz.", "Zweiter Satz."):
+                    chunks.extend([chunk async for chunk in tts.synthesize_stream(sentence)])
+                return chunks
+            finally:
+                tts._end_tts_turn(token)
+
+        assert asyncio.run(collect()) == [b"OGG:cartesia", google_audio]
+        assert calls == ["cartesia", "cartesia", "google"]
+        assert tts._cartesia_paused_until == 4600.0
 
     def test_erschoepfter_retry_kehrt_im_selben_turn_nicht_zur_hauptengine_zurueck(
         self, monkeypatch
