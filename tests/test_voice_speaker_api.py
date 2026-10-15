@@ -276,6 +276,23 @@ def test_speaker_enrollment_rejects_invalid_wav_without_adding_clip(monkeypatch)
     assert finish.status_code == 404
 
 
+def test_failed_clip_discards_session_so_retries_do_not_exhaust_the_limit(monkeypatch):
+    service = FakeSpeakerService()
+    client = _client(service, monkeypatch)
+    for _ in range(9):
+        session_id = uuid4()
+        assert _upload_clip(client, session_id, _wav(60)).status_code == 200
+        assert _upload_clip(client, session_id, _wav(31)).status_code == 413
+        finish = client.post(
+            "/api/voice/speaker/enroll/finish",
+            params={"session_id": str(session_id)},
+        )
+        assert finish.status_code == 404
+
+    assert _upload_clip(client, uuid4(), _wav(1)).status_code == 200
+    assert service.received is None
+
+
 def test_speaker_delete_resets_profile(monkeypatch):
     service = FakeSpeakerService()
     response = _client(service, monkeypatch).delete("/api/voice/speaker")

@@ -1199,12 +1199,13 @@ def build_router(orch=None) -> APIRouter:
                 enrollment_sessions[session_id] = session
             return session
 
-    async def discard_empty_enrollment_session(
+    async def discard_enrollment_session(
         session_id: UUID, session: _SpeakerEnrollmentSession,
     ) -> None:
+        # Ein fehlgeschlagener Clip verwirft die ganze Sitzung; der Client
+        # beginnt danach ohnehin mit einer neuen ID, sonst blockieren Reste
+        # bis zum Ablauf die Sitzungsgrenze.
         async with session.lock:
-            if session.clips:
-                return
             async with enrollment_sessions_lock:
                 if enrollment_sessions.get(session_id) is session:
                     enrollment_sessions.pop(session_id, None)
@@ -1268,10 +1269,10 @@ def build_router(orch=None) -> APIRouter:
                 session.updated_at = time.monotonic()
                 return {"clips": len(session.clips)}
         except HTTPException:
-            await discard_empty_enrollment_session(session_id, session)
+            await discard_enrollment_session(session_id, session)
             raise
         except ValueError as exc:
-            await discard_empty_enrollment_session(session_id, session)
+            await discard_enrollment_session(session_id, session)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/api/voice/speaker/enroll/finish")
