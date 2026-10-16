@@ -204,24 +204,34 @@ class Orchestrator:
 
     async def voice_respond(
         self, text: str, stream_cb=None, prework=None, defer_finish: bool = False,
-        interrupt_check=None, execution_gate=None,
+        interrupt_check=None, execution_gate=None, voice_turn_id: str | None = None,
     ) -> tuple[str, list]:
         """Wie dashboard_respond, aber über die Voice-Variante der Cloud-Kette."""
         return await self.msg_handler.dashboard_respond(
             text, stream_cb, agent=self.voice_agent, channel_name="voice",
             resume_idle_cb=self.idle_loop.resume, prework=prework,
             defer_finish=defer_finish, interrupt_check=interrupt_check,
-            execution_gate=execution_gate,
+            execution_gate=execution_gate, voice_turn_id=voice_turn_id,
         )
 
-    def finish_voice_turn(self, text: str, reply: str, trace: list) -> None:
+    def finish_voice_turn(
+        self, text: str, reply: str, trace: list, turn_id: str | None = None,
+    ) -> None:
         """Schreibt eine gestreamte Voice-Antwort nach bestätigtem Playback fest."""
         self.msg_handler._finish_turn(
             text, reply, trace, channel_name="voice", agent=self.voice_agent,
+            turn_id=turn_id,
         )
 
-    def record_interrupted_voice_turn(self, spoken_text: str) -> None:
-        self.msg_handler.record_interrupted_voice_turn(spoken_text)
+    def record_interrupted_voice_turn(
+        self, spoken_text: str, turn_id: str | None = None,
+    ) -> None:
+        self.msg_handler.record_interrupted_voice_turn(spoken_text, turn_id=turn_id)
+
+    def record_aborted_voice_turn(
+        self, spoken_text: str, turn_id: str | None = None,
+    ) -> None:
+        self.msg_handler.record_aborted_voice_turn(spoken_text, turn_id=turn_id)
 
     def lzg_embed(self, text: str) -> list[float]:
         """Synchroner Embedding-Wrapper für API-Endpoints.
