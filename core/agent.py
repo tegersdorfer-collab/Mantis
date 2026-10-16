@@ -162,7 +162,7 @@ class Agent:
         tool_selection_task: asyncio.Future | None = None,
         interrupt_check: Callable[[], bool] | None = None,
         execution_gate: Callable[[], Awaitable[bool]] | None = None,
-        tool_gate: Callable[[str], str | None] | None = None,
+        tool_gate: Callable[[str, dict], str | None] | None = None,
         not_permitted_cb: Callable[[str, dict], str | None] | None = None,
     ) -> tuple[str, list[dict]]:
         """
@@ -333,7 +333,7 @@ class Agent:
                     result = f"[Eval-Dry-Run] Tool '{name}' würde ausgeführt (Argumente akzeptiert)."
                 else:
                     await require_execution_permission()
-                    blocked = tool_gate(name) if tool_gate is not None else None
+                    blocked = tool_gate(name, args) if tool_gate is not None else None
                     if blocked is not None:
                         result = blocked
                     else:

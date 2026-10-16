@@ -38,7 +38,7 @@ def _attempt(calls, results, *, respect_gate=False):
                 results.append(("blocked", name, result))
                 trace.append({"tool": name, "args": args, "result": result or "FEHLER"})
                 continue
-            blocked = kwargs["tool_gate"](name)
+            blocked = kwargs["tool_gate"](name, args)
             if blocked is not None:
                 results.append(("gate", name, blocked))
                 trace.append({"tool": name, "args": args, "result": blocked})
@@ -329,3 +329,92 @@ def test_confirmed_tool_started_by_other_turn_meanwhile_is_blocked(env):
     asyncio.run(run())
     assert gate["other"] is None
     assert gate["lampe"] is not None
+
+
+def test_only_allowlisted_tools_become_confirmable(env):
+    """Security 1: E-Mail-Versand o. ä. wird nie per „ja“ bestätigbar."""
+    results = []
+    calls = (("email_send", {"to": "x@example.org", "body": "Hi"}), ("lampe", {"aktion": "aus"}))
+    env.agent.behaviors.append(_attempt(calls, results))
+    _turn(env, "Probier einfach alles nochmal")
+    email_message = next(item[2] for item in results if item[1] == "email_send")
+    assert "Bestätigung" not in (email_message or "")
+    pending = env.handler._voice_ledger().pending
+    assert pending is not None and pending.names == frozenset({"lampe"})
+
+    env.clock.now += 3
+    _turn(env, "ja")
+    assert "lampe" in _last_allowed(env)
+    assert "email_send" not in _last_allowed(env)
+
+
+def test_non_allowlisted_pending_is_neither_granted_nor_passed_by_gate(env):
+    """Security 1: auch eine (fremd) gemerkte Bestätigung wird an der Allowlist gefiltert."""
+    gate = {}
+
+    async def confirm(kwargs):
+        gate["email_send"] = kwargs["tool_gate"]("email_send", {"to": "x"})
+        return "Okay.", []
+
+    ledger = env.handler._voice_ledger()
+    ledger.pending = message_handler._PendingConfirmation(
+        calls=(("email_send", {"to": "x"}),), created_at=env.clock.now,
+        since=env.clock.now - 1,
+    )
+    env.agent.behaviors.append(confirm)
+    env.clock.now += 2
+    _turn(env, "ja")
+    assert "email_send" not in _last_allowed(env)
+    assert gate["email_send"] is not None
+
+
+def test_confirmed_tool_requires_same_arguments(env):
+    """Security 2: Bestätigung gilt nur für die gemerkten Argumente."""
+    results = []
+    _block_four(env, results)
+    gate = {}
+
+    async def confirm(kwargs):
+        gate_fn = kwargs["tool_gate"]
+        gate["other"] = gate_fn("set_reminder", {"text": "Bier", "zeit": "21:00"})
+        gate["same"] = gate_fn("set_reminder", {"zeit": "21:00", "text": " Kreatin "})
+        return "Okay.", []
+
+    env.agent.behaviors.append(confirm)
+    env.clock.now += 3
+    _turn(env, "ja")
+    assert gate["other"] is not None and "weichen" in gate["other"]
+    assert gate["same"] is None
+
+
+def test_older_turn_finishing_late_does_not_set_pending(env):
+    """Security 3: A blockiert, B wird inzwischen autorisiert, A endet → kein pending."""
+    results = []
+    release_a, a_running = asyncio.Event(), asyncio.Event()
+    blocked_a = _attempt((("lampe", {"aktion": "aus"}),), results)
+
+    async def slow_a(kwargs):
+        reply = await blocked_a(kwargs)
+        a_running.set()
+        await release_a.wait()
+        return reply
+
+    env.agent.behaviors.extend([slow_a])
+
+    async def run():
+        task = asyncio.create_task(env.handler.dashboard_respond(
+            "Probier einfach alles nochmal", agent=env.agent, channel_name="voice",
+        ))
+        await asyncio.wait_for(a_running.wait(), timeout=2)
+        env.clock.now += 2
+        await env.handler.dashboard_respond(
+            "Wie spät ist es", agent=env.agent, channel_name="voice",
+        )
+        release_a.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(run())
+    assert env.handler._voice_ledger().pending is None
+    env.clock.now += 2
+    _turn(env, "ja")
+    assert "lampe" not in _last_allowed(env)
