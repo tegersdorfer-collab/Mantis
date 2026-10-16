@@ -527,6 +527,98 @@ def test_conversation_window_reflex_skips_address_check_and_uses_window_mode(mon
     assert gates == [None, None]
 
 
+def test_pending_confirmation_okay_reflex_requires_address_check(monkeypatch):
+    import core.vad as vad
+    import core.wakeword as wakeword_module
+    import web.routers.voice as voice_router
+
+    first_response_done = asyncio.Event()
+    address_checked = asyncio.Event()
+    second_response_done = asyncio.Event()
+    authorized_calls = []
+
+    class FakeSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def handle_chunk(self, chunk, muted=False):
+            if chunk == b"wakeword":
+                return {"text": "Mantis, frag nach dem Merker.", "wakeword_triggered": True}
+            if chunk == b"okay":
+                return {"text": "Okay."}
+            return None
+
+        async def close(self):
+            pass
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.receive_index = 0
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, _data):
+            pass
+
+        async def receive(self):
+            self.receive_index += 1
+            if self.receive_index == 1:
+                return {"text": json.dumps({"type": "hello", "audio": "stream"})}
+            if self.receive_index == 2:
+                return {"bytes": b"wakeword"}
+            if self.receive_index == 3:
+                await asyncio.wait_for(first_response_done.wait(), timeout=1)
+                return {"bytes": b"okay"}
+            if self.receive_index == 4:
+                await asyncio.wait_for(address_checked.wait(), timeout=1)
+                return {"type": "websocket.disconnect"}
+            raise AssertionError("unerwartete WebSocket-Nachricht")
+
+    class FakeOrchestrator:
+        def voice_confirmation_pending(self):
+            return True
+
+        async def voice_respond(self, text, execution_gate=None, **_kwargs):
+            if execution_gate is not None and not await execution_gate():
+                raise asyncio.CancelledError
+            authorized_calls.append(text)
+            return "Antwort.", []
+
+    async def address_check(_text, **_kwargs):
+        address_checked.set()
+        return False
+
+    async def fake_response(_websocket, text, orch, **kwargs):
+        try:
+            reply, _trace = await orch.voice_respond(
+                text, execution_gate=kwargs.get("execution_gate"),
+            )
+            return reply
+        finally:
+            if text == "Mantis, frag nach dem Merker.":
+                first_response_done.set()
+            else:
+                second_response_done.set()
+
+    monkeypatch.setattr(voice_router, "VoiceStreamSession", FakeSession)
+    monkeypatch.setattr(voice_router, "is_addressed_to_mantis", address_check)
+    monkeypatch.setattr(voice_router, "sende_streaming_antwort", fake_response)
+    monkeypatch.setattr(vad, "SileroVAD", lambda _path: object())
+    monkeypatch.setattr(vad, "VadSegmenter", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(wakeword_module, "WakeWordDetector", lambda _path: object())
+    monkeypatch.setattr(voice_router.db, "log_event", lambda *_args: None)
+
+    endpoint = next(
+        route.endpoint for route in build_router(FakeOrchestrator()).routes
+        if route.path == "/ws/voice/stream"
+    )
+    asyncio.run(asyncio.wait_for(endpoint(FakeWebSocket()), timeout=2))
+
+    assert address_checked.is_set()
+    assert authorized_calls == ["Mantis, frag nach dem Merker."]
+
+
 def test_playback_turn_tracks_monotonic_progress_and_spoken_prefix():
     import web.routers.voice as voice_router
 

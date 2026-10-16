@@ -36,11 +36,14 @@ def build_router(orch=None) -> APIRouter:
         channel_name = d.get("channel", "web")
         if not isinstance(channel_name, str) or channel_name not in {"web", "ios", "mcp"}:
             channel_name = "web"
-        resp, trace = await orch.dashboard_respond(d["text"], channel_name=channel_name)
+        resp, trace = await orch.dashboard_respond(
+            d["text"], channel_name=channel_name,
+            conversation_id=d.get("conversation_id"),
+        )
         return {"response": resp, "tools": [t["tool"] for t in trace]}
 
     @router.get("/api/chat/stream")
-    async def chat_stream(text: str):
+    async def chat_stream(text: str, conversation_id: str | None = None):
         if not orch:
             return JSONResponse({"error": "kein Kern"}, 503)
         q: asyncio.Queue = asyncio.Queue()
@@ -60,7 +63,10 @@ def build_router(orch=None) -> APIRouter:
 
         async def run():
             try:
-                resp, trace = await orch.dashboard_respond(text, stream_cb=cb, channel_name="web")
+                resp, trace = await orch.dashboard_respond(
+                    text, stream_cb=cb, channel_name="web",
+                    conversation_id=conversation_id,
+                )
                 await q.put({"done": resp, "tools": [t["tool"] for t in trace]})
             except Exception as e:
                 await q.put({"done": f"Fehler: {e}", "tools": []})

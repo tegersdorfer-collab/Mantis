@@ -1951,12 +1951,20 @@ def build_router(orch=None) -> APIRouter:
             conversation_context = conversation_window.address_context()
             command = fast_commands.match_voice(raw_text)
             is_local_reflex = command is not None and command.tool == "voice_reflex"
+            confirmation_pending = bool(
+                orch is not None
+                and callable(getattr(orch, "voice_confirmation_pending", None))
+                and orch.voice_confirmation_pending()
+            )
             stop_reflex = _is_stop_reflex(raw_text)
             playback_or_window_active = (
                 active_playback is not None and active_playback.playback_active
             ) or conversation_window.is_active()
             wakeword_triggered = bool(result.get("wakeword_triggered"))
-            window_reflex = is_local_reflex and playback_or_window_active
+            window_reflex = (
+                is_local_reflex and playback_or_window_active
+                and not confirmation_pending
+            )
             immediate = wakeword_triggered or window_reflex
             address_mode = "wakeword" if wakeword_triggered else (
                 "window" if window_reflex else (

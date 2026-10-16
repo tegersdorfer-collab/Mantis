@@ -135,7 +135,7 @@ def test_confirmation_does_not_run_tool_twice_in_parallel(env):
     def try_lampe(kwargs):
         if "lampe" not in kwargs["allowed_tools"]:
             return "nicht freigegeben"
-        return kwargs["tool_gate"]("lampe")
+        return kwargs["tool_gate"]("lampe", {"aktion": "aus"})
 
     async def first(kwargs):
         first_in_run.set()
@@ -385,6 +385,101 @@ def test_confirmed_tool_requires_same_arguments(env):
     _turn(env, "ja")
     assert gate["other"] is not None and "weichen" in gate["other"]
     assert gate["same"] is None
+
+
+def test_async_own_selection_cannot_change_confirmed_arguments(env, monkeypatch):
+    results = []
+    _block_four(env, results)
+
+    async def select_tools(text):
+        if text == "ja":
+            return ["set_reminder"], False
+        return [], False
+
+    monkeypatch.setattr(message_handler.skills.T, "select_tools_async", select_tools)
+    env.agent.behaviors.append(_attempt((
+        ("set_reminder", {"text": "Bier", "zeit": "23:00"}),
+    ), results))
+    env.clock.now += 3
+    _turn(env, "ja")
+
+    assert not any(item[0] == "ran" and item[1] == "set_reminder" for item in results)
+    assert any(item[0] == "gate" and "weichen" in item[2] for item in results)
+
+
+def test_retry_keeps_confirmed_arguments_after_mismatch(env):
+    results = []
+    _block_four(env, results)
+    changed_args = {"text": "Bier", "zeit": "23:00"}
+    env.agent.behaviors.append(_attempt((("set_reminder", changed_args),), results))
+    env.clock.now += 3
+    _turn(env, "ja")
+    assert any(item[0] == "gate" and "weichen" in item[2] for item in results)
+
+    env.clock.now += 3
+    env.agent.behaviors.append(_attempt((("set_reminder", changed_args),), results))
+    _turn(env, "Nochmal")
+
+    assert not any(item[0] == "ran" and item[1] == "set_reminder" for item in results)
+    assert any(item[0] == "gate" and "weichen" in item[2] for item in results[5:])
+
+
+def test_real_agent_consumes_confirmed_call_once_per_turn(env, monkeypatch):
+    from core.agent import Agent
+
+    results = []
+    _block_four(env, results)
+    executions = []
+
+    async def execute(tool, args):
+        executions.append((tool, args))
+        return "Erinnerung gespeichert."
+
+    monkeypatch.setattr(message_handler.skills.T, "execute", execute)
+
+    def tool_call():
+        return {"function": {
+            "name": "set_reminder",
+            "arguments": {"text": "Kreatin", "zeit": "21:00"},
+        }}
+
+    class Backend:
+        model_name = "fake"
+
+        def __init__(self):
+            self.responses = [("", [tool_call(), tool_call()]), ("Fertig.", [])]
+
+        async def call(self, *_args, **_kwargs):
+            return self.responses.pop(0)
+
+    async def confirm():
+        return await env.handler.dashboard_respond(
+            "ja", agent=Agent(Backend()), channel_name="voice",
+        )
+
+    _reply, trace = asyncio.run(confirm())
+
+    assert executions == [(
+        "set_reminder", {"text": "Kreatin", "zeit": "21:00"},
+    )], trace
+
+
+def test_confirmation_keeps_case_sensitive_string_arguments(env):
+    results = []
+    env.agent.behaviors.append(_attempt((
+        ("complete_task", {"query": "Maße prüfen"}),
+    ), results))
+    _turn(env, "Probier einfach alles nochmal")
+    assert results[0][0] == "blocked"
+
+    env.agent.behaviors.append(_attempt((
+        ("complete_task", {"query": "Masse prüfen"}),
+    ), results))
+    env.clock.now += 3
+    _turn(env, "ja")
+
+    assert not any(item[0] == "ran" and item[1] == "complete_task" for item in results)
+    assert any(item[0] == "gate" and "weichen" in item[2] for item in results)
 
 
 def test_older_turn_finishing_late_does_not_set_pending(env):
