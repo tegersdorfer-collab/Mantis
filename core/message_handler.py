@@ -255,6 +255,10 @@ class _VoiceTurnLedger:
         self.latest = state
         if state not in self.recent:
             self.recent.append(state)
+        if _is_voice_cancel_request(state.text):
+            # Widerruf erst nach bestandenem Adress-Check: nichts Abgebrochenes
+            # mehr nachholen, keine Retry-Freigabe (TV/Echo darf nichts verwerfen).
+            self.cancel(state.started_at)
 
     def cancel(self, at: float) -> None:
         """Widerruf: offene Anfragen und Retry-Freigabe verfallen, auch spätere Meldungen."""
@@ -271,9 +275,11 @@ class _VoiceTurnLedger:
 
     def handled_since(
         self, name: str, since: float, exclude: _VoiceTurnState | None,
+        *, strict: bool = False,
     ) -> bool:
         return any(
-            state is not exclude and state.started_at >= since
+            state is not exclude
+            and (state.started_at > since if strict else state.started_at >= since)
             and name in state.handled_tools()
             for state in (*self.recent, *self.open)
         )
@@ -1057,12 +1063,8 @@ class MessageHandler:
             if channel_name == "voice" else None
         )
         response_complete = False
-        if voice_state is not None:
-            if _is_voice_cancel_request(text):
-                # Widerruf: nichts Abgebrochenes mehr nachholen, keine Retry-Freigabe.
-                self._voice_ledger().cancel(voice_state.started_at)
-            if not speculative:
-                self._voice_ledger().authorize(voice_state)
+        if voice_state is not None and not speculative:
+            self._voice_ledger().authorize(voice_state)
 
         if not speculative:
             self._begin_user_turn()
@@ -1203,7 +1205,7 @@ class MessageHandler:
         carry_excluded: set[str] = set()
         carry_since: float | None = None
         retry_grant = None
-        if voice_turn:
+        if voice_turn and not _is_voice_cancel_request(text):
             selection_text, inherited_context = (
                 _tool_selection_context(getattr(self, "kzg", None), text)
             )
@@ -1221,12 +1223,20 @@ class MessageHandler:
                     carry_excluded |= state.handled_tools()
             if _is_voice_retry_request(text):
                 retry_grant = ledger.retry_grant(now)
+        elif voice_turn:
+            # Widerruf: kein übernommener Kontext mit vollen Rechten, keine Retry-Freigabe.
+            selection_text, inherited_context = (
+                _tool_selection_context(getattr(self, "kzg", None), text)
+            )
         else:
             selection_text, inherited_context = text, False
         retry_names = frozenset(retry_grant[0]) if retry_grant is not None else frozenset()
+        retry_since = retry_grant[1] if retry_grant is not None else None
         carried = carry_since is not None or retry_grant is not None
         selection_overridden = carried
         own_cache: list[tuple[frozenset[str], bool]] = []
+        # Tools, die die Cloud-Auswahl allein für den aktuellen Satz liefert.
+        own_async: set[str] = set()
 
         def _own_selection() -> tuple[frozenset[str], bool]:
             """Auswahl allein aus dem aktuellen Satz (Ausnahmen und force)."""
@@ -1235,7 +1245,8 @@ class MessageHandler:
                 own_cache.append((
                     frozenset(names), bool(force) and not _is_short_voice_followup(text),
                 ))
-            return own_cache[0]
+            names, force = own_cache[0]
+            return names | own_async, force
 
         def _voice_policy(names, force) -> tuple[list[str], bool]:
             names, force = _apply_voice_tool_context_policy(
@@ -1251,7 +1262,8 @@ class MessageHandler:
                         name for name in names
                         if name not in carry_excluded or name in own_names
                     ]
-                names = [*names, *(name for name in sorted(retry_names) if name not in names)]
+                extra = sorted(retry_names | own_async)
+                names = [*names, *(name for name in extra if name not in names)]
             if voice_state is not None:
                 voice_state.granted.update(names)
                 voice_state.force = voice_state.force or force
@@ -1259,13 +1271,19 @@ class MessageHandler:
 
         def _voice_tool_gate(name: str) -> str | None:
             """Prüft beim Dispatch erneut, ob ein übernommenes Tool inzwischen lief."""
-            if (
-                carry_since is not None
-                and name not in retry_names
-                and name not in _own_selection()[0]
-                and self._voice_ledger().handled_since(name, carry_since, voice_state)
-            ):
-                return _voice_not_repeatable_message(name)
+            if carried and name not in _own_selection()[0]:
+                ledger = self._voice_ledger()
+                if carry_since is not None and ledger.handled_since(
+                    name, carry_since, voice_state,
+                ):
+                    return _voice_not_repeatable_message(name)
+                # Retry: jeder Turn nach dem wiederholten (z. B. ein paralleler
+                # erster Retry) zählt; der wiederholte selbst wurde bei der Auswahl geprüft.
+                if (
+                    retry_since is not None and name in retry_names
+                    and ledger.handled_since(name, retry_since, voice_state, strict=True)
+                ):
+                    return _voice_not_repeatable_message(name)
             if voice_state is not None:
                 voice_state.started_tools.add(name)
             return None
@@ -1407,7 +1425,20 @@ class MessageHandler:
         async def _timed_select():
             with voice_timing.phase("tool_select_ms"):
                 try:
-                    names, force = await skills.T.select_tools_async(selection_text)
+                    if voice_turn and carried:
+                        # Herkunft merken: was wählt die Cloud allein für den aktuellen Satz?
+                        combined, own = await asyncio.gather(
+                            skills.T.select_tools_async(selection_text),
+                            skills.T.select_tools_async(text),
+                            return_exceptions=True,
+                        )
+                        if isinstance(combined, BaseException):
+                            raise combined
+                        if not isinstance(own, BaseException):
+                            own_async.update(own[0])
+                        names, force = combined
+                    else:
+                        names, force = await skills.T.select_tools_async(selection_text)
                 except Exception as exc:
                     log.warning(
                         "Tool-Auswahl fehlgeschlagen (%s) — nutze Keyword-Auswahl",

@@ -563,3 +563,154 @@ def test_router_passes_turn_id_only_to_receivers_that_accept_it():
     voice_router._call_with_turn_id(legacy, "t1", "Hallo")
     voice_router._call_with_turn_id(modern, "t2", "Hallo")
     assert calls == [("legacy", "Hallo"), ("modern", "Hallo", "t2")]
+
+
+def test_retry_gate_blocks_tool_started_by_parallel_retry(env):
+    """Runde 2/P2: R1 und R2 übernehmen dieselbe Retry-Freigabe von L."""
+    side = []
+    r1_started = asyncio.Event()
+    release_r1 = asyncio.Event()
+
+    async def l_blocked(_kwargs):
+        return "Geht nicht.", [{
+            "tool": "set_reminder", "args": {},
+            "result": "FEHLER: Tool 'set_reminder' ist für diesen Satz nicht freigegeben.",
+        }]
+
+    async def r1(kwargs):
+        if kwargs["tool_gate"]("set_reminder") is None:
+            side.append("r1")
+        r1_started.set()
+        await release_r1.wait()
+        raise asyncio.CancelledError
+
+    async def r2(kwargs):
+        if kwargs["tool_gate"]("set_reminder") is None:
+            side.append("r2")
+        return "Okay.", []
+
+    env.agent.behaviors.extend([l_blocked, r1, r2])
+    _turn(env, "Erinnere mich um neun an Kreatin")
+
+    async def run():
+        env.clock.now += 5
+        first = asyncio.create_task(env.handler.dashboard_respond(
+            "Probier's noch mal", agent=env.agent, channel_name="voice",
+        ))
+        await asyncio.wait_for(r1_started.wait(), timeout=2)
+        env.clock.now += 2
+        await env.handler.dashboard_respond(
+            "Probier's noch mal", agent=env.agent, channel_name="voice",
+        )
+        release_r1.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+    asyncio.run(run())
+    assert "set_reminder" in set(env.agent.calls[2]["allowed_tools"])
+    assert side == ["r1"]
+
+
+def _speculative_turn(env, text, *, addressed):
+    async def gate():
+        return addressed
+
+    async def run():
+        try:
+            return await env.handler.dashboard_respond(
+                text, agent=env.agent, channel_name="voice", execution_gate=gate,
+            )
+        except asyncio.CancelledError:
+            return "cancelled"
+
+    return asyncio.run(run())
+
+
+async def _respects_execution_gate(kwargs):
+    if not await kwargs["execution_gate"]():
+        raise asyncio.CancelledError
+    return "Okay.", []
+
+
+def test_rejected_cancel_segment_keeps_open_requests(env):
+    """Runde 2/P3: „Lass das, Kevin!“ aus dem Fernseher darf nichts verwerfen."""
+    env.agent.behaviors.extend([_cancelled_before_tools, _respects_execution_gate])
+    assert _turn(env, FIRST) == "cancelled"
+    env.clock.now += 2
+    assert _speculative_turn(env, "Lass das, Kevin!", addressed=False) == "cancelled"
+    # Auch das Widerrufssegment selbst übernimmt nichts.
+    assert "set_reminder" not in _last_allowed(env)
+
+    env.clock.now += 2
+    _turn(env, "Überblick bitte nicht zu ausführlich")
+    assert {"get_weather", "set_reminder"} <= _last_allowed(env)
+
+
+def test_authorized_speculative_cancel_segment_clears_open_requests(env):
+    env.agent.behaviors.extend([_cancelled_before_tools, _respects_execution_gate])
+    assert _turn(env, FIRST) == "cancelled"
+    env.clock.now += 2
+    _speculative_turn(env, "Lass das, Kevin!", addressed=True)
+    assert "set_reminder" not in _last_allowed(env)
+
+    env.clock.now += 2
+    _turn(env, "Überblick bitte nicht zu ausführlich")
+    assert "set_reminder" not in _last_allowed(env)
+
+
+def test_tool_from_async_selection_of_current_sentence_passes_gate(env):
+    """Runde 2/P3: Spotify kommt nur aus der Cloud-Auswahl von „lauter bitte“."""
+    async def spotify_then_cancel(kwargs):
+        assert kwargs["tool_gate"]("spotify") is None
+        raise asyncio.CancelledError
+
+    gate_result = {}
+
+    async def louder(kwargs):
+        gate_result["spotify"] = kwargs["tool_gate"]("spotify")
+        return "Lauter.", []
+
+    async def select_async(text):
+        env.selections.append(("async", text))
+        names, force = _fake_selection(text)
+        if "lauter" in text.casefold() and "spotify" not in names:
+            names.append("spotify")
+        return names, force
+
+    env.monkeypatch.setattr(message_handler.skills.T, "select_tools_async", select_async)
+    env.agent.behaviors.extend([spotify_then_cancel, louder])
+    assert _turn(env, "Spiel was Ruhiges auf Spotify") == "cancelled"
+
+    env.clock.now += 5
+    _turn(env, "lauter bitte")
+    assert "spotify" in _last_allowed(env)
+    assert gate_result["spotify"] is None
+    assert ("async", "lauter bitte") in env.selections
+
+
+def test_turn_before_cancel_reported_later_does_not_become_open(env):
+    """_valid(): vor „stopp“ gestartet, Unterbrechung erst danach gemeldet."""
+    sentence = "Mach das Licht dunkler und spiel was auf Spotify"
+    command = FastCommand(tool="lampe", args={}, label="lampe-dunkler")
+    env.monkeypatch.setattr(
+        message_handler.fast_commands, "match_voice",
+        lambda text: command if text == sentence else None,
+    )
+
+    async def run():
+        await env.handler.dashboard_respond(
+            sentence, agent=env.agent, channel_name="voice",
+            defer_finish=True, voice_turn_id="fp",
+        )
+        env.clock.now += 2
+        await env.handler.dashboard_respond(
+            "Stopp", agent=env.agent, channel_name="voice", voice_turn_id="stop",
+        )
+
+    asyncio.run(run())
+    env.handler.record_interrupted_voice_turn("Lampe", turn_id="fp")
+    assert env.handler._voice_ledger().open == []
+
+    env.clock.now += 2
+    _turn(env, "Überblick bitte nicht zu ausführlich")
+    assert "spotify" not in _last_allowed(env)
