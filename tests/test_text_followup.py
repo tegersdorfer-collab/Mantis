@@ -239,3 +239,59 @@ def test_new_discord_inbox_input_consumes_previous_text_grant(text_env, monkeypa
     asyncio.run(incoming("ja"))
 
     assert "lampe" not in _last_allowed(env)
+
+
+def test_slow_discord_selection_cannot_restore_grant_after_new_inbox_input(
+    text_env, monkeypatch,
+):
+    env = text_env
+    response_channel = SimpleNamespace(
+        send=AsyncMock(), send_typing=AsyncMock(), stop_typing=AsyncMock(),
+        supports_streaming=False,
+    )
+    monkeypatch.setattr(message_handler.db, "query", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        message_handler.inbox_service, "capture_discord_message",
+        AsyncMock(return_value={"response": "📥 Gemerkt."}),
+    )
+    monkeypatch.setattr("domains.accountability.intercept", lambda _text: None)
+    env.handler.gym_coach.classify = lambda *_args, **_kwargs: None
+    selection_started = asyncio.Event()
+    release_selection = asyncio.Event()
+
+    async def select_tools(text):
+        if text.startswith("Erinnere mich"):
+            selection_started.set()
+            await release_selection.wait()
+            return ["set_reminder"], False
+        return [], False
+
+    monkeypatch.setattr(message_handler.skills.T, "select_tools_async", select_tools)
+
+    def discord_message(text):
+        return IncomingMessage(
+            text=text, sender_id="user-7", timestamp=datetime(2026, 10, 16),
+            raw=SimpleNamespace(channel=SimpleNamespace(id="dm-7")),
+            channel="discord",
+        )
+
+    async def incoming(text):
+        msg = discord_message(text)
+        context = env.handler.begin_incoming_message(msg)
+        await env.handler._handle_incoming(
+            msg, response_channel=response_channel, turn_context=context,
+        )
+
+    async def scenario():
+        slow_selection = asyncio.create_task(
+            incoming("Erinnere mich heute um neun an Kreatin"),
+        )
+        await asyncio.wait_for(selection_started.wait(), timeout=2)
+        await incoming("https://example.org/article")
+        release_selection.set()
+        await asyncio.wait_for(slow_selection, timeout=2)
+        await incoming("ja")
+
+    asyncio.run(scenario())
+
+    assert "set_reminder" not in _last_allowed(env)

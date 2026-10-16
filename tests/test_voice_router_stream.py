@@ -448,6 +448,7 @@ def test_conversation_window_reflex_skips_address_check_and_uses_window_mode(mon
     second_response_done = asyncio.Event()
     modes = []
     gates = []
+    authorization_types = []
     calls = []
 
     class FakeSession:
@@ -499,8 +500,10 @@ def test_conversation_window_reflex_skips_address_check_and_uses_window_mode(mon
     async def fake_response(_websocket, text, _orch, **kwargs):
         modes.append(kwargs["address_check_mode"])
         gates.append(kwargs.get("execution_gate"))
+        authorization_types.append(kwargs.get("authorization_type"))
         reply, _trace = await _orch.voice_respond(
             text, execution_gate=kwargs.get("execution_gate"),
+            authorization_type=kwargs.get("authorization_type"),
         )
         if text == "Okay.":
             second_response_done.set()
@@ -525,6 +528,7 @@ def test_conversation_window_reflex_skips_address_check_and_uses_window_mode(mon
     assert calls == ["Mantis, sag etwas.", "Okay."]
     assert modes == ["wakeword", "window"]
     assert gates == [None, None]
+    assert authorization_types == ["wakeword", "window"]
 
 
 def test_pending_confirmation_okay_reflex_requires_address_check(monkeypatch):
@@ -3465,13 +3469,16 @@ def _make_real_voice_orchestrator(monkeypatch, responses):
             self.prepared_texts.append(text)
             return await handler.prepare_voice_turn(text)
 
-        async def voice_respond(self, text, prework=None, execution_gate=None):
+        async def voice_respond(
+            self, text, prework=None, execution_gate=None, authorization_type=None,
+        ):
             return await handler.dashboard_respond(
                 text,
                 agent=agent,
                 channel_name="voice",
                 prework=prework,
                 execution_gate=execution_gate,
+                authorization_type=authorization_type,
             )
 
     return Orchestrator(), handler, agent, persisted

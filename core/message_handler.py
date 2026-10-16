@@ -205,6 +205,36 @@ _VOICE_CONFIRM_FILLERS = _VOICE_CONFIRM_CORE | frozenset({
     "bitte", "das", "es", "s", "mal", "ich", "ausdrücklich", "ausdruecklich",
     "doch", "dann", "ruhig", "alles", "jetzt", "sicher", "natürlich", "natuerlich",
 })
+_VOICE_CONFIRMATION_AUTH_TYPES = frozenset({
+    "wakeword", "addressed", "speaker_verified",
+})
+_VOICE_GATED_CONFIRMATION_AUTH_TYPES = frozenset({"speculative", "stop_word"})
+
+
+def _voice_confirmation_eligible(
+    authorization_type: str | None, *, has_execution_gate: bool,
+) -> bool:
+    return (
+        authorization_type in _VOICE_CONFIRMATION_AUTH_TYPES
+        or (
+            has_execution_gate
+            and authorization_type in _VOICE_GATED_CONFIRMATION_AUTH_TYPES
+        )
+    )
+
+
+def _voice_confirmation_authorized(
+    authorization_type: str | None, *, execution_gate_passed: bool,
+) -> bool:
+    return (
+        authorization_type in _VOICE_CONFIRMATION_AUTH_TYPES
+        or (
+            execution_gate_passed
+            and authorization_type in _VOICE_GATED_CONFIRMATION_AUTH_TYPES
+        )
+    )
+
+
 # Behauptete Aktion ohne Tool-Aufruf (nur Log, kein Umschreiben).
 _VOICE_ACTION_CLAIM_RE = re.compile(
     r"\b(?:habe|hab)\b[^.!?]{0,80}?\b(?:versucht|ausgeführt|gesetzt|eingeschaltet|"
@@ -278,6 +308,9 @@ class _VoiceTurnState:
     text: str
     started_at: float
     turn_id: str | None = None
+    authorization_type: str | None = None
+    confirmation_eligible: bool = False
+    confirmation_authorized: bool = False
     ended_at: float | None = None
     agent_done: bool = False
     granted: set[str] = field(default_factory=set)
@@ -395,8 +428,13 @@ class _VoiceTurnLedger:
             if now - state.started_at <= _VOICE_DEFERRED_TTL
         ]
 
-    def authorize(self, state: _VoiceTurnState) -> None:
+    def authorize(
+        self, state: _VoiceTurnState, *, confirmation_authorized: bool = False,
+    ) -> None:
         self._prune()
+        state.confirmation_authorized = confirmation_authorized
+        if not confirmation_authorized:
+            return
         self.latest = state
         if state not in self.recent:
             self.recent.append(state)
@@ -404,11 +442,12 @@ class _VoiceTurnLedger:
             # Widerruf erst nach bestandenem Adress-Check: nichts Abgebrochenes
             # mehr nachholen, keine Retry-Freigabe (TV/Echo darf nichts verwerfen).
             self.cancel(state.started_at)
-        # Ausstehende Bestätigung: Zustimmung verbraucht sie, jeder andere
-        # autorisierte Satz verwirft sie (ein spätes „ja“ löst nichts Altes aus).
-        if _is_voice_confirmation(state.text):
-            state.confirmed = self.peek_pending(_voice_clock())
-        self.pending = None
+        if confirmation_authorized:
+            # Nur ein explizit autorisierter Turn darf bestätigen oder die alte
+            # Rückfrage durch einen anderen Satz verwerfen.
+            if _is_voice_confirmation(state.text):
+                state.confirmed = self.peek_pending(_voice_clock())
+            self.pending = None
 
     def cancel(self, at: float) -> None:
         """Widerruf: offene Anfragen und Retry-Freigabe verfallen, auch spätere Meldungen."""
@@ -420,7 +459,11 @@ class _VoiceTurnLedger:
     def open_requests(self, now: float) -> list[_VoiceTurnState]:
         self.open = [
             state for state in self.open
-            if now - state.started_at <= _VOICE_CARRYOVER_TTL and self._valid(state)
+            if (
+                state.confirmation_authorized
+                and now - state.started_at <= _VOICE_CARRYOVER_TTL
+                and self._valid(state)
+            )
         ][-_VOICE_CARRYOVER_MAX:]
         return list(self.open)
 
@@ -437,11 +480,11 @@ class _VoiceTurnLedger:
 
     def _end(self, state: _VoiceTurnState) -> None:
         state.ended_at = _voice_clock()
-        if self._valid(state):
+        if state.confirmation_authorized and self._valid(state):
             self.last = state
 
     def mark_open(self, state: _VoiceTurnState) -> None:
-        if self._valid(state) and state not in self.open:
+        if state.confirmation_authorized and self._valid(state) and state not in self.open:
             self.open.append(state)
             self.open = self.open[-_VOICE_CARRYOVER_MAX:]
         self._end(state)
@@ -450,14 +493,17 @@ class _VoiceTurnLedger:
         """Agent-Lauf regulär beendet; das Playback-Ende kommt evtl. nie."""
         state.agent_done = True
         # Nur der jüngste autorisierte Turn darf eine Bestätigung hinterlassen.
-        if state.blocked_calls and self._valid(state) and self.latest is state:
+        if (
+            state.confirmation_authorized and state.blocked_calls
+            and self._valid(state) and self.latest is state
+        ):
             # Das Modell hat nach Bestätigung gefragt; nur der jüngste Turn zählt.
             self.pending = _PendingConfirmation(
                 calls=tuple(state.blocked_calls),
                 created_at=_voice_clock(),
                 since=state.started_at,
             )
-        if not state.reflex_tools:
+        if state.confirmation_authorized and not state.reflex_tools:
             # Ein LLM-Turn hat die übernommenen Anfragen bearbeitet.
             self.open.clear()
         self._prune()
@@ -501,7 +547,10 @@ class _VoiceTurnLedger:
         self, now: float,
     ) -> tuple[list[str], float, _PendingConfirmation | None] | None:
         last = self.last
-        if last is None or last.ended_at is None or not self._valid(last):
+        if (
+            last is None or not last.confirmation_authorized
+            or last.ended_at is None or not self._valid(last)
+        ):
             return None
         if now - last.ended_at > _VOICE_RETRY_TTL:
             return None
@@ -773,6 +822,8 @@ class MessageHandler:
         self._incoming_message_sequence = 0
         self._text_turn_grants: dict[tuple[str, ...], _TextTurnGrant] = {}
         self._text_turn_incoming_grants: dict[int, _TextTurnGrant | None] = {}
+        self._text_turn_generations: dict[tuple[str, ...], int] = {}
+        self._text_turn_incoming_generations: dict[int, int] = {}
         self._pending_inbox_deletions: dict[str, PendingInboxDeletion] = {}
 
     def _channel_for(self, msg: IncomingMessage):
@@ -786,6 +837,14 @@ class MessageHandler:
         if ledger is None:
             ledger = self._voice_turns = _VoiceTurnLedger()
         return ledger
+
+    def _advance_text_turn_generation(self, key: tuple[str, ...]) -> int:
+        generations = getattr(self, "_text_turn_generations", None)
+        if generations is None:
+            generations = self._text_turn_generations = {}
+        generation = generations.get(key, 0) + 1
+        generations[key] = generation
+        return generation
 
     def voice_confirmation_pending(self) -> bool:
         """Gibt an, ob ein aktueller Voice-Turn noch eine Bestätigung erwartet."""
@@ -852,14 +911,24 @@ class MessageHandler:
             incoming_grants = getattr(self, "_text_turn_incoming_grants", None)
             if incoming_grants is None:
                 incoming_grants = self._text_turn_incoming_grants = {}
+            incoming_generations = getattr(
+                self, "_text_turn_incoming_generations", None,
+            )
+            if incoming_generations is None:
+                incoming_generations = self._text_turn_incoming_generations = {}
+            followup_key = _text_followup_key_for_message(msg)
+            incoming_generations[message_sequence] = (
+                self._advance_text_turn_generation(followup_key)
+            )
             previous = text_grants.pop(
-                _text_followup_key_for_message(msg), None,
+                followup_key, None,
             )
             incoming_grants[message_sequence] = previous
             if len(incoming_grants) > 128:
                 oldest = sorted(incoming_grants)[:-128]
                 for sequence in oldest:
                     incoming_grants.pop(sequence, None)
+                    incoming_generations.pop(sequence, None)
         pending_deletion = self._take_pending_inbox_deletion(sender_key)
         has_attachments = bool(getattr(msg, "attachments", ()))
         inbox_confirmation = bool(
@@ -962,6 +1031,9 @@ class MessageHandler:
         text_followup_grant = getattr(self, "_text_turn_incoming_grants", {}).pop(
             message_sequence, None,
         )
+        text_followup_generation = getattr(
+            self, "_text_turn_incoming_generations", {},
+        ).pop(message_sequence, None)
         now = time.monotonic()
         pending_delete_id = None
         if (
@@ -1229,7 +1301,8 @@ class MessageHandler:
         response, trace = await self._agent_turn(msg.text, channel_name=channel_name,
                                                  stream_cb=stream_cb,
                                                  text_followup_key=_text_followup_key_for_message(msg),
-                                                 text_followup_grant=text_followup_grant)
+                                                 text_followup_grant=text_followup_grant,
+                                                 text_followup_generation=text_followup_generation)
         if not response:
             response = "…"
         self._finish_turn(msg.text, response, trace, channel_name=channel_name)
@@ -1295,6 +1368,7 @@ class MessageHandler:
         execution_gate: Callable[[], Awaitable[bool]] | None = None,
         voice_turn_id: str | None = None,
         text_followup_key: tuple[str, ...] | None = None,
+        authorization_type: str | None = None,
     ) -> tuple[str, list]:
         speculative = execution_gate is not None
         turn_started = False
@@ -1306,6 +1380,10 @@ class MessageHandler:
             else ("web",) if channel_name == "web"
             else (channel_name, "", "")
         )
+        text_followup_generation = (
+            self._advance_text_turn_generation(resolved_text_followup_key)
+            if channel_name in _TEXT_FOLLOWUP_CHANNELS else None
+        )
         text_followup_grant = (
             self._text_turn_grants.pop(resolved_text_followup_key, None)
             if not speculative and channel_name in _TEXT_FOLLOWUP_CHANNELS
@@ -1314,12 +1392,22 @@ class MessageHandler:
         voice_state = (
             _VoiceTurnState(
                 text=text, started_at=_voice_clock(), turn_id=voice_turn_id,
+                authorization_type=authorization_type,
+                confirmation_eligible=_voice_confirmation_eligible(
+                    authorization_type,
+                    has_execution_gate=execution_gate is not None,
+                ),
             )
             if channel_name == "voice" else None
         )
         response_complete = False
         if voice_state is not None and not speculative:
-            self._voice_ledger().authorize(voice_state)
+            self._voice_ledger().authorize(
+                voice_state,
+                confirmation_authorized=_voice_confirmation_authorized(
+                    authorization_type, execution_gate_passed=False,
+                ),
+            )
 
         if not speculative:
             self._begin_user_turn()
@@ -1348,7 +1436,12 @@ class MessageHandler:
                 return False
             authorized = True
             if voice_state is not None:
-                self._voice_ledger().authorize(voice_state)
+                self._voice_ledger().authorize(
+                    voice_state,
+                    confirmation_authorized=_voice_confirmation_authorized(
+                        authorization_type, execution_gate_passed=True,
+                    ),
+                )
             if not turn_started:
                 self._begin_user_turn()
                 self._start_turn()
@@ -1382,6 +1475,7 @@ class MessageHandler:
                 transient_user_message=speculative,
                 text_followup_key=resolved_text_followup_key,
                 text_followup_grant=text_followup_grant,
+                text_followup_generation=text_followup_generation,
             )
             if speculative:
                 agent_kwargs["on_context_built"] = stage_context_recall
@@ -1453,6 +1547,7 @@ class MessageHandler:
                           voice_state: _VoiceTurnState | None = None,
                           text_followup_key: tuple[str, ...] | None = None,
                           text_followup_grant: _TextTurnGrant | None = None,
+                          text_followup_generation: int | None = None,
                           ) -> tuple[str, list]:
         """Prompt bauen, Tools wählen, Agent laufen lassen — mit Fehler-Fallback."""
         voice_turn = channel_name == "voice" and agent is not None
@@ -1494,7 +1589,12 @@ class MessageHandler:
         text_granted: set[str] = set()
 
         def _remember_text_grant(names) -> None:
-            if not text_followup_channel:
+            generations = getattr(self, "_text_turn_generations", {})
+            if (
+                not text_followup_channel
+                or text_followup_generation is None
+                or generations.get(text_followup_key) != text_followup_generation
+            ):
                 return
             text_granted.update(name for name in names if name not in _fallback_tools())
             text_grants[text_followup_key] = _TextTurnGrant(
@@ -1515,12 +1615,15 @@ class MessageHandler:
             _remember_text_grant(names)
             return names, force
 
-        if voice_turn and _is_voice_confirmation(text):
+        voice_grants_eligible = bool(
+            voice_state is not None and voice_state.confirmation_eligible
+        )
+        if voice_turn and voice_grants_eligible and _is_voice_confirmation(text):
             confirm_pending = (
                 voice_state.confirmed if voice_state is not None and voice_state.confirmed
                 else self._voice_ledger().peek_pending(_voice_clock())
             )
-        if voice_turn and not _is_voice_cancel_request(text):
+        if voice_turn and voice_grants_eligible and not _is_voice_cancel_request(text):
             selection_text, inherited_context = (
                 _tool_selection_context(getattr(self, "kzg", None), text)
             )
@@ -1551,6 +1654,10 @@ class MessageHandler:
         retry_names = frozenset(retry_grant[0]) if retry_grant is not None else frozenset()
         retry_since = retry_grant[1] if retry_grant is not None else None
         retry_confirmation = retry_grant[2] if retry_grant is not None else None
+        if retry_confirmation is not None and voice_state is not None:
+            # Jeder Retry trägt dieselbe Argumentbindung weiter, damit auch das
+            # nächste „Nochmal“ sie aus retry_grant erneut erben kann.
+            voice_state.confirmed = retry_confirmation
         confirm_names = (
             confirm_pending.names if confirm_pending is not None else frozenset()
         )
@@ -1606,6 +1713,8 @@ class MessageHandler:
             """
             confirmation: _PendingConfirmation | None = None
             if carried:
+                if voice_state is None or not voice_state.confirmation_authorized:
+                    return _voice_not_repeatable_message(name)
                 if name in carry_excluded:
                     return _voice_not_repeatable_message(name)
                 ledger = self._voice_ledger()

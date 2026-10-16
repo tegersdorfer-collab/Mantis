@@ -87,6 +87,60 @@ def test_confirmation_after_ttl_grants_nothing(env):
     assert not ({"set_reminder", "lampe", "spotify"} & _last_allowed(env))
 
 
+@pytest.mark.parametrize(
+    "authorization_type", [None, "window", "stop_word", "speculative", "unknown"],
+)
+def test_missing_or_ineligible_voice_authorization_cannot_consume_confirmation(
+    env, authorization_type,
+):
+    results = []
+    pending = message_handler._PendingConfirmation(
+        calls=(("set_reminder", {"text": "Kreatin", "zeit": "21:00"}),),
+        created_at=env.clock.now,
+        since=env.clock.now - 1,
+    )
+    ledger = env.handler._voice_ledger()
+    ledger.pending = pending
+    env.agent.behaviors.append(_attempt((
+        ("set_reminder", {"text": "Kreatin", "zeit": "21:00"}),
+    ), results))
+
+    kwargs = {}
+    if authorization_type is not None:
+        kwargs["authorization_type"] = authorization_type
+    asyncio.run(env.handler.dashboard_respond(
+        "Okay.", agent=env.agent, channel_name="voice", **kwargs,
+    ))
+
+    assert not any(item[0] == "ran" and item[1] == "set_reminder" for item in results)
+    assert ledger.pending is pending
+
+
+@pytest.mark.parametrize("authorization_type", ["wakeword", "addressed", "speaker_verified"])
+def test_explicit_authorization_types_can_consume_pending_confirmation(
+    env, authorization_type,
+):
+    results = []
+    pending = message_handler._PendingConfirmation(
+        calls=(("set_reminder", {"text": "Kreatin", "zeit": "21:00"}),),
+        created_at=env.clock.now,
+        since=env.clock.now - 1,
+    )
+    ledger = env.handler._voice_ledger()
+    ledger.pending = pending
+    env.agent.behaviors.append(_attempt((
+        ("set_reminder", {"text": "Kreatin", "zeit": "21:00"}),
+    ), results))
+
+    asyncio.run(env.handler.dashboard_respond(
+        "Okay.", agent=env.agent, channel_name="voice",
+        authorization_type=authorization_type,
+    ))
+
+    assert any(item[0] == "ran" and item[1] == "set_reminder" for item in results)
+    assert ledger.pending is None
+
+
 @pytest.mark.parametrize("rejection", ["nein", "Stopp, lass es", "doch nicht"])
 def test_rejection_clears_pending_confirmation(env, rejection):
     results = []
@@ -165,12 +219,14 @@ def test_confirmation_does_not_run_tool_twice_in_parallel(env):
         t1 = asyncio.create_task(env.handler.dashboard_respond(
             "ja", agent=env.agent, channel_name="voice",
             execution_gate=gate_for(addressed_first),
+            authorization_type="speculative",
         ))
         await asyncio.wait_for(first_in_run.wait(), timeout=2)
         env.clock.now += 1
         t2 = asyncio.create_task(env.handler.dashboard_respond(
             "ja mach", agent=env.agent, channel_name="voice",
             execution_gate=gate_for(addressed_second),
+            authorization_type="speculative",
         ))
         await asyncio.wait_for(second_in_run.wait(), timeout=2)
         addressed_first.set()
@@ -278,10 +334,12 @@ def test_confirmation_consumed_by_parallel_yes_blocks_second(env):
         t2 = asyncio.create_task(env.handler.dashboard_respond(
             "ja mach", agent=env.agent, channel_name="voice",
             execution_gate=_gate_for(addressed_second),
+            authorization_type="speculative",
         ))
         await asyncio.wait_for(second_in_run.wait(), timeout=2)
         t1 = asyncio.create_task(env.handler.dashboard_respond(
             "ja", agent=env.agent, channel_name="voice",
+            authorization_type="wakeword",
         ))
         await asyncio.wait_for(first_authorized.wait(), timeout=2)
         addressed_second.set()
@@ -317,11 +375,13 @@ def test_confirmed_tool_started_by_other_turn_meanwhile_is_blocked(env):
         env.clock.now += 3
         t1 = asyncio.create_task(env.handler.dashboard_respond(
             "ja", agent=env.agent, channel_name="voice",
+            authorization_type="wakeword",
         ))
         await asyncio.wait_for(ja_authorized.wait(), timeout=2)
         env.clock.now += 1
         await env.handler.dashboard_respond(
             "Mach das Licht aus", agent=env.agent, channel_name="voice",
+            authorization_type="wakeword",
         )
         release_ja.set()
         await asyncio.wait_for(t1, timeout=2)
@@ -424,6 +484,76 @@ def test_retry_keeps_confirmed_arguments_after_mismatch(env):
     assert any(item[0] == "gate" and "weichen" in item[2] for item in results[5:])
 
 
+def test_retry_confirmation_arguments_survive_three_consecutive_retries(env):
+    results = []
+    _block_four(env, results)
+    changed_args = {"text": "Bier", "zeit": "23:00"}
+    env.agent.behaviors.append(_attempt((("set_reminder", changed_args),), results))
+    env.clock.now += 3
+    _turn(env, "ja")
+
+    for _ in range(3):
+        env.clock.now += 3
+        env.agent.behaviors.append(_attempt((("set_reminder", changed_args),), results))
+        _turn(env, "Nochmal")
+
+    assert not any(item[0] == "ran" and item[1] == "set_reminder" for item in results)
+    assert sum(
+        item[0] == "gate" and "weichen" in item[2]
+        for item in results
+    ) == 4
+
+
+def test_real_agent_retry_binding_survives_three_consecutive_retries(env, monkeypatch):
+    from core.agent import Agent
+
+    results = []
+    _block_four(env, results)
+    changed_args = {"text": "Bier", "zeit": "23:00"}
+    executions = []
+
+    async def execute(tool, args):
+        executions.append((tool, args))
+        return "Erinnerung gespeichert."
+
+    monkeypatch.setattr(message_handler.skills.T, "execute", execute)
+
+    def tool_call():
+        return {"function": {
+            "name": "set_reminder",
+            "arguments": changed_args,
+        }}
+
+    class Backend:
+        model_name = "fake"
+        sends_full_tool_catalog = False
+
+        def __init__(self):
+            self.responses = []
+            for _ in range(4):
+                self.responses.extend([("", [tool_call()]), ("Antwort.", [])])
+
+        async def call(self, *_args, **_kwargs):
+            return self.responses.pop(0)
+
+    agent = Agent(Backend())
+
+    async def turn(text):
+        return await env.handler.dashboard_respond(
+            text, agent=agent, channel_name="voice", authorization_type="wakeword",
+        )
+
+    async def run():
+        await turn("ja")
+        for _ in range(3):
+            env.clock.now += 3
+            await turn("Nochmal")
+
+    asyncio.run(run())
+
+    assert executions == []
+
+
 def test_real_agent_consumes_confirmed_call_once_per_turn(env, monkeypatch):
     from core.agent import Agent
 
@@ -455,6 +585,7 @@ def test_real_agent_consumes_confirmed_call_once_per_turn(env, monkeypatch):
     async def confirm():
         return await env.handler.dashboard_respond(
             "ja", agent=Agent(Backend()), channel_name="voice",
+            authorization_type="wakeword",
         )
 
     _reply, trace = asyncio.run(confirm())
@@ -499,11 +630,13 @@ def test_older_turn_finishing_late_does_not_set_pending(env):
     async def run():
         task = asyncio.create_task(env.handler.dashboard_respond(
             "Probier einfach alles nochmal", agent=env.agent, channel_name="voice",
+            authorization_type="wakeword",
         ))
         await asyncio.wait_for(a_running.wait(), timeout=2)
         env.clock.now += 2
         await env.handler.dashboard_respond(
             "Wie spät ist es", agent=env.agent, channel_name="voice",
+            authorization_type="wakeword",
         )
         release_a.set()
         await asyncio.wait_for(task, timeout=2)

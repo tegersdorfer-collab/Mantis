@@ -132,7 +132,7 @@ def _turn(env, text, *, defer_finish=False, stream_cb=None):
         try:
             return await env.handler.dashboard_respond(
                 text, stream_cb=stream_cb, agent=env.agent, channel_name="voice",
-                defer_finish=defer_finish,
+                defer_finish=defer_finish, authorization_type="wakeword",
             )
         except asyncio.CancelledError:
             return "cancelled"
@@ -157,6 +157,41 @@ def test_cancelled_turn_is_carried_into_next_voice_turn_with_full_rights(env):
     allowed = _last_allowed(env)
     assert {"get_weather", "set_reminder"} <= allowed
     assert ("async", f"{FIRST}\nÜberblick bitte nicht zu ausführlich") in env.selections
+
+
+def test_window_reflex_does_not_clear_open_carry_grant(env):
+    env.agent.behaviors.append(_cancelled_before_tools)
+    assert _turn(env, FIRST) == "cancelled"
+    ledger = env.handler._voice_ledger()
+    carried = ledger.open[0]
+    env.agent.behaviors.append(lambda _kwargs: asyncio.sleep(0, result=("Okay.", [])))
+
+    asyncio.run(env.handler.dashboard_respond(
+        "Okay.", agent=env.agent, channel_name="voice", authorization_type="window",
+    ))
+
+    assert ledger.open == [carried]
+    env.clock.now += 3
+    _turn(env, "Überblick bitte nicht zu ausführlich")
+    assert "set_reminder" in _last_allowed(env)
+
+
+def test_window_reflex_does_not_replace_retry_grant(env):
+    env.agent.behaviors.append(_cancelled_before_tools)
+    assert _turn(env, FIRST) == "cancelled"
+    ledger = env.handler._voice_ledger()
+    previous = ledger.last
+    ledger.open.clear()
+    env.agent.behaviors.append(lambda _kwargs: asyncio.sleep(0, result=("Okay.", [])))
+
+    asyncio.run(env.handler.dashboard_respond(
+        "Okay.", agent=env.agent, channel_name="voice", authorization_type="window",
+    ))
+
+    assert ledger.last is previous
+    env.clock.now += 3
+    _turn(env, "Probier's noch mal")
+    assert "set_reminder" in _last_allowed(env)
 
 
 def test_cancelled_turn_older_than_45_seconds_is_not_carried(env):
@@ -308,7 +343,7 @@ def test_unauthorized_speculative_turn_is_not_carried(env):
         try:
             await env.handler.dashboard_respond(
                 FIRST, agent=env.agent, channel_name="voice",
-                execution_gate=rejected,
+                execution_gate=rejected, authorization_type="speculative",
             )
         except asyncio.CancelledError:
             return "cancelled"
@@ -378,12 +413,12 @@ def test_interrupt_and_finish_are_matched_by_turn_id(env):
     async def run():
         await env.handler.dashboard_respond(
             sentence, agent=env.agent, channel_name="voice",
-            defer_finish=True, voice_turn_id="turn-a",
+            defer_finish=True, voice_turn_id="turn-a", authorization_type="wakeword",
         )
         env.clock.now += 2
         await env.handler.dashboard_respond(
             "Wie spät ist es", agent=env.agent, channel_name="voice",
-            defer_finish=True, voice_turn_id="turn-b",
+            defer_finish=True, voice_turn_id="turn-b", authorization_type="wakeword",
         )
 
     asyncio.run(run())
@@ -423,11 +458,13 @@ def test_dispatch_gate_blocks_carried_tool_already_started_by_parallel_turn(env)
         env.clock.now += 3
         b = asyncio.create_task(env.handler.dashboard_respond(
             "mit Ton bitte", agent=env.agent, channel_name="voice",
+            authorization_type="wakeword",
         ))
         await asyncio.wait_for(b_started.wait(), timeout=2)
         env.clock.now += 2
         await env.handler.dashboard_respond(
             "Überblick bitte nicht zu ausführlich", agent=env.agent, channel_name="voice",
+            authorization_type="wakeword",
         )
         release_b.set()
         await b
@@ -596,11 +633,13 @@ def test_retry_gate_blocks_tool_started_by_parallel_retry(env):
         env.clock.now += 5
         first = asyncio.create_task(env.handler.dashboard_respond(
             "Probier's noch mal", agent=env.agent, channel_name="voice",
+            authorization_type="wakeword",
         ))
         await asyncio.wait_for(r1_started.wait(), timeout=2)
         env.clock.now += 2
         await env.handler.dashboard_respond(
             "Probier's noch mal", agent=env.agent, channel_name="voice",
+            authorization_type="wakeword",
         )
         release_r1.set()
         with pytest.raises(asyncio.CancelledError):
@@ -619,6 +658,7 @@ def _speculative_turn(env, text, *, addressed):
         try:
             return await env.handler.dashboard_respond(
                 text, agent=env.agent, channel_name="voice", execution_gate=gate,
+                authorization_type="speculative",
             )
         except asyncio.CancelledError:
             return "cancelled"
@@ -731,11 +771,12 @@ def test_turn_before_cancel_reported_later_does_not_become_open(env):
     async def run():
         await env.handler.dashboard_respond(
             sentence, agent=env.agent, channel_name="voice",
-            defer_finish=True, voice_turn_id="fp",
+            defer_finish=True, voice_turn_id="fp", authorization_type="wakeword",
         )
         env.clock.now += 2
         await env.handler.dashboard_respond(
             "Stopp", agent=env.agent, channel_name="voice", voice_turn_id="stop",
+            authorization_type="wakeword",
         )
 
     asyncio.run(run())
