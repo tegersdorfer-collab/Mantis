@@ -53,6 +53,10 @@ def test_lamp_tool_aliases_and_steps():
     assert calls == [("NECext", "EF00", "FF00")] * 3   # 3 Dimm-Stufen
 
     calls.clear()
+    asyncio.run(_lampe("heller", schritte=10))   # Lampe hat nur 3 Stufen
+    assert len(calls) == 3
+
+    calls.clear()
     asyncio.run(_lampe("weiß"))          # Alias → weiss
     assert calls[-1] == ("NECext", "EF00", "F807")
 
