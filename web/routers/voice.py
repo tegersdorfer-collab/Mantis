@@ -534,6 +534,24 @@ def _record_voice_latency(
     return detail
 
 
+def _accepts_kwarg(func, name: str) -> bool:
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _call_with_turn_id(func, turn_id: str, *args):
+    """Reicht die Playback-Turn-ID durch, wenn der Empfänger sie annimmt."""
+    if _accepts_kwarg(func, "turn_id"):
+        return func(*args, turn_id=turn_id)
+    return func(*args)
+
+
 def _mark_reflex(trace) -> None:
     if any(isinstance(item, dict) and item.get("reflex") is True for item in (trace or [])):
         voice_timing.mark_reflex()
@@ -860,6 +878,8 @@ async def sende_streaming_antwort(
                     for parameter in parameters
                 ):
                     respond_kwargs["execution_gate"] = execution_gate
+            if _accepts_kwarg(orch.voice_respond, "voice_turn_id"):
+                respond_kwargs["voice_turn_id"] = playback.turn_id
             reply, trace = await orch.voice_respond(text, **respond_kwargs)
             _mark_reflex(trace)
             reply = reply or ""
@@ -1041,7 +1061,7 @@ async def sende_streaming_antwort(
             playback.estimate_progress()
         recorder = getattr(orch, "record_interrupted_voice_turn", None)
         if callable(recorder):
-            recorder(playback.spoken_text())
+            _call_with_turn_id(recorder, playback.turn_id, playback.spoken_text())
 
     try:
         tasks = (responder, synthesizer, sender, ack_task)
@@ -1095,14 +1115,14 @@ async def sende_streaming_antwort(
                         if not callable(recorder):
                             recorder = getattr(orch, "record_interrupted_voice_turn", None)
                         if callable(recorder) and spoken_text:
-                            recorder(spoken_text)
+                            _call_with_turn_id(recorder, playback.turn_id, spoken_text)
                     elif (
                         defer_history and not playback.timed_out
                         and response_error is None
                     ):
                         finish = getattr(orch, "finish_voice_turn", None)
                         if callable(finish) and reply:
-                            finish(text, reply, trace)
+                            _call_with_turn_id(finish, playback.turn_id, text, reply, trace)
         finally:
             try:
                 _record_voice_latency(

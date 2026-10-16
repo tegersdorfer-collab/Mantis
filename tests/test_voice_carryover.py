@@ -215,7 +215,8 @@ def test_retry_request_reuses_previous_voice_grant(env):
     env.clock.now += 30
     _turn(env, "Mantis, probier's noch mal.")
     assert "set_reminder" in _last_allowed(env)
-    assert env.agent.calls[-1]["force_tools"] is True
+    # S1: Force nie aus Retry/übernommenem Text, nur aus dem aktuellen Satz.
+    assert env.agent.calls[-1]["force_tools"] is False
 
 
 def test_retry_request_expires_after_120_seconds(env):
@@ -232,7 +233,8 @@ def test_retry_request_expires_after_120_seconds(env):
 @pytest.mark.parametrize("text", [
     "Probier's noch mal", "probiers nochmal", "Versuch es noch mal.",
     "Nochmal", "Noch einmal bitte", "Mach nochmal", "Mantis, nochmal!",
-    "versuch's noch einmal",
+    "versuch's noch einmal", "kannst du es nochmal versuchen", "nochmal probieren",
+    "versuch's nochmal, Mantis",
 ])
 def test_retry_phrases_are_recognized(text):
     assert message_handler._is_voice_retry_request(text)
@@ -240,7 +242,8 @@ def test_retry_phrases_are_recognized(text):
 
 @pytest.mark.parametrize("text", [
     "Mach das Licht nochmal an", "Spiel das Lied noch mal", "Wie wird das Wetter",
-    "", "Erzähl mir nochmal einen Witz",
+    "", "Erzähl mir nochmal einen Witz", "schick die Nachricht nochmal",
+    "spiel das nochmal", "nicht nochmal",
 ])
 def test_retry_detection_ignores_new_requests(text):
     assert not message_handler._is_voice_retry_request(text)
@@ -316,3 +319,247 @@ def test_unauthorized_speculative_turn_is_not_carried(env):
     env.clock.now += 5
     _turn(env, "Überblick bitte nicht zu ausführlich")
     assert "set_reminder" not in _last_allowed(env)
+
+
+def _success(tool):
+    async def run(_kwargs):
+        return "Erledigt.", [{"tool": tool, "args": {}, "result": "ok"}]
+    return run
+
+
+def test_carry_turn_completing_agent_run_clears_open_list_even_if_playback_interrupted(env):
+    """P1: B erledigt A, Playback von B wird unterbrochen → A darf nicht offen bleiben."""
+    env.agent.behaviors.extend([_cancelled_before_tools, _success("set_reminder")])
+    assert _turn(env, "Erinnere mich um neun an Kreatin") == "cancelled"
+    env.clock.now += 3
+    _turn(env, "mit Ton bitte", defer_finish=True)
+    assert "set_reminder" in _last_allowed(env)
+    env.handler.record_interrupted_voice_turn("Erle")
+
+    env.clock.now += 5
+    _turn(env, "danke dir")
+    assert "set_reminder" not in _last_allowed(env)
+    assert env.agent.calls[-1]["force_tools"] is False
+
+
+def test_carry_turn_without_playback_end_still_clears_open_list(env):
+    """P1: Timeout/Disconnect – weder finish noch interrupt kommen."""
+    env.agent.behaviors.extend([_cancelled_before_tools, _success("set_reminder")])
+    assert _turn(env, "Erinnere mich um neun an Kreatin") == "cancelled"
+    env.clock.now += 3
+    _turn(env, "mit Ton bitte", defer_finish=True)
+
+    env.clock.now += 5
+    _turn(env, "danke dir")
+    assert "set_reminder" not in _last_allowed(env)
+
+
+def test_interrupt_without_turn_id_ignores_stale_deferred_turn(env):
+    """P2a: alter, nie abgeschlossener Turn darf nicht dem neuen Abbruch zugeordnet werden."""
+    _turn(env, "Spiel was auf Spotify", defer_finish=True)
+    env.clock.now += 30
+    env.agent.behaviors.append(_cancelled_before_tools)
+    assert _turn(env, "Wie wird das Wetter") == "cancelled"
+    env.handler.record_interrupted_voice_turn("")
+
+    ledger = env.handler._voice_ledger()
+    assert ledger.last.text == "Wie wird das Wetter"
+
+
+def test_interrupt_and_finish_are_matched_by_turn_id(env):
+    """P2a: Router meldet Turn-IDs; Unterbrechung trifft genau den gemeldeten Turn."""
+    sentence = "Mach das Licht dunkler und spiel was auf Spotify"
+    command = FastCommand(tool="lampe", args={}, label="lampe-dunkler")
+    env.monkeypatch.setattr(
+        message_handler.fast_commands, "match_voice",
+        lambda text: command if text == sentence else None,
+    )
+
+    async def run():
+        await env.handler.dashboard_respond(
+            sentence, agent=env.agent, channel_name="voice",
+            defer_finish=True, voice_turn_id="turn-a",
+        )
+        env.clock.now += 2
+        await env.handler.dashboard_respond(
+            "Wie spät ist es", agent=env.agent, channel_name="voice",
+            defer_finish=True, voice_turn_id="turn-b",
+        )
+
+    asyncio.run(run())
+    # Die Unterbrechung von A kommt erst nach dem Lauf von B an.
+    env.handler.record_interrupted_voice_turn("Lampe", turn_id="turn-a")
+    env.handler._finish_turn(
+        "Wie spät ist es", "Zehn.", [], channel_name="voice", turn_id="turn-b",
+    )
+
+    env.clock.now += 3
+    _turn(env, "Überblick bitte nicht zu ausführlich")
+    assert "spotify" in _last_allowed(env)
+    assert "lampe" not in _last_allowed(env)
+
+
+def test_dispatch_gate_blocks_carried_tool_already_started_by_parallel_turn(env):
+    """P2b: C wählt Tools, während B die Anfrage A schon ausführt."""
+    b_started = asyncio.Event()
+    release_b = asyncio.Event()
+    gate_results = {}
+
+    async def b_runs_reminder(kwargs):
+        gate_results["b"] = kwargs["tool_gate"]("set_reminder")
+        b_started.set()
+        await release_b.wait()
+        return "Erledigt.", [{"tool": "set_reminder", "args": {}, "result": "ok"}]
+
+    async def c_tries_reminder(kwargs):
+        gate_results["c"] = kwargs["tool_gate"]("set_reminder")
+        gate_results["c_weather"] = kwargs["tool_gate"]("get_weather")
+        return "Okay.", []
+
+    env.agent.behaviors.extend([_cancelled_before_tools, b_runs_reminder, c_tries_reminder])
+    assert _turn(env, FIRST) == "cancelled"
+
+    async def run():
+        env.clock.now += 3
+        b = asyncio.create_task(env.handler.dashboard_respond(
+            "mit Ton bitte", agent=env.agent, channel_name="voice",
+        ))
+        await asyncio.wait_for(b_started.wait(), timeout=2)
+        env.clock.now += 2
+        await env.handler.dashboard_respond(
+            "Überblick bitte nicht zu ausführlich", agent=env.agent, channel_name="voice",
+        )
+        release_b.set()
+        await b
+
+    asyncio.run(run())
+    assert gate_results["b"] is None
+    assert "set_reminder" in set(env.agent.calls[2]["allowed_tools"])
+    assert gate_results["c"] is not None and "bereits" in gate_results["c"]
+    assert gate_results["c_weather"] is None
+
+
+@pytest.mark.parametrize("cancel_text", [
+    "Ja okay, dann lass es. Stop.", "Stopp", "Nein, vergiss es", "doch nicht",
+    "Warte mal", "abbrechen", "Das meinte ich nicht",
+])
+def test_cancel_phrase_clears_open_requests_and_retry(env, cancel_text):
+    """S2: Nach einem Widerruf wird nichts mehr nachgeholt."""
+    env.agent.behaviors.append(_cancelled_before_tools)
+    assert _turn(env, FIRST) == "cancelled"
+    env.clock.now += 3
+    _turn(env, cancel_text)
+    assert "set_reminder" not in _last_allowed(env)
+
+    env.clock.now += 3
+    _turn(env, "Überblick bitte nicht zu ausführlich")
+    assert "set_reminder" not in _last_allowed(env)
+    env.clock.now += 3
+    _turn(env, "Probier's noch mal")
+    assert "set_reminder" not in _last_allowed(env)
+
+
+def test_cancel_phrase_during_interrupted_fast_path_keeps_rest_closed(env):
+    """S2: Die Unterbrechung des Fast-Path-Turns kommt nach dem Widerruf an."""
+    sentence = "Mach das Licht dunkler und spiel was auf Spotify"
+    command = FastCommand(tool="lampe", args={}, label="lampe-dunkler")
+    env.monkeypatch.setattr(
+        message_handler.fast_commands, "match_voice",
+        lambda text: command if text == sentence else None,
+    )
+    _turn(env, sentence, defer_finish=True)
+    env.clock.now += 2
+    _turn(env, "Stopp, lass es")
+    env.handler.record_interrupted_voice_turn("Lampe")
+
+    env.clock.now += 2
+    _turn(env, "Überblick bitte nicht zu ausführlich")
+    assert "spotify" not in _last_allowed(env)
+
+
+def test_carried_text_never_forces_tool_call(env):
+    """S1: Übernommener Text mit Aktions-Tools setzt kein force."""
+    env.agent.behaviors.append(_cancelled_before_tools)
+    assert _turn(env, FIRST) == "cancelled"
+    env.clock.now += 3
+    _turn(env, "Überblick bitte nicht zu ausführlich")
+    assert "set_reminder" in _last_allowed(env)
+    assert env.agent.calls[-1]["force_tools"] is False
+
+
+def test_fast_path_cancelled_during_execution_is_not_retried(env):
+    """P3a: Abbruch während skills.T.execute → Tool zählt als gestartet."""
+    sentence = "Mach das Licht aus"
+    command = FastCommand(tool="lampe", args={}, label="lampe-aus")
+    env.monkeypatch.setattr(
+        message_handler.fast_commands, "match_voice",
+        lambda text: command if text == sentence else None,
+    )
+
+    async def hanging_execute(_tool, _args):
+        raise asyncio.CancelledError
+
+    env.monkeypatch.setattr(message_handler.skills.T, "execute", hanging_execute)
+    assert _turn(env, sentence) == "cancelled"
+
+    env.clock.now += 5
+    _turn(env, "Probier's noch mal")
+    assert "lampe" not in _last_allowed(env)
+
+
+def test_retry_does_not_regrant_successfully_executed_tool(env):
+    """Mutationen: retry_grant ignoriert executed / record_trace zählt Erfolg nicht."""
+    env.agent.behaviors.append(_success("set_reminder"))
+    _turn(env, "Erinnere mich heute Abend um neun an Kreatin")
+
+    env.clock.now += 10
+    _turn(env, "Probier's noch mal")
+    assert "set_reminder" not in _last_allowed(env)
+
+
+def test_record_trace_counts_only_successful_tools_as_executed():
+    state = message_handler._VoiceTurnState(text="x", started_at=0.0)
+    state.record_trace([
+        {"tool": "set_reminder", "result": "Erinnerung gesetzt."},
+        {"tool": "spotify", "result": "FEHLER: Tool 'spotify' ist nicht freigegeben."},
+        {"tool": "lampe", "result": "❌ lampe fehlgeschlagen"},
+    ])
+    assert state.executed == {"set_reminder"}
+
+
+def test_failed_interrupted_fast_path_tool_is_not_carried_again(env):
+    """Mutation: reflex_tools aus carry_excluded entfernt → Lampe würde erneut freigegeben."""
+    sentence = "Mach das Licht dunkler und spiel was auf Spotify"
+    command = FastCommand(tool="lampe", args={}, label="lampe-dunkler")
+    env.monkeypatch.setattr(
+        message_handler.fast_commands, "match_voice",
+        lambda text: command if text == sentence else None,
+    )
+
+    async def failing_execute(_tool, _args):
+        return "❌ lampe fehlgeschlagen: keine Hardware"
+
+    env.monkeypatch.setattr(message_handler.skills.T, "execute", failing_execute)
+    _turn(env, sentence, defer_finish=True)
+    env.handler.record_interrupted_voice_turn("Lampe")
+
+    env.clock.now += 5
+    _turn(env, "Überblick bitte nicht zu ausführlich")
+    assert "spotify" in _last_allowed(env)
+    assert "lampe" not in _last_allowed(env)
+
+
+def test_router_passes_turn_id_only_to_receivers_that_accept_it():
+    import web.routers.voice as voice_router
+
+    calls = []
+
+    def legacy(spoken_text):
+        calls.append(("legacy", spoken_text))
+
+    def modern(spoken_text, turn_id=None):
+        calls.append(("modern", spoken_text, turn_id))
+
+    voice_router._call_with_turn_id(legacy, "t1", "Hallo")
+    voice_router._call_with_turn_id(modern, "t2", "Hallo")
+    assert calls == [("legacy", "Hallo"), ("modern", "Hallo", "t2")]

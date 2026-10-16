@@ -162,6 +162,7 @@ class Agent:
         tool_selection_task: asyncio.Future | None = None,
         interrupt_check: Callable[[], bool] | None = None,
         execution_gate: Callable[[], Awaitable[bool]] | None = None,
+        tool_gate: Callable[[str], str | None] | None = None,
     ) -> tuple[str, list[dict]]:
         """
         Führt den ReAct-Loop aus.
@@ -170,6 +171,9 @@ class Agent:
 
         dry_run_tools: Tool-Calls werden aufgezeichnet aber NICHT ausgeführt
         (für die Eval-Suite — kein Test-Müll in der Produktions-DB).
+
+        tool_gate: letzte Prüfung direkt vor der Ausführung (nach dem Execution-Gate);
+        liefert eine Sperrmeldung oder None.
         """
         norm: list[dict] = []
         for m in messages:
@@ -323,14 +327,18 @@ class Agent:
                     result = f"[Eval-Dry-Run] Tool '{name}' würde ausgeführt (Argumente akzeptiert)."
                 else:
                     await require_execution_permission()
-                    if stream_cb is not None:
-                        await stream_cb(StreamEvent(
-                            "tool_start", attempt_id or "", tool_name=name,
-                        ))
-                    if interrupt_check is not None and interrupt_check():
-                        raise asyncio.CancelledError
-                    with voice_timing.phase("tool_exec_ms"):
-                        result = await toolreg.execute(name, args)
+                    blocked = tool_gate(name) if tool_gate is not None else None
+                    if blocked is not None:
+                        result = blocked
+                    else:
+                        if stream_cb is not None:
+                            await stream_cb(StreamEvent(
+                                "tool_start", attempt_id or "", tool_name=name,
+                            ))
+                        if interrupt_check is not None and interrupt_check():
+                            raise asyncio.CancelledError
+                        with voice_timing.phase("tool_exec_ms"):
+                            result = await toolreg.execute(name, args)
                 trace.append({"tool": name, "args": args, "result": result[:500]})
                 if not dry_run_tools:
                     if name.startswith("inbox_"):

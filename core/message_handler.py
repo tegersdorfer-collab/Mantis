@@ -4,6 +4,7 @@ Zuständig für: ReAct-Loop, Streaming, Post-Turn-Learning, Persistenz.
 """
 import asyncio
 from copy import deepcopy
+import inspect
 from collections.abc import Awaitable, Callable
 import json
 import logging
@@ -139,22 +140,36 @@ _voice_clock = time.monotonic
 _VOICE_CARRYOVER_TTL = 45.0
 _VOICE_CARRYOVER_MAX = 3
 _VOICE_RETRY_TTL = 120.0
+# Laufende Voice-Turns ohne Playback-Ende (Timeout, Disconnect) verfallen danach.
+_VOICE_DEFERRED_TTL = 300.0
 _VOICE_TOOL_FAILURE_PREFIXES = ("FEHLER", "❌", "⚠️")
 _VOICE_RETRY_PHRASE_RE = re.compile(r"\bnoch\s*(?:mal|einmal)\b|\berneut\b")
 _VOICE_RETRY_FILLERS = frozenset({
-    "probier", "probiere", "probiers", "versuch", "versuche", "versuchs", "s",
+    "probier", "probiere", "probiers", "probieren", "versuch", "versuche",
+    "versuchs", "versuchen", "s", "kannst", "könntest", "koenntest", "du",
     "mach", "mache", "machs", "es", "das", "bitte", "doch", "einfach", "jetzt",
     "mal", "ok", "okay", "also", "ach", "na", "dann",
 })
+_VOICE_CANCEL_RE = re.compile(
+    r"^(?:nein|warte|wart|halt|stopp?|abbrechen|abbruch)\b"
+    r"|\b(?:stopp?|vergiss\s+(?:es|das)|doch\s+nicht|abbrechen|"
+    r"brich\s+(?:es\s+|das\s+)?ab|lass\s+(?:es|das)|das\s+meinte\s+ich\s+nicht|"
+    r"nicht\s+noch\s*(?:mal|einmal)|falsch\s+verstanden)\b"
+)
+
+
+def _voice_words(text: str) -> list[str]:
+    value = str(text or "").casefold().replace("’", "'").replace("‘", "'")
+    return [
+        word for word in re.findall(r"[^\W_]+", value, flags=re.UNICODE)
+        if word != "mantis"
+    ]
 
 
 def _is_voice_retry_request(text: str) -> bool:
     """Erkennt kurze, ausdrückliche Wiederholungswünsche wie „probier's noch mal“."""
-    value = re.sub(
-        r"^\s*mantis\b[\s,;:.!?—-]*", "", str(text or ""), flags=re.IGNORECASE,
-    ).casefold()
-    words = re.findall(r"[^\W_]+", value, flags=re.UNICODE)
-    if not words or len(words) > 6:
+    words = _voice_words(text)
+    if not words or len(words) > 7:
         return False
     joined = " ".join(words)
     if not _VOICE_RETRY_PHRASE_RE.search(joined):
@@ -163,12 +178,26 @@ def _is_voice_retry_request(text: str) -> bool:
     return all(word in _VOICE_RETRY_FILLERS for word in rest)
 
 
+def _is_voice_cancel_request(text: str) -> bool:
+    """Widerruf („stopp“, „vergiss es“, „lass es“): nichts Altes mehr nachholen."""
+    return _VOICE_CANCEL_RE.search(" ".join(_voice_words(text))) is not None
+
+
+def _voice_not_repeatable_message(name: str) -> str:
+    return (
+        f"FEHLER: Tool '{name}' wurde für diese Anfrage bereits ausgeführt oder "
+        "gestartet. Nicht erneut aufrufen; sag kurz, dass es schon erledigt ist."
+    )
+
+
 @dataclass(eq=False)
 class _VoiceTurnState:
     """Freigaben und Ausführungen eines autorisierten Voice-Turns."""
     text: str
     started_at: float
+    turn_id: str | None = None
     ended_at: float | None = None
+    agent_done: bool = False
     granted: set[str] = field(default_factory=set)
     force: bool = False
     started_tools: set[str] = field(default_factory=set)
@@ -188,6 +217,13 @@ class _VoiceTurnState:
         # Gestartet, aber ohne Ergebnis: Seiteneffekt möglich, nie erneut freigeben.
         self.executed |= self.started_tools - traced
 
+    def handled_tools(self) -> set[str]:
+        """Tools, die für diese Anfrage nicht erneut laufen dürfen."""
+        handled = self.executed | self.reflex_tools
+        if not self.agent_done:
+            handled |= self.started_tools
+        return handled
+
 
 class _VoiceTurnLedger:
     """Offene (abgebrochene) Anfragen und letzte Freigabe des Voice-Kanals."""
@@ -195,58 +231,126 @@ class _VoiceTurnLedger:
     def __init__(self):
         self.open: list[_VoiceTurnState] = []
         self.deferred: list[_VoiceTurnState] = []
+        self.recent: list[_VoiceTurnState] = []
+        self.latest: _VoiceTurnState | None = None
         self.last: _VoiceTurnState | None = None
+        self.cancelled_at: float | None = None
+
+    def _valid(self, state: _VoiceTurnState) -> bool:
+        return self.cancelled_at is None or state.started_at > self.cancelled_at
+
+    def _prune(self) -> None:
+        now = _voice_clock()
+        self.deferred = [
+            state for state in self.deferred
+            if now - state.started_at <= _VOICE_DEFERRED_TTL
+        ]
+        self.recent = [
+            state for state in self.recent
+            if now - state.started_at <= _VOICE_DEFERRED_TTL
+        ]
+
+    def authorize(self, state: _VoiceTurnState) -> None:
+        self._prune()
+        self.latest = state
+        if state not in self.recent:
+            self.recent.append(state)
+
+    def cancel(self, at: float) -> None:
+        """Widerruf: offene Anfragen und Retry-Freigabe verfallen, auch spätere Meldungen."""
+        self.cancelled_at = at
+        self.open.clear()
+        self.last = None
 
     def open_requests(self, now: float) -> list[_VoiceTurnState]:
         self.open = [
             state for state in self.open
-            if now - state.started_at <= _VOICE_CARRYOVER_TTL
+            if now - state.started_at <= _VOICE_CARRYOVER_TTL and self._valid(state)
         ][-_VOICE_CARRYOVER_MAX:]
         return list(self.open)
 
+    def handled_since(
+        self, name: str, since: float, exclude: _VoiceTurnState | None,
+    ) -> bool:
+        return any(
+            state is not exclude and state.started_at >= since
+            and name in state.handled_tools()
+            for state in (*self.recent, *self.open)
+        )
+
     def _end(self, state: _VoiceTurnState) -> None:
         state.ended_at = _voice_clock()
-        self.last = state
+        if self._valid(state):
+            self.last = state
 
     def mark_open(self, state: _VoiceTurnState) -> None:
-        if state not in self.open:
+        if self._valid(state) and state not in self.open:
             self.open.append(state)
             self.open = self.open[-_VOICE_CARRYOVER_MAX:]
         self._end(state)
 
-    def defer(self, state: _VoiceTurnState) -> None:
-        self.deferred = [*self.deferred, state][-_VOICE_CARRYOVER_MAX:]
+    def ran(self, state: _VoiceTurnState) -> None:
+        """Agent-Lauf regulär beendet; das Playback-Ende kommt evtl. nie."""
+        state.agent_done = True
+        if not state.reflex_tools:
+            # Ein LLM-Turn hat die übernommenen Anfragen bearbeitet.
+            self.open.clear()
+        self._prune()
+        if state not in self.deferred:
+            self.deferred.append(state)
+        self._end(state)
 
-    def complete(self, user_text: str) -> None:
-        state = next(
-            (item for item in reversed(self.deferred) if item.text == user_text), None,
-        )
+    def _take_deferred(
+        self, turn_id: str | None = None, user_text: str | None = None,
+    ) -> _VoiceTurnState | None:
+        self._prune()
+        if turn_id is not None:
+            state = next((s for s in self.deferred if s.turn_id == turn_id), None)
+        elif user_text is not None:
+            state = next(
+                (s for s in reversed(self.deferred) if s.text == user_text), None,
+            )
+        else:
+            # Ohne ID nur der jüngste Turn; ist der schon abgebrochen, gibt es nichts.
+            state = self.latest if self.latest in self.deferred else None
         if state is not None:
             self.deferred.remove(state)
-        # Ein reiner Fast-Path-Turn hat die offenen Anfragen nicht bearbeitet.
-        if state is None or not state.reflex_tools:
-            self.open.clear()
+        return state
+
+    def complete(self, user_text: str, turn_id: str | None = None) -> None:
+        state = self._take_deferred(turn_id, user_text)
         if state is not None:
             self._end(state)
 
-    def interrupt(self) -> None:
-        if not self.deferred:
+    def interrupt(self, turn_id: str | None = None) -> None:
+        state = self._take_deferred(turn_id)
+        if state is None:
             return
-        state = self.deferred.pop()
         if state.reflex_tools:
             # Fast-Path lief nur für sein eines Tool; der Rest des Satzes bleibt offen.
             self.mark_open(state)
         else:
             self._end(state)
 
-    def retry_grant(self, now: float) -> tuple[list[str], bool] | None:
+    def retry_grant(self, now: float) -> tuple[list[str], float] | None:
         last = self.last
-        if last is None or last.ended_at is None:
+        if last is None or last.ended_at is None or not self._valid(last):
             return None
         if now - last.ended_at > _VOICE_RETRY_TTL:
             return None
         names = [name for name in sorted(last.granted) if name not in last.executed]
-        return names, last.force
+        return names, last.started_at
+
+
+def _accepts_kwarg(func, name: str) -> bool:
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def _keyword_tool_selection(text: str) -> tuple[list[str], bool]:
@@ -939,6 +1043,7 @@ class MessageHandler:
         resume_idle_cb=None, prework: VoiceTurnPrework | None = None,
         defer_finish: bool = False, interrupt_check=None,
         execution_gate: Callable[[], Awaitable[bool]] | None = None,
+        voice_turn_id: str | None = None,
     ) -> tuple[str, list]:
         speculative = execution_gate is not None
         turn_started = False
@@ -946,10 +1051,18 @@ class MessageHandler:
         authorized = not speculative
         pending_recall_ids: list[int] = []
         voice_state = (
-            _VoiceTurnState(text=text, started_at=_voice_clock())
+            _VoiceTurnState(
+                text=text, started_at=_voice_clock(), turn_id=voice_turn_id,
+            )
             if channel_name == "voice" else None
         )
         response_complete = False
+        if voice_state is not None:
+            if _is_voice_cancel_request(text):
+                # Widerruf: nichts Abgebrochenes mehr nachholen, keine Retry-Freigabe.
+                self._voice_ledger().cancel(voice_state.started_at)
+            if not speculative:
+                self._voice_ledger().authorize(voice_state)
 
         if not speculative:
             self._begin_user_turn()
@@ -977,6 +1090,8 @@ class MessageHandler:
             if not await execution_gate():
                 return False
             authorized = True
+            if voice_state is not None:
+                self._voice_ledger().authorize(voice_state)
             if not turn_started:
                 self._begin_user_turn()
                 self._start_turn()
@@ -1022,28 +1137,36 @@ class MessageHandler:
             response_complete = True
             if voice_state is not None:
                 voice_state.record_trace(trace)
-                # Bis zur Bestätigung des Playbacks gilt der Turn als laufend.
-                self._voice_ledger().defer(voice_state)
+                # Agent-Lauf fertig: übernommene Anfragen sind bearbeitet, auch wenn
+                # das Playback danach unterbrochen wird oder nie ein Ende meldet.
+                self._voice_ledger().ran(voice_state)
             if not defer_finish:
-                self._finish_turn(text, response, trace, channel_name=channel_name, agent=agent)
+                self._finish_turn(
+                    text, response, trace, channel_name=channel_name, agent=agent,
+                    turn_id=voice_turn_id,
+                )
             return response, trace
         finally:
             if voice_state is not None and authorized and not response_complete:
                 # Abgebrochen, bevor die Antwort fertig war: Timo hat das gesagt,
                 # es lief aber nie vollständig. Der nächste Voice-Turn übernimmt es.
-                voice_state.executed |= voice_state.started_tools
+                voice_state.executed |= voice_state.started_tools | voice_state.reflex_tools
                 self._voice_ledger().mark_open(voice_state)
             if turn_started:
                 self._release_active_turn(resume_idle_cb)
 
-    def record_interrupted_voice_turn(self, spoken_text: str) -> None:
+    def record_interrupted_voice_turn(
+        self, spoken_text: str, turn_id: str | None = None,
+    ) -> None:
         """Persistiert ausschließlich den vom Client als gespielt gemeldeten Teil."""
-        self._voice_ledger().interrupt()
+        self._voice_ledger().interrupt(turn_id)
         self._record_voice_prefix(spoken_text, "[unterbrochen]")
 
-    def record_aborted_voice_turn(self, spoken_text: str) -> None:
+    def record_aborted_voice_turn(
+        self, spoken_text: str, turn_id: str | None = None,
+    ) -> None:
         """Persistiert den gehörten Präfix, wenn die Synthese vorzeitig scheiterte."""
-        self._voice_ledger().interrupt()
+        self._voice_ledger().interrupt(turn_id)
         self._record_voice_prefix(spoken_text, "[abgebrochen]")
 
     def _record_voice_prefix(self, spoken_text: str, marker: str) -> None:
@@ -1078,6 +1201,7 @@ class MessageHandler:
             and partial_text_matches_final(prework.text, text)
         )
         carry_excluded: set[str] = set()
+        carry_since: float | None = None
         retry_grant = None
         if voice_turn:
             selection_text, inherited_context = (
@@ -1092,31 +1216,59 @@ class MessageHandler:
                 # Unerledigte Anfragen hat Timo wirklich gesagt: volle Rechte.
                 selection_text = "\n".join([*(state.text for state in open_turns), text])
                 inherited_context = False
+                carry_since = min(state.started_at for state in open_turns)
                 for state in open_turns:
-                    carry_excluded |= state.executed | state.reflex_tools
+                    carry_excluded |= state.handled_tools()
             if _is_voice_retry_request(text):
                 retry_grant = ledger.retry_grant(now)
         else:
             selection_text, inherited_context = text, False
-        selection_overridden = selection_text != text and not inherited_context
-        selection_overridden = selection_overridden or retry_grant is not None
+        retry_names = frozenset(retry_grant[0]) if retry_grant is not None else frozenset()
+        carried = carry_since is not None or retry_grant is not None
+        selection_overridden = carried
+        own_cache: list[tuple[frozenset[str], bool]] = []
+
+        def _own_selection() -> tuple[frozenset[str], bool]:
+            """Auswahl allein aus dem aktuellen Satz (Ausnahmen und force)."""
+            if not own_cache:
+                names, force = _keyword_tool_selection(text)
+                own_cache.append((
+                    frozenset(names), bool(force) and not _is_short_voice_followup(text),
+                ))
+            return own_cache[0]
 
         def _voice_policy(names, force) -> tuple[list[str], bool]:
             names, force = _apply_voice_tool_context_policy(
                 names, force,
                 inherited_context=inherited_context,
             )
-            if carry_excluded:
-                own = set(_keyword_tool_selection(text)[0])
-                names = [name for name in names if name not in carry_excluded or name in own]
-            if retry_grant is not None:
-                retry_names, retry_force = retry_grant
-                names = [*names, *(name for name in retry_names if name not in names)]
-                force = bool(force or (retry_force and retry_names))
+            if carried:
+                own_names, own_force = _own_selection()
+                # force nie aus übernommenem Text oder Retry, nur aus dem aktuellen Satz.
+                force = own_force
+                if carry_excluded:
+                    names = [
+                        name for name in names
+                        if name not in carry_excluded or name in own_names
+                    ]
+                names = [*names, *(name for name in sorted(retry_names) if name not in names)]
             if voice_state is not None:
                 voice_state.granted.update(names)
                 voice_state.force = voice_state.force or force
             return names, force
+
+        def _voice_tool_gate(name: str) -> str | None:
+            """Prüft beim Dispatch erneut, ob ein übernommenes Tool inzwischen lief."""
+            if (
+                carry_since is not None
+                and name not in retry_names
+                and name not in _own_selection()[0]
+                and self._voice_ledger().handled_since(name, carry_since, voice_state)
+            ):
+                return _voice_not_repeatable_message(name)
+            if voice_state is not None:
+                voice_state.started_tools.add(name)
+            return None
 
         async def build_context():
             if execution_gate is not None:
@@ -1195,6 +1347,7 @@ class MessageHandler:
                     await _require_execution_gate(execution_gate)
                 if voice_state is not None:
                     voice_state.reflex_tools.add(fast.tool)
+                    voice_state.started_tools.add(fast.tool)
                     voice_state.granted.add(fast.tool)
                 result = await skills.T.execute(fast.tool, fast.args)
             except Exception as e:
@@ -1304,6 +1457,8 @@ class MessageHandler:
                 run_kwargs["interrupt_check"] = interrupt_check
             if voice_turn and execution_gate is not None:
                 run_kwargs["execution_gate"] = execution_gate
+            if voice_state is not None and _accepts_kwarg(agent.run, "tool_gate"):
+                run_kwargs["tool_gate"] = _voice_tool_gate
             if voice_turn and interrupt_check is not None and interrupt_check():
                 raise asyncio.CancelledError
             if tool_selection_task is not None:
@@ -1328,11 +1483,12 @@ class MessageHandler:
                         raise
 
     def _finish_turn(self, user_text: str, response: str, trace: list,
-                     channel_name: str, agent=None, meta: dict | None = None) -> None:
+                     channel_name: str, agent=None, meta: dict | None = None,
+                     turn_id: str | None = None) -> None:
         """Antwort in KZG/DB persistieren, UI aktualisieren, Post-Turn-Learning starten."""
         agent = agent or self.agent
         if channel_name == "voice":
-            self._voice_ledger().complete(user_text)
+            self._voice_ledger().complete(user_text, turn_id)
         self.kzg.add("assistant", response)
         tools_used = [t["tool"] for t in trace]
         _safe_task(ui_state.maybe_update_ui(tools_used), "ui_update")

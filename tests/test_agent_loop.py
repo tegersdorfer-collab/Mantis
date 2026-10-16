@@ -540,3 +540,34 @@ def test_unknown_tool_is_rejected_in_dry_run(echo_tool):
     be = FakeBackend([("", [_tc("nonexistent")]), ("Done", [])])
     _, trace = asyncio.run(Agent(be).run([], system="s", dry_run_tools=True))
     assert "FEHLER" in trace[0]["result"]
+
+
+def test_tool_gate_runs_after_execution_gate_and_blocks_dispatch(echo_tool):
+    executed, order = [], []
+
+    async def write(text=""):
+        executed.append(text)
+        return "written"
+
+    toolreg.REGISTRY["echo"].handler = write
+    be = FakeBackend([
+        ("", [_tc("echo", {"text": "a"}), _tc("calculate", {"expression": "1"})]),
+        ("Done", []),
+    ])
+
+    async def gate():
+        order.append("execution_gate")
+        return True
+
+    def tool_gate(name):
+        order.append(f"tool_gate:{name}")
+        return "FEHLER: bereits ausgeführt" if name == "echo" else None
+
+    _, trace = asyncio.run(Agent(be).run(
+        [], system="s", allowed_tools=["echo", "calculate"],
+        execution_gate=gate, tool_gate=tool_gate,
+    ))
+    assert executed == []
+    assert trace[0]["result"] == "FEHLER: bereits ausgeführt"
+    assert trace[1]["result"] == "42"
+    assert order[:2] == ["execution_gate", "tool_gate:echo"]
