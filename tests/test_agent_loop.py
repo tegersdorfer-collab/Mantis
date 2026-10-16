@@ -433,6 +433,16 @@ def test_backend_cannot_execute_unpermitted_tools(echo_tool, monkeypatch, permis
     assert be.calls[1]["messages"][-1]["content"] == trace[0]["result"]
 
 
+def test_unpermitted_tool_message_asks_for_explicit_request_instead_of_unavailable(echo_tool):
+    be = FakeBackend([("", [_tc("echo", {"text": "x"})]), ("Done", [])])
+    _, trace = asyncio.run(Agent(be).run([], system="s", allowed_tools=["calculate"]))
+    result = trace[0]["result"]
+    assert result.startswith("FEHLER: Tool 'echo' ist für diesen Satz nicht freigegeben")
+    assert "nicht erlaubt" not in result
+    assert "ausdrücklich" in result
+    assert "nicht verfügbar" in result  # Anweisung: das NICHT behaupten
+
+
 def test_deferred_tool_selection_blocks_unpermitted_tool_after_selection_finishes(echo_tool):
     executed = []
 
@@ -462,7 +472,7 @@ def test_deferred_tool_selection_blocks_unpermitted_tool_after_selection_finishe
 
     _text, trace = asyncio.run(run())
     assert executed == []
-    assert "nicht erlaubt" in trace[0]["result"]
+    assert "nicht freigegeben" in trace[0]["result"]
 
 
 def test_deferred_tool_selection_does_not_delay_answer_without_tool(echo_tool):
@@ -515,7 +525,7 @@ def test_use_tools_false_stays_a_global_lock_after_deferred_selection(echo_tool,
 
     _, trace = asyncio.run(run())
     assert executed == []
-    assert "nicht erlaubt" in trace[0]["result"]
+    assert "nicht freigegeben" in trace[0]["result"]
 
 
 def test_math_guard_does_not_request_disallowed_calculate(echo_tool):

@@ -318,7 +318,7 @@ class Agent:
                         args = {}
                 BUS.emit("tool", f"🔧 {name}", detail=_short(args) or None)
                 if name not in permitted_tools:
-                    result = f"FEHLER: Tool '{name}' ist in diesem Lauf nicht erlaubt."
+                    result = _not_permitted_message(name)
                 elif dry_run_tools:
                     result = f"[Eval-Dry-Run] Tool '{name}' würde ausgeführt (Argumente akzeptiert)."
                 else:
@@ -367,6 +367,16 @@ _MATH_PATTERNS = re.compile(
     r"[~≈]\s*\d+\s*(pro|per|/)\s*\w+)",
     re.IGNORECASE,
 )
+
+
+def _not_permitted_message(name: str) -> str:
+    """Ehrliche Sperr-Meldung: Sicherheitsregel, kein technischer Ausfall."""
+    return (
+        f"FEHLER: Tool '{name}' ist für diesen Satz nicht freigegeben "
+        "(Sicherheitsregel, kein technischer Ausfall). Behaupte NICHT, die Funktion "
+        "sei nicht verfügbar. Bitte den Nutzer in einem kurzen Satz, den Wunsch "
+        "ausdrücklich zu sagen; dann wird das Tool freigegeben."
+    )
 
 
 def _needs_calculate(text: str) -> bool:

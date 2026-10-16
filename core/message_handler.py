@@ -10,7 +10,7 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from communication.base import IncomingMessage
 from core.background_review import run_background_review
@@ -131,6 +131,122 @@ _VOICE_TIME_FOLLOWUP_RE = re.compile(
     r"august|september|oktober|november|dezember)\b",
     re.IGNORECASE,
 )
+
+
+# Abgebrochene Voice-Turns (Barge-in, neues Segment) tragen ihre nie ausgeführte
+# Anfrage in den nächsten Voice-Turn weiter. Monkeypatchbar für Tests.
+_voice_clock = time.monotonic
+_VOICE_CARRYOVER_TTL = 45.0
+_VOICE_CARRYOVER_MAX = 3
+_VOICE_RETRY_TTL = 120.0
+_VOICE_TOOL_FAILURE_PREFIXES = ("FEHLER", "❌", "⚠️")
+_VOICE_RETRY_PHRASE_RE = re.compile(r"\bnoch\s*(?:mal|einmal)\b|\berneut\b")
+_VOICE_RETRY_FILLERS = frozenset({
+    "probier", "probiere", "probiers", "versuch", "versuche", "versuchs", "s",
+    "mach", "mache", "machs", "es", "das", "bitte", "doch", "einfach", "jetzt",
+    "mal", "ok", "okay", "also", "ach", "na", "dann",
+})
+
+
+def _is_voice_retry_request(text: str) -> bool:
+    """Erkennt kurze, ausdrückliche Wiederholungswünsche wie „probier's noch mal“."""
+    value = re.sub(
+        r"^\s*mantis\b[\s,;:.!?—-]*", "", str(text or ""), flags=re.IGNORECASE,
+    ).casefold()
+    words = re.findall(r"[^\W_]+", value, flags=re.UNICODE)
+    if not words or len(words) > 6:
+        return False
+    joined = " ".join(words)
+    if not _VOICE_RETRY_PHRASE_RE.search(joined):
+        return False
+    rest = _VOICE_RETRY_PHRASE_RE.sub(" ", joined).split()
+    return all(word in _VOICE_RETRY_FILLERS for word in rest)
+
+
+@dataclass(eq=False)
+class _VoiceTurnState:
+    """Freigaben und Ausführungen eines autorisierten Voice-Turns."""
+    text: str
+    started_at: float
+    ended_at: float | None = None
+    granted: set[str] = field(default_factory=set)
+    force: bool = False
+    started_tools: set[str] = field(default_factory=set)
+    executed: set[str] = field(default_factory=set)
+    reflex_tools: set[str] = field(default_factory=set)
+
+    def record_trace(self, trace) -> None:
+        traced = set()
+        for item in trace or []:
+            name = item.get("tool") if isinstance(item, dict) else None
+            if not name:
+                continue
+            traced.add(name)
+            result = str(item.get("result") or "").lstrip()
+            if not result.startswith(_VOICE_TOOL_FAILURE_PREFIXES):
+                self.executed.add(name)
+        # Gestartet, aber ohne Ergebnis: Seiteneffekt möglich, nie erneut freigeben.
+        self.executed |= self.started_tools - traced
+
+
+class _VoiceTurnLedger:
+    """Offene (abgebrochene) Anfragen und letzte Freigabe des Voice-Kanals."""
+
+    def __init__(self):
+        self.open: list[_VoiceTurnState] = []
+        self.deferred: list[_VoiceTurnState] = []
+        self.last: _VoiceTurnState | None = None
+
+    def open_requests(self, now: float) -> list[_VoiceTurnState]:
+        self.open = [
+            state for state in self.open
+            if now - state.started_at <= _VOICE_CARRYOVER_TTL
+        ][-_VOICE_CARRYOVER_MAX:]
+        return list(self.open)
+
+    def _end(self, state: _VoiceTurnState) -> None:
+        state.ended_at = _voice_clock()
+        self.last = state
+
+    def mark_open(self, state: _VoiceTurnState) -> None:
+        if state not in self.open:
+            self.open.append(state)
+            self.open = self.open[-_VOICE_CARRYOVER_MAX:]
+        self._end(state)
+
+    def defer(self, state: _VoiceTurnState) -> None:
+        self.deferred = [*self.deferred, state][-_VOICE_CARRYOVER_MAX:]
+
+    def complete(self, user_text: str) -> None:
+        state = next(
+            (item for item in reversed(self.deferred) if item.text == user_text), None,
+        )
+        if state is not None:
+            self.deferred.remove(state)
+        # Ein reiner Fast-Path-Turn hat die offenen Anfragen nicht bearbeitet.
+        if state is None or not state.reflex_tools:
+            self.open.clear()
+        if state is not None:
+            self._end(state)
+
+    def interrupt(self) -> None:
+        if not self.deferred:
+            return
+        state = self.deferred.pop()
+        if state.reflex_tools:
+            # Fast-Path lief nur für sein eines Tool; der Rest des Satzes bleibt offen.
+            self.mark_open(state)
+        else:
+            self._end(state)
+
+    def retry_grant(self, now: float) -> tuple[list[str], bool] | None:
+        last = self.last
+        if last is None or last.ended_at is None:
+            return None
+        if now - last.ended_at > _VOICE_RETRY_TTL:
+            return None
+        names = [name for name in sorted(last.granted) if name not in last.executed]
+        return names, last.force
 
 
 def _keyword_tool_selection(text: str) -> tuple[list[str], bool]:
@@ -334,6 +450,12 @@ class MessageHandler:
         if hasattr(channel, "for_message") and msg.raw is not None:
             return channel.for_message(msg.raw)
         return channel
+
+    def _voice_ledger(self) -> _VoiceTurnLedger:
+        ledger = getattr(self, "_voice_turns", None)
+        if ledger is None:
+            ledger = self._voice_turns = _VoiceTurnLedger()
+        return ledger
 
     def _resume_idle_loop(self, callback=None) -> None:
         callback = callback or self.on_idle_ready
@@ -823,6 +945,11 @@ class MessageHandler:
         user_committed = not speculative
         authorized = not speculative
         pending_recall_ids: list[int] = []
+        voice_state = (
+            _VoiceTurnState(text=text, started_at=_voice_clock())
+            if channel_name == "voice" else None
+        )
+        response_complete = False
 
         if not speculative:
             self._begin_user_turn()
@@ -871,6 +998,7 @@ class MessageHandler:
                 text, channel_name,
                 execution_gate=authorize_execution if speculative else None,
             ):
+                response_complete = True
                 return "", []
 
             agent_kwargs = dict(
@@ -883,25 +1011,39 @@ class MessageHandler:
             )
             if speculative:
                 agent_kwargs["on_context_built"] = stage_context_recall
+            if voice_state is not None:
+                agent_kwargs["voice_state"] = voice_state
             response, trace = await self._agent_turn(
                 text, channel_name=channel_name, **agent_kwargs,
             )
             await _require_execution_gate(
                 authorize_execution if speculative else None,
             )
+            response_complete = True
+            if voice_state is not None:
+                voice_state.record_trace(trace)
+                # Bis zur Bestätigung des Playbacks gilt der Turn als laufend.
+                self._voice_ledger().defer(voice_state)
             if not defer_finish:
                 self._finish_turn(text, response, trace, channel_name=channel_name, agent=agent)
             return response, trace
         finally:
+            if voice_state is not None and authorized and not response_complete:
+                # Abgebrochen, bevor die Antwort fertig war: Timo hat das gesagt,
+                # es lief aber nie vollständig. Der nächste Voice-Turn übernimmt es.
+                voice_state.executed |= voice_state.started_tools
+                self._voice_ledger().mark_open(voice_state)
             if turn_started:
                 self._release_active_turn(resume_idle_cb)
 
     def record_interrupted_voice_turn(self, spoken_text: str) -> None:
         """Persistiert ausschließlich den vom Client als gespielt gemeldeten Teil."""
+        self._voice_ledger().interrupt()
         self._record_voice_prefix(spoken_text, "[unterbrochen]")
 
     def record_aborted_voice_turn(self, spoken_text: str) -> None:
         """Persistiert den gehörten Präfix, wenn die Synthese vorzeitig scheiterte."""
+        self._voice_ledger().interrupt()
         self._record_voice_prefix(spoken_text, "[abgebrochen]")
 
     def _record_voice_prefix(self, spoken_text: str, marker: str) -> None:
@@ -924,7 +1066,8 @@ class MessageHandler:
                           interrupt_check=None,
                           execution_gate: Callable[[], Awaitable[bool]] | None = None,
                           transient_user_message: bool = False,
-                          on_context_built: Callable[[object], None] | None = None
+                          on_context_built: Callable[[object], None] | None = None,
+                          voice_state: _VoiceTurnState | None = None,
                           ) -> tuple[str, list]:
         """Prompt bauen, Tools wählen, Agent laufen lassen — mit Fehler-Fallback."""
         voice_turn = channel_name == "voice" and agent is not None
@@ -934,12 +1077,46 @@ class MessageHandler:
             voice_turn and prework is not None
             and partial_text_matches_final(prework.text, text)
         )
+        carry_excluded: set[str] = set()
+        retry_grant = None
         if voice_turn:
             selection_text, inherited_context = (
                 _tool_selection_context(getattr(self, "kzg", None), text)
             )
+            ledger = self._voice_ledger()
+            now = _voice_clock()
+            open_turns = [
+                state for state in ledger.open_requests(now) if state is not voice_state
+            ]
+            if open_turns:
+                # Unerledigte Anfragen hat Timo wirklich gesagt: volle Rechte.
+                selection_text = "\n".join([*(state.text for state in open_turns), text])
+                inherited_context = False
+                for state in open_turns:
+                    carry_excluded |= state.executed | state.reflex_tools
+            if _is_voice_retry_request(text):
+                retry_grant = ledger.retry_grant(now)
         else:
             selection_text, inherited_context = text, False
+        selection_overridden = selection_text != text and not inherited_context
+        selection_overridden = selection_overridden or retry_grant is not None
+
+        def _voice_policy(names, force) -> tuple[list[str], bool]:
+            names, force = _apply_voice_tool_context_policy(
+                names, force,
+                inherited_context=inherited_context,
+            )
+            if carry_excluded:
+                own = set(_keyword_tool_selection(text)[0])
+                names = [name for name in names if name not in carry_excluded or name in own]
+            if retry_grant is not None:
+                retry_names, retry_force = retry_grant
+                names = [*names, *(name for name in retry_names if name not in names)]
+                force = bool(force or (retry_force and retry_names))
+            if voice_state is not None:
+                voice_state.granted.update(names)
+                voice_state.force = voice_state.force or force
+            return names, force
 
         async def build_context():
             if execution_gate is not None:
@@ -1016,6 +1193,9 @@ class MessageHandler:
                     raise asyncio.CancelledError
                 if voice_turn:
                     await _require_execution_gate(execution_gate)
+                if voice_state is not None:
+                    voice_state.reflex_tools.add(fast.tool)
+                    voice_state.granted.add(fast.tool)
                 result = await skills.T.execute(fast.tool, fast.args)
             except Exception as e:
                 result = f"❌ {fast.tool} fehlgeschlagen: {e}"
@@ -1057,7 +1237,10 @@ class MessageHandler:
                 return await build_context()
 
         def _keyword_selection():
-            if prework_matches and _same_normalized_transcript(prework.text, text):
+            if (
+                prework_matches and not selection_overridden
+                and _same_normalized_transcript(prework.text, text)
+            ):
                 names, force = list(prework.keyword_tools), prework.force_tools
             else:
                 # Tool-Freigaben für geänderte Teiltexte werden immer aus dem finalen
@@ -1065,10 +1248,7 @@ class MessageHandler:
                 # erhält ebenfalls ausschließlich den finalen Text.
                 names, force = _keyword_tool_selection(selection_text)
             if voice_turn:
-                return _apply_voice_tool_context_policy(
-                    names, force,
-                    inherited_context=inherited_context,
-                )
+                return _voice_policy(names, force)
             return names, force
 
         async def _timed_select():
@@ -1082,10 +1262,7 @@ class MessageHandler:
                     )
                     return _keyword_selection()
                 if voice_turn:
-                    return _apply_voice_tool_context_policy(
-                        names, force,
-                        inherited_context=inherited_context,
-                    )
+                    return _voice_policy(names, force)
                 return names, force
 
         tool_selection_task = None
@@ -1111,9 +1288,15 @@ class MessageHandler:
                 messages.append({"role": "user", "content": text})
             if voice_turn:
                 messages = _messages_with_voice_reminder(messages, text)
+            run_stream_cb = stream_cb
+            if voice_state is not None and stream_cb is not None:
+                async def run_stream_cb(event, _inner=stream_cb):
+                    if getattr(event, "kind", None) == "tool_start" and event.tool_name:
+                        voice_state.started_tools.add(event.tool_name)
+                    return await _inner(event)
             run_kwargs = dict(
                 messages=messages,
-                system=system, stream_cb=stream_cb,
+                system=system, stream_cb=run_stream_cb,
                 allowed_tools=allowed, force_tools=force_tools,
                 temperature=0.75, max_tokens=max_tokens,
             )
@@ -1148,6 +1331,8 @@ class MessageHandler:
                      channel_name: str, agent=None, meta: dict | None = None) -> None:
         """Antwort in KZG/DB persistieren, UI aktualisieren, Post-Turn-Learning starten."""
         agent = agent or self.agent
+        if channel_name == "voice":
+            self._voice_ledger().complete(user_text)
         self.kzg.add("assistant", response)
         tools_used = [t["tool"] for t in trace]
         _safe_task(ui_state.maybe_update_ui(tools_used), "ui_update")
