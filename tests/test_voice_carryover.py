@@ -659,11 +659,7 @@ def test_authorized_speculative_cancel_segment_clears_open_requests(env):
 
 
 def test_tool_from_async_selection_of_current_sentence_passes_gate(env):
-    """Runde 2/P3: Spotify kommt nur aus der Cloud-Auswahl von „lauter bitte“."""
-    async def spotify_then_cancel(kwargs):
-        assert kwargs["tool_gate"]("spotify") is None
-        raise asyncio.CancelledError
-
+    """Runde 2/P3: Spotify kommt nur aus der Cloud-Auswahl von „lauter bitte“ allein."""
     gate_result = {}
 
     async def louder(kwargs):
@@ -672,20 +668,55 @@ def test_tool_from_async_selection_of_current_sentence_passes_gate(env):
 
     async def select_async(text):
         env.selections.append(("async", text))
-        names, force = _fake_selection(text)
-        if "lauter" in text.casefold() and "spotify" not in names:
-            names.append("spotify")
-        return names, force
+        if text == "lauter bitte":
+            return ["spotify"], False
+        return _fake_selection(text)
 
     env.monkeypatch.setattr(message_handler.skills.T, "select_tools_async", select_async)
-    env.agent.behaviors.extend([spotify_then_cancel, louder])
-    assert _turn(env, "Spiel was Ruhiges auf Spotify") == "cancelled"
+    env.agent.behaviors.extend([_cancelled_before_tools, louder])
+    assert _turn(env, FIRST) == "cancelled"
 
     env.clock.now += 5
     _turn(env, "lauter bitte")
     assert "spotify" in _last_allowed(env)
     assert gate_result["spotify"] is None
     assert ("async", "lauter bitte") in env.selections
+
+
+def test_started_carried_tool_is_not_regranted_via_same_category_sentence(env):
+    """Runde 3/P2: Kategorie-Auswahl des aktuellen Satzes enthält das schon gestartete Tool."""
+    async def reminder_started_then_cancel(kwargs):
+        assert kwargs["tool_gate"]("set_reminder") is None
+        raise asyncio.CancelledError
+
+    gate_result = {}
+
+    async def calendar(kwargs):
+        gate_result["set_reminder"] = kwargs["tool_gate"]("set_reminder")
+        gate_result["get_calendar"] = kwargs["tool_gate"]("get_calendar")
+        return "Morgen nichts.", []
+
+    def productivity(text):
+        names, force = _fake_selection(text)
+        if "termine" in text.casefold():
+            # Kategorie „productivity“: Termine, Kalender UND Erinnerungen.
+            names = [*names, *(n for n in ("get_calendar", "set_reminder") if n not in names)]
+        return names, force
+
+    async def select_async(text):
+        return productivity(text)
+
+    env.monkeypatch.setattr(message_handler, "_keyword_tool_selection", productivity)
+    env.monkeypatch.setattr(message_handler.skills.T, "select_tools_async", select_async)
+    env.agent.behaviors.extend([reminder_started_then_cancel, calendar])
+    assert _turn(env, "Erinnere mich morgen um neun an Kreatin") == "cancelled"
+
+    env.clock.now += 5
+    _turn(env, "und welche Termine habe ich morgen?")
+    assert "set_reminder" not in _last_allowed(env)
+    assert gate_result["set_reminder"] is not None
+    assert "bereits" in gate_result["set_reminder"]
+    assert gate_result["get_calendar"] is None
 
 
 def test_turn_before_cancel_reported_later_does_not_become_open(env):
@@ -714,3 +745,26 @@ def test_turn_before_cancel_reported_later_does_not_become_open(env):
     env.clock.now += 2
     _turn(env, "Überblick bitte nicht zu ausführlich")
     assert "spotify" not in _last_allowed(env)
+
+
+def test_retry_does_not_regrant_executed_tool_via_current_sentence_selection(env):
+    """Runde 3/P2: auch im Retry-Kontext keine Ausnahme für bereits gelaufene Tools."""
+    gate_result = {}
+
+    async def retry(kwargs):
+        gate_result["set_reminder"] = kwargs["tool_gate"]("set_reminder")
+        return "Okay.", []
+
+    async def select_async(text):
+        if "noch mal" in text:
+            return ["set_reminder"], False
+        return _fake_selection(text)
+
+    env.monkeypatch.setattr(message_handler.skills.T, "select_tools_async", select_async)
+    env.agent.behaviors.extend([_success("set_reminder"), retry])
+    _turn(env, "Erinnere mich heute Abend um neun an Kreatin")
+
+    env.clock.now += 10
+    _turn(env, "Probier's noch mal")
+    assert "set_reminder" not in _last_allowed(env)
+    assert gate_result["set_reminder"] is not None

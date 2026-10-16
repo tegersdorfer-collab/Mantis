@@ -1223,6 +1223,9 @@ class MessageHandler:
                     carry_excluded |= state.handled_tools()
             if _is_voice_retry_request(text):
                 retry_grant = ledger.retry_grant(now)
+                if retry_grant is not None and ledger.last is not None:
+                    # Im wiederholten Turn erfolgreich gelaufene Tools.
+                    carry_excluded |= ledger.last.executed
         elif voice_turn:
             # Widerruf: kein übernommener Kontext mit vollen Rechten, keine Retry-Freigabe.
             selection_text, inherited_context = (
@@ -1254,24 +1257,30 @@ class MessageHandler:
                 inherited_context=inherited_context,
             )
             if carried:
-                own_names, own_force = _own_selection()
+                _own_names, own_force = _own_selection()
                 # force nie aus übernommenem Text oder Retry, nur aus dem aktuellen Satz.
                 force = own_force
-                if carry_excluded:
-                    names = [
-                        name for name in names
-                        if name not in carry_excluded or name in own_names
-                    ]
                 extra = sorted(retry_names | own_async)
                 names = [*names, *(name for name in extra if name not in names)]
+                # Bereits gestartete/ausgeführte Tools der übernommenen Anfragen nie
+                # erneut freigeben, auch nicht über die Auswahl des aktuellen Satzes:
+                # die liefert Kategorien (Termine ⇒ auch Erinnerungen).
+                names = [name for name in names if name not in carry_excluded]
             if voice_state is not None:
                 voice_state.granted.update(names)
                 voice_state.force = voice_state.force or force
             return names, force
 
         def _voice_tool_gate(name: str) -> str | None:
-            """Prüft beim Dispatch erneut, ob ein übernommenes Tool inzwischen lief."""
-            if carried and name not in _own_selection()[0]:
+            """Prüft beim Dispatch erneut, ob ein übernommenes Tool inzwischen lief.
+
+            Keine Ausnahme für Tools des aktuellen Satzes: dessen Auswahl ist
+            kategorienweit. Wiederholt Timo binnen 45 s ausdrücklich dasselbe,
+            bekommt das Modell die „bereits ausgeführt“-Meldung.
+            """
+            if carried:
+                if name in carry_excluded:
+                    return _voice_not_repeatable_message(name)
                 ledger = self._voice_ledger()
                 if carry_since is not None and ledger.handled_since(
                     name, carry_since, voice_state,
