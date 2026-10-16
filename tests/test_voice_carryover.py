@@ -176,6 +176,24 @@ def test_window_reflex_does_not_clear_open_carry_grant(env):
     assert "set_reminder" in _last_allowed(env)
 
 
+def test_window_stop_clears_open_requests_and_retry(env):
+    """Sol P1: „Stopp“ im Gesprächsfenster (ohne Gate) verwirft trotzdem alles."""
+    env.agent.behaviors.append(_cancelled_before_tools)
+    assert _turn(env, FIRST) == "cancelled"
+    env.agent.behaviors.append(lambda _kwargs: asyncio.sleep(0, result=("Okay.", [])))
+
+    asyncio.run(env.handler.dashboard_respond(
+        "Stopp", agent=env.agent, channel_name="voice", authorization_type="window",
+    ))
+
+    env.clock.now += 3
+    _turn(env, "Wie wird das Wetter morgen?")
+    assert "set_reminder" not in _last_allowed(env)
+    env.clock.now += 3
+    _turn(env, "Probier's noch mal")
+    assert "set_reminder" not in _last_allowed(env)
+
+
 def test_window_reflex_does_not_replace_retry_grant(env):
     env.agent.behaviors.append(_cancelled_before_tools)
     assert _turn(env, FIRST) == "cancelled"

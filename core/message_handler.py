@@ -433,15 +433,16 @@ class _VoiceTurnLedger:
     ) -> None:
         self._prune()
         state.confirmation_authorized = confirmation_authorized
+        if _is_voice_cancel_request(state.text):
+            # Widerruf auch ohne volle Autorisierung (z. B. "Stopp" im
+            # Gesprächsfenster): Verwerfen ist die sichere Richtung. Vom
+            # Adress-Check abgelehnte Segmente erreichen authorize() nie.
+            self.cancel(state.started_at)
         if not confirmation_authorized:
             return
         self.latest = state
         if state not in self.recent:
             self.recent.append(state)
-        if _is_voice_cancel_request(state.text):
-            # Widerruf erst nach bestandenem Adress-Check: nichts Abgebrochenes
-            # mehr nachholen, keine Retry-Freigabe (TV/Echo darf nichts verwerfen).
-            self.cancel(state.started_at)
         if confirmation_authorized:
             # Nur ein explizit autorisierter Turn darf bestätigen oder die alte
             # Rückfrage durch einen anderen Satz verwerfen.
