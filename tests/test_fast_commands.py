@@ -50,6 +50,13 @@ def test_lamp_brightness():
     assert _m("licht dunkler") == ("lampe", {"action": "dunkler"})
 
 
+def test_lamp_brightness_extremes_use_all_three_steps():
+    assert _m("lampe so hell wie möglich machen") == ("lampe", {"action": "heller", "schritte": 3})
+    assert _m("mach das licht ganz dunkel") == ("lampe", {"action": "dunkler", "schritte": 3})
+    assert _m("lampe maximal hell") == ("lampe", {"action": "heller", "schritte": 3})
+    assert _m("mach die lampe heller") == ("lampe", {"action": "heller"})
+
+
 # ── Positive: Roboter-Not-Stopp ───────────────────────────────────────────────
 
 def test_robot_stop():

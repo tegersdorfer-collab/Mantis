@@ -34,6 +34,9 @@ _OFF = {"aus", "ausmachen", "ausschalten", "abschalten"}
 _COLORS = {"rot": "rot", "grün": "gruen", "gruen": "gruen", "blau": "blau",
            "weiß": "weiss", "weiss": "weiss", "warmweiß": "warmweiss", "warmweiss": "warmweiss"}
 _BRIGHT = {"heller": "heller", "dunkler": "dunkler"}
+# "so hell wie möglich", "ganz dunkel", "maximal hell" → alle drei Stufen auf einmal.
+_BRIGHT_MAX = {"hell": "heller", "heller": "heller", "dunkel": "dunkler", "dunkler": "dunkler"}
+_EXTREME = {"möglich", "maximal", "maximum", "ganz", "voll", "volle", "komplett", "minimal", "minimum"}
 _CMD_VERBS = {"mach", "macht", "mache", "schalt", "schalte", "schaltet",
               "dreh", "drehe", "stell", "stelle", "setz", "setze"}
 
@@ -154,11 +157,18 @@ def match(text: str) -> FastCommand | None:
     # ── Lampe / Licht ─────────────────────────────────────────────────────────
     if w & _LAMP:
         # Nur echte Kommandos: entweder ein Kommando-Verb oder sehr kurz ("lampe an").
-        if not (w & _CMD_VERBS or len(w) <= 3):
+        wants_extreme = bool(w & _EXTREME and w & set(_BRIGHT_MAX))
+        if not (w & _CMD_VERBS or len(w) <= 3 or wants_extreme):
             return None
         for token, action in _COLORS.items():
             if token in w:
                 return FastCommand("lampe", {"action": action}, f"lampe-{action}")
+        if wants_extreme:
+            for token, action in _BRIGHT_MAX.items():
+                if token in w:
+                    return FastCommand(
+                        "lampe", {"action": action, "schritte": 3}, f"lampe-{action}-max",
+                    )
         for token, action in _BRIGHT.items():
             if token in w:
                 return FastCommand("lampe", {"action": action}, f"lampe-{action}")

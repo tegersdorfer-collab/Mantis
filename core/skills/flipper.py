@@ -40,7 +40,8 @@ _LAMP_EMOJI = {
     "lampe",
     "Steuert Timos Schreibtischlampe per Infrarot über den Flipper Zero: an/aus, heller/"
     "dunkler und Farbe (weiß, warmweiß, rot, grün, blau). Nutze dies wenn Timo das Licht "
-    "schalten, dimmen oder die Lichtfarbe ändern will. 'schritte' wiederholt heller/dunkler.",
+    "schalten, dimmen oder die Lichtfarbe ändern will. 'schritte' wiederholt heller/dunkler; 3 Stufen reichen vom Minimum zum "
+    "Maximum (\"so hell wie möglich\" = heller mit schritte=3).",
     {
         "action": {
             "type": "string",
@@ -50,7 +51,7 @@ _LAMP_EMOJI = {
         },
         "schritte": {
             "type": "integer",
-            "description": "nur für heller/dunkler: wie viele Dimm-Stufen (Standard 1, max 10)",
+            "description": "nur für heller/dunkler: wie viele Dimm-Stufen (Standard 1, max 3 = volle Helligkeit bzw. ganz dunkel)",
         },
     },
     ["action"],
@@ -63,7 +64,8 @@ async def _lampe(action: str, schritte: int = 1):
                 f"weiss, warmweiss, rot, gruen, blau.")
     reps = 1
     if sig in ("heller", "dunkler"):
-        reps = max(1, min(10, int(schritte or 1)))
+        # Die Lampe hat nur drei Stufen; mehr Signale kosten nur Zeit.
+        reps = max(1, min(3, int(schritte or 1)))
     try:
         for i in range(reps):
             await MANAGER.send_named("schreibtischlampe", sig)
