@@ -7,8 +7,8 @@ import {
 import * as speakerEnrollment from './speaker-enrollment';
 
 describe('speaker enrollment helpers', () => {
-  it('liefert sechs deutsche Übungssätze mit englischen Fachwörtern', () => {
-    expect(SPEAKER_ENROLLMENT_PROMPTS).toHaveLength(6);
+  it('liefert zwölf deutsche Übungssätze mit englischen Fachwörtern', () => {
+    expect(SPEAKER_ENROLLMENT_PROMPTS).toHaveLength(12);
     const text = SPEAKER_ENROLLMENT_PROMPTS.join(' ').toLowerCase();
     expect(text).toContain('backend');
     expect(text).toContain('api');

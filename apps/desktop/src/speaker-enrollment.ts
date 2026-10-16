@@ -1,13 +1,21 @@
 import { authenticatedFetch } from './api-auth';
 import { getBaseUrl } from './config';
 
+// Zwölf längere Sätze: der Server verlangt mindestens 20 s erkannte Sprache,
+// sechs kurze Sätze kamen nur auf rund 10 s.
 export const SPEAKER_ENROLLMENT_PROMPTS = [
-  'Mantis, bitte starte den Kalender und prüfe meine Termine für morgen.',
-  'Ich möchte heute den aktuellen Status des Backend-Servers und der API sehen.',
-  'Erstelle eine kurze Zusammenfassung vom letzten Meeting und speichere sie im Dashboard.',
-  'Vergleiche die Ergebnisse aus dem letzten Deployment mit dem aktuellen Build.',
+  'Mantis, wie wird das Wetter morgen in Nürnberg? Ich will wissen, ob ich mit dem Fahrrad zum Gym fahren kann.',
+  'Erinnere mich heute Abend um neun daran, mein Kreatin zu nehmen und die Wäsche aus der Maschine zu holen.',
+  'Mach das Licht im Wohnzimmer etwas dunkler und spiel irgendwas Ruhiges auf Spotify, aber nicht zu laut.',
+  'Was steht diese Woche noch alles an? Gib mir einen kurzen Überblick, bitte nicht zu ausführlich.',
+  'Ich möchte heute den aktuellen Status des Backend-Servers und der API sehen, am besten mit den letzten Fehlern.',
+  'Vergleiche die Ergebnisse aus dem letzten Deployment mit dem aktuellen Build und sag mir, was sich geändert hat.',
+  'Trag mein Training von heute ein: Bankdrücken, drei Sätze mit achtzig Kilo, und danach noch Klimmzüge.',
   'Suche im Knowledge Graph nach meinen Notizen zu Voice Barge-in und Speaker Verification.',
-  'Wenn der Streaming-Client die Verbindung verliert, prüfe zuerst das Log und starte den Service danach erneut.',
+  'Wenn der Streaming-Client die Verbindung verliert, prüfe zuerst das Log und starte den Service danach neu.',
+  'Stopp, warte mal kurz. Das meinte ich gar nicht, ich wollte eigentlich wissen, wann mein nächster Termin ist.',
+  'Schreib mir eine kurze Notiz: Morgen früh beim Bäcker vorbei, Paket bei der Post abholen und Mama anrufen.',
+  'Okay, danke dir. Das reicht erstmal, wir machen später weiter, wenn ich vom Training zurück bin.',
 ];
 
 const TARGET_SAMPLE_RATE = 16_000;
