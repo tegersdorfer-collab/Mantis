@@ -46,7 +46,9 @@ VOICE_RESPONSE_INSTRUCTIONS = (
     "Uhrzeiten, Dezimalzahlen und Einheiten vollständig in Wörtern und im grammatisch passenden Kasus: "
     "„vom zwölften auf den dreizehnten Oktober“, „zehn Komma vier Stunden“, „acht Uhr dreißig“ und "
     "„dreiundfünfzig Schläge pro Minute“. Englische Fachbegriffe schreibst du in normaler Schreibweise. "
-    "Bei viel Inhalt nenne nur die wichtigste Aussage und biete an, mehr dazu zu sagen."
+    "Bei viel Inhalt nenne nur die wichtigste Aussage und biete an, mehr dazu zu sagen. "
+    "Behaupte nie, eine Aktion versucht oder ausgeführt zu haben, wenn in diesem Turn kein "
+    "entsprechender Tool-Aufruf stattfand."
 )
 VOICE_USER_REMINDER = (
     "[Sprachmodus: höchstens drei kurze gesprochene Sätze, keine Aufzählungen; "
@@ -183,6 +185,52 @@ def _is_voice_cancel_request(text: str) -> bool:
     return _VOICE_CANCEL_RE.search(" ".join(_voice_words(text))) is not None
 
 
+_VOICE_CONFIRM_TTL = 90.0
+_VOICE_CONFIRM_CORE = frozenset({
+    "ja", "jo", "jap", "jawohl", "mach", "mache", "machs", "okay", "ok", "genau",
+    "bestätige", "bestaetige", "passt", "klar", "los", "gerne", "gern", "yes",
+})
+_VOICE_CONFIRM_FILLERS = _VOICE_CONFIRM_CORE | frozenset({
+    "bitte", "das", "es", "s", "mal", "ich", "ausdrücklich", "ausdruecklich",
+    "doch", "dann", "ruhig", "alles", "jetzt", "sicher", "natürlich", "natuerlich",
+})
+# Behauptete Aktion ohne Tool-Aufruf (nur Log, kein Umschreiben).
+_VOICE_ACTION_CLAIM_RE = re.compile(
+    r"\b(?:habe|hab)\b[^.!?]{0,80}?\b(?:versucht|ausgeführt|gesetzt|eingeschaltet|"
+    r"ausgeschaltet|gestartet|erledigt|abgespielt|eingestellt|angelegt|erstellt|"
+    r"gelöscht|gespeichert|gedimmt)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_voice_confirmation(text: str) -> bool:
+    """Kurze Zustimmung („ja“, „mach das“, „ich bestätige es ausdrücklich“)."""
+    words = _voice_words(text)
+    if not words or len(words) > 6 or _is_voice_cancel_request(text):
+        return False
+    return (
+        all(word in _VOICE_CONFIRM_FILLERS for word in words)
+        and any(word in _VOICE_CONFIRM_CORE for word in words)
+    )
+
+
+def _voice_call_summary(name: str, args) -> str:
+    try:
+        rendered = json.dumps(args or {}, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        rendered = str(args)
+    return f"{name}({rendered[:200]})"
+
+
+def _voice_confirmation_message(name: str, args) -> str:
+    return (
+        f"FEHLER: Tool '{name}' braucht eine kurze Bestätigung des Nutzers und wurde "
+        f"nicht ausgeführt ({_voice_call_summary(name, args)}). Frage den Nutzer in EINEM "
+        "kurzen Satz konkret, ob du diese Aktion(en) jetzt ausführen sollst. Behaupte "
+        "nicht, es versucht oder ausgeführt zu haben, und nicht, es sei nicht verfügbar."
+    )
+
+
 def _voice_not_repeatable_message(name: str) -> str:
     return (
         f"FEHLER: Tool '{name}' wurde für diese Anfrage bereits ausgeführt oder "
@@ -203,6 +251,9 @@ class _VoiceTurnState:
     started_tools: set[str] = field(default_factory=set)
     executed: set[str] = field(default_factory=set)
     reflex_tools: set[str] = field(default_factory=set)
+    # Mangels Freigabe blockierte Aufrufe (Name, Argumente) → ausstehende Bestätigung.
+    blocked_calls: list[tuple[str, dict]] = field(default_factory=list)
+    confirmed: "_PendingConfirmation | None" = None
 
     def record_trace(self, trace) -> None:
         traced = set()
@@ -225,6 +276,17 @@ class _VoiceTurnState:
         return handled
 
 
+@dataclass(frozen=True)
+class _PendingConfirmation:
+    calls: tuple[tuple[str, dict], ...]
+    created_at: float
+    since: float
+
+    @property
+    def names(self) -> frozenset[str]:
+        return frozenset(name for name, _args in self.calls)
+
+
 class _VoiceTurnLedger:
     """Offene (abgebrochene) Anfragen und letzte Freigabe des Voice-Kanals."""
 
@@ -235,6 +297,15 @@ class _VoiceTurnLedger:
         self.latest: _VoiceTurnState | None = None
         self.last: _VoiceTurnState | None = None
         self.cancelled_at: float | None = None
+        self.pending: _PendingConfirmation | None = None
+
+    def peek_pending(self, now: float) -> _PendingConfirmation | None:
+        pending = self.pending
+        if pending is None or now - pending.created_at > _VOICE_CONFIRM_TTL:
+            return None
+        if self.cancelled_at is not None and pending.since <= self.cancelled_at:
+            return None
+        return pending
 
     def _valid(self, state: _VoiceTurnState) -> bool:
         return self.cancelled_at is None or state.started_at > self.cancelled_at
@@ -259,12 +330,18 @@ class _VoiceTurnLedger:
             # Widerruf erst nach bestandenem Adress-Check: nichts Abgebrochenes
             # mehr nachholen, keine Retry-Freigabe (TV/Echo darf nichts verwerfen).
             self.cancel(state.started_at)
+        # Ausstehende Bestätigung: Zustimmung verbraucht sie, jeder andere
+        # autorisierte Satz verwirft sie (ein spätes „ja“ löst nichts Altes aus).
+        if _is_voice_confirmation(state.text):
+            state.confirmed = self.peek_pending(_voice_clock())
+        self.pending = None
 
     def cancel(self, at: float) -> None:
         """Widerruf: offene Anfragen und Retry-Freigabe verfallen, auch spätere Meldungen."""
         self.cancelled_at = at
         self.open.clear()
         self.last = None
+        self.pending = None
 
     def open_requests(self, now: float) -> list[_VoiceTurnState]:
         self.open = [
@@ -298,6 +375,13 @@ class _VoiceTurnLedger:
     def ran(self, state: _VoiceTurnState) -> None:
         """Agent-Lauf regulär beendet; das Playback-Ende kommt evtl. nie."""
         state.agent_done = True
+        if state.blocked_calls and self._valid(state):
+            # Das Modell hat nach Bestätigung gefragt; nur der jüngste Turn zählt.
+            self.pending = _PendingConfirmation(
+                calls=tuple(state.blocked_calls),
+                created_at=_voice_clock(),
+                since=state.started_at,
+            )
         if not state.reflex_tools:
             # Ein LLM-Turn hat die übernommenen Anfragen bearbeitet.
             self.open.clear()
@@ -346,6 +430,20 @@ class _VoiceTurnLedger:
             return None
         names = [name for name in sorted(last.granted) if name not in last.executed]
         return names, last.started_at
+
+
+def _log_voice_claim_without_tool(user_text: str, response, trace) -> None:
+    """Nur Log: Antwort behauptet eine Aktion, obwohl kein Tool aufgerufen wurde."""
+    if trace or not _VOICE_ACTION_CLAIM_RE.search(str(response or "")):
+        return
+    log.warning("Voice-Antwort behauptet Aktion ohne Tool-Aufruf")
+    try:
+        db.log_event(
+            "voice_claim_without_tool", str(response)[:300],
+            {"user_text": str(user_text)[:300]},
+        )
+    except Exception as exc:
+        log.debug("voice_claim_without_tool nicht geloggt (%s)", type(exc).__name__)
 
 
 def _accepts_kwarg(func, name: str) -> bool:
@@ -1138,6 +1236,7 @@ class MessageHandler:
             )
             response_complete = True
             if voice_state is not None:
+                _log_voice_claim_without_tool(text, response, trace)
                 voice_state.record_trace(trace)
                 # Agent-Lauf fertig: übernommene Anfragen sind bearbeitet, auch wenn
                 # das Playback danach unterbrochen wird oder nie ein Ende meldet.
@@ -1205,6 +1304,12 @@ class MessageHandler:
         carry_excluded: set[str] = set()
         carry_since: float | None = None
         retry_grant = None
+        confirm_pending: _PendingConfirmation | None = None
+        if voice_turn and _is_voice_confirmation(text):
+            confirm_pending = (
+                voice_state.confirmed if voice_state is not None and voice_state.confirmed
+                else self._voice_ledger().peek_pending(_voice_clock())
+            )
         if voice_turn and not _is_voice_cancel_request(text):
             selection_text, inherited_context = (
                 _tool_selection_context(getattr(self, "kzg", None), text)
@@ -1235,7 +1340,13 @@ class MessageHandler:
             selection_text, inherited_context = text, False
         retry_names = frozenset(retry_grant[0]) if retry_grant is not None else frozenset()
         retry_since = retry_grant[1] if retry_grant is not None else None
-        carried = carry_since is not None or retry_grant is not None
+        confirm_names = (
+            confirm_pending.names if confirm_pending is not None else frozenset()
+        )
+        carried = (
+            carry_since is not None or retry_grant is not None
+            or confirm_pending is not None
+        )
         selection_overridden = carried
         own_cache: list[tuple[frozenset[str], bool]] = []
         # Tools, die die Cloud-Auswahl allein für den aktuellen Satz liefert.
@@ -1260,7 +1371,7 @@ class MessageHandler:
                 _own_names, own_force = _own_selection()
                 # force nie aus übernommenem Text oder Retry, nur aus dem aktuellen Satz.
                 force = own_force
-                extra = sorted(retry_names | own_async)
+                extra = sorted(retry_names | own_async | confirm_names)
                 names = [*names, *(name for name in extra if name not in names)]
                 # Bereits gestartete/ausgeführte Tools der übernommenen Anfragen nie
                 # erneut freigeben, auch nicht über die Auswahl des aktuellen Satzes:
@@ -1293,9 +1404,27 @@ class MessageHandler:
                     and ledger.handled_since(name, retry_since, voice_state, strict=True)
                 ):
                     return _voice_not_repeatable_message(name)
+                if confirm_pending is not None and name in confirm_names:
+                    # Bestätigung muss bei der Autorisierung dieses Turns noch
+                    # gegolten haben (nicht von einem parallelen „ja“ verbraucht).
+                    if voice_state is not None and voice_state.confirmed is not confirm_pending:
+                        return _voice_not_repeatable_message(name)
+                    if ledger.handled_since(name, confirm_pending.since, voice_state):
+                        return _voice_not_repeatable_message(name)
             if voice_state is not None:
                 voice_state.started_tools.add(name)
             return None
+
+        def _voice_not_permitted(name: str, args) -> str | None:
+            """Gesperrter Aufruf → ausstehende Bestätigung statt leerer Absage."""
+            if voice_state is None:
+                return None
+            if name not in getattr(skills.T, "REGISTRY", {}):
+                return None
+            voice_state.blocked_calls.append(
+                (name, dict(args) if isinstance(args, dict) else {}),
+            )
+            return _voice_confirmation_message(name, args)
 
         async def build_context():
             if execution_gate is not None:
@@ -1357,6 +1486,9 @@ class MessageHandler:
         # ruft das Tool DIREKT, ohne LLM — 100% zuverlässig, sofort, modellunabhängig.
         # (Kleine Modelle täuschen sonst unter dem großen Prompt Erfolg vor.)
         fast = fast_commands.match_voice(text) if voice_turn else fast_commands.match(text)
+        if fast is not None and fast.tool == "voice_reflex" and confirm_pending is not None:
+            # „Okay“ ist hier eine Zustimmung, kein Reflex.
+            fast = None
         if fast is not None:
             if voice_turn:
                 await _require_execution_gate(execution_gate)
@@ -1476,6 +1608,16 @@ class MessageHandler:
                 )
             if voice_turn:
                 system += "\n\n" + VOICE_RESPONSE_INSTRUCTIONS
+            if confirm_pending is not None:
+                calls = "\n".join(
+                    f"- {_voice_call_summary(name, args)}"
+                    for name, args in confirm_pending.calls
+                )
+                system += (
+                    "\n\n## Bestätigte Aktionen\n"
+                    "Der Nutzer hat gerade bestätigt. Führe jetzt genau diese Tool-Aufrufe "
+                    "aus und berichte danach nur, was die Tools zurückgeben:\n" + calls
+                )
             messages = self.kzg.recent_messages(max_tokens=3000)
             if transient_user_message:
                 messages.append({"role": "user", "content": text})
@@ -1499,6 +1641,8 @@ class MessageHandler:
                 run_kwargs["execution_gate"] = execution_gate
             if voice_state is not None and _accepts_kwarg(agent.run, "tool_gate"):
                 run_kwargs["tool_gate"] = _voice_tool_gate
+            if voice_state is not None and _accepts_kwarg(agent.run, "not_permitted_cb"):
+                run_kwargs["not_permitted_cb"] = _voice_not_permitted
             if voice_turn and interrupt_check is not None and interrupt_check():
                 raise asyncio.CancelledError
             if tool_selection_task is not None:
