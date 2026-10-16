@@ -191,20 +191,30 @@ class Orchestrator:
         await self.msg_handler.handle(msg, resume_idle_cb=self.idle_loop.resume)
 
     async def dashboard_respond(
-        self, text: str, stream_cb=None, channel_name: str = "web"
+        self, text: str, stream_cb=None, channel_name: str = "web",
+        conversation_id: str | None = None,
     ) -> tuple[str, list]:
+        text_followup_key = None
+        if channel_name == "web" and conversation_id:
+            text_followup_key = ("web", str(conversation_id))
         return await self.msg_handler.dashboard_respond(
             text, stream_cb, channel_name=channel_name,
             resume_idle_cb=self.idle_loop.resume,
+            text_followup_key=text_followup_key,
         )
 
     async def prepare_voice_turn(self, text: str):
         """Bereitet Kontext und lokale Tool-Auswahl parallel zur Spracheingabe vor."""
         return await self.msg_handler.prepare_voice_turn(text)
 
+    def voice_confirmation_pending(self) -> bool:
+        """Der Voice-Router nutzt dies, um den Bestätigungs-Adresscheck zu erzwingen."""
+        return self.msg_handler.voice_confirmation_pending()
+
     async def voice_respond(
         self, text: str, stream_cb=None, prework=None, defer_finish: bool = False,
         interrupt_check=None, execution_gate=None, voice_turn_id: str | None = None,
+        authorization_type: str | None = None,
     ) -> tuple[str, list]:
         """Wie dashboard_respond, aber über die Voice-Variante der Cloud-Kette."""
         return await self.msg_handler.dashboard_respond(
@@ -212,6 +222,7 @@ class Orchestrator:
             resume_idle_cb=self.idle_loop.resume, prework=prework,
             defer_finish=defer_finish, interrupt_check=interrupt_check,
             execution_gate=execution_gate, voice_turn_id=voice_turn_id,
+            authorization_type=authorization_type,
         )
 
     def finish_voice_turn(

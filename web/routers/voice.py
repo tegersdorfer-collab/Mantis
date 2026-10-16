@@ -689,6 +689,7 @@ async def sende_streaming_antwort(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     playback: _PlaybackTurn | None = None,
     execution_gate: Callable[[], Awaitable[bool]] | None = None,
+    authorization_type: str | None = None,
     output_gate: _AudioOutputGate | None = None,
     defer_history: bool = False,
     wait_for_playback: bool = False,
@@ -878,6 +879,10 @@ async def sende_streaming_antwort(
                     for parameter in parameters
                 ):
                     respond_kwargs["execution_gate"] = execution_gate
+            if authorization_type is not None and _accepts_kwarg(
+                orch.voice_respond, "authorization_type",
+            ):
+                respond_kwargs["authorization_type"] = authorization_type
             if _accepts_kwarg(orch.voice_respond, "voice_turn_id"):
                 respond_kwargs["voice_turn_id"] = playback.turn_id
             reply, trace = await orch.voice_respond(text, **respond_kwargs)
@@ -1407,7 +1412,13 @@ def build_router(orch=None) -> APIRouter:
 
             if addressed and orch is not None:
                 timing_token = voice_timing.start()
-                reply, trace = await orch.voice_respond(text)
+                authorization_type = (
+                    "speaker_verified" if speaker_profile_active else "addressed"
+                )
+                respond_kwargs = {}
+                if _accepts_kwarg(orch.voice_respond, "authorization_type"):
+                    respond_kwargs["authorization_type"] = authorization_type
+                reply, trace = await orch.voice_respond(text, **respond_kwargs)
                 _mark_reflex(trace)
                 try:
                     ogg = await synthesize(reply)
@@ -1789,6 +1800,7 @@ def build_router(orch=None) -> APIRouter:
                     partial_as_final=result.get("partial_as_final", False),
                     playback=playback,
                     execution_gate=execution_gate,
+                    authorization_type=result.get("authorization_type"),
                     output_gate=output_gate,
                     defer_history=callable(getattr(orch, "finish_voice_turn", None)),
                     wait_for_playback=(
@@ -1951,12 +1963,20 @@ def build_router(orch=None) -> APIRouter:
             conversation_context = conversation_window.address_context()
             command = fast_commands.match_voice(raw_text)
             is_local_reflex = command is not None and command.tool == "voice_reflex"
+            confirmation_pending = bool(
+                orch is not None
+                and callable(getattr(orch, "voice_confirmation_pending", None))
+                and orch.voice_confirmation_pending()
+            )
             stop_reflex = _is_stop_reflex(raw_text)
             playback_or_window_active = (
                 active_playback is not None and active_playback.playback_active
             ) or conversation_window.is_active()
             wakeword_triggered = bool(result.get("wakeword_triggered"))
-            window_reflex = is_local_reflex and playback_or_window_active
+            window_reflex = (
+                is_local_reflex and playback_or_window_active
+                and not confirmation_pending
+            )
             immediate = wakeword_triggered or window_reflex
             address_mode = "wakeword" if wakeword_triggered else (
                 "window" if window_reflex else (
@@ -1964,6 +1984,17 @@ def build_router(orch=None) -> APIRouter:
                 )
             )
             result["address_check_mode"] = address_mode
+            speaker_verified = (
+                speaker_profile_active
+                and result.get("speaker_decision") in {"accepted", "early_accept"}
+            )
+            result["authorization_type"] = (
+                "wakeword" if wakeword_triggered else
+                "window" if window_reflex else
+                "stop_word" if stop_reflex else
+                "speaker_verified" if speaker_verified else
+                "speculative"
+            )
             result["address_check_ms"] = None
             wakeword_hint = bool(
                 result.get("wakeword_hint") or has_voice_wakeword_hint(raw_text)
@@ -1990,6 +2021,8 @@ def build_router(orch=None) -> APIRouter:
 
             async def call_voice_response():
                 kwargs = {}
+                if _accepts_kwarg(orch.voice_respond, "authorization_type"):
+                    kwargs["authorization_type"] = result["authorization_type"]
                 if prework is not None:
                     kwargs["prework"] = prework
                 if execution_gate is not None:

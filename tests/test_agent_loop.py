@@ -559,8 +559,8 @@ def test_tool_gate_runs_after_execution_gate_and_blocks_dispatch(echo_tool):
         order.append("execution_gate")
         return True
 
-    def tool_gate(name):
-        order.append(f"tool_gate:{name}")
+    def tool_gate(name, args):
+        order.append(f"tool_gate:{name}:{sorted(args)}")
         return "FEHLER: bereits ausgeführt" if name == "echo" else None
 
     _, trace = asyncio.run(Agent(be).run(
@@ -570,4 +570,19 @@ def test_tool_gate_runs_after_execution_gate_and_blocks_dispatch(echo_tool):
     assert executed == []
     assert trace[0]["result"] == "FEHLER: bereits ausgeführt"
     assert trace[1]["result"] == "42"
-    assert order[:2] == ["execution_gate", "tool_gate:echo"]
+    assert order[:2] == ["execution_gate", "tool_gate:echo:['text']"]
+
+
+def test_not_permitted_callback_replaces_message_and_receives_args(echo_tool):
+    seen = []
+
+    def callback(name, args):
+        seen.append((name, args))
+        return "FEHLER: Bestätigung nötig"
+
+    be = FakeBackend([("", [_tc("echo", {"text": "x"})]), ("Done", [])])
+    _, trace = asyncio.run(Agent(be).run(
+        [], system="s", allowed_tools=["calculate"], not_permitted_cb=callback,
+    ))
+    assert seen == [("echo", {"text": "x"})]
+    assert trace[0]["result"] == "FEHLER: Bestätigung nötig"

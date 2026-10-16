@@ -61,7 +61,9 @@ class TestVoiceSegmentEndpoint:
         assert body["addressed"] is True
         assert body["reply"] == "Dein Schlaf war gut."
         assert base64.b64decode(body["audio_b64"]) == b"FAKE_OGG_BYTES"
-        fake_orch.voice_respond.assert_awaited_once_with("Wie war mein Schlaf?")
+        fake_orch.voice_respond.assert_awaited_once_with(
+            "Wie war mein Schlaf?", authorization_type="addressed",
+        )
 
     def test_nicht_adressiert_ruft_agent_nicht_auf(self):
         fake_orch = MagicMock()
@@ -188,7 +190,7 @@ class TestVoiceSegmentEndpoint:
         logged = []
         fake_orch = MagicMock()
 
-        async def reflex(_text):
+        async def reflex(_text, **_kwargs):
             voice_timing.mark_reflex()
             return "Es ist 09:07 Uhr.", [{"tool": "voice_reflex", "reflex": True}]
 

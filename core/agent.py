@@ -162,7 +162,8 @@ class Agent:
         tool_selection_task: asyncio.Future | None = None,
         interrupt_check: Callable[[], bool] | None = None,
         execution_gate: Callable[[], Awaitable[bool]] | None = None,
-        tool_gate: Callable[[str], str | None] | None = None,
+        tool_gate: Callable[[str, dict], str | None] | None = None,
+        not_permitted_cb: Callable[[str, dict], str | None] | None = None,
     ) -> tuple[str, list[dict]]:
         """
         Führt den ReAct-Loop aus.
@@ -174,6 +175,8 @@ class Agent:
 
         tool_gate: letzte Prüfung direkt vor der Ausführung (nach dem Execution-Gate);
         liefert eine Sperrmeldung oder None.
+        not_permitted_cb: liefert für nicht freigegebene Tools eine eigene Meldung
+        (z. B. Bestätigungs-Rückfrage im Voice-Kanal) oder None für die Standardmeldung.
         """
         norm: list[dict] = []
         for m in messages:
@@ -322,12 +325,15 @@ class Agent:
                         args = {}
                 BUS.emit("tool", f"🔧 {name}", detail=_short(args) or None)
                 if name not in permitted_tools:
-                    result = _not_permitted_message(name)
+                    custom = (
+                        not_permitted_cb(name, args) if not_permitted_cb is not None else None
+                    )
+                    result = custom or _not_permitted_message(name)
                 elif dry_run_tools:
                     result = f"[Eval-Dry-Run] Tool '{name}' würde ausgeführt (Argumente akzeptiert)."
                 else:
                     await require_execution_permission()
-                    blocked = tool_gate(name) if tool_gate is not None else None
+                    blocked = tool_gate(name, args) if tool_gate is not None else None
                     if blocked is not None:
                         result = blocked
                     else:
