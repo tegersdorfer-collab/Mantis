@@ -33,7 +33,7 @@ import config
 HERE = Path(__file__).parent
 RESULTS = HERE / "results"
 OR_URL = "https://openrouter.ai/api/alpha/decisions"
-JEV_MODEL = "~typesafe/jev-latest"
+JEV_MODEL = jevkit.PINNED.openrouter_id
 CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts"
 # Puffer über der Modellgröße für den RAM-Guard (frei+inaktiv aus vm_stat).
 RAM_MARGIN_MB = int(os.environ.get("BENCH_RAM_MARGIN_MB", "2048"))
@@ -81,8 +81,8 @@ def _post_json(url: str, token: str, body: dict) -> tuple[dict, float]:
     raise RuntimeError("unreachable")
 
 
-def jev_call(key: str, state, questions: dict) -> tuple[dict, float]:
-    body = {"model": JEV_MODEL, "state": state, "questions": questions}
+def jev_call(key: str, state, questions: dict, model: str = JEV_MODEL) -> tuple[dict, float]:
+    body = {"model": model, "state": state, "questions": questions}
     return _post_json(OR_URL, key, body)
 
 
@@ -335,6 +335,7 @@ async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--jev-backend", choices=("openrouter", "clef", "clef-flash"), default="openrouter",
                     help="Decision-Backend für Jev; Cloudflare-Backends benötigen --tag")
+    ap.add_argument("--model", default=JEV_MODEL, help="OpenRouter-Modell-ID (Standard: jevkit-Pin)")
     ap.add_argument("--local", default="gemma4:e2b,qwen3.5:9b")
     ap.add_argument("--local-logits", metavar="MODELL[,MODELL]",
                     help="zusätzliche Logit-Bewertung mit diesen Ollama-Modellen")
@@ -375,7 +376,7 @@ async def main() -> None:
         if args.jev_backend == "openrouter":
             key = _load_env_key()
             backend_name = "jev"
-            decision_call = lambda state, questions: jev_call(key, state, questions)
+            decision_call = lambda state, questions: jev_call(key, state, questions, args.model)
             display_name = "Jev"
         else:
             account_id, token = _load_cloudflare_credentials()

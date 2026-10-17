@@ -225,7 +225,7 @@ class MantisSettings(BaseSettings):
     JEV_PROVIDER_CHAIN: str = ""
     TYPESAFE_API_KEY: str = ""
     OPENROUTER_API_KEY: str = ""
-    JEV_MODEL: str = "jev-latest"
+    JEV_MODEL: str = ""
     CLEF_MODEL: str = "clef-flash"
     CLOUDFLARE_ACCOUNT_ID: str = ""
     CLOUDFLARE_AUTH_TOKEN: str = ""

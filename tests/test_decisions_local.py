@@ -179,7 +179,7 @@ def test_every_generated_question_id_sent_to_jev_matches_api_pattern(monkeypatch
     monkeypatch.setattr(decide.config, "JEV_PROVIDER", "typesafe")
     monkeypatch.setattr(decide.config, "TYPESAFE_API_KEY", "test-key")
     monkeypatch.setattr(decide.config, "OPENROUTER_API_KEY", "")
-    monkeypatch.setattr(decide.config, "JEV_MODEL", "jev-latest")
+    monkeypatch.setattr(decide.config, "JEV_MODEL", "")
     decide.reset_for_tests()
 
     questions = {
@@ -214,7 +214,7 @@ def test_every_generated_question_id_sent_to_jev_matches_api_pattern(monkeypatch
                     "confidence": 1.0,
                 }
         return httpx.Response(200, json={
-            "model": "jev-1.13", "answers": answers, "usage": {},
+            "model": "jev-1.14.0", "answers": answers, "usage": {},
         })
 
     with patch.object(decide, "_transport", httpx.MockTransport(handler)):

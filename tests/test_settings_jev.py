@@ -13,7 +13,7 @@ def test_jev_defaults_sind_aus():
     assert s.JEV_PROVIDER_CHAIN == ""
     assert s.TYPESAFE_API_KEY == ""
     assert s.OPENROUTER_API_KEY == ""
-    assert s.JEV_MODEL == "jev-latest"
+    assert s.JEV_MODEL == ""
     assert s.CLEF_MODEL == "clef-flash"
     assert s.CLOUDFLARE_ACCOUNT_ID == ""
     assert s.CLOUDFLARE_AUTH_TOKEN == ""
