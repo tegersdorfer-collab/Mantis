@@ -2,7 +2,11 @@
 
 import pytest
 
-from core.voice_text import last_complete_sentence, normalize_wakeword_transcript
+from core.voice_text import (
+    has_mantis_like_wakeword_prefix,
+    last_complete_sentence,
+    normalize_wakeword_transcript,
+)
 
 
 def test_numeric_sentence_end_keeps_the_complete_sentence():
@@ -44,6 +48,34 @@ def test_acoustic_wakeword_is_added_to_transcript_context_once():
     assert normalize_wakeword_transcript(
         "Wie spät ist es?", wakeword_triggered=True,
     ) == "Mantis, Wie spät ist es?"
+
+
+def test_second_word_mishearing_is_only_removed_after_an_introductory_word():
+    assert normalize_wakeword_transcript(
+        "Was meintest du mit Pause?", wakeword_triggered=True,
+    ) == "Mantis, Was meintest du mit Pause?"
+
+
+@pytest.mark.parametrize(
+    "introductory_word",
+    ["hey", "hallo", "ok", "okay", "äh", "ähm", "also", "yo"],
+)
+def test_second_word_mishearing_is_allowed_after_a_real_introductory_word(
+    introductory_word,
+):
+    assert normalize_wakeword_transcript(
+        f"{introductory_word}, Mentis, wie spät ist es?",
+        wakeword_triggered=True,
+    ) == f"Mantis, {introductory_word}, wie spät ist es?"
+
+
+def test_third_word_is_not_treated_as_a_wakeword_mishearing():
+    text = "Hey also Mentis, wie spät ist es?"
+
+    assert has_mantis_like_wakeword_prefix(text, max_words=3) is False
+    assert normalize_wakeword_transcript(
+        text, wakeword_triggered=True,
+    ) == "Mantis, Hey also Mentis, wie spät ist es?"
 
 
 @pytest.mark.parametrize(

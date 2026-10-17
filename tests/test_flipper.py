@@ -18,7 +18,32 @@ def _patch_tx(monkey_calls):
     async def fake_ir_tx(protocol, address, command):
         monkey_calls.append((protocol, address, command))
         return ">: "  # sauberer Prompt, kein Fehler
+    async def fake_talk_many(cmds, read_secs=2.0, gap_secs=0.12):
+        for cmd in cmds:
+            _, _, protocol, address, command = cmd.split()
+            monkey_calls.append((protocol, address, command))
+        return [">: "] * len(cmds)
+
     driver.ir_tx = fake_ir_tx  # type: ignore[assignment]
+    driver.talk_many = fake_talk_many  # type: ignore[assignment]
+
+
+def test_prompt_with_trailing_bell_ends_read():
+    """Live: Antwort endet auf '>: \\x07'; vorher wartete jedes Lesen volle 2 s."""
+    assert driver._ends_with_prompt(b"ir tx NECext EF00 FC03\r\n\r\n>: \x07")
+    assert not driver._ends_with_prompt(b"ir tx NECext EF00 FC03\r\n")
+
+
+def test_repeated_dimming_uses_one_connection():
+    sessions: list = []
+
+    async def fake_talk_many(cmds, read_secs=2.0, gap_secs=0.12):
+        sessions.append(list(cmds))
+        return [">: "] * len(cmds)
+
+    driver.talk_many = fake_talk_many  # type: ignore[assignment]
+    asyncio.run(FlipperManager().send_named_repeated("schreibtischlampe", "heller", 3))
+    assert sessions == [["ir tx NECext EF00 FF00"] * 3]
 
 
 def test_lamp_remote_is_configured():
@@ -103,3 +128,41 @@ def test_send_ir_detects_error_output():
         assert False, "sollte werfen"
     except RuntimeError:
         pass
+
+
+def test_open_flipper_app_is_closed_and_ir_resent():
+    """Live 17.10.: 'Passport' war offen, IR wurde stumm verworfen, Mantis meldete Erfolg."""
+    calls: list = []
+    talks: list = []
+    answers = iter([
+        "ir tx NECext EF00 FC03\r\nOther application is running, close it first\r\n>: ",
+        "ir tx NECext EF00 FC03\r\n>: ",
+    ])
+
+    async def fake_ir_tx(protocol, address, command):
+        calls.append((protocol, address, command))
+        return next(answers)
+
+    async def fake_talk(cmd, read_secs=2.0):
+        talks.append(cmd)
+        return ">: "
+
+    driver.ir_tx = fake_ir_tx  # type: ignore[assignment]
+    driver.talk = fake_talk  # type: ignore[assignment]
+    asyncio.run(FlipperManager().send_ir("NECext", "EF00", "FC03"))
+    assert talks == ["loader close"]
+    assert len(calls) == 2
+
+
+def test_still_blocked_flipper_app_is_reported_as_error():
+    async def fake_ir_tx(protocol, address, command):
+        return "Other application is running, close it first\r\n>: "
+
+    async def fake_talk(cmd, read_secs=2.0):
+        return ">: "
+
+    driver.ir_tx = fake_ir_tx  # type: ignore[assignment]
+    driver.talk = fake_talk  # type: ignore[assignment]
+    import pytest
+    with pytest.raises(RuntimeError, match="Other application"):
+        asyncio.run(FlipperManager().send_ir("NECext", "EF00", "FC03"))

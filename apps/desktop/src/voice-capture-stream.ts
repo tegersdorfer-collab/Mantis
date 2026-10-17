@@ -10,8 +10,11 @@ export function startVoiceCaptureStream(
   baseUrl: string,
   onSegment: (result: VoiceSegmentResult) => void,
   wsFactory: (url: string) => WebSocket = authenticatedWebSocket,
+  onClosed?: (reason: string) => void,
+  onConnected?: () => void,
 ): () => void {
   let stopped = false;
+  let connected = false;
   let stream: MediaStream | null = null;
   let audioCtx: AudioContext | null = null;
   let workletNode: AudioWorkletNode | null = null;
@@ -19,6 +22,57 @@ export function startVoiceCaptureStream(
   let currentReplyAudio: HTMLAudioElement | null = null;
   let player: StreamingAudioPlayer | null = null;
   let playbackDucked = false;
+
+  function cleanup(closeSocket: boolean): void {
+    if (stopped) return;
+    stopped = true;
+    playbackDucked = false;
+    try { player?.stop(); } catch { /* cleanup continues for the remaining resources */ }
+    player = null;
+    if (currentReplyAudio) {
+      try { currentReplyAudio.pause(); } catch { /* element may already be detached */ }
+      currentReplyAudio.onended = null;
+      currentReplyAudio.onerror = null;
+      currentReplyAudio = null;
+    }
+    if (workletNode) {
+      workletNode.port.onmessage = null;
+      try { workletNode.disconnect(); } catch { /* context may already be closed */ }
+      workletNode = null;
+    }
+    if (stream) {
+      try {
+        stream.getTracks().forEach((track) => {
+          try { track.stop(); } catch { /* continue releasing the other tracks */ }
+        });
+      } catch { /* stream may already be unavailable */ }
+      stream = null;
+    }
+    if (audioCtx) {
+      const context = audioCtx;
+      audioCtx = null;
+      try { void context.close().catch(() => {}); } catch { /* context may already be closed */ }
+    }
+    ws.onmessage = null;
+    ws.onopen = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    if (closeSocket && ws.readyState < 2) {
+      try { ws.close(); } catch { /* socket already closed */ }
+    }
+  }
+
+  function reportConnected(): void {
+    if (stopped || connected) return;
+    connected = true;
+    onConnected?.();
+  }
+
+  function reportClosed(reason: string, closeSocket: boolean): void {
+    if (stopped) return;
+    cleanup(closeSocket);
+    try { onClosed?.(reason); } catch { /* reconnect callback must not disrupt cleanup */ }
+  }
 
   function duckPlayback(): void {
     playbackDucked = true;
@@ -130,8 +184,20 @@ export function startVoiceCaptureStream(
       }));
     }
   };
-  if (ws.readyState === 1) sendeHello();
-  else ws.onopen = sendeHello;
+  ws.onclose = (event: CloseEvent) => {
+    const reason = event.reason || `WebSocket closed (${event.code})`;
+    reportClosed(reason, false);
+  };
+  ws.onerror = () => reportClosed('WebSocket error', true);
+  if (ws.readyState === 1) {
+    sendeHello();
+    reportConnected();
+  } else {
+    ws.onopen = () => {
+      sendeHello();
+      reportConnected();
+    };
+  }
 
   navigator.mediaDevices
     .getUserMedia({
@@ -162,20 +228,5 @@ export function startVoiceCaptureStream(
       // Mikrofon-Zugriff verweigert/nicht verfügbar — Voice-Capture bleibt inaktiv
     });
 
-  return () => {
-    stopped = true;
-    playbackDucked = false;
-    player?.stop();
-    player = null;
-    if (currentReplyAudio) {
-      currentReplyAudio.pause();
-      currentReplyAudio.onended = null;
-      currentReplyAudio.onerror = null;
-      currentReplyAudio = null;
-    }
-    if (workletNode) workletNode.port.onmessage = null;
-    if (stream) stream.getTracks().forEach((t) => t.stop());
-    if (audioCtx) audioCtx.close();
-    ws.close();
-  };
+  return () => cleanup(true);
 }

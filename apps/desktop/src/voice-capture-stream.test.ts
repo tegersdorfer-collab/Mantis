@@ -6,6 +6,8 @@ class FakeWebSocket {
   sent: unknown[] = [];
   onmessage: ((ev: { data: string }) => void) | null = null;
   onopen: (() => void) | null = null;
+  onclose: ((ev: CloseEvent) => void) | null = null;
+  onerror: ((ev: Event) => void) | null = null;
   readyState = 1; // OPEN
   constructor(public url: string) {
     FakeWebSocket.instances.push(this);
@@ -13,7 +15,17 @@ class FakeWebSocket {
   send(data: unknown) {
     this.sent.push(data);
   }
-  close() {}
+  close() {
+    this.readyState = 3;
+    this.onclose?.({ code: 1000, reason: '' } as CloseEvent);
+  }
+  serverClose(code = 1006, reason = '') {
+    this.readyState = 3;
+    this.onclose?.({ code, reason } as CloseEvent);
+  }
+  fail() {
+    this.onerror?.(new Event('error'));
+  }
 }
 
 describe('startVoiceCaptureStream', () => {
@@ -28,6 +40,157 @@ describe('startVoiceCaptureStream', () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(FakeWebSocket.instances[0].url).toBe('ws://localhost:7779/ws/voice/stream');
     stop();
+  });
+
+  it('reports an unexpected close exactly once and does not report an intentional stop', () => {
+    FakeWebSocket.instances = [];
+    const onClosed = vi.fn();
+    const stop = startVoiceCaptureStream(
+      'http://localhost:7779',
+      vi.fn(),
+      (url) => new FakeWebSocket(url) as unknown as WebSocket,
+      onClosed,
+    );
+    const ws = FakeWebSocket.instances[0];
+
+    ws.serverClose(1006, 'backend restarted');
+    ws.serverClose(1006, 'duplicate close');
+    stop();
+
+    expect(onClosed).toHaveBeenCalledTimes(1);
+    expect(onClosed).toHaveBeenCalledWith('backend restarted');
+  });
+
+  it('reports a connection only when the WebSocket opens and only once', () => {
+    FakeWebSocket.instances = [];
+    const onConnected = vi.fn();
+    const stop = startVoiceCaptureStream(
+      'http://localhost:7779',
+      vi.fn(),
+      (url) => {
+        const ws = new FakeWebSocket(url);
+        ws.readyState = 0;
+        return ws as unknown as WebSocket;
+      },
+      undefined,
+      onConnected,
+    );
+    const ws = FakeWebSocket.instances[0];
+
+    expect(onConnected).not.toHaveBeenCalled();
+    ws.readyState = 1;
+    ws.onopen?.();
+    ws.onopen?.();
+
+    expect(onConnected).toHaveBeenCalledTimes(1);
+    stop();
+  });
+
+  it('reports a WebSocket error once even if the socket also closes', () => {
+    FakeWebSocket.instances = [];
+    const onClosed = vi.fn();
+    startVoiceCaptureStream(
+      'http://localhost:7779',
+      vi.fn(),
+      (url) => new FakeWebSocket(url) as unknown as WebSocket,
+      onClosed,
+    );
+    const ws = FakeWebSocket.instances[0];
+
+    ws.fail();
+    ws.serverClose();
+
+    expect(onClosed).toHaveBeenCalledTimes(1);
+    expect(onClosed).toHaveBeenCalledWith('WebSocket error');
+  });
+
+  it('does not report a close caused by stop()', () => {
+    FakeWebSocket.instances = [];
+    const onClosed = vi.fn();
+    const stop = startVoiceCaptureStream(
+      'http://localhost:7779',
+      vi.fn(),
+      (url) => new FakeWebSocket(url) as unknown as WebSocket,
+      onClosed,
+    );
+
+    stop();
+
+    expect(onClosed).not.toHaveBeenCalled();
+  });
+
+  it('releases the microphone, audio contexts and streaming player after an unexpected close', async () => {
+    FakeWebSocket.instances = [];
+    const trackStop = vi.fn();
+    const originalMediaDevices = navigator.mediaDevices;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: {
+        getUserMedia: async () => ({
+          getTracks: () => [{ stop: trackStop }],
+        } as unknown as MediaStream),
+      }, configurable: true,
+    });
+
+    class FakeSource {
+      buffer: AudioBuffer | null = null;
+      onended: (() => void) | null = null;
+      stop = vi.fn();
+      connect() {}
+      start() {}
+    }
+    class FakeAudioContext {
+      static instances: FakeAudioContext[] = [];
+      state = 'running';
+      currentTime = 0;
+      destination = {};
+      source = new FakeSource();
+      gain = { gain: { value: 1 }, connect() {} };
+      audioWorklet = { addModule: async () => {} };
+      close = vi.fn(async () => {});
+      constructor() { FakeAudioContext.instances.push(this); }
+      createMediaStreamSource() { return { connect() {} }; }
+      createGain() { return this.gain as unknown as GainNode; }
+      createBufferSource() { return this.source as unknown as AudioBufferSourceNode; }
+      decodeAudioData() { return Promise.resolve({ duration: 1 } as AudioBuffer); }
+      resume() { return Promise.resolve(); }
+    }
+    const workletDisconnect = vi.fn();
+    class FakeWorkletNode {
+      port = { onmessage: null as ((event: MessageEvent<ArrayBuffer>) => void) | null };
+      connect() {}
+      disconnect = workletDisconnect;
+    }
+    vi.stubGlobal('AudioContext', FakeAudioContext);
+    vi.stubGlobal('AudioWorkletNode', FakeWorkletNode);
+    try {
+      const onClosed = vi.fn();
+      startVoiceCaptureStream(
+        'http://localhost:7779', vi.fn(),
+        (url) => new FakeWebSocket(url) as unknown as WebSocket,
+        onClosed,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const ws = FakeWebSocket.instances[0];
+      ws.onmessage?.({ data: JSON.stringify({
+        type: 'audio_chunk', seq: 0, block_id: 'turn:0', b64: btoa('audio'),
+      }) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      ws.serverClose(1006, 'backend restarted');
+
+      expect(trackStop).toHaveBeenCalledTimes(1);
+      expect(workletDisconnect).toHaveBeenCalledTimes(1);
+      expect(FakeAudioContext.instances).toHaveLength(2);
+      expect(FakeAudioContext.instances.every((context) => context.close.mock.calls.length === 1))
+        .toBe(true);
+      expect(FakeAudioContext.instances[1].source.stop).toHaveBeenCalledTimes(1);
+      expect(onClosed).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: originalMediaDevices, configurable: true,
+      });
+    }
   });
 
   it('forwards segment_result messages to onSegment', () => {

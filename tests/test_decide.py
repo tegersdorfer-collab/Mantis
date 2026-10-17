@@ -232,7 +232,7 @@ def test_request_validation_error_does_not_open_jev_provider_cooldown(monkeypatc
     with patch.object(decide, "_transport", _transport(handler)):
         for _ in range(2):
             with pytest.raises(JevUnavailable):
-                asyncio.run(decide.decide("state", {"cat:fitness": Noul("Frage?")}))
+                asyncio.run(decide.decide("state", {"cat.fitness": Noul("Frage?")}))
 
     assert calls == ["api.typesafe.ai", "api.typesafe.ai"]
     assert decide._down_until["typesafe"] <= 20.0

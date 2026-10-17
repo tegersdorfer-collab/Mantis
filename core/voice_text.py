@@ -16,9 +16,44 @@ _ABBREVIATION_BEFORE_PERIOD = re.compile(
 )
 _ACOUSTIC_WAKEWORD_PREFIX = re.compile(
     r"^\s*(?:meintest|mehr[\s-]+das|mertes|mantasy|bantas|mann[\s-]+das|"
-    r"mentiones|mendes|mandis|mentis|mantas|mantis)\b[\s,;:!?-]*(?P<rest>.*)$",
+    r"mentiones|mendes|mandis|mentis|mantas|mantis)\b[\s,;:.!?-]*(?P<rest>.*)$",
     re.IGNORECASE,
 )
+_INITIAL_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+_WAKEWORD_INTRODUCTIONS = frozenset({
+    "hey", "hallo", "ok", "okay", "äh", "ähm", "also", "yo",
+})
+
+
+def _wakeword_prefix_parts(text: str, *, max_words: int = 2):
+    value = str(text or "").strip()
+    words = list(_INITIAL_WORD.finditer(value))
+    for index, word in enumerate(words[:min(max_words, 2)]):
+        if (
+            index > 0
+            and words[index - 1].group().casefold() not in _WAKEWORD_INTRODUCTIONS
+        ):
+            continue
+        match = _ACOUSTIC_WAKEWORD_PREFIX.match(value[word.start():])
+        if match is not None:
+            return (
+                word.start(),
+                word.start() + match.start("rest"),
+                match.group("rest"),
+            )
+    return None
+
+
+def has_mantis_like_wakeword_prefix(text: str, *, max_words: int = 2) -> bool:
+    """Erkennt ein normalisierbares Mantis-Wort in den ersten zwei STT-Wörtern."""
+    return _wakeword_prefix_parts(text, max_words=max_words) is not None
+
+
+def has_exact_initial_mantis(text: str) -> bool:
+    """Prüft nur das erste STT-Wort auf das exakt erkannte Wort „Mantis“."""
+    words = _INITIAL_WORD.finditer(str(text or "").strip())
+    first_word = next(words, None)
+    return first_word is not None and first_word.group().casefold() == "mantis"
 
 
 def normalize_wakeword_transcript(text: str, *, wakeword_triggered: bool) -> str:
@@ -29,10 +64,13 @@ def normalize_wakeword_transcript(text: str, *, wakeword_triggered: bool) -> str
     value = raw.strip()
     if not value:
         return value
-    match = _ACOUSTIC_WAKEWORD_PREFIX.match(value)
-    if match is not None:
-        rest = match.group("rest").strip()
-        return f"Mantis, {rest}" if rest else "Mantis"
+    parts = _wakeword_prefix_parts(value)
+    if parts is not None:
+        start, _rest_start, raw_rest = parts
+        before = value[:start].strip()
+        rest = raw_rest.strip()
+        content = " ".join(part for part in (before, rest) if part)
+        return f"Mantis, {content}" if content else "Mantis"
     return f"Mantis, {value}"
 
 
