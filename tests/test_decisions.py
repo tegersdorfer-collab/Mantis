@@ -75,8 +75,9 @@ def test_ui_action_separates_goal_from_foreign_elements():
     assert state[jevkit.SOURCE_KEY] == jevkit.THIRD_PARTY_CONTENT
     assert "Öffne die Einstellungen" not in state["untrusted_text"]
     assert "Delete all" in state["untrusted_text"] and '"goal"' not in state["untrusted_text"]
-    assert state["nutzerziel"] == "Öffne die Einstellungen"
-    assert "nutzerziel_hinweis" in state
+    assert state["agent_ziel"]["untrusted_text"] == "Öffne die Einstellungen"
+    assert jevkit.SOURCE_KEY not in state["agent_ziel"]
+    assert "unverifiziert" in state["agent_ziel_hinweis"]
 
 
 def test_ui_action_returns_safe_choice_at_configured_confidence():

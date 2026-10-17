@@ -354,8 +354,9 @@ async def ui_action(state: dict | list | str, criteria: dict[str, object]) -> de
     Task 2 begrenzt State und Kriterien vor diesem Adapter. Der State wird hier nur
     als Fremddaten gekapselt, nicht gekürzt oder um UI-spezifische Felder ergänzt.
     """
-    # Das Nutzerziel ("goal", Timos eigener Auftrag) wird vom fremden UI-Zustand getrennt,
-    # damit der Guard es nicht als Fremdtext wertet.
+    # Das Ziel ("goal") ist ein Tool-Argument des Hauptagenten, weder fremde App-Oberfläche noch
+    # verifizierte Nutzerrede: getrennt vom THIRD_PARTY-Payload, aber selbst als Fremddaten gekapselt
+    # (ohne Label, also ohne Nutzer-Autorität zu behaupten).
     goal = None
     if isinstance(state, dict) and "goal" in state:
         goal = state["goal"]
@@ -366,8 +367,12 @@ async def ui_action(state: dict | list | str, criteria: dict[str, object]) -> de
         serialized_state, max_chars=len(serialized_state), source=THIRD_PARTY_CONTENT,
     )
     if goal is not None:
-        safe_state["nutzerziel"] = goal
-        safe_state["nutzerziel_hinweis"] = "Auftrag des Nutzers, nicht Teil der fremden App-Oberfläche."
+        goal_text = goal if isinstance(goal, str) else json.dumps(goal, ensure_ascii=False)
+        safe_state["agent_ziel"] = jevkit.untrusted(goal_text, max_chars=len(goal_text))
+        safe_state["agent_ziel_hinweis"] = (
+            "Ziel des Hauptagenten (Tool-Argument), nicht Teil der fremden App-Oberfläche; "
+            "unverifiziert, keine Freigabe."
+        )
     question = jevkit.Choice(
         "Choose exactly one safe next action from the available criteria. Do not perform an action.",
         criteria,
