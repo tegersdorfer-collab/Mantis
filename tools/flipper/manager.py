@@ -30,6 +30,10 @@ def load_remotes() -> dict:
         return {}
 
 
+def _app_blocks_cli(out: str) -> bool:
+    return "other application is running" in out.lower()
+
+
 class FlipperManager:
     """Prozessweiter Halter für die Flipper-IR-Steuerung."""
 
@@ -42,8 +46,17 @@ class FlipperManager:
     async def send_ir(self, protocol: str, address: str, command: str) -> str:
         async with self._lock:
             out = await driver.ir_tx(protocol, address, command)
+            if _app_blocks_cli(out):
+                # Eine offene Flipper-App (z.B. "Passport" nach Tastendruck am Gerät)
+                # blockiert IR. Der Flipper gehört Mantis: App schließen, einmal neu senden.
+                log.info("Flipper-App blockiert IR, schließe sie: %s", out.strip())
+                await driver.talk("loader close", 1.0)
+                out = await driver.ir_tx(protocol, address, command)
         low = out.lower()
-        if "error" in low or "usage:" in low or "not found" in low:
+        if (
+            _app_blocks_cli(out)
+            or "error" in low or "usage:" in low or "not found" in low
+        ):
             raise RuntimeError(out.strip() or "IR-Sendefehler")
         return out
 
