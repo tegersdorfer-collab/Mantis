@@ -979,8 +979,11 @@ def test_wakeword_hit_one_frame_before_segment_start_is_tolerated(monkeypatch):
     assert result["wakeword_decision"] == "in_segment"
 
 
-def test_stale_hit_can_be_confirmed_by_mantis_like_word_in_first_two_stt_words(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "transcript", ["Mantis, erzähl mir etwas", "MANTIS, erzähl mir etwas"],
+)
+def test_stale_hit_can_be_confirmed_by_exact_initial_mantis_in_final_stt(
+    monkeypatch, transcript,
 ):
     import core.voice_stream as voice_stream
     from core.vad import SegmentEvent
@@ -995,7 +998,7 @@ def test_stale_hit_can_be_confirmed_by_mantis_like_word_in_first_two_stt_words(
             return SegmentEvent(audio=segment_audio, duration_ms=1800)
 
     async def final_stt(_audio):
-        return "Ähm, Mentis, erzähl mir etwas", False
+        return transcript, False
 
     session = VoiceStreamSession(
         vad_segmenter=Segmenter(),
@@ -1012,11 +1015,40 @@ def test_stale_hit_can_be_confirmed_by_mantis_like_word_in_first_two_stt_words(
 
     assert result["wakeword_triggered"] is True
     assert result["wakeword_decision"] == "transcript"
-    assert result["text"] == "Mantis, Ähm, erzähl mir etwas"
+    assert result["text"] == "Mantis, erzähl mir etwas"
 
 
-def test_wakeword_hit_1200ms_before_segment_is_rejected_without_transcript_prefix(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("offset_ms", "transcript", "expected_wakeword", "expected_text", "decision"),
+    [
+        (
+            -1200.0, "Ähm, bist du jetzt bei mir mit drin oder?", False,
+            "Ähm, bist du jetzt bei mir mit drin oder?", "rejected_before_segment",
+        ),
+        (
+            -1200.0, "Meintest du jetzt mich?", False,
+            "Meintest du jetzt mich?", "rejected_before_segment",
+        ),
+        (
+            -1200.0, "Ähm, Mantis du jetzt mich?", False,
+            "Ähm, Mantis du jetzt mich?", "rejected_before_segment",
+        ),
+        (
+            -272.0, "Ähm, bist du jetzt bei mir mit drin oder?", False,
+            "Ähm, bist du jetzt bei mir mit drin oder?", "rejected_before_segment",
+        ),
+        (
+            -256.0, "Ähm, bist du jetzt bei mir mit drin oder?", True,
+            "Mantis, Ähm, bist du jetzt bei mir mit drin oder?", "in_segment",
+        ),
+    ],
+    ids=[
+        "very-stale-no-prefix", "very-stale-mishearing", "mantis-is-second-word",
+        "past-measured-margin", "inside-measured-margin",
+    ],
+)
+def test_stale_wakeword_hit_requires_exact_initial_final_transcript_and_tolerance(
+    monkeypatch, offset_ms, transcript, expected_wakeword, expected_text, decision,
 ):
     import config
     import core.voice_stream as voice_stream
@@ -1035,7 +1067,7 @@ def test_wakeword_hit_1200ms_before_segment_is_rejected_without_transcript_prefi
             )
 
     async def final_stt(_audio):
-        return "Ähm, bist du jetzt bei mir mit drin oder?", False
+        return transcript, False
 
     session = VoiceStreamSession(
         vad_segmenter=Segmenter(),
@@ -1043,10 +1075,11 @@ def test_wakeword_hit_1200ms_before_segment_is_rejected_without_transcript_prefi
         conversation_active_fn=lambda: False,
         partial_executor_available=lambda: False,
     )
-    # Endposition 1,2 s vor dem Beginn des späteren Segment-Audios.
+    # Der Treffer wird relativ zum späteren Segment-Audio gemessen.
     session._vad_samples_processed = 32_000
     segment_start_sample = 32_000 + 512 - len(segment_audio) // 2
-    session._wakeword_hits.append(WakewordHit(segment_start_sample - 19_200, 0.93))
+    offset_samples = int(offset_ms * 16)
+    session._wakeword_hits.append(WakewordHit(segment_start_sample + offset_samples, 0.93))
     monkeypatch.setattr(config, "VOICE_WAKE_PREROLL_MS", 1500, raising=False)
     monkeypatch.setattr(config, "VOICE_RECORD_SEGMENTS", True, raising=False)
     monkeypatch.setattr(voice_stream, "transcribe_pcm", final_stt)
@@ -1059,14 +1092,82 @@ def test_wakeword_hit_1200ms_before_segment_is_rejected_without_transcript_prefi
     result = asyncio.run(session.handle_chunk(vad_frame(), muted=False))
 
     assert result is not None  # als spekulativer Adress-Check weiterreichen
-    assert result["wakeword_triggered"] is False
-    assert result["text"] == "Ähm, bist du jetzt bei mir mit drin oder?"
+    assert result["wakeword_triggered"] is expected_wakeword
+    assert result["text"] == expected_text
     assert result["wakeword_score"] == 0.93
-    assert result["wakeword_hit_offset_ms"] == -1200.0
-    assert result["wakeword_decision"] == "rejected_before_segment"
+    assert result["wakeword_hit_offset_ms"] == offset_ms
+    assert result["wakeword_decision"] == decision
     assert recordings[0][1]["wakeword_score"] == 0.93
-    assert recordings[0][1]["wakeword_hit_offset_ms"] == -1200.0
-    assert recordings[0][1]["wakeword_decision"] == "rejected_before_segment"
+    assert recordings[0][1]["wakeword_hit_offset_ms"] == offset_ms
+    assert recordings[0][1]["wakeword_decision"] == decision
+
+
+def test_delayed_vad_onset_accepts_sol_preroll_repro_with_real_segmenter(monkeypatch):
+    import config
+    import core.voice_stream as voice_stream
+    from core.vad import VadSegmenter
+
+    # Der echte VadSegmenter läuft mit einem reproduzierbaren Silero-Onsetprofil;
+    # STT und der 80-ms-Weckworttreffer sind für diesen Grenzfall kontrolliert.
+    class DelayedOnsetVAD:
+        def __init__(self):
+            self.calls = 0
+
+        def speech_probability(self, _frame):
+            call = self.calls
+            self.calls += 1
+            if call < 18:  # Onset bei 576 ms, nach dem 80-ms-Weckworttreffer.
+                return 0.1
+            if call < 30:
+                return 0.9
+            return 0.1
+
+    class HitAt80ms:
+        first_positive_frame_end_sample = 1_280
+        hit_score = 0.97
+
+        def __init__(self):
+            self.calls = 0
+
+        def check(self, _frame):
+            self.calls += 1
+            return self.calls == 1
+
+    async def final_stt(_audio):
+        return "Wie spät ist es?", False
+
+    monkeypatch.setattr(config, "VOICE_SMART_TURN", False, raising=False)
+    monkeypatch.setattr(config, "VOICE_ADAPTIVE_SILENCE", False, raising=False)
+    monkeypatch.setattr(config, "VOICE_SILENCE_MS", 800, raising=False)
+    monkeypatch.setattr(config, "VOICE_WAKE_PREROLL_MS", 1500, raising=False)
+    monkeypatch.setattr(voice_stream, "transcribe_pcm", final_stt)
+    segmenter = VadSegmenter(DelayedOnsetVAD(), chunk_ms=32)
+    wakeword = HitAt80ms()
+    session = VoiceStreamSession(
+        vad_segmenter=segmenter,
+        wakeword_detector=wakeword,
+        conversation_active_fn=lambda: False,
+        partial_executor_available=lambda: False,
+    )
+    speech_frame = b"\x10\x00" * 512
+
+    async def run():
+        result = None
+        for _ in range(18 + 12 + 25):
+            result = await session.handle_chunk(speech_frame, muted=False)
+            if result is not None:
+                break
+        await session.close()
+        return result
+
+    result = asyncio.run(run())
+
+    assert wakeword.calls >= 1
+    assert result is not None
+    assert result["wakeword_triggered"] is True
+    assert result["wakeword_hit_offset_ms"] == -112.0
+    assert result["wakeword_decision"] == "in_segment"
+    assert result["wakeword_score"] == 0.97
 
 
 @pytest.mark.parametrize(
@@ -1077,13 +1178,14 @@ def test_wakeword_hit_1200ms_before_segment_is_rejected_without_transcript_prefi
             "Ähm, bist du jetzt bei mir mit drin oder?", False,
         ),
         (
-            "Ähm, Mentis, mach das Licht an",
-            "Mantis, Ähm, mach das Licht an", True,
+            "Mantis, mach das Licht an",
+            "Mantis, mach das Licht an", False,
         ),
+        ("Meintest du jetzt mich?", "Meintest du jetzt mich?", False),
     ],
-    ids=["missing-mantis-prefix", "early-mantis-mishearing"],
+    ids=["missing-mantis-prefix", "exact-prefix-is-partial-only", "partial-mishearing"],
 )
-def test_partial_stale_wakeword_requires_transcript_prefix(
+def test_partial_stale_wakeword_needs_final_transcript_confirmation(
     monkeypatch, transcript, expected_text, expected_wakeword,
 ):
     import config

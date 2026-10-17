@@ -20,12 +20,20 @@ _ACOUSTIC_WAKEWORD_PREFIX = re.compile(
     re.IGNORECASE,
 )
 _INITIAL_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+_WAKEWORD_INTRODUCTIONS = frozenset({
+    "hey", "hallo", "ok", "okay", "äh", "ähm", "also", "yo",
+})
 
 
 def _wakeword_prefix_parts(text: str, *, max_words: int = 2):
     value = str(text or "").strip()
     words = list(_INITIAL_WORD.finditer(value))
-    for word in words[:max_words]:
+    for index, word in enumerate(words[:min(max_words, 2)]):
+        if (
+            index > 0
+            and words[index - 1].group().casefold() not in _WAKEWORD_INTRODUCTIONS
+        ):
+            continue
         match = _ACOUSTIC_WAKEWORD_PREFIX.match(value[word.start():])
         if match is not None:
             return (
@@ -39,6 +47,13 @@ def _wakeword_prefix_parts(text: str, *, max_words: int = 2):
 def has_mantis_like_wakeword_prefix(text: str, *, max_words: int = 2) -> bool:
     """Erkennt ein normalisierbares Mantis-Wort in den ersten zwei STT-Wörtern."""
     return _wakeword_prefix_parts(text, max_words=max_words) is not None
+
+
+def has_exact_initial_mantis(text: str) -> bool:
+    """Prüft nur das erste STT-Wort auf das exakt erkannte Wort „Mantis“."""
+    words = _INITIAL_WORD.finditer(str(text or "").strip())
+    first_word = next(words, None)
+    return first_word is not None and first_word.group().casefold() == "mantis"
 
 
 def normalize_wakeword_transcript(text: str, *, wakeword_triggered: bool) -> str:

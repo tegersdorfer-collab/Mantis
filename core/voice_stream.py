@@ -18,7 +18,7 @@ from core import stt_runtime
 from core.vad import VadSegmenter, classify_utterance
 from core.voice_segments import record_voice_segment
 from core.voice_text import (
-    has_mantis_like_wakeword_prefix,
+    has_exact_initial_mantis,
     normalize_wakeword_transcript,
 )
 
@@ -34,10 +34,17 @@ WAKEWORD_SAFETY_MARGIN_MS = 150
 # independently per detector before dispatching full-size frames.
 VAD_FRAME_BYTES = 512 * 2  # 1024 bytes
 WAKEWORD_FRAME_BYTES = 1280 * 2  # 2560 bytes
-# Die Hit-Zeit ist auf volle 80-ms-Wakeword-Frames quantisiert. Silero puffert
-# nominal 400 ms VAD-Preroll; bei 32-ms-Frames landen davon 12 (=384 ms) im Segment.
-# Für einen echten Treffer am Rand reicht daher höchstens ein Wakeword-Frame Jitter.
-WAKEWORD_SEGMENT_START_TOLERANCE_MS = WAKEWORD_FRAME_BYTES // 2 * 1000 / SAMPLE_RATE
+# 20 echte Mantis-Erstwort-Segmente (15.–17.10.2026) wurden mit VadSegmenter und
+# Silero erneut ausgewertet: der späteste Onset lag 416 ms nach dem ersten 32-ms-
+# RMS-Frame. Bei 384 ms Preroll und einem Hit-Ende bei 80 ms bleibt das 48 ms im
+# Segment. Der Sol-Repro mit Onset bei 576 ms ergibt dagegen −112 ms; darauf kommen
+# 150 ms Reserve. Das ergibt eine Toleranz von 262 ms und öffnet die alte
+# 384-ms-Toleranz nicht wieder.
+WAKEWORD_MAX_OBSERVED_PRESEGMENT_MS = 112
+WAKEWORD_SEGMENT_START_MARGIN_MS = 150
+WAKEWORD_SEGMENT_START_TOLERANCE_MS = (
+    WAKEWORD_MAX_OBSERVED_PRESEGMENT_MS + WAKEWORD_SEGMENT_START_MARGIN_MS
+)
 _DEFAULT_PARTIAL = object()
 PARTIAL_SKIP_REASONS = (
     "busy", "budget", "interval", "no_speech", "disabled", "not_wired",
@@ -65,6 +72,8 @@ def _resolve_wakeword_decision(
     segment_start_sample: int,
     segment_end_sample: int,
     transcript: str,
+    *,
+    allow_transcript_confirmation: bool = False,
 ) -> tuple[bool, str | None]:
     if hit is None:
         return False, None
@@ -76,7 +85,7 @@ def _resolve_wakeword_decision(
         <= hit.sample_index <= segment_end_sample
     ):
         return True, "in_segment"
-    if has_mantis_like_wakeword_prefix(transcript, max_words=2):
+    if allow_transcript_confirmation and has_exact_initial_mantis(transcript):
         return True, "transcript"
     return False, "rejected_before_segment"
 
@@ -495,6 +504,7 @@ class VoiceStreamSession:
                 )
             wake_fired, wakeword_decision = _resolve_wakeword_decision(
                 wakeword_hit, segment_start_sample, segment_end_sample, raw_text,
+                allow_transcript_confirmation=True,
             )
             text = normalize_wakeword_transcript(
                 raw_text, wakeword_triggered=wake_fired,

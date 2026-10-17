@@ -306,6 +306,9 @@ def test_router_bypasses_real_wakeword_and_speculates_with_tool_and_audio_gates(
     tool_runs = []
     tts_calls = []
     logged = []
+    address_texts = []
+
+    transcript = "Erzähl mir etwas." if wakeword else "Meintest du jetzt mich?"
 
     class FakeSession:
         def __init__(self, **_kwargs):
@@ -314,7 +317,7 @@ def test_router_bypasses_real_wakeword_and_speculates_with_tool_and_audio_gates(
         async def handle_chunk(self, chunk, muted=False):
             if chunk == b"turn":
                 return {
-                    "text": "Erzähl mir etwas.", "wakeword_triggered": wakeword,
+                    "text": transcript, "wakeword_triggered": wakeword,
                     "wakeword_score": 0.93,
                     "wakeword_hit_offset_ms": 100.0 if wakeword else -1200.0,
                     "wakeword_decision": (
@@ -369,7 +372,8 @@ def test_router_bypasses_real_wakeword_and_speculates_with_tool_and_audio_gates(
             tool_runs.append("read-only-tool")
             return "Antwort.", [{"tool": "read-only-tool"}]
 
-    async def address_check(_text, **_kwargs):
+    async def address_check(text, **_kwargs):
+        address_texts.append(text)
         address_started.set()
         await release_address.wait()
         return authorized
@@ -423,6 +427,8 @@ def test_router_bypasses_real_wakeword_and_speculates_with_tool_and_audio_gates(
         detail = next(item[2] for item in logged if item[0] == "voice_latency")
         assert detail["address_check_mode"] == expected_mode
         assert detail["wakeword_score"] == 0.93
+        if not wakeword:
+            assert address_texts == [transcript]
         assert detail["wakeword_hit_offset_ms"] == (100.0 if wakeword else -1200.0)
         assert detail["wakeword_decision"] == (
             "in_segment" if wakeword else "rejected_before_segment"
