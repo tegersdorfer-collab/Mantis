@@ -23,7 +23,7 @@ def _transport(handler):
 
 def _ok_response(request):
     body = json.loads(request.content)
-    assert body["model"] == "~typesafe/jev-latest"
+    assert body["model"] == "typesafe/jev-1.14-20261014"
     assert request.headers["authorization"] == "Bearer sk-test"
     answers = {}
     for qid, q in body["questions"].items():
@@ -32,7 +32,7 @@ def _ok_response(request):
         else:
             answers[qid] = {"type": "choice", "choice": "flipper",
                             "probabilities": {"flipper": 0.9, "robot": 0.1}, "confidence": 0.88}
-    return httpx.Response(200, json={"model": "typesafe/jev-1.13", "answers": answers,
+    return httpx.Response(200, json={"model": "typesafe/jev-1.14-20261014", "answers": answers,
                                      "usage": {"input_tokens": 10, "output_tokens": 2, "cost": 0.0}})
 
 
@@ -42,7 +42,7 @@ def _enabled(monkeypatch):
     monkeypatch.setattr(decide.config, "JEV_PROVIDER", "openrouter")
     monkeypatch.setattr(decide.config, "OPENROUTER_API_KEY", "sk-test")
     monkeypatch.setattr(decide.config, "TYPESAFE_API_KEY", "")
-    monkeypatch.setattr(decide.config, "JEV_MODEL", "~typesafe/jev-latest")
+    monkeypatch.setattr(decide.config, "JEV_MODEL", "")
     decide.reset_for_tests()
 
 
@@ -52,8 +52,109 @@ def _enabled_typesafe(monkeypatch):
     monkeypatch.setattr(decide.config, "JEV_PROVIDER", "typesafe")
     monkeypatch.setattr(decide.config, "TYPESAFE_API_KEY", "sk-test")
     monkeypatch.setattr(decide.config, "OPENROUTER_API_KEY", "")
-    monkeypatch.setattr(decide.config, "JEV_MODEL", "jev-latest")
+    monkeypatch.setattr(decide.config, "JEV_MODEL", "")
     decide.reset_for_tests()
+
+
+def _enabled_provider(monkeypatch, provider, model=""):
+    monkeypatch.setattr(decide.config, "JEV_ENABLED", True)
+    monkeypatch.setattr(decide.config, "JEV_PROVIDER_CHAIN", "", raising=False)
+    monkeypatch.setattr(decide.config, "JEV_PROVIDER", provider)
+    monkeypatch.setattr(decide.config, "TYPESAFE_API_KEY", "sk-test" if provider == "typesafe" else "")
+    monkeypatch.setattr(decide.config, "OPENROUTER_API_KEY", "sk-test" if provider == "openrouter" else "")
+    monkeypatch.setattr(decide.config, "JEV_MODEL", model)
+    decide.reset_for_tests()
+
+
+@pytest.mark.parametrize(("provider", "request_model", "response_model"), [
+    ("typesafe", "jev-1.14.0", "jev-1.14.0"),
+    ("openrouter", "typesafe/jev-1.14-20261014", "typesafe/jev-1.14-20261014"),
+])
+def test_leeres_jev_model_verwendet_provider_pin(monkeypatch, provider, request_model, response_model, caplog):
+    _enabled_provider(monkeypatch, provider, "  \t")
+
+    def handler(request):
+        assert json.loads(request.content)["model"] == request_model
+        return httpx.Response(200, json={
+            "model": response_model,
+            "answers": {"q": {"type": "noul", "noul": 0.93}},
+            "usage": {},
+        })
+
+    with caplog.at_level(logging.WARNING, logger="jevkit.client"):
+        with patch.object(decide, "_transport", _transport(handler)):
+            answer = asyncio.run(decide.decide("state", {"q": Noul("Frage?")}))["q"]
+
+    assert answer.model == response_model
+    assert answer.p == 0.93
+    assert "instead of expected" not in caplog.text
+
+
+@pytest.mark.parametrize(("provider", "request_model", "response_model"), [
+    ("typesafe", "jev-1.13", "jev-1.13.0"),
+    ("openrouter", "~typesafe/jev-1.13", "typesafe/jev-1.13-20260917"),
+])
+def test_explizites_jev_model_bleibt_provider_override(monkeypatch, provider, request_model, response_model):
+    _enabled_provider(monkeypatch, provider, "~typesafe/jev-1.13")
+
+    def handler(request):
+        assert json.loads(request.content)["model"] == request_model
+        return httpx.Response(200, json={
+            "model": response_model,
+            "answers": {"q": {"type": "noul", "noul": 0.93}},
+            "usage": {},
+        })
+
+    with patch.object(decide, "_transport", _transport(handler)):
+        answer = asyncio.run(decide.decide("state", {"q": Noul("Frage?")}))["q"]
+
+    assert answer.model == response_model
+
+
+@pytest.mark.parametrize(("configured_model", "request_model"), [
+    ("jev-latest", "~typesafe/jev-latest"),
+    ("jev-1.13.0", "~typesafe/jev-1.13.0"),
+    ("~typesafe/jev-1.13.0", "~typesafe/jev-1.13.0"),
+    ("typesafe/jev-1.13.0", "typesafe/jev-1.13.0"),
+])
+def test_openrouter_jev_model_verwendet_typesafe_alias(monkeypatch, configured_model, request_model):
+    _enabled_provider(monkeypatch, "openrouter", configured_model)
+
+    def handler(request):
+        assert json.loads(request.content)["model"] == request_model
+        return httpx.Response(200, json={
+            "model": request_model,
+            "answers": {"q": {"type": "noul", "noul": 0.93}},
+            "usage": {},
+        })
+
+    with patch.object(decide, "_transport", _transport(handler)):
+        answer = asyncio.run(decide.decide("state", {"q": Noul("Frage?")}))["q"]
+
+    assert answer.model == request_model
+
+
+@pytest.mark.parametrize(("provider", "response_model"), [
+    ("typesafe", "jev-1.13.0"),
+    ("openrouter", "typesafe/jev-1.13-20260917"),
+])
+def test_antwort_von_jev_1_13_loest_modellwarnung_aus(monkeypatch, provider, response_model, caplog):
+    _enabled_provider(monkeypatch, provider)
+
+    def handler(request):
+        return httpx.Response(200, json={
+            "model": response_model,
+            "answers": {"q": {"type": "noul", "noul": 0.93}},
+            "usage": {},
+        })
+
+    with caplog.at_level(logging.WARNING, logger="jevkit.client"):
+        with patch.object(decide, "_transport", _transport(handler)):
+            answer = asyncio.run(decide.decide("state", {"q": Noul("Frage?")}))["q"]
+
+    assert answer.model == response_model
+    assert answer.p == 0.93
+    assert "instead of expected" in caplog.text
 
 
 def _enabled_chain(monkeypatch, chain="cloudflare,openrouter"):
@@ -62,7 +163,7 @@ def _enabled_chain(monkeypatch, chain="cloudflare,openrouter"):
     monkeypatch.setattr(decide.config, "JEV_PROVIDER", "typesafe")
     monkeypatch.setattr(decide.config, "TYPESAFE_API_KEY", "")
     monkeypatch.setattr(decide.config, "OPENROUTER_API_KEY", "or-test")
-    monkeypatch.setattr(decide.config, "JEV_MODEL", "~typesafe/jev-latest")
+    monkeypatch.setattr(decide.config, "JEV_MODEL", "")
     monkeypatch.setattr(decide.config, "CLEF_MODEL", "clef-flash", raising=False)
     monkeypatch.setattr(decide.config, "CLOUDFLARE_ACCOUNT_ID", "account-test", raising=False)
     monkeypatch.setattr(decide.config, "CLOUDFLARE_AUTH_TOKEN", "cf-test", raising=False)
@@ -151,7 +252,7 @@ def test_cloudflare_422_logs_full_field_errors_and_falls_back_to_openrouter(monk
                 }],
             })
         return httpx.Response(200, json={
-            "model": "typesafe/jev-1.13",
+            "model": "typesafe/jev-1.14-20261014",
             "answers": {"q": {"type": "noul", "noul": 0.91}},
             "usage": {},
         })
@@ -161,7 +262,7 @@ def test_cloudflare_422_logs_full_field_errors_and_falls_back_to_openrouter(monk
             answer = asyncio.run(decide.decide("x", {"q": Noul("Ist x?")}))["q"]
 
     assert seen == ["api.cloudflare.com", "openrouter.ai"]
-    assert answer.model == "typesafe/jev-1.13"
+    assert answer.model == "typesafe/jev-1.14-20261014"
     assert "String must contain at most 4096 characters" in caplog.text
     assert "cf-test" not in caplog.text
 
@@ -189,9 +290,9 @@ def test_cloudflare_fehler_faellt_auf_openrouter_zurueck(monkeypatch):
         if request.url.host == "api.cloudflare.com":
             return httpx.Response(503, json={"success": False, "errors": []})
         body = json.loads(request.content)
-        assert body["model"] == "~typesafe/jev-latest"
+        assert body["model"] == "typesafe/jev-1.14-20261014"
         assert request.headers["authorization"] == "Bearer or-test"
-        return httpx.Response(200, json={"model": "typesafe/jev-1.13", "answers": {
+        return httpx.Response(200, json={"model": "typesafe/jev-1.14-20261014", "answers": {
             "q": {"type": "noul", "noul": 0.91}}, "usage": {"input_tokens": 5, "output_tokens": 1}})
 
     with patch.object(decide, "_transport", _transport(h)):
@@ -199,7 +300,7 @@ def test_cloudflare_fehler_faellt_auf_openrouter_zurueck(monkeypatch):
 
     assert seen == ["api.cloudflare.com", "openrouter.ai"]
     assert answer.p == 0.91
-    assert answer.model == "typesafe/jev-1.13"
+    assert answer.model == "typesafe/jev-1.14-20261014"
 
 
 def test_provider_ohne_credentials_wird_uebersprungen(monkeypatch):
@@ -210,13 +311,13 @@ def test_provider_ohne_credentials_wird_uebersprungen(monkeypatch):
 
     def h(request):
         assert request.url.host == "openrouter.ai"
-        return httpx.Response(200, json={"model": "typesafe/jev-1.13", "answers": {
+        return httpx.Response(200, json={"model": "typesafe/jev-1.14-20261014", "answers": {
             "q": {"type": "noul", "noul": 0.91}}, "usage": {}})
 
     with patch.object(decide, "_transport", _transport(h)):
         answer = asyncio.run(decide.decide("x", {"q": Noul("Ist x?")}))["q"]
 
-    assert answer.model == "typesafe/jev-1.13"
+    assert answer.model == "typesafe/jev-1.14-20261014"
 
 
 @pytest.mark.parametrize("status", [400, 422])
@@ -271,7 +372,7 @@ def test_cloudflare_tageskontingent_cooldown_endet_um_mitternacht_utc(monkeypatc
                 ]})
             return _cloudflare_ok(request)
         calls["openrouter"] += 1
-        return httpx.Response(200, json={"model": "typesafe/jev-1.13", "answers": {
+        return httpx.Response(200, json={"model": "typesafe/jev-1.14-20261014", "answers": {
             "q": {"type": "noul", "noul": 0.91}}, "usage": {}})
 
     with patch.object(decide, "_transport", _transport(h)):
@@ -350,7 +451,7 @@ def test_leere_provider_chain_verwendet_nur_legacy_provider(monkeypatch):
     with patch.object(decide, "_transport", _transport(h)):
         answer = asyncio.run(decide.decide("x", {"q": Noul("Ist x?")}))["q"]
 
-    assert answer.model == "typesafe/jev-1.13"
+    assert answer.model == "typesafe/jev-1.14-20261014"
 
 
 def test_disabled_ohne_key(monkeypatch):
@@ -371,9 +472,9 @@ def test_direct_typesafe_backend_sendet_direct_endpoint(monkeypatch):
         body = json.loads(request.content)
         assert str(request.url) == "https://api.typesafe.ai/v1/systemone"
         assert request.headers["authorization"] == "Bearer sk-test"
-        assert body["model"] == "jev-latest"
+        assert body["model"] == "jev-1.14.0"
         return httpx.Response(200, json={
-            "model": "jev-1.13.0",
+            "model": "jev-1.14.0",
             "answers": {"q": {"type": "noul", "noul": 0.93}},
             "usage": {"input_tokens": 10, "output_tokens": 2},
         })
@@ -381,7 +482,7 @@ def test_direct_typesafe_backend_sendet_direct_endpoint(monkeypatch):
     with patch.object(decide, "_transport", _transport(h)):
         out = asyncio.run(decide.decide("x", {"q": Noul("Ist x?")}))
 
-    assert out["q"].model == "jev-1.13.0"
+    assert out["q"].model == "jev-1.14.0"
     assert out["q"].p == 0.93
 
 
@@ -403,7 +504,7 @@ def test_from_jevkit_keeps_score_probabilities():
     score = jevkit.ScoreAnswer(2.0, {"0": "low", "1": "mid", "2": "high"},
                                {"0": 0.1, "1": 0.2, "2": 0.7}, 0.6)
 
-    answer = decide.Answer.from_jevkit(score, model="jev-1.13")
+    answer = decide.Answer.from_jevkit(score, model="jev-1.14.0")
 
     assert answer.kind == "score"
     assert answer.probabilities == {"0": 0.1, "1": 0.2, "2": 0.7}

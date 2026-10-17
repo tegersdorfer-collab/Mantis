@@ -71,15 +71,14 @@ def _is_request_validation_error(error: BaseException | None) -> bool:
         return True
     return bool(re.match(r"^HTTP (?:400|422):", str(error)))
 
-# Modellpräfixe, für die die Bänder in core/decisions.py kalibriert sind. Der
-# direkte TypeSafe-Endpunkt und OpenRouter geben unterschiedliche IDs zurück.
+# Beide Anbieter liefern IDs für dieselbe jevkit-Modellversion. Je Provider
+# übersetzt das jeweilige Backend den Pin in die passende ID.
 JEV_EXPECTED_MODELS = {
     "cloudflare": str(config.CLEF_MODEL).strip() or "clef-flash",
-    "typesafe": "jev-1.13",
-    "openrouter": "typesafe/jev-1.13",
+    "typesafe": jevkit.PINNED,
+    "openrouter": jevkit.PINNED,
 }
-# Kompatibilität für bench/jev/live_path.py und externe Auswertung; der aktive
-# Präfix wird in client() providerabhängig gewählt.
+# Kompatibilität für bench/jev/live_path.py und externe Auswertung.
 JEV_EXPECTED_MODEL = JEV_EXPECTED_MODELS["typesafe"]
 
 
@@ -132,8 +131,8 @@ def provider_chain() -> list[str]:
     return [legacy] if legacy else []
 
 
-def expected_model(provider: str) -> str:
-    """Präfix, das jevkit für den gewählten Provider erwarten soll."""
+def expected_model(provider: str) -> str | jevkit.JevModel:
+    """Modellversion, die jevkit für den gewählten Provider erwarten soll."""
     if provider == "cloudflare":
         return str(config.CLEF_MODEL).strip() or "clef-flash"
     return JEV_EXPECTED_MODELS[provider]
@@ -158,16 +157,21 @@ def reset_for_tests() -> None:
 def client(provider: str | None = None, *, timeout_s: float | None = None) -> jevkit.Client:
     """Frischer Client für einen Provider; dessen Breaker-Zustand ist modulweit."""
     provider = (provider or (provider_chain() or [""])[0]).strip().lower()
+    configured_model = str(config.JEV_MODEL or "").strip()
     if provider == "typesafe":
-        model = config.JEV_MODEL.removeprefix("~typesafe/") or "jev-latest"
-        backend = jevkit.TypeSafeBackend(config.TYPESAFE_API_KEY, model=model,
-                                          transport=_transport, retries=0)
+        model = configured_model.removeprefix("~typesafe/") if configured_model else jevkit.PINNED.typesafe_id
+        backend_options = {"transport": _transport, "retries": 0}
+        if configured_model:
+            backend_options["model"] = model
+        backend = jevkit.TypeSafeBackend(config.TYPESAFE_API_KEY, **backend_options)
     elif provider == "openrouter":
-        model = config.JEV_MODEL
-        if model == "jev-latest":
-            model = "~typesafe/jev-latest"
-        backend = jevkit.OpenRouterBackend(config.OPENROUTER_API_KEY, model=model,
-                                           transport=_transport, retries=0)
+        model = configured_model or jevkit.PINNED.openrouter_id
+        backend_options = {"transport": _transport, "retries": 0}
+        if configured_model:
+            if not model.startswith(("~typesafe/", "typesafe/")):
+                model = f"~typesafe/{model}"
+            backend_options["model"] = model
+        backend = jevkit.OpenRouterBackend(config.OPENROUTER_API_KEY, **backend_options)
     elif provider == "cloudflare":
         model = str(config.CLEF_MODEL).strip() or "clef-flash"
         backend = CloudflareBackend(

@@ -93,6 +93,14 @@ class TestEntscheidung:
         assert isinstance(calls[0][0], dict)
         assert "untrusted_text" in calls[0][0]
 
+    def test_state_label_nach_task_source(self):
+        timo = jev_gate._state({**_task(), "source": "timo"})
+        roadmap = jev_gate._state({**_task(), "source": "roadmap"})
+        fehlt = jev_gate._state(_task())
+        assert timo[jevkit.SOURCE_KEY] == jevkit.USER_UTTERANCE
+        assert jevkit.SOURCE_KEY not in roadmap
+        assert jevkit.SOURCE_KEY not in fehlt
+
     def test_unsicherer_mode_faellt_auf_plan_zurueck(self, monkeypatch):
         _enable(monkeypatch)
 

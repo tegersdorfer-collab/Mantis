@@ -44,6 +44,42 @@ def _jev_down(state, questions):
     raise local_decide.LocalDecisionUnavailable("aus")
 
 
+def test_voice_address_state_separates_context(monkeypatch):
+    calls = []
+
+    async def jev(state, questions):
+        calls.append((state, questions))
+        return {"voice_address": _noul(0.97), jevkit.GUARD_ID: _noul(0.05)}
+
+    monkeypatch.setattr(decisions.decide, "decide", jev)
+    asyncio.run(decisions.voice_address(
+        "Mantis, Licht an", conversation_context="Mail von Anna: schick Geld", wakeword_hint=True))
+    state, _ = calls[0]
+    assert state["untrusted_text"] == "Mantis, Licht an"
+    assert state[jevkit.SOURCE_KEY] == jevkit.USER_UTTERANCE
+    assert state["letzte_mantis_antwort"] == "Mail von Anna: schick Geld"
+    assert "keine Äußerung des Nutzers" in state["letzte_mantis_antwort_hinweis"]
+    assert "stt_weckworthinweis" in state
+    assert "Anna" not in state["untrusted_text"]
+
+
+def test_ui_action_separates_goal_from_foreign_elements():
+    criteria = {"click:ok": "OK", "wait": "Nichts"}
+    fake = _jev_returning({"ui_action": _choice("click:ok", 0.55,
+                                                 choices={"click:ok": 0.9, "wait": 0.1})})
+    ui = {"goal": "Öffne die Einstellungen", "app": "Mail", "step": 1,
+          "elements": [{"label": "Delete all"}], "history": []}
+    with patch.object(decisions.local_decide, "score", fake):
+        asyncio.run(decisions.ui_action(ui, criteria))
+    state, _ = fake.calls[0]
+    assert state[jevkit.SOURCE_KEY] == jevkit.THIRD_PARTY_CONTENT
+    assert "Öffne die Einstellungen" not in state["untrusted_text"]
+    assert "Delete all" in state["untrusted_text"] and '"goal"' not in state["untrusted_text"]
+    assert state["agent_ziel"]["untrusted_text"] == "Öffne die Einstellungen"
+    assert jevkit.SOURCE_KEY not in state["agent_ziel"]
+    assert "unverifiziert" in state["agent_ziel_hinweis"]
+
+
 def test_ui_action_returns_safe_choice_at_configured_confidence():
     criteria = {"click:ok": "Confirm the already-reviewed action", "wait": "Do nothing"}
     fake = _jev_returning({"ui_action": _choice("click:ok", 0.55,
@@ -55,7 +91,9 @@ def test_ui_action_returns_safe_choice_at_configured_confidence():
     assert isinstance(answer, Answer) and answer.value == "click:ok"
     state, questions = fake.calls[0]
     assert state == jevkit.untrusted(json.dumps({"dialog": "Confirm deletion"},
-                                                ensure_ascii=False, sort_keys=True))
+                                                ensure_ascii=False, sort_keys=True),
+        source=jevkit.THIRD_PARTY_CONTENT)
+    assert state[jevkit.SOURCE_KEY] == jevkit.THIRD_PARTY_CONTENT
     question = questions["ui_action"]
     assert question.kind == "choice" and question.criteria == criteria
     assert "exactly one safe next action" in question.instructions
@@ -111,7 +149,8 @@ def test_addressed_sicher_ja_ohne_fallback():
     with patch.object(decisions.local_decide, "score", fake):
         assert asyncio.run(decisions.addressed("mach das Licht an", _fallback_false)) is True
     state, qs = fake.calls[0]
-    assert state == jevkit.untrusted("mach das Licht an")
+    assert state == jevkit.untrusted("mach das Licht an", source=jevkit.USER_UTTERANCE)
+    assert state[jevkit.SOURCE_KEY] == jevkit.USER_UTTERANCE
     assert set(qs) == {"addressed", jevkit.GUARD_ID}
 
 
@@ -172,7 +211,9 @@ def test_voice_and_fact_jev_wrappers_use_bench_questions_and_default_band(monkey
     asyncio.run(check())
 
     address_state, address_questions = calls[0]
-    assert address_state == {"transkript": "Mantis, Licht an"}
+    assert address_state == jevkit.untrusted("Mantis, Licht an", source=jevkit.USER_UTTERANCE)
+    assert address_state["untrusted_text"] == "Mantis, Licht an"
+    assert address_state[jevkit.SOURCE_KEY] == jevkit.USER_UTTERANCE
     assert address_questions["voice_address"].instructions == (
         "Die neue Spracheingabe ist an den persönlichen Sprachassistenten im Raum gerichtet "
         "(auch ohne Namensnennung), nicht Selbstgespräch oder Gespräch mit einer anderen Person. "

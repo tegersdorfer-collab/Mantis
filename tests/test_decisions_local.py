@@ -40,6 +40,7 @@ def test_addressed_uses_fast_cloud_score_and_guards_untrusted_transcript(monkeyp
     assert calls[0][1]["addressed"] == decisions.Q_ADDRESSED
     assert jevkit.GUARD_ID in calls[0][1]
     assert calls[0][0]["untrusted_text"] == "mach das Licht an"
+    assert calls[0][0][jevkit.SOURCE_KEY] == jevkit.USER_UTTERANCE
 
 
 def test_guard_hit_or_uncertain_cloud_answer_uses_conservative_fallback(monkeypatch):
@@ -178,7 +179,7 @@ def test_every_generated_question_id_sent_to_jev_matches_api_pattern(monkeypatch
     monkeypatch.setattr(decide.config, "JEV_PROVIDER", "typesafe")
     monkeypatch.setattr(decide.config, "TYPESAFE_API_KEY", "test-key")
     monkeypatch.setattr(decide.config, "OPENROUTER_API_KEY", "")
-    monkeypatch.setattr(decide.config, "JEV_MODEL", "jev-latest")
+    monkeypatch.setattr(decide.config, "JEV_MODEL", "")
     decide.reset_for_tests()
 
     questions = {
@@ -213,7 +214,7 @@ def test_every_generated_question_id_sent_to_jev_matches_api_pattern(monkeypatch
                     "confidence": 1.0,
                 }
         return httpx.Response(200, json={
-            "model": "jev-1.13", "answers": answers, "usage": {},
+            "model": "jev-1.14.0", "answers": answers, "usage": {},
         })
 
     with patch.object(decide, "_transport", httpx.MockTransport(handler)):
