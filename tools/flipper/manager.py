@@ -61,6 +61,34 @@ class FlipperManager:
             raise RuntimeError(out.strip() or "IR-Sendefehler")
         return out
 
+    async def send_named_repeated(self, remote: str, signal: str, times: int) -> None:
+        """Ein benanntes Signal mehrfach über eine Verbindung senden (Dimmstufen)."""
+        if times <= 1:
+            await self.send_named(remote, signal)
+            return
+        sig = self._resolve(remote, signal)
+        cmd = f"ir tx {sig['protocol']} {sig['address']} {sig['command']}"
+        async with self._lock:
+            outs = await driver.talk_many([cmd] * times)
+        for out in outs:
+            if _app_blocks_cli(out) or "error" in out.lower():
+                # Blockierende App o.ä.: über den Einzelpfad (schließt Apps) nachsenden.
+                log.info("Flipper-Serie unterbrochen (%r), sende einzeln", out.strip()[-80:])
+                for _ in range(times):
+                    await self.send_named(remote, signal)
+                return
+        log.info("Flipper IR %s ×%d → ok", cmd, times)
+
+    def _resolve(self, remote: str, signal: str) -> dict:
+        remotes = load_remotes()
+        r = remotes.get(remote)
+        if not r:
+            raise RuntimeError(f"Unbekannte Fernbedienung '{remote}'.")
+        sig = (r.get("signals") or {}).get(signal)
+        if not sig:
+            raise RuntimeError(f"Signal '{signal}' für '{remote}' nicht hinterlegt.")
+        return sig
+
     async def send_named(self, remote: str, signal: str) -> None:
         """Ein benanntes Signal (z.B. remote='schreibtischlampe', signal='an') senden."""
         remotes = load_remotes()
