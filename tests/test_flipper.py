@@ -18,7 +18,32 @@ def _patch_tx(monkey_calls):
     async def fake_ir_tx(protocol, address, command):
         monkey_calls.append((protocol, address, command))
         return ">: "  # sauberer Prompt, kein Fehler
+    async def fake_talk_many(cmds, read_secs=2.0, gap_secs=0.12):
+        for cmd in cmds:
+            _, _, protocol, address, command = cmd.split()
+            monkey_calls.append((protocol, address, command))
+        return [">: "] * len(cmds)
+
     driver.ir_tx = fake_ir_tx  # type: ignore[assignment]
+    driver.talk_many = fake_talk_many  # type: ignore[assignment]
+
+
+def test_prompt_with_trailing_bell_ends_read():
+    """Live: Antwort endet auf '>: \\x07'; vorher wartete jedes Lesen volle 2 s."""
+    assert driver._ends_with_prompt(b"ir tx NECext EF00 FC03\r\n\r\n>: \x07")
+    assert not driver._ends_with_prompt(b"ir tx NECext EF00 FC03\r\n")
+
+
+def test_repeated_dimming_uses_one_connection():
+    sessions: list = []
+
+    async def fake_talk_many(cmds, read_secs=2.0, gap_secs=0.12):
+        sessions.append(list(cmds))
+        return [">: "] * len(cmds)
+
+    driver.talk_many = fake_talk_many  # type: ignore[assignment]
+    asyncio.run(FlipperManager().send_named_repeated("schreibtischlampe", "heller", 3))
+    assert sessions == [["ir tx NECext EF00 FF00"] * 3]
 
 
 def test_lamp_remote_is_configured():

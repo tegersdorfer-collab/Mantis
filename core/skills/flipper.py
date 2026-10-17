@@ -13,7 +13,6 @@ from tools.flipper.manager import MANAGER
 log = logging.getLogger("core.skills")
 
 
-import asyncio
 
 # Eingabe-Normalisierung: Umlaut-/Synonym-Varianten → Signalname in remotes.json
 _LAMP_ALIASES = {
@@ -67,10 +66,7 @@ async def _lampe(action: str, schritte: int = 1):
         # Die Lampe hat nur drei Stufen; mehr Signale kosten nur Zeit.
         reps = max(1, min(3, int(schritte or 1)))
     try:
-        for i in range(reps):
-            await MANAGER.send_named("schreibtischlampe", sig)
-            if i + 1 < reps:
-                await asyncio.sleep(0.18)
+        await MANAGER.send_named_repeated("schreibtischlampe", sig, reps)
     except Exception as e:
         log.warning("lampe fehlgeschlagen: %s", e)
         return f"❌ Lampe nicht erreichbar: {e}. Hängt der Flipper per USB am Mac?"
