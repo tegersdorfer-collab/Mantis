@@ -87,7 +87,7 @@ def test_tool_categories_uses_one_cloud_fanout(monkeypatch):
 
     async def cloud_score(state, questions):
         seen.append((state, questions))
-        return _answers(questions, {"cat:fitness", "aktion"})
+        return _answers(questions, {"cat.fitness", "aktion"})
 
     monkeypatch.setattr(local_decide, "score", cloud_score)
 
@@ -95,7 +95,7 @@ def test_tool_categories_uses_one_cloud_fanout(monkeypatch):
 
     assert result == ({"fitness"}, True)
     assert len(seen) == 1
-    assert set(seen[0][1]) == {"aktion", *(f"cat:{cat}" for cat in decisions.TOOL_CATEGORY_DESCRIPTIONS)}
+    assert set(seen[0][1]) == {"aktion", *(f"cat.{cat}" for cat in decisions.TOOL_CATEGORY_DESCRIPTIONS)}
 
 
 def test_tool_categories_defers_when_cloud_confidence_is_uncertain(monkeypatch):
@@ -103,7 +103,7 @@ def test_tool_categories_defers_when_cloud_confidence_is_uncertain(monkeypatch):
 
     async def cloud_score(_state, questions):
         result = _answers(questions)
-        result["cat:fitness"] = _noul(0.6)
+        result["cat.fitness"] = _noul(0.6)
         return result
 
     monkeypatch.setattr(local_decide, "score", cloud_score)
@@ -189,7 +189,7 @@ def test_every_generated_question_id_sent_to_jev_matches_api_pattern(monkeypatch
         "supported": decisions.Q_CLAIM_SUPPORTED,
         "supersedes": decisions.Q_SUPERSEDES,
         **{
-            f"cat:{category}": decisions.Noul(description)
+            f"cat.{category}": decisions.Noul(description)
             for category, description in decisions.TOOL_CATEGORY_DESCRIPTIONS.items()
         },
         "aktion": decisions.Q_ACTION,
@@ -221,4 +221,4 @@ def test_every_generated_question_id_sent_to_jev_matches_api_pattern(monkeypatch
 
     assert len(seen_ids) == len(questions)
     assert set(answers) == set(questions)
-    assert answers["cat:fitness"].p == 0.9
+    assert answers["cat.fitness"].p == 0.9

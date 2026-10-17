@@ -303,7 +303,7 @@ async def tool_categories(text: str) -> tuple[set[str], bool | None] | None:
     None = Cloud-Kette nicht verfügbar (Aufrufer bleibt beim Keyword-Pfad).
     aktion ist None, wenn die Cloud-Antwort nicht sicher genug ist."""
     questions: dict[str, Noul] = {
-        f"cat:{cat}": Noul(f"Die Nachricht betrifft: {desc}.",
+        f"cat.{cat}": Noul(f"Die Nachricht betrifft: {desc}.",
                            criteria={"true": "Ein Tool aus diesem Bereich wird gebraucht",
                                      "false": "Dieser Bereich ist nicht gemeint"})
         for cat, desc in TOOL_CATEGORY_DESCRIPTIONS.items()
@@ -334,7 +334,7 @@ async def tool_categories(text: str) -> tuple[set[str], bool | None] | None:
             continue
         b = band(_jev_answer(ans), BANDS.get(name, _DEFAULT))
         await asyncio.to_thread(_log, name, ans, b, text)
-    cats = {cat for cat in TOOL_CATEGORY_DESCRIPTIONS if answers[f"cat:{cat}"].p >= TOOL_CATEGORY_P}
+    cats = {cat for cat in TOOL_CATEGORY_DESCRIPTIONS if answers[f"cat.{cat}"].p >= TOOL_CATEGORY_P}
     a = answers["aktion"]
     aktion: bool | None = None
     if a.p >= TOOL_ACTION_P:

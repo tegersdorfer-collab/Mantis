@@ -228,9 +228,9 @@ def test_supersedes_state_felder():
 
 
 def test_tool_categories_fanout():
-    answers = {f"cat:{c}": _noul(0.02) for c in decisions.TOOL_CATEGORY_DESCRIPTIONS}
-    answers["cat:flipper"] = _noul(0.95)
-    answers["cat:productivity"] = _noul(0.81)
+    answers = {f"cat.{c}": _noul(0.02) for c in decisions.TOOL_CATEGORY_DESCRIPTIONS}
+    answers["cat.flipper"] = _noul(0.95)
+    answers["cat.productivity"] = _noul(0.81)
     answers["aktion"] = _noul(0.9)
     fake = _jev_returning(answers)
     with patch.object(decisions.local_decide, "score", fake):
@@ -241,7 +241,7 @@ def test_tool_categories_fanout():
 
 
 def test_tool_categories_aktion_unsicher_ist_none():
-    answers = {f"cat:{c}": _noul(0.02) for c in decisions.TOOL_CATEGORY_DESCRIPTIONS}
+    answers = {f"cat.{c}": _noul(0.02) for c in decisions.TOOL_CATEGORY_DESCRIPTIONS}
     answers["aktion"] = _noul(0.55)
     with patch.object(decisions.local_decide, "score", _jev_returning(answers)):
         cats, aktion = asyncio.run(decisions.tool_categories("hm"))
@@ -261,10 +261,10 @@ def test_tool_category_threshold_is_independent_of_action_uncertainty(
     monkeypatch, category_p, action_p, expected_action,
 ):
     answers = {
-        f"cat:{category}": _noul(0.02)
+        f"cat.{category}": _noul(0.02)
         for category in decisions.TOOL_CATEGORY_DESCRIPTIONS
     }
-    answers["cat:flipper"] = _noul(category_p)
+    answers["cat.flipper"] = _noul(category_p)
     answers["aktion"] = _noul(action_p)
 
     async def jev(_state, questions):
