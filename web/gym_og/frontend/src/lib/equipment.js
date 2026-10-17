@@ -1,5 +1,7 @@
 import { t } from './i18n-core.js'
-import { EXDB } from './exercises-data.js'
+import { EXDB } from './exercises.js'
+
+// mantis: Use the build-filtered catalogue so the Mantis fork exposes no bundled exercises.
 
 // Pieces of kit the catalogue never names as an exercise's equipment — "dumbbell bench press" is
 // tagged `dumbbell`, yet it needs a bench; "chin-up" is tagged `body weight`, yet it needs a bar.

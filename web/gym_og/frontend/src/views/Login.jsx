@@ -11,6 +11,7 @@ import { Button, Segmented } from '../components/ui.jsx'
 import { askAddDeviceData } from '../sheets.jsx'
 import { passwordOn, PasswordRegisterForm, openPasswordSignIn } from '../components/PasswordAuth.jsx'
 import { openDeviceLinkRedeem } from '../components/Passkeys.jsx'
+import { MANTIS_OG } from '../lib/mantis-og.js'
 
 function RegisterSheet({ close }) {
   const { setUser, pushState, pullState, loadConfig } = useStore()
@@ -80,6 +81,17 @@ export default function Login() {
     <h1 style={{ fontSize: 34, fontWeight: 700, letterSpacing: '-.028em', margin: '10px 0 4px' }}>openGym</h1>
   </>
   const wrap = { display: 'flex', flexDirection: 'column', justifyContent: 'center', minHeight: '78vh', textAlign: 'center' }
+
+  // mantis: Authentication is handled by the existing Mantis token login at /; no passkey,
+  // registration, or guest path is available in this build.
+  if (MANTIS_OG) return (
+    <div className="narrow" style={wrap}>
+      <div style={{ fontSize: 54, color: 'var(--acc)' }}><Icon name="dumbbell" /></div>
+      <h1 style={{ fontSize: 28, margin: '10px 0' }}>{t('Session ended')}</h1>
+      <div className="muted" style={{ marginBottom: 20 }}>{t('Sign in again to open your workouts.')}</div>
+      <Button variant="primary" onClick={() => { window.location.assign('/?next=%2Fog%2F') }}>{t('Open Mantis login')}</Button>
+    </div>
+  )
 
   // Demo build: no backend to sign in against — the only way in is the local guest profile.
   if (DEMO) return (

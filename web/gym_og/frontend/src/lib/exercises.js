@@ -1,9 +1,11 @@
-import { EXDB, EXALIAS } from './exercises-data.js'
+import { EXDB as SOURCE_EXDB, EXALIAS } from './exercises-data.js'
 import MUSCLE_MAP from './exercise-muscle-map.json' with { type: 'json' }
 import V13_IDS from './catalogue-v13-ids.json' with { type: 'json' }
 import { t, getVersion, exerciseNameSearchText } from './i18n-core.js'
+import { MANTIS_OG } from './mantis-og.js'
 
-export { EXDB }
+// mantis: Server customEx is the only exercise catalogue in this build.
+export const EXDB = MANTIS_OG ? [] : SOURCE_EXDB
 
 // EXDB carries each exercise as the catalogue describes it in words (target, secondary muscles).
 // Where someone has drawn the muscles more precisely (catalogue "muscleMap": the compound lifts,

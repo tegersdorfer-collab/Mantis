@@ -16,6 +16,7 @@ import { useWakeLock } from './lib/wakelock.js'
 import { installViewportGuard } from './lib/viewport-guard.js'
 import { installChipDrag } from './lib/hchips.js'
 import { syncPushSubscription } from './lib/push.js'
+import { MANTIS_OG } from './lib/mantis-og.js'
 import { MOBILE } from './lib/mobile.js'
 import { exitWorkoutEdit, startFlow } from './sheets.jsx'
 import Icon from './components/Icon.jsx'
@@ -130,7 +131,8 @@ function Shell() {
   // lib/push.js): a subscription the instance lost is back before the next reminder is due,
   // with nobody having to visit Settings. Web only — the APK has no service worker.
   useEffect(() => {
-    if (MOBILE || !user || !ready) return
+    // mantis: The read-only build never subscribes to push notifications.
+    if (MOBILE || MANTIS_OG || !user || !ready) return
     syncPushSubscription().catch(() => {})
   }, [user?.id, ready])
   // Opened from a device-link QR code (#95): once boot knows who is here, the sheet that redeems
@@ -223,10 +225,11 @@ function Shell() {
               {/* The Coach screens gate themselves on the instance config; the routes exist
                   unconditionally so a deep link from a notification lands somewhere sane
                   rather than on the catch-all. */}
-              <Route path="/coach" element={<CoachChat />} />
-              <Route path="/coach/intake" element={<CoachIntake />} />
+              <Route path="/coach" element={MANTIS_OG ? <Navigate to="/home" replace /> : <CoachChat />} />
+              <Route path="/coach/intake" element={MANTIS_OG ? <Navigate to="/home" replace /> : <CoachIntake />} />
               <Route path="/coach/proposal" element={<Navigate to="/coach" replace />} />
-              <Route path="/coach/setup" element={<CoachSetup />} />
+              {/* // mantis: This fork has no Coach surface or local provider setup. */}
+              <Route path="/coach/setup" element={MANTIS_OG ? <Navigate to="/home" replace /> : <CoachSetup />} />
               <Route path="/admin" element={user?.admin ? <Admin /> : <Navigate to="/home" replace />} />
               <Route path="*" element={<Navigate to="/home" replace />} />
             </Routes>

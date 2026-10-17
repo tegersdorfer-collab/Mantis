@@ -123,6 +123,27 @@ describe('sync status', () => {
   })
 })
 
+describe('read-only server', () => {
+  it('keeps local edits, shows a hint, and stops retrying after a read-only refusal', async () => {
+    const S = { ...clone(DEF), _ts: 500, workouts: [workout('w1')] }
+    signedIn(S)
+    localStorage.setItem('gym_sync', JSON.stringify({ rev: 1, ts: 100 }))
+    api.mockRejectedValueOnce(httpError(423, { error: 'read_only' }))
+
+    await useStore.getState().pushState()
+    await useStore.getState().pushState()
+    useStore.getState().update(s => { s.restSec = 45 }, false)
+    await useStore.getState().pushState()
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(api.mock.calls.filter(([, options]) => options?.method === 'PUT')).toHaveLength(1)
+    expect(useStore.getState().S.restSec).toBe(45)
+    expect(JSON.parse(localStorage.getItem('gym_state_v1')).restSec).toBe(45)
+    expect(useStore.getState().readOnly).toBe(true)
+    expect(toast).toHaveBeenCalledWith('Nur-Lesen-Vorschau')
+  })
+})
+
 describe('the web boot', () => {
   const boot = async (me, user = USER) => {
     api.mockImplementation(async path => {

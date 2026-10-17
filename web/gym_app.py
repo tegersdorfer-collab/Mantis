@@ -10,15 +10,17 @@ from pathlib import Path
 import time
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 import config
 from domains.gym import library, overview, plans, tracker
+from web import gym_og_data
 
 
 COOKIE = "mantis_gym"
 STATIC_DIR = Path(__file__).parent / "gym"
+GYM_OG_DIST_DIR = Path(__file__).parent / "gym_og" / "frontend" / "dist"
 STATIC_FILES = {
     "/app.js": ("app.js", "text/javascript"),
     "/app.css": ("app.css", "text/css"),
@@ -160,6 +162,26 @@ async def _require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
 
+def _og_login_redirect() -> RedirectResponse:
+    return RedirectResponse("/?next=%2Fog%2F", status_code=307)
+
+
+def _gym_og_file_response(asset_path: str) -> FileResponse:
+    root = GYM_OG_DIST_DIR.resolve()
+    relative = "index.html" if not asset_path else asset_path
+    file_path = (root / relative).resolve()
+    if not file_path.is_relative_to(root) or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    headers = {"Cache-Control": "no-cache"}
+    if relative == "sw.js":
+        headers["Service-Worker-Allowed"] = "/og/"
+    return FileResponse(
+        file_path,
+        media_type="application/javascript" if relative == "sw.js" else None,
+        headers=headers,
+    )
+
+
 def _static_response(path: str) -> FileResponse:
     filename, media_type = STATIC_FILES[path]
     file_path = STATIC_DIR / filename
@@ -175,6 +197,7 @@ def _static_response(path: str) -> FileResponse:
 def create_gym_app() -> FastAPI:
     app = FastAPI(title="Mantis Gym Tracker", docs_url=None, redoc_url=None)
     api = APIRouter(prefix="/api", dependencies=[Depends(_require_auth)])
+    og_api = APIRouter(prefix="/og/api", dependencies=[Depends(_require_auth)])
 
     @app.middleware("http")
     async def check_write_origin(request: Request, call_next):
@@ -216,6 +239,74 @@ def create_gym_app() -> FastAPI:
     @app.get("/icon.png", include_in_schema=False)
     async def icon():
         return _static_response("/icon.png")
+
+    @app.get("/og", include_in_schema=False)
+    async def open_gym_no_slash(request: Request):
+        if not _session_ok(request.cookies.get(COOKIE)):
+            return _og_login_redirect()
+        return RedirectResponse("/og/", status_code=307)
+
+    @app.get("/og/", include_in_schema=False)
+    async def open_gym_index(request: Request):
+        if not _session_ok(request.cookies.get(COOKIE)):
+            return _og_login_redirect()
+        if not (GYM_OG_DIST_DIR / "index.html").is_file():
+            return RedirectResponse("/", status_code=307)
+        return _gym_og_file_response("index.html")
+
+    @og_api.get("/me")
+    async def open_gym_me():
+        return {"user": {"id": 1, "name": "Timo", "admin": False}}
+
+    @og_api.get("/config")
+    async def open_gym_config():
+        return {
+            "invite_only": True,
+            "allow_guest": False,
+            "password_login": False,
+            "passkeys": False,
+            "registration": False,
+            "push": False,
+            "media": False,
+            "coach": False,
+        }
+
+    @og_api.get("/health")
+    async def open_gym_health():
+        return {"ok": True}
+
+    @og_api.get("/data")
+    async def open_gym_data():
+        state, revision = await asyncio.gather(
+            asyncio.to_thread(gym_og_data.get_state),
+            asyncio.to_thread(gym_og_data.get_revision),
+        )
+        return {"state": state, "rev": revision["rev"]}
+
+    @og_api.get("/data/rev")
+    async def open_gym_data_revision():
+        return await asyncio.to_thread(gym_og_data.get_revision)
+
+    @og_api.put("/data")
+    async def open_gym_data_read_only():
+        return JSONResponse({"error": "read_only"}, status_code=423)
+
+    @og_api.api_route(
+        "/{unsupported_path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+    async def unsupported_open_gym_api(unsupported_path: str):
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
+    app.include_router(og_api)
+
+    @app.get("/og/{asset_path:path}", include_in_schema=False)
+    async def open_gym_static(asset_path: str, request: Request):
+        if not _session_ok(request.cookies.get(COOKIE)):
+            return _og_login_redirect()
+        if not (GYM_OG_DIST_DIR / "index.html").is_file():
+            return RedirectResponse("/", status_code=307)
+        return _gym_og_file_response(asset_path)
 
     @app.post("/auth/session")
     async def login(body: LoginBody, request: Request):

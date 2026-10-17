@@ -15,13 +15,14 @@ import { askAddDeviceData, menuSheet } from '../sheets.jsx'
 import { ConnectSheet, CfAccessSheet } from '../views/MobileOnboarding.jsx'
 import { passwordOn, openPasswordSignIn } from './PasswordAuth.jsx'
 import { Section, Row, Button } from './ui.jsx'
+import { MANTIS_OG } from '../lib/mantis-og.js'
 
 const ui = () => useUI.getState()
 const toast = m => ui().toast(m)
 // Whether this browser has a way to sign in at all: a passkey, or a password on an instance that
 // offers one (#118) — which is also what a browser without passkey support has left.
 const pwOn = () => passwordOn(useStore.getState?.()?.config)
-const canSignIn = () => webauthnOK() || pwOn()
+const canSignIn = () => MANTIS_OG || webauthnOK() || pwOn()
 
 // "gym.example.com" out of the base URL the store keeps (a subpath stays: it is part of which
 // server this is). Anything unparseable is shown as it is.
@@ -82,6 +83,11 @@ export function connectionView(sync, { mobile = MOBILE, online = isOnline() } = 
         banner: sync.pending ? t('Offline. Your changes are saved on this device and sync when you’re back online.') : t('Offline. Showing the last copy synced with the server.'),
       }
     case 'error':
+      // mantis: The API is intentionally read-only until Phase 2 implements writes.
+      if (err.code === 'read_only') return {
+        tone: 'quiet', icon: 'lock', action: null,
+        line: 'Nur-Lesen-Vorschau', banner: 'Nur-Lesen-Vorschau',
+      }
       return err.code === 'bad-response'
         ? { tone: 'bad', icon: 'warning', action: 'retry', line: t('Not an openGym answer (HTTP {0})', err.status), banner: t('Your server’s address answered with something other than openGym (HTTP {0}). Your changes are kept here.', err.status) }
         : { tone: 'bad', icon: 'warning', action: 'retry', line: t('Server error (HTTP {0})', err.status), banner: t('Your server answered with an error (HTTP {0}). Your changes are kept here.', err.status) }
@@ -129,6 +135,8 @@ export function connectServer() {
 // first, with the passkey one tap away on it: which of the two this account has is not
 // something this browser can know.
 export function signInAgain() {
+  // mantis: Expired Mantis sessions return to the existing token login, never passkeys.
+  if (MANTIS_OG) { window.location.assign('/?next=%2Fog%2F'); return }
   if (pwOn()) { openPasswordSignIn(webauthnOK() ? passkeySignIn : undefined); return }
   return passkeySignIn()
 }
@@ -221,7 +229,7 @@ export function OwedSheet({ kind, count: count0, media: media0 = 0, exportBackup
         : t('Try again, or export a backup first. Going ahead anyway keeps a copy of these changes on this device until it connects to this server as this account again. Then they’re added back.')}
     </div>
     {refused && MOBILE && <><button className="btn primary" disabled={busy} onClick={() => { close(); pairAgain() }}>{t('Pair again')}</button><div style={{ height: 8 }} /></>}
-    {refused && !MOBILE && canSignIn() && <><button className="btn primary" disabled={busy} onClick={() => { close(); signInAgain() }}>{pwOn() ? t('Sign in') : t('Sign in with passkey')}</button><div style={{ height: 8 }} /></>}
+    {refused && !MOBILE && canSignIn() && <><button className="btn primary" disabled={busy} onClick={() => { close(); signInAgain() }}>{MANTIS_OG ? t('Open Mantis login') : pwOn() ? t('Sign in') : t('Sign in with passkey')}</button><div style={{ height: 8 }} /></>}
     {!refused && <><button className="btn primary" disabled={busy} onClick={retry}>{busy ? t('Syncing…') : t('Try again')}</button><div style={{ height: 8 }} /></>}
     {media > 0 && exportBackupZip
       ? <Button icon="share" disabled={busy} onClick={exportBackupZip}>{t('Export with photos & videos (.zip)')}</Button>
@@ -275,7 +283,7 @@ export function ServerSyncSection({ children }) {
       onClick={() => ui().openSheet(close => <CfAccessSheet close={close} server={sync.server || ''} />)} />}
     {sync.status === 'auth' && (MOBILE
       ? <Row icon="qr" iconTint="var(--indigo)" title={t('Pair again')} subtitle={t('Your changes are kept here, and merged into your account once it is paired again.')} accessory="chevron" onClick={pairAgain} />
-      : canSignIn() && <Row icon={pwOn() ? 'person' : 'fingerprint'} iconTint="var(--blue)" title={pwOn() ? t('Sign in') : t('Sign in with passkey')} subtitle={t('Your changes are kept here, and merged into your account once you are signed in again.')} accessory="chevron" onClick={signInAgain} />)}
+      : canSignIn() && <Row icon={MANTIS_OG || pwOn() ? 'person' : 'fingerprint'} iconTint="var(--blue)" title={MANTIS_OG ? t('Open Mantis login') : pwOn() ? t('Sign in') : t('Sign in with passkey')} subtitle={t('Your changes are kept here, and merged into your account once you are signed in again.')} accessory="chevron" onClick={signInAgain} />)}
     {/* another account's, kept when this one signed in over a copy that still owed them */}
     <KeptChangesRows />
     {children}

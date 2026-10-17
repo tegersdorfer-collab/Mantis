@@ -750,6 +750,17 @@ export const useStore = create((set, get) => {
         mergeInto(get().S, e.data.state, e.data.rev || 0)
         return doPush(attempt + 1)
       }
+      if (e?.data?.error === 'read_only') {
+        // mantis: Keep the edit on this device and stop sending it to the phase-1 read-only API.
+        e.code = 'read_only'
+        set({ readOnly: true })
+        markOwed(true)
+        failed(e, { pending: true })
+        import('./useUI.js')
+          .then(({ useUI }) => useUI.getState().toast('Nur-Lesen-Vorschau'))
+          .catch(() => {})
+        return
+      }
       // Whatever went wrong — no network, a refused token, a phone without a pairing, a server
       // error — the copy stays owed to the server and the next check retries it.
       markOwed(true)
@@ -1299,6 +1310,7 @@ export const useStore = create((set, get) => {
   return {
     S: S0,
     user: user0,
+    readOnly: false,
     ready: false,
     // The connection as the screens show it — see statusOf above for every field.
     sync: sync0,
@@ -1572,7 +1584,7 @@ export const useStore = create((set, get) => {
         // session and is already the right answer, Coach or no Coach.
         if (get().config && !('coach' in get().config)) get().refreshConfig()
       } else { rejoined = false; adoptHold = false; localStorage.removeItem('gym_user') }
-      set({ user: u })
+      set({ user: u, readOnly: false })
       setSync({ held: adoptHold })
     },
 
@@ -1585,6 +1597,7 @@ export const useStore = create((set, get) => {
       pushTm = null
       if (adoptHold) return   // the sign-in has not decided what this copy is yet (adoptProfile)
       if (pushing) { pushAgain = true; return pushing.then(() => pushing) }
+      if (get().readOnly) return
       pushing = doPush().finally(() => {
         pushing = null
         if (pushAgain) { pushAgain = false; get().pushState() }

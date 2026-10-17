@@ -2043,6 +2043,12 @@ document.addEventListener("submit", async (event) => {
     try {
       const { response, payload } = await requestJson("/auth/session", "POST", { token });
       if (!response.ok) throw new Error(payload?.detail || payload?.error || "Sign in failed.");
+      // mantis: Return to /og/ after the shared Mantis session is set.
+      const returnTo = new URLSearchParams(window.location.search).get("next");
+      if (returnTo === "/og/") {
+        window.location.assign("/og/");
+        return;
+      }
       screenMode = "loading";
       await loadState();
       if (screenMode === "app") await flushQueue();
