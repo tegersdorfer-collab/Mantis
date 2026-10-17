@@ -103,3 +103,41 @@ def test_send_ir_detects_error_output():
         assert False, "sollte werfen"
     except RuntimeError:
         pass
+
+
+def test_open_flipper_app_is_closed_and_ir_resent():
+    """Live 17.10.: 'Passport' war offen, IR wurde stumm verworfen, Mantis meldete Erfolg."""
+    calls: list = []
+    talks: list = []
+    answers = iter([
+        "ir tx NECext EF00 FC03\r\nOther application is running, close it first\r\n>: ",
+        "ir tx NECext EF00 FC03\r\n>: ",
+    ])
+
+    async def fake_ir_tx(protocol, address, command):
+        calls.append((protocol, address, command))
+        return next(answers)
+
+    async def fake_talk(cmd, read_secs=2.0):
+        talks.append(cmd)
+        return ">: "
+
+    driver.ir_tx = fake_ir_tx  # type: ignore[assignment]
+    driver.talk = fake_talk  # type: ignore[assignment]
+    asyncio.run(FlipperManager().send_ir("NECext", "EF00", "FC03"))
+    assert talks == ["loader close"]
+    assert len(calls) == 2
+
+
+def test_still_blocked_flipper_app_is_reported_as_error():
+    async def fake_ir_tx(protocol, address, command):
+        return "Other application is running, close it first\r\n>: "
+
+    async def fake_talk(cmd, read_secs=2.0):
+        return ">: "
+
+    driver.ir_tx = fake_ir_tx  # type: ignore[assignment]
+    driver.talk = fake_talk  # type: ignore[assignment]
+    import pytest
+    with pytest.raises(RuntimeError, match="Other application"):
+        asyncio.run(FlipperManager().send_ir("NECext", "EF00", "FC03"))
