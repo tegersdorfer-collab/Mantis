@@ -55,6 +55,9 @@ def test_snapshot_maps_history_plan_timed_sets_warmups_and_weight():
             "days": [{
                 "id": 9, "name": "Upper A", "exercises": [{
                     "exercise_id": 5, "target_sets": 3, "rep_min": 8, "rep_max": 12,
+                }, {
+                    "exercise_id": 8, "target_sets": 2, "rep_min": 45, "rep_max": 60,
+                    "target_unit": "seconds",
                 }],
             }, {"id": 10, "name": "Lower A", "exercises": []}],
         },
@@ -80,7 +83,10 @@ def test_snapshot_maps_history_plan_timed_sets_warmups_and_weight():
     ]
     assert state["routines"] == [{
         "id": "r-9", "name": "Upper A", "emoji": "",
-        "ex": [{"id": "m-5", "sets": 3, "reps": "8-12"}],
+        "ex": [
+            {"id": "m-5", "sets": 3, "reps": 12, "repsMin": 8},
+            {"id": "m-8", "sets": 2, "mode": "time", "sec": 60},
+        ],
     }, {"id": "r-10", "name": "Lower A", "emoji": "", "ex": []}]
     assert state["dayPlan"] == {"2026-10-17": "r-10"}
     assert state["week"] == {}
@@ -120,6 +126,10 @@ def test_revision_migration_covers_every_table_used_by_the_snapshot():
         "gym_workout_exercises", "exercises", "exercise_aliases", "body_measurements", "health_data",
     ):
         assert f"create trigger gym_sync_revision_{table}" in sql
+    assert "after update of weight on health_data for each row when (old.weight is distinct from new.weight)" in sql
+    assert "after insert on health_data for each row when (new.weight is not null)" in sql
+    assert "after delete on health_data for each row when (old.weight is not null)" in sql
+    assert "after update on workouts for each row when (old.* is distinct from new.*)" in sql
 
 
 def test_open_gym_requires_session_cookie_and_returns_to_login(og_client):
@@ -152,6 +162,65 @@ def test_authenticated_open_gym_api_contract_and_read_only_put(og_client, monkey
     response = og_client.put("/og/api/data", json={"state": {"workouts": []}})
     assert response.status_code == 423
     assert response.json() == {"error": "read_only"}
+
+
+def test_open_gym_logout_deletes_the_existing_gym_session(og_client):
+    sign_in(og_client)
+
+    response = og_client.post("/og/api/logout")
+
+    assert response.status_code == 204
+    assert 'mantis_gym="";' in response.headers["set-cookie"]
+    assert "Max-Age=0" in response.headers["set-cookie"]
+    assert og_client.get("/og/api/data").status_code == 401
+
+
+def test_open_gym_static_gates_stay_closed_without_dashboard_token(og_client, monkeypatch, tmp_path):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<title>OG test</title>", encoding="utf-8")
+    (dist / "sw.js").write_text("self.addEventListener('install', () => {})", encoding="utf-8")
+    monkeypatch.setattr(gym_app, "GYM_OG_DIST_DIR", dist)
+    monkeypatch.setattr(config, "DASHBOARD_TOKEN", "")
+    forged, _ = gym_app._session_value()
+    og_client.cookies.set(gym_app.COOKIE, forged)
+
+    assert og_client.get("/og/").status_code == 503
+    assert og_client.get("/og/sw.js").status_code == 503
+    assert og_client.get("/og/api/data").status_code == 503
+
+
+def test_open_gym_snapshot_retries_when_revision_moves_while_state_is_read(og_client, monkeypatch):
+    sign_in(og_client)
+    revisions = iter([
+        {"rev": 1, "wid": "old"}, {"rev": 2, "wid": "new"},
+        {"rev": 2, "wid": "new"}, {"rev": 2, "wid": "new"},
+    ])
+    states = iter([{"workouts": [{"id": "old"}]}, {"workouts": [{"id": "new"}]}])
+    monkeypatch.setattr(gym_og_data, "get_revision", lambda: next(revisions))
+    monkeypatch.setattr(gym_og_data, "get_state", lambda: next(states))
+
+    response = og_client.get("/og/api/data")
+
+    assert response.status_code == 200
+    assert response.json() == {"state": {"workouts": [{"id": "new"}]}, "rev": 2}
+
+
+def test_bodyweight_keeps_the_newest_plausible_measurement_per_day():
+    state = gym_og_data.map_snapshot(
+        workouts=[], workout_sets=[], exercises=[], active_plan=None, next_day=None,
+        bodyweight=[
+            {"date": date(2026, 7, 1), "weight_kg": 72.0,
+             "recorded_at": datetime(2026, 7, 1, 8, tzinfo=timezone.utc), "source_order": 0},
+            {"date": date(2026, 7, 1), "weight_kg": 71.5,
+             "recorded_at": datetime(2026, 7, 1, 12, tzinfo=timezone.utc), "source_order": 1},
+            {"date": date(2026, 7, 2), "weight_kg": 700.0,
+             "recorded_at": datetime(2026, 7, 2, 12, tzinfo=timezone.utc), "source_order": 1},
+        ],
+        rest_sec=90, today=date(2026, 7, 3),
+    )
+
+    assert state["bodyweight"] == [{"d": "2026-07-01", "w": 71.5}]
 
 
 def test_foreign_origin_is_rejected_for_open_gym_write(og_client):
@@ -295,12 +364,15 @@ def test_synthetic_database_rows_map_and_advance_gym_revision():
         )
         assert state["customEx"][0]["n"] == alias
         assert state["routines"][0]["ex"][0] == {
-            "id": f"m-{exercise_id}", "sets": 3, "reps": "8-12",
+            "id": f"m-{exercise_id}", "sets": 3, "reps": 12, "repsMin": 8,
         }
         assert state["workouts"][0]["entries"][0]["sets"] == [
             {"w": 20, "r": 5, "done": True, "warmup": True},
             {"w": 40, "r": 8, "done": True},
         ]
+        no_op_rev = db.query_one("SELECT rev FROM gym_sync_state WHERE id=1")["rev"]
+        db.execute("UPDATE workouts SET title=title WHERE id=%s", (workout_id,))
+        assert db.query_one("SELECT rev FROM gym_sync_state WHERE id=1")["rev"] == no_op_rev
         current = db.query_one("SELECT rev FROM gym_sync_state WHERE id=1")["rev"]
         assert current > previous
     finally:
@@ -310,4 +382,69 @@ def test_synthetic_database_rows_map_and_advance_gym_revision():
             db.execute("DELETE FROM gym_plans WHERE id=%s", (plan_id,))
         if exercise_id is not None:
             db.execute("DELETE FROM exercises WHERE id=%s", (exercise_id,))
+
+
+@pytest.mark.parametrize(("pair", "expected_volume", "expects_each"), [
+    (None, 320, True), (True, 320, True), (False, 160, False),
+])
+def test_dumbbell_volume_matches_mantis_pair_contract(pair, expected_volume, expects_each):
+    state = gym_og_data.map_snapshot(
+        workouts=[{
+            "id": 7, "date": date(2026, 10, 17), "title": "Dumbbell Press",
+            "created_at": datetime(2026, 10, 17, 9, tzinfo=timezone.utc),
+            "ended_at": datetime(2026, 10, 17, 10, tzinfo=timezone.utc),
+        }],
+        workout_sets=[{
+            "workout_id": 7, "exercise_id": 5, "set_index": 1,
+            "weight_kg": 20, "reps": 8, "duration_s": None, "is_warmup": False,
+        }],
+        exercises=[{
+            "id": 5, "name": "Dumbbell Press", "equipment": "dumbbell", "dumbbell_pair": pair,
+        }],
+        active_plan=None, next_day=None, bodyweight=[], rest_sec=90,
+        today=date(2026, 10, 17),
+    )
+
+    workout = state["workouts"][0]
+    assert workout["vol"] == expected_volume
+    target = workout["entries"][0].get("target")
+    assert (target == {"dbLoad": "each", "mantisPair": True}) is expects_each
+
+
+@pytest.mark.db
+def test_health_data_revision_ignores_non_weight_and_noop_updates():
+    """Only a changed weight value advances openGym's bodyweight revision."""
+    from datetime import timedelta
+
+    try:
+        db.query_one("SELECT 1 AS connected")
+    except Exception:
+        pytest.skip("mantis_test/PostgreSQL is not reachable")
+    db.run_migrations()
+
+    measured_on = next(
+        date.today() + timedelta(days=offset)
+        for offset in range(1000, 20000)
+        if db.query_one(
+            "SELECT 1 FROM health_data WHERE date=%s", (date.today() + timedelta(days=offset),)
+        ) is None
+    )
+    try:
+        db.execute(
+            "INSERT INTO health_data (date,steps,weight,updated_at) VALUES (%s,%s,NULL,NOW())",
+            (measured_on, 1),
+        )
+        rev = db.query_one("SELECT rev FROM gym_sync_state WHERE id=1")["rev"]
+        db.execute("UPDATE health_data SET steps=steps+1 WHERE date=%s", (measured_on,))
+        assert db.query_one("SELECT rev FROM gym_sync_state WHERE id=1")["rev"] == rev
+        db.execute("UPDATE health_data SET steps=steps WHERE date=%s", (measured_on,))
+        assert db.query_one("SELECT rev FROM gym_sync_state WHERE id=1")["rev"] == rev
+
+        db.execute("UPDATE health_data SET weight=71.5 WHERE date=%s", (measured_on,))
+        rev += 1
+        assert db.query_one("SELECT rev FROM gym_sync_state WHERE id=1")["rev"] == rev
+        db.execute("UPDATE health_data SET weight=weight WHERE date=%s", (measured_on,))
+        assert db.query_one("SELECT rev FROM gym_sync_state WHERE id=1")["rev"] == rev
+    finally:
+        db.execute("DELETE FROM health_data WHERE date=%s", (measured_on,))
 

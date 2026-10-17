@@ -15,6 +15,31 @@ import { api } from '../lib/api.js'
 import { DEF, useStore } from './useStore.js'
 
 const clone = value => JSON.parse(JSON.stringify(value))
+const memoryStorage = (() => {
+  const entries = new Map()
+  const storage = {}
+  Object.defineProperties(storage, {
+    length: { configurable: true, get: () => entries.size },
+    key: { configurable: true, value: index => [...entries.keys()][index] ?? null, writable: true },
+    getItem: { configurable: true, value: key => entries.get(String(key)) ?? null, writable: true },
+    setItem: { configurable: true, value: (key, value) => {
+      key = String(key)
+      value = String(value)
+      entries.set(key, value)
+      Object.defineProperty(storage, key, { configurable: true, enumerable: true, value, writable: true })
+    }, writable: true },
+    removeItem: { configurable: true, value: key => {
+      key = String(key)
+      entries.delete(key)
+      delete storage[key]
+    }, writable: true },
+    clear: { configurable: true, value: () => {
+      for (const key of entries.keys()) delete storage[key]
+      entries.clear()
+    }, writable: true },
+  })
+  return storage
+})()
 const workout = (id, d = '2026-09-01') => ({ id, d, start: 1, entries: [] })
 const routine = (id, reps = 10) => ({ id, name: id, ex: [{ id: 'bench', sets: 3, reps }] })
 const httpError = (status, data = {}) => Object.assign(new Error(data.error || 'HTTP ' + status), { status, data })
@@ -30,6 +55,8 @@ const signedIn = (S, extra = {}) => useStore.setState({ S, user: USER, ready: tr
 // key), and setUser re-asks /api/config for such a copy (#249), which would take the next test's
 // queued answer meant for its pull.
 beforeEach(() => {
+  // Node 26 exposes an empty global localStorage getter, so use an explicit storage shim.
+  vi.stubGlobal('localStorage', memoryStorage)
   localStorage.clear()
   localStorage.setItem('gym_owner', USER.id)
   api.mockReset(); toast.mockReset()
@@ -39,6 +66,7 @@ afterEach(() => {
   vi.useRealTimers()
   localStorage.clear()
   useStore.setState({ S: clone(DEF), user: null, ready: false, sync: { ...fresh }, config: null })
+  vi.unstubAllGlobals()
 })
 
 describe('sync status', () => {
@@ -124,23 +152,57 @@ describe('sync status', () => {
 })
 
 describe('read-only server', () => {
-  it('keeps local edits, shows a hint, and stops retrying after a read-only refusal', async () => {
-    const S = { ...clone(DEF), _ts: 500, workouts: [workout('w1')] }
-    signedIn(S)
-    localStorage.setItem('gym_sync', JSON.stringify({ rev: 1, ts: 100 }))
-    api.mockRejectedValueOnce(httpError(423, { error: 'read_only' }))
+  it('disables local writes and replaces the local copy with the server snapshot without a PUT', async () => {
+    vi.stubEnv('VITE_MANTIS_OG', '1')
+    vi.resetModules()
+    let previewStore
+    try {
+      const { api: previewApi } = await import('../lib/api.js')
+      const { DEF: previewDef, useStore: previewStoreInstance } = await import('./useStore.js')
+      previewStore = previewStoreInstance
+      previewApi.mockReset()
 
-    await useStore.getState().pushState()
-    await useStore.getState().pushState()
-    useStore.getState().update(s => { s.restSec = 45 }, false)
-    await useStore.getState().pushState()
-    await new Promise(resolve => setTimeout(resolve, 0))
+      const local = {
+        ...clone(previewDef), _ts: 500, restSec: 30,
+        workouts: [workout('w1')],
+        edited: { restSec: 400 },
+        deleted: [{ type: 'workouts', id: 'w-deleted', at: 475 }],
+      }
+      const remote = {
+        restSec: 90,
+        workouts: [workout('w-server')],
+        routines: [routine('r-server')],
+        customEx: [], bodyweight: [], dayPlan: {}, week: {}, unit: 'kg',
+      }
+      previewStore.setState({ S: local, user: USER, ready: true, readOnly: true, sync: { ...fresh, pending: true } })
+      localStorage.setItem('gym_state_v1', JSON.stringify(local))
+      localStorage.setItem('gym_sync', JSON.stringify({ rev: 1, ts: 100 }))
+      localStorage.setItem('gym_dirty', '1')
 
-    expect(api.mock.calls.filter(([, options]) => options?.method === 'PUT')).toHaveLength(1)
-    expect(useStore.getState().S.restSec).toBe(45)
-    expect(JSON.parse(localStorage.getItem('gym_state_v1')).restSec).toBe(45)
-    expect(useStore.getState().readOnly).toBe(true)
-    expect(toast).toHaveBeenCalledWith('Nur-Lesen-Vorschau')
+      previewStore.getState().update(s => { s.restSec = 45 })
+      await previewStore.getState().pushState()
+      await previewStore.getState().pushState()
+
+      expect(previewStore.getState().readOnly).toBe(true)
+      expect(previewStore.getState().S.restSec).toBe(30)
+      expect(previewApi).not.toHaveBeenCalled()
+
+      previewApi.mockResolvedValueOnce({ state: remote, rev: 2, wid: 'server-2' })
+      await previewStore.getState().pullState()
+
+      const { S } = previewStore.getState()
+      expect(S).toMatchObject({ restSec: 90, workouts: [workout('w-server')], routines: [routine('r-server')] })
+      expect(S).not.toHaveProperty('edited')
+      expect(S).not.toHaveProperty('deleted')
+      expect(JSON.parse(localStorage.getItem('gym_state_v1'))).toMatchObject({ restSec: 90, workouts: [workout('w-server')] })
+      expect(localStorage.getItem('gym_dirty')).toBeNull()
+      expect(previewStore.getState().sync.pending).toBe(false)
+      expect(previewApi.mock.calls.map(([path, options]) => [path, options?.method || 'GET'])).toEqual([['/api/data', 'GET']])
+    } finally {
+      previewStore?.setState({ user: null, ready: false, sync: { ...fresh } })
+      vi.unstubAllEnvs()
+      vi.resetModules()
+    }
   })
 })
 

@@ -3,6 +3,7 @@ import { t } from './i18n-core.js'
 import { MOBILE } from './mobile.js'
 import { appBase } from './app-base.js'
 import { nativeFetch } from './capacitor-fetch.js'
+import { MANTIS_OG } from './mantis-og.js'
 
 export const IS_APPLE = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent)
 export const IS_ANDROID = /Android/.test(navigator.userAgent)
@@ -85,6 +86,11 @@ async function request(url, init, ms) {
 // and dropped from the queue. It is an error, with the status it came with.
 async function exchange(url, init) {
   const r = await fetch(url, init)
+  // mantis: The Mantis build's only sign-in is the token login at the root.
+  if (MANTIS_OG && r.status === 401 && /\/api\/(?:me|config)$/.test(new URL(url, 'http://localhost').pathname)) {
+    window.location.assign('/?next=%2Fog%2F')
+  }
+  if (r.status === 204) return { ok: true }
   let data
   let parsed = true
   try { data = await r.json() } catch { parsed = false }

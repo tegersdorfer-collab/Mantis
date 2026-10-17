@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useStore } from '../store/useStore.js'
 import { DEMO } from '../lib/demo.js'
 import { t } from '../lib/i18n.js'
+import { MANTIS_OG } from '../lib/mantis-og.js'
 import { connectionView, actionLabel, syncNowWithToast, pairAgain, connectServer, signInAgain, useOnline } from './ServerSync.jsx'
 import Icon from './Icon.jsx'
 
@@ -77,7 +78,7 @@ export default function SyncBanner() {
   const conn = useConnection()
   const { view, user, status } = conn
   const quiet = view?.tone === 'quiet'
-  const show = conn.show && on && (!quiet || local)
+  const show = MANTIS_OG || (conn.show && on && (!quiet || local))
   const row = useRef(null)
 
   useLayoutEffect(() => {
@@ -92,6 +93,12 @@ export default function SyncBanner() {
   }, [show])
 
   if (!show) return null
+  // mantis: A fixed preview notice replaces retry messaging throughout the read-only build.
+  if (MANTIS_OG) return <div className="conn-bar quiet">
+    <div className="conn-row" ref={row} role="status">
+      <div className="conn"><Icon name="info" /><span className="conn-t">Vorschau – Änderungen werden nicht gespeichert</span></div>
+    </div>
+  </div>
   const act = {
     retry: () => { syncNowWithToast() },
     pair: pairAgain,

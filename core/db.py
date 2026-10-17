@@ -915,10 +915,24 @@ for _table in (
 ):
     _trigger = f"gym_sync_revision_{_table}"
     MIGRATIONS.append(f"DROP TRIGGER IF EXISTS {_trigger} ON {_table};")
-    MIGRATIONS.append(
-        f"CREATE TRIGGER {_trigger} AFTER INSERT OR UPDATE OR DELETE ON {_table} "
-        "FOR EACH STATEMENT EXECUTE FUNCTION gym_sync_state_bump();"
-    )
+    MIGRATIONS.append(f"DROP TRIGGER IF EXISTS {_trigger}_delete ON {_table};")
+    MIGRATIONS.append(f"DROP TRIGGER IF EXISTS {_trigger}_update ON {_table};")
+    if _table == "health_data":
+        MIGRATIONS.extend([
+            f"CREATE TRIGGER {_trigger} AFTER INSERT ON {_table} FOR EACH ROW "
+            "WHEN (NEW.weight IS NOT NULL) EXECUTE FUNCTION gym_sync_state_bump();",
+            f"CREATE TRIGGER {_trigger}_delete AFTER DELETE ON {_table} FOR EACH ROW "
+            "WHEN (OLD.weight IS NOT NULL) EXECUTE FUNCTION gym_sync_state_bump();",
+            f"CREATE TRIGGER {_trigger}_update AFTER UPDATE OF weight ON {_table} FOR EACH ROW "
+            "WHEN (OLD.weight IS DISTINCT FROM NEW.weight) EXECUTE FUNCTION gym_sync_state_bump();",
+        ])
+    else:
+        MIGRATIONS.extend([
+            f"CREATE TRIGGER {_trigger} AFTER INSERT OR DELETE ON {_table} "
+            "FOR EACH STATEMENT EXECUTE FUNCTION gym_sync_state_bump();",
+            f"CREATE TRIGGER {_trigger}_update AFTER UPDATE ON {_table} FOR EACH ROW "
+            "WHEN (OLD.* IS DISTINCT FROM NEW.*) EXECUTE FUNCTION gym_sync_state_bump();",
+        ])
 del _table, _trigger
 
 

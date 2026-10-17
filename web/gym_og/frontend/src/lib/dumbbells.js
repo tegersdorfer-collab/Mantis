@@ -86,8 +86,11 @@ export const entryDbLoad = entry => dbLoadOf(entry?.target?.dbLoad) || 'as'
 const cfgOfEntry = entry => ({ ...(entry?.target || {}), id: entry?.id })
 
 /** What one logged kilo of this entry is worth in volume: 2 for "each" on two bells, else 1. */
-export const volumeFactor = entry =>
-  (entryDbLoad(entry) === 'each' ? bellsIn(cfgOfEntry(entry)) : 1)
+export const volumeFactor = entry => {
+  if (entryDbLoad(entry) !== 'each') return 1
+  // mantis: dumbbell_pair doubles even legacy one-arm names, matching Mantis' workout contract.
+  return entry?.target?.mantisPair === true ? 2 : bellsIn(cfgOfEntry(entry))
+}
 
 /**
  * The factor that turns a weight meant as `from` into the same load meant as `to`. Only the two

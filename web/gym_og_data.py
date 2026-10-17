@@ -51,19 +51,28 @@ def _plan_parts(active_plan):
         routine_id = _routine_id(day_id)
         day_name = str(day.get("name") or "")
         day_ids[day_name.casefold()] = routine_id
+        routine_exercises = []
+        for item in day.get("exercises", []):
+            if item.get("exercise_id") is None:
+                continue
+            target_unit = str(item.get("target_unit") or "reps").casefold()
+            target = {
+                "id": _exercise_id(item["exercise_id"]),
+                "sets": int(item.get("target_sets") or 0),
+            }
+            if target_unit == "seconds":
+                target.update({"mode": "time", "sec": int(item.get("rep_max") or item.get("rep_min") or 0)})
+            else:
+                target.update({
+                    "reps": int(item.get("rep_max") or 0),
+                    "repsMin": int(item.get("rep_min") or 0),
+                })
+            routine_exercises.append(target)
         routines.append({
             "id": routine_id,
             "name": day_name,
             "emoji": "",
-            "ex": [
-                {
-                    "id": _exercise_id(item["exercise_id"]),
-                    "sets": int(item.get("target_sets") or 0),
-                    "reps": f"{int(item.get('rep_min') or 0)}-{int(item.get('rep_max') or 0)}",
-                }
-                for item in day.get("exercises", [])
-                if item.get("exercise_id") is not None
-            ],
+            "ex": routine_exercises,
         })
     return routines, day_ids
 
@@ -85,6 +94,10 @@ def _map_workout(workout, rows, exercise_by_id, day_ids):
         entry = entries_by_id.get(entry_id)
         if entry is None:
             entry = {"id": entry_id, "sets": []}
+            exercise = exercise_by_id.get(int(exercise_id), {})
+            pair = exercise.get("dumbbell_pair")
+            if exercise.get("equipment") == "dumbbell" and (pair is None or pair is True):
+                entry["target"] = {"dbLoad": "each", "mantisPair": True}
             entries_by_id[entry_id] = entry
             entries.append(entry)
 
@@ -101,7 +114,8 @@ def _map_workout(workout, rows, exercise_by_id, day_ids):
 
         exercise = exercise_by_id.get(int(exercise_id), {})
         if not warmup and duration is None and weight is not None and reps is not None:
-            multiplier = 2 if exercise.get("equipment") == "dumbbell" and exercise.get("dumbbell_pair", True) else 1
+            pair = exercise.get("dumbbell_pair")
+            multiplier = 2 if exercise.get("equipment") == "dumbbell" and (pair is None or pair is True) else 1
             volume += float(weight) * int(reps) * multiplier
 
     started = workout.get("created_at")
@@ -152,12 +166,29 @@ def map_snapshot(
         for row in exercises
         if row.get("id") is not None
     ]
+    latest_weight_by_day = {}
+    for row in bodyweight:
+        day = row.get("date")
+        weight = _number(row.get("weight_kg"))
+        if day is None or weight is None:
+            continue
+        try:
+            weight_value = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if not 20 <= weight_value <= 500:
+            continue
+        timestamp = _milliseconds(row.get("recorded_at"))
+        source_order = int(row.get("source_order") or 0)
+        rank = (timestamp, source_order)
+        key = _iso(day)
+        previous = latest_weight_by_day.get(key)
+        if previous is None or rank > previous[0]:
+            latest_weight_by_day[key] = (rank, weight)
     weight_rows = [
-        {"d": _iso(row.get("date")), "w": _number(row.get("weight_kg"))}
-        for row in bodyweight
-        if row.get("date") is not None and row.get("weight_kg") is not None
+        {"d": key, "w": value[1]}
+        for key, value in sorted(latest_weight_by_day.items())
     ]
-    weight_rows.sort(key=lambda row: row["d"])
     day_plan = {}
     if next_day and next_day.get("id") is not None:
         day_plan[today.isoformat()] = _routine_id(next_day["id"])
@@ -204,19 +235,14 @@ def get_state() -> dict:
     plan = plans.active_plan()
     home = plans.home_state()
     bodyweight = db.query(
-        """WITH measurements AS (
-               SELECT date,weight_kg,0 AS source_order FROM body_measurements
-               WHERE weight_kg IS NOT NULL
+        """SELECT date,weight_kg,recorded_at,source_order FROM (
+               SELECT date,weight_kg,created_at AS recorded_at,0 AS source_order
+               FROM body_measurements WHERE weight_kg BETWEEN 20 AND 500
                UNION ALL
-               SELECT date,weight AS weight_kg,1 AS source_order FROM health_data
-               WHERE weight IS NOT NULL
-           ), latest_per_date AS (
-               SELECT date,weight_kg,ROW_NUMBER() OVER
-                      (PARTITION BY date ORDER BY source_order) AS row_number
-               FROM measurements
-           )
-           SELECT date,weight_kg FROM latest_per_date
-           WHERE row_number=1 ORDER BY date"""
+               SELECT date,weight AS weight_kg,updated_at AS recorded_at,1 AS source_order
+               FROM health_data WHERE weight BETWEEN 20 AND 500
+           ) measurements
+           ORDER BY date,recorded_at,source_order"""
     )
     default_rest = next(iter(tracker.REST_SECONDS.values()), plans.DEFAULT_REST_SECONDS)
     rest_sec = db.get_setting("gym_rest_sec", default_rest)

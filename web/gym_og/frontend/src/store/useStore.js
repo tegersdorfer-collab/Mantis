@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { api, setRemoteAuth } from '../lib/api.js'
-import { localTZ } from '../lib/format.js'
+import { localTZ, todayISO } from '../lib/format.js'
 import { t } from '../lib/i18n.js'
 import { registerCustom, healCustomEx } from '../lib/exercises.js'
 import { DEMO, DEMO_SEEDED } from '../lib/demo.js'
@@ -27,6 +27,7 @@ import { DEFAULT_TEMPLATE_ID } from '../lib/structuralBalanceTemplates.js'
 
 import { WC_DEFAULT } from '../lib/workout-controls.js'
 import { sanitizeAccent } from '../lib/accent.js'
+import { MANTIS_OG } from '../lib/mantis-og.js'
 
 const KEY = 'gym_state_v1'
 // Where the saved copy stands with the server: the revision it descends from, and its own `_ts`
@@ -321,6 +322,8 @@ export const useStore = create((set, get) => {
   let replaceRev = null
   let importRead = null    // what importConflict last read: { uid, state, rev }
   let lastCheck = 0
+  // mantis: The server's day plan rolls over even when its data revision stays the same.
+  let lastPullDay = null
   let pollTm = null
   let offlineChanges = false   // a push failed for lack of network — the next one that lands says so
   let backupTm = null      // phone: the auto-backup after workout media changed, on its debounce
@@ -412,8 +415,9 @@ export const useStore = create((set, get) => {
   // A sign-in whose question is still open (adoptHold, e.g. its GET failed) holds a copy that has
   // reached no server yet: with any data in it, it is owed, so a sign-out asks and keeps it aside
   // instead of wiping the guest's history and what was logged during the hold.
-  const owesOwn = () => metaOf().owed || pushPending || pushTm !== null || !!pushing || localChanged()
-  const owes = () => owesOwn() || (adoptHold && hasData(get().S))
+  // mantis: Phase 1 never uploads local preview state, so old dirty markers cannot trigger pulls.
+  const owesOwn = () => !MANTIS_OG && (metaOf().owed || pushPending || pushTm !== null || !!pushing || localChanged())
+  const owes = () => !MANTIS_OG && (owesOwn() || (adoptHold && hasData(get().S)))
 
   /* The connection as the screens show it (components/SyncBanner.jsx, Settings). The flags are set
      where each outcome is known; `status` is derived from them here, once, so no screen has to
@@ -555,6 +559,7 @@ export const useStore = create((set, get) => {
   // What it was asked to save was made on the empty copy it holds meanwhile, never on the previous
   // owner's: that small change is kept aside, as "Keep profile as is" keeps a device's copy.
   const refuseStale = S => {
+    if (MANTIS_OG) return false
     if (!handedOver) return false
     takeSaved()
     clearTimeout(pushTm)
@@ -563,9 +568,12 @@ export const useStore = create((set, get) => {
     return true
   }
   const persist = (S, push = true, stamp = true) => {
+    // mantis: Reject direct write paths such as reset/import as well as ordinary edits.
+    if (MANTIS_OG && push) return
     if (refuseStale(S)) return
     const { base, owed } = metaOf()   // the copy being replaced; the new one stands where it stood
-    const joined = joinSaved(S, get()?.S)
+    // mantis: A preview state must never rejoin local dirty edits over the server snapshot.
+    const joined = MANTIS_OG ? null : joinSaved(S, get()?.S)
     if (joined) S = joined
     // A join holds another tab's changes, which this copy then owes the server too.
     if (stamp || joined) S._ts = Math.max(Date.now(), (base?.ts || 0) + 1, Number(S._ts) || 0)
@@ -602,14 +610,15 @@ export const useStore = create((set, get) => {
           .catch(() => {})
       }
     }
-    meta.set(S, { base, owed: owed || !saved || (!!joined && storedOwed()) })
-    if (!saved) saveOwed(true)
+    meta.set(S, { base, owed: MANTIS_OG ? false : owed || !saved || (!!joined && storedOwed()) })
+    if (MANTIS_OG) saveOwed(false)
+    else if (!saved) saveOwed(true)
     set({ S })
     // A copy that replaces the last one wholesale and keeps an older stamp — adopted from the
     // server — goes to the file at once. Until it does, the file holds the copy it replaced,
     // which looks newer, and a start in between would take that one back (restoreFromMirror).
     if (MOBILE) nativePersist(!stamp)
-    if (push && get().user) {
+    if (push && get().user && !MANTIS_OG) {
       // Before boot has pulled, the copy in hand may be older than the server's: a push now
       // would carry it with a stale (or no) baseRev. It waits for finishBoot.
       if (!get().ready) { pushPending = true; return }
@@ -634,6 +643,8 @@ export const useStore = create((set, get) => {
   // desktop tab left open all week used to show, and then push, whatever they last had.
   const checkRev = async (force = false) => {
     if (!get().user || !get().ready || document.visibilityState === 'hidden') return
+    // mantis: Pull the new server rotation day once local midnight has passed.
+    if (MANTIS_OG && lastPullDay && lastPullDay !== todayISO()) return get().pullState()
     if (!force && Date.now() - lastCheck < CHECK_MIN_MS) return
     lastCheck = Date.now()
     // A sign-in still deciding what becomes of this copy: no check of its own. One whose adoption
@@ -642,13 +653,15 @@ export const useStore = create((set, get) => {
     if (adoptHold) { if (!adopting && adoptOwed()) get().resumeAdoption(); return }
     if (pulling) return pulling
     const { base } = metaOf()
-    if (!base || owes()) return get().pullState()
+    // mantis: After a failed first pull, wait for focus/network recovery instead of polling full data.
+    if (MANTIS_OG && !base && !force) return
+    if (!base || (!MANTIS_OG && owes())) return get().pullState()
     try {
       const { rev, wid } = await api('/api/data/rev')
       if (rev !== base.rev || (base.wid && wid && wid !== base.wid)) return get().pullState()
       confirmed(get().S)   // nothing moved on either side
     } catch (e) {
-      if (isNetworkError(e) || refused(e)) failed(e)
+      if (isNetworkError(e) || refused(e) || MANTIS_OG) failed(e)
       else return get().pullState()   // a server that lacks the route (older API) — the full pull knows the old protocol
     }
   }
@@ -1303,14 +1316,17 @@ export const useStore = create((set, get) => {
   if (referencedHashes(S0).size) loadPending()
   meta.set(S0, { base: readStoredSync(), owed: storedOwed() })
   const user0 = (() => { try { return JSON.parse(localStorage.getItem('gym_user')) || null } catch { return null } })()
-  adoptHold = !!user0 && readAdopt()?.uid === user0.id
-  const sync0 = { offline: false, pending: storedOwed(), auth: false, lastError: null, lastSynced: (() => { try { return +localStorage.getItem(SYNCED_AT_KEY) || 0 } catch { return 0 } })(), server: serverBase(), held: adoptHold }
+  adoptHold = !MANTIS_OG && !!user0 && readAdopt()?.uid === user0.id
+  // mantis: Ignore adoption prompts left by the upstream openGym client.
+  if (MANTIS_OG) writeAdopt(null)
+  const sync0 = { offline: false, pending: MANTIS_OG ? false : storedOwed(), auth: false, lastError: null, lastSynced: (() => { try { return +localStorage.getItem(SYNCED_AT_KEY) || 0 } catch { return 0 } })(), server: serverBase(), held: adoptHold }
   sync0.status = statusOf(sync0, user0)
 
   return {
     S: S0,
     user: user0,
-    readOnly: false,
+    // mantis: The branded build is always a preview, from first render onward.
+    readOnly: MANTIS_OG,
     ready: false,
     // The connection as the screens show it — see statusOf above for every field.
     sync: sync0,
@@ -1333,6 +1349,8 @@ export const useStore = create((set, get) => {
     // Mutate a draft of S via producer fn, then persist + schedule sync. Every routine the change
     // touched carries the time of it, for a conflict to keep the version edited last.
     update(mut, push = true) {
+      // mantis: Ignore edits in the read-only build instead of keeping unsaved local state.
+      if (MANTIS_OG) return
       const prev = get().S
       const S = clone(prev)
       mut(S)
@@ -1486,10 +1504,12 @@ export const useStore = create((set, get) => {
       if (MOBILE && S.autoBackup) writeAutoBackup(S)
     },
 
-    isGuest: () => localStorage.getItem('gym_guest') === '1',
+    // mantis: A Mantis session is never a local guest, even with an old stored flag.
+    isGuest: () => !MANTIS_OG && localStorage.getItem('gym_guest') === '1',
     // Choosing to go on without a server ends whatever was said about the last one.
     setGuest(v) {
-      if (v) localStorage.setItem('gym_guest', '1'); else localStorage.removeItem('gym_guest')
+      // mantis: Discard the upstream guest choice and its stale localStorage flag.
+      if (MANTIS_OG || !v) localStorage.removeItem('gym_guest'); else localStorage.setItem('gym_guest', '1')
       set({})
       if (v) setSync({ auth: false, offline: false, lastError: null })
     },
@@ -1584,7 +1604,8 @@ export const useStore = create((set, get) => {
         // session and is already the right answer, Coach or no Coach.
         if (get().config && !('coach' in get().config)) get().refreshConfig()
       } else { rejoined = false; adoptHold = false; localStorage.removeItem('gym_user') }
-      set({ user: u, readOnly: false })
+      // mantis: Signing in must not turn the Mantis preview into a writable client.
+      set({ user: u, readOnly: MANTIS_OG })
       setSync({ held: adoptHold })
     },
 
@@ -1612,12 +1633,29 @@ export const useStore = create((set, get) => {
       if (pulling) return pulling
       pulling = (async () => {
         try {
-          if (pushTm) { clearTimeout(pushTm); pushTm = null; await get().pushState() }
+          // mantis: The server is authoritative; discard queued local writes before reading it.
+          if (MANTIS_OG) {
+            clearTimeout(pushTm)
+            pushTm = null
+            pushPending = false
+          } else if (pushTm) { clearTimeout(pushTm); pushTm = null; await get().pushState() }
           else if (pushing) await pushing
+          const pullDay = MANTIS_OG ? todayISO() : null
           const res = await api('/api/data')
           lastCheck = Date.now()
           reached()
           const { state, rev } = res
+          if (MANTIS_OG) {
+            const next = sanitizeAccent(Object.assign(clone(DEF), state || {}))
+            persist(next, false, false)
+            if (rev == null) dropSync()
+            else writeSync(rev, next._ts || 0, state?._wid)
+            clearLegacy()
+            markOwed(false)
+            lastPullDay = pullDay
+            confirmed(get().S)
+            return
+          }
           const S = get().S
           const { base, owed } = metaOf()
           // Owed to the server: a push that failed, or a change made while boot was still pulling.
@@ -1671,7 +1709,9 @@ export const useStore = create((set, get) => {
       // Held for a sign-in's question: "Sync now" is asking it (again), and the sync follows.
       if (adoptHold) { await get().resumeAdoption(); if (adoptHold) return get().sync }
       if (pulling) await pulling
-      await get().pullState()
+      // mantis: A manual check follows the same revision gate as the background poll.
+      if (MANTIS_OG) await checkRev(true)
+      else await get().pullState()
       return get().sync
     },
 
@@ -1776,8 +1816,10 @@ export const useStore = create((set, get) => {
       if (!left.owed && !(await stashActive())) return { owed: true, count: 0, stashed: false }
       // The device is signed out either way. A request that did not get through leaves the cookie
       // behind, still valid, so the logout is owed until the server answers it (see boot).
+      // mantis: Clear the same HttpOnly session cookie used by openGym, then return to token login.
       try { await api('/api/logout', { method: 'POST', body: '{}' }) } catch (e) { if (!MOBILE) logoutOwed(true) }
       await clearLocalSession()
+      if (MANTIS_OG) window.location.assign('/?next=%2Fog%2F')
       return left.owed ? owedResult(left, { stashed: true }) : { owed: false }
     },
 
@@ -1942,13 +1984,16 @@ export const useStore = create((set, get) => {
       // refuse — the only way the switch reaches someone already inside is here, on their next
       // boot. Ending the session needs a positive `allow_guest: false`; see lib/guest.js for why
       // an unreachable server must not be allowed to lock anyone out (#42).
+      // mantis: Remove the upstream guest marker before the token session check.
+      if (MANTIS_OG) get().setGuest(false)
       const cfg = await get().loadConfig()
       if (!guestAllowed(cfg)) get().setGuest(false)
       // A sign-out that could not reach the server: finish it first. Still unanswered, the
       // browser stays signed out rather than adopt the session it left behind.
       if (logoutOwed()) {
+        // mantis: Retry cookie deletion, but never strand the preview at boot when that request fails.
         try { await api('/api/logout', { method: 'POST', body: '{}' }); logoutOwed(false) } catch { /* owed until it is answered */ }
-        if (logoutOwed()) { finishBoot(); return }
+        if (logoutOwed() && !MANTIS_OG) { finishBoot(); return }
       }
       try {
         const me = await api('/api/me')
