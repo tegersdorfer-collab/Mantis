@@ -81,11 +81,22 @@ class WakeWordDetector:
         self._consecutive_hits = 0
         self._samples_processed = 0
         self._first_positive_frame_end_sample: int | None = None
+        self._hit_score: float | None = None
 
     @property
     def first_positive_frame_end_sample(self) -> int | None:
         """Ende des ersten über der Schwelle liegenden Frames der Treffer-Serie."""
         return self._first_positive_frame_end_sample
+
+    @property
+    def hit_score(self) -> float | None:
+        """Höchster Score der aktuellen zusammenhängenden Treffer-Serie."""
+        return self._hit_score
+
+    @property
+    def max_score(self) -> float | None:
+        """Alias für den Spitzenwert der aktuellen Treffer-Serie."""
+        return self._hit_score
 
     def check(self, pcm_chunk: bytes) -> bool:
         n_samples = len(pcm_chunk) // 2
@@ -105,6 +116,7 @@ class WakeWordDetector:
         if embeddings.shape[0] < N_FRAMES:
             self._consecutive_hits = 0
             self._first_positive_frame_end_sample = None
+            self._hit_score = None
             return False
 
         scores = []
@@ -117,9 +129,13 @@ class WakeWordDetector:
         if score >= self._threshold:
             if self._consecutive_hits == 0:
                 self._first_positive_frame_end_sample = self._samples_processed
+                self._hit_score = score
+            else:
+                self._hit_score = max(self._hit_score or score, score)
             self._consecutive_hits += 1
         else:
             self._consecutive_hits = 0
             self._first_positive_frame_end_sample = None
+            self._hit_score = None
 
         return self._consecutive_hits >= CONSECUTIVE_HITS_REQUIRED

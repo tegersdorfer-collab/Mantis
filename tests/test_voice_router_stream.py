@@ -315,6 +315,11 @@ def test_router_bypasses_real_wakeword_and_speculates_with_tool_and_audio_gates(
             if chunk == b"turn":
                 return {
                     "text": "Erzähl mir etwas.", "wakeword_triggered": wakeword,
+                    "wakeword_score": 0.93,
+                    "wakeword_hit_offset_ms": 100.0 if wakeword else -1200.0,
+                    "wakeword_decision": (
+                        "in_segment" if wakeword else "rejected_before_segment"
+                    ),
                     "stt_ms": 1.0, "turn_started_at": time.perf_counter(),
                 }
             return None
@@ -417,6 +422,11 @@ def test_router_bypasses_real_wakeword_and_speculates_with_tool_and_audio_gates(
         await asyncio.wait_for(latency_logged.wait(), timeout=1)
         detail = next(item[2] for item in logged if item[0] == "voice_latency")
         assert detail["address_check_mode"] == expected_mode
+        assert detail["wakeword_score"] == 0.93
+        assert detail["wakeword_hit_offset_ms"] == (100.0 if wakeword else -1200.0)
+        assert detail["wakeword_decision"] == (
+            "in_segment" if wakeword else "rejected_before_segment"
+        )
         if wakeword:
             assert detail["address_check_ms"] is None
             assert tool_runs == ["read-only-tool"]

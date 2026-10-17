@@ -2,6 +2,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
+import pytest
 from unittest.mock import MagicMock, patch
 
 import core.wakeword as wakeword
@@ -54,6 +55,18 @@ class TestWakeWordDetector:
         ]
 
         assert results[-1] is True
+        assert detector.first_positive_frame_end_sample == wakeword.WAKEWORD_REQUIRED_SAMPLES
+
+    def test_hit_series_exposes_its_peak_score(self, tmp_path):
+        detector = make_detector_with_scores(tmp_path, scores=[0.7, 0.9, 0.8])
+
+        results = [
+            detector.check(b"\x00\x00" * wakeword.WAKEWORD_REQUIRED_SAMPLES)
+            for _ in range(wakeword.CONSECUTIVE_HITS_REQUIRED)
+        ]
+
+        assert results[-1] is True
+        assert detector.hit_score == pytest.approx(0.9)
         assert detector.first_positive_frame_end_sample == wakeword.WAKEWORD_REQUIRED_SAMPLES
 
     def test_check_resets_streak_on_a_low_score(self, tmp_path):
