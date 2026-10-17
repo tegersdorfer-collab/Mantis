@@ -77,9 +77,10 @@ function logoutOwed(on) {
 const MIRROR_OWNER_FILE = 'opengym-state-owner.json'
 const CHECK_MIN_MS = 3000    // rev checks closer together than this are the same event (focus + visibility)
 const POLL_MS = 30000        // while the app is open and signed in, ask the server for its revision this often
-// mantis: First-snapshot retries stop after five failures and cap backoff at one poll interval.
+// mantis: First-snapshot retries back off exponentially, then stay at a fixed cap (below the poll
+// interval, so every poll can retry) for as long as the server is down. They never stop for good.
 const INITIAL_PULL_MAX_FAILURES = 5
-const INITIAL_PULL_MAX_BACKOFF_MS = POLL_MS
+const INITIAL_PULL_MAX_BACKOFF_MS = POLL_MS - CHECK_MIN_MS
 const AUTO_BACKUP_SOON_MS = 2000   // several photos picked at once make one backup
 // Whether `next` has a workout photo or video that `prev` had on none of its workouts.
 const workoutMediaHashes = S => (Array.isArray(S?.workouts) ? S.workouts : [])
@@ -664,7 +665,7 @@ export const useStore = create((set, get) => {
     const { base } = metaOf()
     // mantis: Recover a missing first snapshot through bounded full pulls on polls and focus.
     if (MANTIS_OG && !base) {
-      if (!force && (initialPullFailures >= INITIAL_PULL_MAX_FAILURES || Date.now() < initialPullRetryAt)) return
+      if (!force && Date.now() < initialPullRetryAt) return
       return get().pullState()
     }
     if (!base || (!MANTIS_OG && owes())) return get().pullState()
