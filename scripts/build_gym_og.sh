@@ -10,4 +10,5 @@ fi
 
 cd "$FRONTEND_DIR"
 # mantis: This build flag disables the bundled catalogue, passkey/account flows, push, and media sync.
-VITE_MANTIS_OG=1 VITE_DEMO=0 VITE_MOBILE=0 npx vite build --base=/og/
+# mantis: The app is served at /, its API stays under /og/api (no clash with the old tracker's /api).
+VITE_MANTIS_OG=1 VITE_MANTIS_API_BASE=/og VITE_DEMO=0 VITE_MOBILE=0 npx vite build --base=/

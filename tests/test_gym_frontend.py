@@ -18,11 +18,12 @@ def test_shell_links_assets_and_ios_install_metadata():
     assert 'rel="apple-touch-icon"' in index
 
 
-def test_manifest_opens_the_full_screen_app_at_root():
+def test_manifest_opens_the_full_screen_app_under_old():
     manifest = json.loads((GYM_DIR / "manifest.webmanifest").read_text(encoding="utf-8"))
 
     assert manifest["display"] == "standalone"
-    assert manifest["start_url"] == "/"
+    assert manifest["start_url"] == "/old/"
+    assert manifest["scope"] == "/old/"
 
 
 def test_frontend_uses_idempotent_offline_queue_and_rest_timer():

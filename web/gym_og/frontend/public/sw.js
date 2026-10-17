@@ -256,6 +256,8 @@ self.addEventListener('fetch', e => {
   const url = new URL(e.request.url)
   if (e.request.method !== 'GET' || url.origin !== location.origin) return
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith(API)) return    // never cache auth/data
+  // mantis: Mantis keeps its API under /og/api and its old tracker, login and session under /old/, /login, /auth.
+  if (/^\/(?:og\/api|old|login|auth)(?:\/|$)/.test(url.pathname)) return
 
   if (isMediaPath(url.pathname)) {
     e.respondWith(media(e))

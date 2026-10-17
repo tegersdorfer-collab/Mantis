@@ -18,7 +18,7 @@ describe('Mantis openGym token login redirect', () => {
 
     await expect(api(path)).rejects.toMatchObject({ status: 401 })
 
-    expect(assign).toHaveBeenCalledWith('/?next=%2Fog%2F')
+    expect(assign).toHaveBeenCalledWith('/login?next=%2F')
     Object.defineProperty(window, 'location', oldLocation)
   })
 

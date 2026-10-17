@@ -29,7 +29,7 @@ describe('Mantis openGym expired session', () => {
 
     signInAgain()
 
-    expect(assign).toHaveBeenCalledWith('/?next=%2Fog%2F')
+    expect(assign).toHaveBeenCalledWith('/login?next=%2F')
     expect(mocks.passkeyLogin).not.toHaveBeenCalled()
     Object.defineProperty(window, 'location', oldLocation)
   })

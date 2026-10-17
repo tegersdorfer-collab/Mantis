@@ -1,7 +1,7 @@
 // Backend + WebAuthn helpers (ported from the vanilla app).
 import { t } from './i18n-core.js'
 import { MOBILE } from './mobile.js'
-import { appBase } from './app-base.js'
+import { appBase, apiBase } from './app-base.js'
 import { nativeFetch } from './capacitor-fetch.js'
 import { MANTIS_OG } from './mantis-og.js'
 
@@ -59,7 +59,7 @@ export async function api(path, opts) {
   const headers = Object.assign({ 'Content-Type': 'application/json' }, init.headers, remoteHeaders())
   // A paired phone has an absolute base of its own; everyone else is relative to where the app
   // is served, so a subpath deployment reaches its own API instead of the proxy's root.
-  const url = remoteBase ? remoteBase + path : appBase().replace(/\/$/, '') + path
+  const url = remoteBase ? remoteBase + path : apiBase().replace(/\/$/, '') + path
   const ms = timeout != null ? timeout : (init.method || 'GET').toUpperCase() === 'GET' ? TIMEOUT_GET_MS : TIMEOUT_MS
   return request(url, Object.assign({}, init, { headers }), ms)
 }
@@ -88,7 +88,7 @@ async function exchange(url, init) {
   const r = await fetch(url, init)
   // mantis: The Mantis build's only sign-in is the token login at the root.
   if (MANTIS_OG && r.status === 401 && /\/api\/(?:me|config)$/.test(new URL(url, 'http://localhost').pathname)) {
-    window.location.assign('/?next=%2Fog%2F')
+    window.location.assign('/login?next=%2F')
   }
   // mantis: The token-backed logout endpoint acknowledges success without a JSON body.
   if (r.status === 204) return { ok: true }
@@ -111,7 +111,7 @@ export function beacon(path, body) {
   if (MOBILE) return false
   try {
     if (typeof navigator === 'undefined' || typeof navigator.sendBeacon !== 'function') return false
-    return !!navigator.sendBeacon(appBase().replace(/\/$/, '') + path, new Blob([JSON.stringify(body)], { type: 'application/json' }))
+    return !!navigator.sendBeacon(apiBase().replace(/\/$/, '') + path, new Blob([JSON.stringify(body)], { type: 'application/json' }))
   } catch { return false }
 }
 
@@ -120,7 +120,7 @@ export function beacon(path, body) {
    base api() uses and carry the paired phone's Bearer token the same way (the server's CORS
    answer allows it for GET and PUT); both refuse to run on a phone without a server, like api(). */
 
-const mediaUrl = path => (remoteBase ? remoteBase + path : appBase().replace(/\/$/, '') + path)
+const mediaUrl = path => (remoteBase ? remoteBase + path : apiBase().replace(/\/$/, '') + path)
 const mediaHeaders = remoteHeaders
 const notPaired = () => failure(t('This phone is not connected to a server.'), 'not-paired', 0)
 const timedOut = () => failure(t('The server did not answer in time.'), 'timeout')

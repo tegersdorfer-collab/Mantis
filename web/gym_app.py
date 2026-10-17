@@ -8,6 +8,7 @@ import hashlib
 import hmac
 from pathlib import Path
 import time
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -21,12 +22,14 @@ from web import gym_og_data
 COOKIE = "mantis_gym"
 STATIC_DIR = Path(__file__).parent / "gym"
 GYM_OG_DIST_DIR = Path(__file__).parent / "gym_og" / "frontend" / "dist"
+# Die alte Vanilla-App liegt unter /old/; ihre Dateien sind öffentlich, weil /login sie braucht.
 STATIC_FILES = {
-    "/app.js": ("app.js", "text/javascript"),
-    "/app.css": ("app.css", "text/css"),
-    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
-    "/icon.png": ("icon.png", "image/png"),
+    "app.js": ("app.js", "text/javascript"),
+    "app.css": ("app.css", "text/css"),
+    "manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+    "icon.png": ("icon.png", "image/png"),
 }
+LOGIN_PATH = "/login"
 
 
 class LoginBody(BaseModel):
@@ -164,8 +167,8 @@ async def _require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
 
-def _og_login_redirect() -> RedirectResponse:
-    return RedirectResponse("/?next=%2Fog%2F", status_code=307)
+def _login_redirect(next_path: str) -> RedirectResponse:
+    return RedirectResponse(f"{LOGIN_PATH}?{urlencode({'next': next_path})}", status_code=307)
 
 
 def _require_og_session(request: Request) -> bool:
@@ -194,7 +197,7 @@ def _gym_og_file_response(asset_path: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="Not found")
     headers = {"Cache-Control": "no-cache"}
     if relative == "sw.js":
-        headers["Service-Worker-Allowed"] = "/og/"
+        headers["Service-Worker-Allowed"] = "/"
     return FileResponse(
         file_path,
         media_type="application/javascript" if relative == "sw.js" else None,
@@ -203,6 +206,8 @@ def _gym_og_file_response(asset_path: str) -> FileResponse:
 
 
 def _static_response(path: str) -> FileResponse:
+    if path not in STATIC_FILES:
+        raise HTTPException(status_code=404, detail="Not found")
     filename, media_type = STATIC_FILES[path]
     file_path = STATIC_DIR / filename
     if not file_path.is_file():
@@ -236,43 +241,43 @@ def create_gym_app() -> FastAPI:
     async def tracker_error_handler(_request: Request, error: tracker.TrackerError):
         return JSONResponse({"error": error.message}, status_code=error.status)
 
-    @app.get("/", include_in_schema=False)
-    async def index():
+    def old_index() -> FileResponse:
         return FileResponse(
             STATIC_DIR / "index.html",
             media_type="text/html",
             headers={"Cache-Control": "no-cache"},
         )
 
-    @app.get("/app.js", include_in_schema=False)
-    async def app_js():
-        return _static_response("/app.js")
+    @app.get("/", include_in_schema=False)
+    async def index(request: Request):
+        if not _require_og_session(request):
+            return _login_redirect("/")
+        if not (GYM_OG_DIST_DIR / "index.html").is_file():
+            return RedirectResponse("/old/", status_code=307)
+        return _gym_og_file_response("index.html")
 
-    @app.get("/app.css", include_in_schema=False)
-    async def app_css():
-        return _static_response("/app.css")
+    @app.get(LOGIN_PATH, include_in_schema=False)
+    async def login_page():
+        # The old app's token login; app.js follows `next` afterwards (internal paths only).
+        return old_index()
 
-    @app.get("/manifest.webmanifest", include_in_schema=False)
-    async def manifest():
-        return _static_response("/manifest.webmanifest")
+    @app.get("/old", include_in_schema=False)
+    async def old_no_slash():
+        return RedirectResponse("/old/", status_code=307)
 
-    @app.get("/icon.png", include_in_schema=False)
-    async def icon():
-        return _static_response("/icon.png")
+    @app.get("/old/", include_in_schema=False)
+    async def old_app(request: Request):
+        if not _require_og_session(request):
+            return _login_redirect("/old/")
+        return old_index()
+
+    @app.get("/old/{filename}", include_in_schema=False)
+    async def old_static(filename: str):
+        return _static_response(filename)
 
     @app.get("/og", include_in_schema=False)
-    async def open_gym_no_slash(request: Request):
-        if not _require_og_session(request):
-            return _og_login_redirect()
-        return RedirectResponse("/og/", status_code=307)
-
-    @app.get("/og/", include_in_schema=False)
-    async def open_gym_index(request: Request):
-        if not _require_og_session(request):
-            return _og_login_redirect()
-        if not (GYM_OG_DIST_DIR / "index.html").is_file():
-            return RedirectResponse("/", status_code=307)
-        return _gym_og_file_response("index.html")
+    async def open_gym_legacy_root():
+        return RedirectResponse("/", status_code=307)
 
     @og_api.get("/me")
     async def open_gym_me():
@@ -326,13 +331,10 @@ def create_gym_app() -> FastAPI:
 
     app.include_router(og_api)
 
-    @app.get("/og/{asset_path:path}", include_in_schema=False)
-    async def open_gym_static(asset_path: str, request: Request):
-        if not _require_og_session(request):
-            return _og_login_redirect()
-        if not (GYM_OG_DIST_DIR / "index.html").is_file():
-            return RedirectResponse("/", status_code=307)
-        return _gym_og_file_response(asset_path)
+    @app.get("/og/{_legacy_path:path}", include_in_schema=False)
+    async def open_gym_legacy_path(_legacy_path: str):
+        # Old /og/ bookmarks; openGym now lives at the root (its API stays under /og/api).
+        return RedirectResponse("/", status_code=307)
 
     @app.post("/auth/session")
     async def login(body: LoginBody, request: Request):
@@ -567,4 +569,13 @@ def create_gym_app() -> FastAPI:
         return await asyncio.to_thread(tracker.history, exercise, limit)
 
     app.include_router(api)
+
+    @app.get("/{asset_path:path}", include_in_schema=False)
+    async def open_gym_static(asset_path: str, request: Request):
+        if not _require_og_session(request):
+            return _login_redirect("/")
+        if not (GYM_OG_DIST_DIR / "index.html").is_file():
+            return RedirectResponse("/old/", status_code=307)
+        return _gym_og_file_response(asset_path)
+
     return app

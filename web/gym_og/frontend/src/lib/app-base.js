@@ -18,3 +18,10 @@ export function appBase(loc = typeof location !== 'undefined' ? location : null)
   const path = (loc && loc.pathname) || '/'
   return path.slice(0, path.lastIndexOf('/') + 1) || '/'
 }
+
+// mantis: Mantis serves the app at the site root but keeps its API under /og/api, away from the
+// old tracker's /api/*. VITE_MANTIS_API_BASE (set by scripts/build_gym_og.sh) is that prefix.
+export function apiBase(loc) {
+  const fixed = import.meta.env?.VITE_MANTIS_API_BASE
+  return fixed ? fixed.replace(/\/?$/, '/') : appBase(loc)
+}

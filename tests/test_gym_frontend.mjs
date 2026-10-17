@@ -43,6 +43,7 @@ function createFrontend({
   storage = new Map(),
   failGetItem = () => false,
   failSetItem = () => false,
+  location = {},
 } = {}) {
   const calls = [];
   const documentListeners = new Map();
@@ -116,7 +117,7 @@ function createFrontend({
       addEventListener: (name, callback) => documentListeners.set(name, callback),
     },
     window: {
-      location: { reload() { reloads += 1; } },
+      location: { ...location, reload() { reloads += 1; } },
       confirm: () => true,
       addEventListener: (name, callback) => windowListeners.set(name, callback),
     },
@@ -2204,4 +2205,34 @@ test("library pills are capitalised for display only and unset equipment shows n
   assert.doesNotMatch(screen(), /Equipment not set/);
   assert.match(screen(), /<small><\/small>|<small>Barbell<\/small>/);
   assert.doesNotMatch(screen(), /<strong>Treadmill<\/strong><small>[^<]+/);
+});
+
+test("Token-Login folgt nur internen next-Pfaden (kein Open Redirect)", async () => {
+  const cases = [
+    ["/login", "?next=%2Fold%2F", "/old/"],
+    ["/login", "?next=%2F", "/"],
+    ["/login", "", "/"],
+    ["/login", "?next=https%3A%2F%2Fevil.example%2F", "/"],
+    ["/login", "?next=%2F%2Fevil.example", "/"],
+    ["/login", "?next=%2F%5Cevil.example", "/"],
+    ["/login", "?next=javascript%3Aalert(1)", "/"],
+    ["/old/", "?next=%2F%2Fevil.example", null],
+    ["/old/", "", null],
+  ];
+  for (const [pathname, search, expected] of cases) {
+    const assigned = [];
+    let authenticated = false;
+    const app = createFrontend({
+      location: { pathname, search, assign: (target) => assigned.push(target) },
+      fetch: async (url) => {
+        if (url === "/auth/session") { authenticated = true; return response(200, { ok: true }); }
+        if (url === "/api/state") return authenticated ? response(200, makeState()) : response(401, {});
+        return response(200, {});
+      },
+    });
+    assert.equal(await waitFor(() => app.elements.get("#screen").innerHTML.includes("Access key")), true);
+    await app.submit("valid-token");
+    await waitFor(() => false);
+    assert.deepEqual(assigned, expected === null ? [] : [expected], `${pathname}${search}`);
+  }
 });
