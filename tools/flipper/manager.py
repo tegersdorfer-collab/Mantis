@@ -52,6 +52,7 @@ class FlipperManager:
                 log.info("Flipper-App blockiert IR, schließe sie: %s", out.strip())
                 await driver.talk("loader close", 1.0)
                 out = await driver.ir_tx(protocol, address, command)
+        log.info("Flipper IR %s %s %s → %r", protocol, address, command, out.strip()[-120:])
         low = out.lower()
         if (
             _app_blocks_cli(out)
