@@ -54,3 +54,5 @@ mlx_models/
 # in den Commit-Nachrichten, nicht hier.
 bench/nanbeige42/
 .venv-tts/
+web/gym_og/frontend/node_modules/
+web/gym_og/frontend/dist/

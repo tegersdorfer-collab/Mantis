@@ -10,15 +10,17 @@ from pathlib import Path
 import time
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 import config
 from domains.gym import library, overview, plans, tracker
+from web import gym_og_data
 
 
 COOKIE = "mantis_gym"
 STATIC_DIR = Path(__file__).parent / "gym"
+GYM_OG_DIST_DIR = Path(__file__).parent / "gym_og" / "frontend" / "dist"
 STATIC_FILES = {
     "/app.js": ("app.js", "text/javascript"),
     "/app.css": ("app.css", "text/css"),
@@ -137,6 +139,8 @@ def _session_value() -> tuple[str, int]:
 
 
 def _session_ok(value: str | None) -> bool:
+    if not config.DASHBOARD_TOKEN:
+        return False
     try:
         expiry, signature = value.split(".")
         if int(expiry) <= time.time():
@@ -160,6 +164,44 @@ async def _require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Authentication required")
 
 
+def _og_login_redirect() -> RedirectResponse:
+    return RedirectResponse("/?next=%2Fog%2F", status_code=307)
+
+
+def _require_og_session(request: Request) -> bool:
+    if not config.DASHBOARD_TOKEN:
+        raise HTTPException(status_code=503, detail="Set DASHBOARD_TOKEN on the server")
+    return _session_ok(request.cookies.get(COOKIE))
+
+
+def _clear_gym_session(request: Request) -> Response:
+    response = Response(status_code=204)
+    response.delete_cookie(
+        COOKIE,
+        path="/",
+        secure=request.url.scheme == "https",
+        httponly=True,
+        samesite="strict",
+    )
+    return response
+
+
+def _gym_og_file_response(asset_path: str) -> FileResponse:
+    root = GYM_OG_DIST_DIR.resolve()
+    relative = "index.html" if not asset_path else asset_path
+    file_path = (root / relative).resolve()
+    if not file_path.is_relative_to(root) or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    headers = {"Cache-Control": "no-cache"}
+    if relative == "sw.js":
+        headers["Service-Worker-Allowed"] = "/og/"
+    return FileResponse(
+        file_path,
+        media_type="application/javascript" if relative == "sw.js" else None,
+        headers=headers,
+    )
+
+
 def _static_response(path: str) -> FileResponse:
     filename, media_type = STATIC_FILES[path]
     file_path = STATIC_DIR / filename
@@ -175,6 +217,7 @@ def _static_response(path: str) -> FileResponse:
 def create_gym_app() -> FastAPI:
     app = FastAPI(title="Mantis Gym Tracker", docs_url=None, redoc_url=None)
     api = APIRouter(prefix="/api", dependencies=[Depends(_require_auth)])
+    og_api = APIRouter(prefix="/og/api", dependencies=[Depends(_require_auth)])
 
     @app.middleware("http")
     async def check_write_origin(request: Request, call_next):
@@ -217,6 +260,80 @@ def create_gym_app() -> FastAPI:
     async def icon():
         return _static_response("/icon.png")
 
+    @app.get("/og", include_in_schema=False)
+    async def open_gym_no_slash(request: Request):
+        if not _require_og_session(request):
+            return _og_login_redirect()
+        return RedirectResponse("/og/", status_code=307)
+
+    @app.get("/og/", include_in_schema=False)
+    async def open_gym_index(request: Request):
+        if not _require_og_session(request):
+            return _og_login_redirect()
+        if not (GYM_OG_DIST_DIR / "index.html").is_file():
+            return RedirectResponse("/", status_code=307)
+        return _gym_og_file_response("index.html")
+
+    @og_api.get("/me")
+    async def open_gym_me():
+        return {"user": {"id": 1, "name": "Timo", "admin": False}}
+
+    @og_api.get("/config")
+    async def open_gym_config():
+        return {
+            "invite_only": True,
+            "allow_guest": False,
+            "password_login": False,
+            "passkeys": False,
+            "registration": False,
+            "push": False,
+            "media": False,
+            "coach": False,
+        }
+
+    @og_api.get("/health")
+    async def open_gym_health():
+        return {"ok": True}
+
+    @og_api.get("/data")
+    async def open_gym_data():
+        for _ in range(3):
+            before = await asyncio.to_thread(gym_og_data.get_revision)
+            state = await asyncio.to_thread(gym_og_data.get_state)
+            after = await asyncio.to_thread(gym_og_data.get_revision)
+            if (before.get("rev"), before.get("wid")) == (after.get("rev"), after.get("wid")):
+                return {"state": state, "rev": after["rev"]}
+        raise HTTPException(status_code=503, detail="Gym data changed while the snapshot was read")
+
+    @og_api.get("/data/rev")
+    async def open_gym_data_revision():
+        return await asyncio.to_thread(gym_og_data.get_revision)
+
+    @og_api.put("/data")
+    async def open_gym_data_read_only():
+        return JSONResponse({"error": "read_only"}, status_code=423)
+
+    @og_api.api_route(
+        "/{unsupported_path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+    async def unsupported_open_gym_api(unsupported_path: str):
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
+    @app.post("/og/api/logout", status_code=204, include_in_schema=False)
+    async def open_gym_logout(request: Request):
+        return _clear_gym_session(request)
+
+    app.include_router(og_api)
+
+    @app.get("/og/{asset_path:path}", include_in_schema=False)
+    async def open_gym_static(asset_path: str, request: Request):
+        if not _require_og_session(request):
+            return _og_login_redirect()
+        if not (GYM_OG_DIST_DIR / "index.html").is_file():
+            return RedirectResponse("/", status_code=307)
+        return _gym_og_file_response(asset_path)
+
     @app.post("/auth/session")
     async def login(body: LoginBody, request: Request):
         if not config.DASHBOARD_TOKEN:
@@ -238,15 +355,7 @@ def create_gym_app() -> FastAPI:
 
     @app.delete("/auth/session", status_code=204)
     async def logout(request: Request):
-        response = Response(status_code=204)
-        response.delete_cookie(
-            COOKIE,
-            path="/",
-            secure=request.url.scheme == "https",
-            httponly=True,
-            samesite="strict",
-        )
-        return response
+        return _clear_gym_session(request)
 
     @api.get("/state")
     async def state():

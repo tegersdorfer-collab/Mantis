@@ -883,6 +883,58 @@ MIGRATIONS.extend([
     "ALTER TABLE gym_workout_exercises ADD COLUMN IF NOT EXISTS removed BOOLEAN NOT NULL DEFAULT FALSE;",
 ])
 
+MIGRATIONS.extend([
+    # openGym-Read-only-Snapshot: eine monoton steigende Revision plus Schreib-ID.
+    """
+    CREATE TABLE IF NOT EXISTS gym_sync_state (
+        id   SMALLINT PRIMARY KEY CHECK (id=1),
+        rev  BIGINT NOT NULL DEFAULT 1,
+        wid  TEXT NOT NULL
+    );
+    """,
+    """INSERT INTO gym_sync_state (id,rev,wid)
+       VALUES (1,1,md5(clock_timestamp()::text || random()::text))
+       ON CONFLICT (id) DO NOTHING;""",
+    """
+    CREATE OR REPLACE FUNCTION gym_sync_state_bump() RETURNS trigger AS $$
+    BEGIN
+        INSERT INTO gym_sync_state (id,rev,wid)
+        VALUES (1,1,md5(clock_timestamp()::text || random()::text))
+        ON CONFLICT (id) DO UPDATE SET
+            rev=gym_sync_state.rev+1,
+            wid=md5(gym_sync_state.wid || clock_timestamp()::text || random()::text);
+        RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+])
+
+for _table in (
+    "workouts", "workout_sets", "gym_plans", "gym_plan_days", "gym_plan_exercises",
+    "gym_workout_exercises", "exercises", "exercise_aliases", "body_measurements", "health_data",
+):
+    _trigger = f"gym_sync_revision_{_table}"
+    MIGRATIONS.append(f"DROP TRIGGER IF EXISTS {_trigger} ON {_table};")
+    MIGRATIONS.append(f"DROP TRIGGER IF EXISTS {_trigger}_delete ON {_table};")
+    MIGRATIONS.append(f"DROP TRIGGER IF EXISTS {_trigger}_update ON {_table};")
+    if _table == "health_data":
+        MIGRATIONS.extend([
+            f"CREATE TRIGGER {_trigger} AFTER INSERT ON {_table} FOR EACH ROW "
+            "WHEN (NEW.weight IS NOT NULL) EXECUTE FUNCTION gym_sync_state_bump();",
+            f"CREATE TRIGGER {_trigger}_delete AFTER DELETE ON {_table} FOR EACH ROW "
+            "WHEN (OLD.weight IS NOT NULL) EXECUTE FUNCTION gym_sync_state_bump();",
+            f"CREATE TRIGGER {_trigger}_update AFTER UPDATE OF weight ON {_table} FOR EACH ROW "
+            "WHEN (OLD.weight IS DISTINCT FROM NEW.weight) EXECUTE FUNCTION gym_sync_state_bump();",
+        ])
+    else:
+        MIGRATIONS.extend([
+            f"CREATE TRIGGER {_trigger} AFTER INSERT OR DELETE ON {_table} "
+            "FOR EACH STATEMENT EXECUTE FUNCTION gym_sync_state_bump();",
+            f"CREATE TRIGGER {_trigger}_update AFTER UPDATE ON {_table} FOR EACH ROW "
+            "WHEN (OLD.* IS DISTINCT FROM NEW.*) EXECUTE FUNCTION gym_sync_state_bump();",
+        ])
+del _table, _trigger
+
 
 def _backfill_legacy_exercise_metadata(cur) -> None:
     """Füllt Gym-Metadaten der Import-Bestandsübungen, nur wo sie noch NULL sind.
