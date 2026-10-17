@@ -1034,11 +1034,11 @@ def test_stale_hit_can_be_confirmed_by_exact_initial_mantis_in_final_stt(
             "Ähm, Mantis du jetzt mich?", "rejected_before_segment",
         ),
         (
-            -272.0, "Ähm, bist du jetzt bei mir mit drin oder?", False,
+            -630.0, "Ähm, bist du jetzt bei mir mit drin oder?", False,
             "Ähm, bist du jetzt bei mir mit drin oder?", "rejected_before_segment",
         ),
         (
-            -256.0, "Ähm, bist du jetzt bei mir mit drin oder?", True,
+            -600.0, "Ähm, bist du jetzt bei mir mit drin oder?", True,
             "Mantis, Ähm, bist du jetzt bei mir mit drin oder?", "in_segment",
         ),
     ],
@@ -1682,7 +1682,7 @@ class TestVoiceStreamSession:
 
     @pytest.mark.parametrize(
         ("silence_before_speech_ms", "expect_speculative_result", "offset_ms"),
-        [(1000, True, -528.0), (2000, False, None)],
+        [(1200, True, -720.0), (2000, False, None)],
         ids=["old-preroll-hit-rejected", "hit-outside-preroll-is-discarded"],
     )
     def test_old_preroll_hit_does_not_authorize_a_later_segment(
@@ -1716,8 +1716,9 @@ class TestVoiceStreamSession:
                 partial_executor_available=lambda: False,
             )
             silence = b"\0\0" * 16_000
-            for _ in range(silence_before_speech_ms // 1000):
-                await session.handle_chunk(silence, muted=False)
+            await session.handle_chunk(
+                b"\0\0" * (16 * silence_before_speech_ms), muted=False,
+            )
             await session.handle_chunk(b"\xe8\x03" * (3 * 16_000), muted=False)
             result = await session.handle_chunk(silence, muted=False)
             await session.close()
