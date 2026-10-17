@@ -75,6 +75,42 @@ describe('Mantis read-only preview', () => {
     expect(api.mock.calls.map(([path, options]) => [path, options?.method || 'GET'])).toEqual([['/api/data', 'GET']])
   })
 
+  it('discards a stale stash after reload when the API user ID is numeric', async () => {
+    const stale = {
+      ...clone(DEF), restSec: 30,
+      workouts: [{ id: 'w-2', name: 'Deleted on server', entries: [] }],
+    }
+    const remote = {
+      ...clone(DEF), restSec: 90, workouts: [], routines: [], customEx: [],
+      bodyweight: [], dayPlan: {}, week: {}, unit: 'kg',
+    }
+    useStore.setState({ S: stale, user: null, ready: false, config: null, sync: { ...sync } })
+    localStorage.setItem('gym_owner', '1')
+    localStorage.setItem('gym_state_v1', JSON.stringify(stale))
+    localStorage.setItem('gym_stash', JSON.stringify({
+      'http://localhost:3000|1': {
+        server: 'http://localhost:3000', uid: '1', name: 'Timo', at: 1, state: stale,
+      },
+    }))
+    api.mockImplementation(async (path, options = {}) => {
+      if (path === '/api/config') return { allow_guest: false, coach: false }
+      if (path === '/api/me') return { user: { id: 1, name: 'Timo', admin: false } }
+      if (path === '/api/data' && !options.method) return { state: remote, rev: 3, wid: 'r3' }
+      if (path === '/api/data/rev') return { rev: 3, wid: 'r3' }
+      throw new Error(`unexpected ${options.method || 'GET'} ${path}`)
+    })
+
+    await useStore.getState().boot()
+    window.dispatchEvent(new Event('online'))
+    await pause()
+
+    expect(useStore.getState().user.id).toBe('1')
+    expect(useStore.getState().S.restSec).toBe(90)
+    expect(useStore.getState().S.workouts).toEqual([])
+    expect(localStorage.getItem('gym_stash')).toBeNull()
+    expect(api).toHaveBeenCalledWith('/api/data/rev')
+  })
+
   it('does not full-pull or retry local preview edits until the server revision changes', async () => {
     api.mockResolvedValueOnce({ state: { ...clone(DEF), restSec: 90 }, rev: 7, wid: 'r7' })
     await useStore.getState().pullState()

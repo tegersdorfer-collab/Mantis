@@ -178,9 +178,8 @@ def map_snapshot(
             continue
         if not 20 <= weight_value <= 500:
             continue
-        timestamp = _milliseconds(row.get("recorded_at"))
         source_order = int(row.get("source_order") or 0)
-        rank = (timestamp, source_order)
+        rank = source_order
         key = _iso(day)
         previous = latest_weight_by_day.get(key)
         if previous is None or rank > previous[0]:
@@ -235,14 +234,14 @@ def get_state() -> dict:
     plan = plans.active_plan()
     home = plans.home_state()
     bodyweight = db.query(
-        """SELECT date,weight_kg,recorded_at,source_order FROM (
-               SELECT date,weight_kg,created_at AS recorded_at,0 AS source_order
+        """SELECT date,weight_kg,source_order FROM (
+               SELECT date,weight_kg,0 AS source_order
                FROM body_measurements WHERE weight_kg BETWEEN 20 AND 500
                UNION ALL
-               SELECT date,weight AS weight_kg,updated_at AS recorded_at,1 AS source_order
+               SELECT date,weight AS weight_kg,1 AS source_order
                FROM health_data WHERE weight BETWEEN 20 AND 500
            ) measurements
-           ORDER BY date,recorded_at,source_order"""
+           ORDER BY date,source_order"""
     )
     default_rest = next(iter(tracker.REST_SECONDS.values()), plans.DEFAULT_REST_SECONDS)
     rest_sec = db.get_setting("gym_rest_sec", default_rest)

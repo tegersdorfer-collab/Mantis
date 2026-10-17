@@ -25,6 +25,7 @@ if (!MANTIS_OG) startMediaSync(useStore)
 startNativeKeyboard()
 
 // Not in the mobile build: the native shell already serves everything from disk.
+// mantis: Keep this fork out of the upstream service-worker cache.
 if (!MANTIS_OG && !MOBILE && 'serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {})
   // The plan's exercise media, kept by the worker for a workout opened without a network (#281).

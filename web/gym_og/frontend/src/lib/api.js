@@ -90,6 +90,7 @@ async function exchange(url, init) {
   if (MANTIS_OG && r.status === 401 && /\/api\/(?:me|config)$/.test(new URL(url, 'http://localhost').pathname)) {
     window.location.assign('/?next=%2Fog%2F')
   }
+  // mantis: The token-backed logout endpoint acknowledges success without a JSON body.
   if (r.status === 204) return { ok: true }
   let data
   let parsed = true

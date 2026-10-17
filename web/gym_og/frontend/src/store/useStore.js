@@ -77,6 +77,9 @@ function logoutOwed(on) {
 const MIRROR_OWNER_FILE = 'opengym-state-owner.json'
 const CHECK_MIN_MS = 3000    // rev checks closer together than this are the same event (focus + visibility)
 const POLL_MS = 30000        // while the app is open and signed in, ask the server for its revision this often
+// mantis: First-snapshot retries stop after five failures and cap backoff at one poll interval.
+const INITIAL_PULL_MAX_FAILURES = 5
+const INITIAL_PULL_MAX_BACKOFF_MS = POLL_MS
 const AUTO_BACKUP_SOON_MS = 2000   // several photos picked at once make one backup
 // Whether `next` has a workout photo or video that `prev` had on none of its workouts.
 const workoutMediaHashes = S => (Array.isArray(S?.workouts) ? S.workouts : [])
@@ -322,6 +325,9 @@ export const useStore = create((set, get) => {
   let replaceRev = null
   let importRead = null    // what importConflict last read: { uid, state, rev }
   let lastCheck = 0
+  // mantis: Keep retrying an unavailable first snapshot with bounded exponential backoff.
+  let initialPullFailures = 0
+  let initialPullRetryAt = 0
   // mantis: The server's day plan rolls over even when its data revision stays the same.
   let lastPullDay = null
   let pollTm = null
@@ -559,6 +565,7 @@ export const useStore = create((set, get) => {
   // What it was asked to save was made on the empty copy it holds meanwhile, never on the previous
   // owner's: that small change is kept aside, as "Keep profile as is" keeps a device's copy.
   const refuseStale = S => {
+    // mantis: The server replaces preview state, so upstream tab ownership does not block a pull.
     if (MANTIS_OG) return false
     if (!handedOver) return false
     takeSaved()
@@ -610,6 +617,7 @@ export const useStore = create((set, get) => {
           .catch(() => {})
       }
     }
+    // mantis: A read-only preview never marks local edits as owed to the server.
     meta.set(S, { base, owed: MANTIS_OG ? false : owed || !saved || (!!joined && storedOwed()) })
     if (MANTIS_OG) saveOwed(false)
     else if (!saved) saveOwed(true)
@@ -618,6 +626,7 @@ export const useStore = create((set, get) => {
     // server — goes to the file at once. Until it does, the file holds the copy it replaced,
     // which looks newer, and a start in between would take that one back (restoreFromMirror).
     if (MOBILE) nativePersist(!stamp)
+    // mantis: Server snapshots persist locally without scheduling a write-back.
     if (push && get().user && !MANTIS_OG) {
       // Before boot has pulled, the copy in hand may be older than the server's: a push now
       // would carry it with a stale (or no) baseRev. It waits for finishBoot.
@@ -653,14 +662,18 @@ export const useStore = create((set, get) => {
     if (adoptHold) { if (!adopting && adoptOwed()) get().resumeAdoption(); return }
     if (pulling) return pulling
     const { base } = metaOf()
-    // mantis: After a failed first pull, wait for focus/network recovery instead of polling full data.
-    if (MANTIS_OG && !base && !force) return
+    // mantis: Recover a missing first snapshot through bounded full pulls on polls and focus.
+    if (MANTIS_OG && !base) {
+      if (!force && (initialPullFailures >= INITIAL_PULL_MAX_FAILURES || Date.now() < initialPullRetryAt)) return
+      return get().pullState()
+    }
     if (!base || (!MANTIS_OG && owes())) return get().pullState()
     try {
       const { rev, wid } = await api('/api/data/rev')
       if (rev !== base.rev || (base.wid && wid && wid !== base.wid)) return get().pullState()
       confirmed(get().S)   // nothing moved on either side
     } catch (e) {
+      // mantis: Surface revision-check errors while the preview waits for its next full pull.
       if (isNetworkError(e) || refused(e) || MANTIS_OG) failed(e)
       else return get().pullState()   // a server that lacks the route (older API) — the full pull knows the old protocol
     }
@@ -1108,6 +1121,11 @@ export const useStore = create((set, get) => {
   // merged in like a conflict (lib/sync-merge.js), marked owed and pushed, and the stash goes.
   // If the push does not land, the copy itself owes them from here and nothing wipes it.
   const applyStash = async () => {
+    // mantis: The server snapshot is authoritative; old offline stashes are discarded in this build.
+    if (MANTIS_OG) {
+      await writeStashes({})
+      return
+    }
     const user = get().user
     if (!user) return
     const all = await readStashes()
@@ -1538,7 +1556,9 @@ export const useStore = create((set, get) => {
 
     // `adopt` (a sign-in, a pairing — { alwaysAsk } for a device link): adoptProfile follows and
     // decides what becomes of this copy; until it has, nothing is pulled or pushed (ADOPT_KEY).
-    setUser(u, { adopt } = {}) {
+    setUser(user, { adopt } = {}) {
+      // mantis: Keep API user IDs string-valued like the stored owner and openGym account keys.
+      const u = MANTIS_OG && user?.id != null ? { ...user, id: String(user.id) } : user
       if (u) {
         // The local copy belongs to whoever last signed in here. When a session expires or is
         // revoked elsewhere, boot() only drops the user and the data stays; a different profile
@@ -1618,6 +1638,7 @@ export const useStore = create((set, get) => {
       pushTm = null
       if (adoptHold) return   // the sign-in has not decided what this copy is yet (adoptProfile)
       if (pushing) { pushAgain = true; return pushing.then(() => pushing) }
+      // mantis: A direct push path cannot upload changes from the preview build.
       if (get().readOnly) return
       pushing = doPush().finally(() => {
         pushing = null
@@ -1640,12 +1661,16 @@ export const useStore = create((set, get) => {
             pushPending = false
           } else if (pushTm) { clearTimeout(pushTm); pushTm = null; await get().pushState() }
           else if (pushing) await pushing
+          // mantis: Track the day used to synthesize the preview's rotation plan.
           const pullDay = MANTIS_OG ? todayISO() : null
           const res = await api('/api/data')
           lastCheck = Date.now()
           reached()
           const { state, rev } = res
+          // mantis: Replace local state wholesale with the server's read-only snapshot.
           if (MANTIS_OG) {
+            initialPullFailures = 0
+            initialPullRetryAt = 0
             const next = sanitizeAccent(Object.assign(clone(DEF), state || {}))
             persist(next, false, false)
             if (rev == null) dropSync()
@@ -1696,7 +1721,16 @@ export const useStore = create((set, get) => {
           mergeInto(S, state, rev)
           pushPending = false
           await get().pushState()
-        } catch (e) { failed(e) /* keep local; the poll retries */ }
+        } catch (e) {
+          failed(e) /* keep local; the poll retries */
+          // mantis: Back off repeated full pulls when the first snapshot has no base revision.
+          if (MANTIS_OG && !metaOf().base) {
+            initialPullFailures = Math.min(initialPullFailures + 1, INITIAL_PULL_MAX_FAILURES)
+            initialPullRetryAt = Date.now() + Math.min(
+              CHECK_MIN_MS * 2 ** (initialPullFailures - 1), INITIAL_PULL_MAX_BACKOFF_MS,
+            )
+          }
+        }
         finally { pulling = null }
       })()
       return pulling
@@ -1819,6 +1853,7 @@ export const useStore = create((set, get) => {
       // mantis: Clear the same HttpOnly session cookie used by openGym, then return to token login.
       try { await api('/api/logout', { method: 'POST', body: '{}' }) } catch (e) { if (!MOBILE) logoutOwed(true) }
       await clearLocalSession()
+      // mantis: Return to the existing Mantis token login after clearing the session.
       if (MANTIS_OG) window.location.assign('/?next=%2Fog%2F')
       return left.owed ? owedResult(left, { stashed: true }) : { owed: false }
     },
@@ -1890,6 +1925,8 @@ export const useStore = create((set, get) => {
 
     // Boot: ask the server who we are, then pull.
     async boot() {
+      // mantis: Drop any stash left by an upstream build, even if this pull cannot reach the server.
+      if (MANTIS_OG) await applyStash()
       // Mobile build: no backend by default — restore from the file mirror (the durable copy;
       // localStorage may have been evicted since the last run) and go straight in. Unless this
       // device was paired to a server ("connect to my server" mode, lib/remote.js), in which
@@ -1926,7 +1963,8 @@ export const useStore = create((set, get) => {
               return
             }
             await get().pullState()
-            if (!get().sync.lastError) await applyStash()   // only once the server really answered
+            // mantis: Stashes were discarded at boot and must not overlay the server snapshot.
+            if (!get().sync.lastError && !MANTIS_OG) await applyStash()   // only once the server really answered
           } catch (e) {
             // Whatever the answer — no network, a server error, a token the server no longer
             // accepts — the pairing, this copy and the account all stay, and what is owed stays
@@ -1993,6 +2031,7 @@ export const useStore = create((set, get) => {
       if (logoutOwed()) {
         // mantis: Retry cookie deletion, but never strand the preview at boot when that request fails.
         try { await api('/api/logout', { method: 'POST', body: '{}' }); logoutOwed(false) } catch { /* owed until it is answered */ }
+        // mantis: Continue authentication even if the old logout request remains owed.
         if (logoutOwed() && !MANTIS_OG) { finishBoot(); return }
       }
       try {
@@ -2015,7 +2054,8 @@ export const useStore = create((set, get) => {
           return
         }
         await get().pullState()
-        if (!get().sync.lastError) await applyStash()   // only once the server really answered
+        // mantis: Stashes were discarded at boot and must not overlay the server snapshot.
+        if (!get().sync.lastError && !MANTIS_OG) await applyStash()   // only once the server really answered
         restampTz()
       } catch (e) {
         // The session ended (expired, revoked, signed out everywhere): back to the sign-in

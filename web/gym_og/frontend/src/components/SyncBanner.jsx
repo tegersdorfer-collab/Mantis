@@ -78,6 +78,7 @@ export default function SyncBanner() {
   const conn = useConnection()
   const { view, user, status } = conn
   const quiet = view?.tone === 'quiet'
+  // mantis: Keep the read-only preview notice visible regardless of local edits or sync status.
   const show = MANTIS_OG || (conn.show && on && (!quiet || local))
   const row = useRef(null)
 

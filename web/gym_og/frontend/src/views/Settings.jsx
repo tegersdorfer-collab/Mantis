@@ -93,6 +93,7 @@ export default function Settings({ page = null, find = null, via = null }) {
   const lang = effectiveLang(S, config)
   // This profile's passkeys and the code for another device (#95). A change to them is read back
   // here and by the password row, whose "Remove" depends on there being a passkey.
+  // mantis: The token-backed build has no passkey, device-link or native pairing settings.
   const passkeys = usePasskeys(!!user && !MOBILE && !DEMO && !MANTIS_OG && (page === 'account'))
   const [credsV, setCredsV] = useState(0)
   const credsChanged = () => { passkeys.load(); setCredsV(v => v + 1) }
@@ -865,6 +866,7 @@ export default function Settings({ page = null, find = null, via = null }) {
             onClick={() => window.open(REPO, '_blank', 'noopener')} />
         </> : user ? <>
           {user.admin && <Row icon="crown" iconTint="var(--indigo)" title={t('Admin dashboard')} accessory="chevron" onClick={() => nav('/admin')} />}
+          {/* mantis: Passkeys and device pairing are upstream-only for this fork. */}
           {!MANTIS_OG && <>
             <PasskeysRow state={passkeys.st} changed={credsChanged} />
             <DeviceLinkRow state={passkeys.st} />

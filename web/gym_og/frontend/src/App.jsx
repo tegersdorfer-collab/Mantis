@@ -225,6 +225,7 @@ function Shell() {
               {/* The Coach screens gate themselves on the instance config; the routes exist
                   unconditionally so a deep link from a notification lands somewhere sane
                   rather than on the catch-all. */}
+              {/* mantis: Coach routes have no API in this fork, so deep links return to Home. */}
               <Route path="/coach" element={MANTIS_OG ? <Navigate to="/home" replace /> : <CoachChat />} />
               <Route path="/coach/intake" element={MANTIS_OG ? <Navigate to="/home" replace /> : <CoachIntake />} />
               <Route path="/coach/proposal" element={<Navigate to="/coach" replace />} />

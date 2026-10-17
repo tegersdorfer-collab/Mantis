@@ -206,7 +206,7 @@ def test_open_gym_snapshot_retries_when_revision_moves_while_state_is_read(og_cl
     assert response.json() == {"state": {"workouts": [{"id": "new"}]}, "rev": 2}
 
 
-def test_bodyweight_keeps_the_newest_plausible_measurement_per_day():
+def test_bodyweight_prefers_health_data_source_per_day():
     state = gym_og_data.map_snapshot(
         workouts=[], workout_sets=[], exercises=[], active_plan=None, next_day=None,
         bodyweight=[
@@ -221,6 +221,29 @@ def test_bodyweight_keeps_the_newest_plausible_measurement_per_day():
     )
 
     assert state["bodyweight"] == [{"d": "2026-07-01", "w": 71.5}]
+
+
+def test_steps_update_timestamp_does_not_change_selected_bodyweight():
+    measured_on = date(2026, 7, 1)
+    bodyweight = [
+        {"date": measured_on, "weight_kg": 72.0,
+         "recorded_at": datetime(2026, 7, 1, 12, tzinfo=timezone.utc), "source_order": 0},
+        {"date": measured_on, "weight_kg": 73.0,
+         "recorded_at": datetime(2026, 7, 1, 13, tzinfo=timezone.utc), "source_order": 1},
+    ]
+
+    def snapshot():
+        return gym_og_data.map_snapshot(
+            workouts=[], workout_sets=[], exercises=[], active_plan=None, next_day=None,
+            bodyweight=bodyweight, rest_sec=90, today=date(2026, 7, 2),
+        )["bodyweight"]
+
+    before_steps_update = snapshot()
+    bodyweight[1]["recorded_at"] = datetime(2026, 7, 1, 10, tzinfo=timezone.utc)
+    after_steps_update = snapshot()
+
+    assert before_steps_update == [{"d": "2026-07-01", "w": 73.0}]
+    assert after_steps_update == [{"d": "2026-07-01", "w": 73.0}]
 
 
 def test_foreign_origin_is_rejected_for_open_gym_write(og_client):

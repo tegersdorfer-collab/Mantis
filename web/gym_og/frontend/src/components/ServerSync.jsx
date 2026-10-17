@@ -22,6 +22,7 @@ const toast = m => ui().toast(m)
 // Whether this browser has a way to sign in at all: a passkey, or a password on an instance that
 // offers one (#118) — which is also what a browser without passkey support has left.
 const pwOn = () => passwordOn(useStore.getState?.()?.config)
+// mantis: The expired token session can always return to Mantis' existing login.
 const canSignIn = () => MANTIS_OG || webauthnOK() || pwOn()
 
 // "gym.example.com" out of the base URL the store keeps (a subpath stays: it is part of which
@@ -229,6 +230,7 @@ export function OwedSheet({ kind, count: count0, media: media0 = 0, exportBackup
         : t('Try again, or export a backup first. Going ahead anyway keeps a copy of these changes on this device until it connects to this server as this account again. Then they’re added back.')}
     </div>
     {refused && MOBILE && <><button className="btn primary" disabled={busy} onClick={() => { close(); pairAgain() }}>{t('Pair again')}</button><div style={{ height: 8 }} /></>}
+    {/* mantis: Point the preview's recovery action at the existing Mantis login. */}
     {refused && !MOBILE && canSignIn() && <><button className="btn primary" disabled={busy} onClick={() => { close(); signInAgain() }}>{MANTIS_OG ? t('Open Mantis login') : pwOn() ? t('Sign in') : t('Sign in with passkey')}</button><div style={{ height: 8 }} /></>}
     {!refused && <><button className="btn primary" disabled={busy} onClick={retry}>{busy ? t('Syncing…') : t('Try again')}</button><div style={{ height: 8 }} /></>}
     {media > 0 && exportBackupZip
@@ -282,9 +284,13 @@ export function ServerSyncSection({ children }) {
     {!MANTIS_OG && <Row icon="reset" iconTint="var(--acc)" title={busy ? t('Syncing…') : t('Sync now')} onClick={now} />}
     {MOBILE && <Row icon="key" iconTint="var(--orange)" title={t('Cloudflare Access')} accessory="chevron"
       onClick={() => ui().openSheet(close => <CfAccessSheet close={close} server={sync.server || ''} />)} />}
+    {/* mantis: The expired token session links to Mantis' login instead of upstream sign-in. */}
     {sync.status === 'auth' && (MOBILE
       ? <Row icon="qr" iconTint="var(--indigo)" title={t('Pair again')} subtitle={t('Your changes are kept here, and merged into your account once it is paired again.')} accessory="chevron" onClick={pairAgain} />
-      : canSignIn() && <Row icon={MANTIS_OG || pwOn() ? 'person' : 'fingerprint'} iconTint="var(--blue)" title={MANTIS_OG ? t('Open Mantis login') : pwOn() ? t('Sign in') : t('Sign in with passkey')} subtitle={t('Your changes are kept here, and merged into your account once you are signed in again.')} accessory="chevron" onClick={signInAgain} />)}
+      : canSignIn() && <>
+        {/* mantis: Expired sessions return to Mantis' token login instead of openGym sign-in. */}
+        <Row icon={MANTIS_OG || pwOn() ? 'person' : 'fingerprint'} iconTint="var(--blue)" title={MANTIS_OG ? t('Open Mantis login') : pwOn() ? t('Sign in') : t('Sign in with passkey')} subtitle={t('Your changes are kept here, and merged into your account once you are signed in again.')} accessory="chevron" onClick={signInAgain} />
+      </>)}
     {/* another account's, kept when this one signed in over a copy that still owed them */}
     <KeptChangesRows />
     {children}
