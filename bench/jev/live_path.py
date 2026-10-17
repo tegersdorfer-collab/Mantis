@@ -42,7 +42,7 @@ async def old_path(text: str) -> float:
 async def new_path(text: str) -> tuple[float, float]:
     """So fragt Mantis jetzt: State via jevkit.untrusted, Guard im selben Fan-out."""
     qs = jevkit.with_guard({"addressed": decisions.Q_ADDRESSED})
-    ans = await decide.decide(jevkit.untrusted(text), qs)
+    ans = await decide.decide(jevkit.untrusted(text, source=jevkit.USER_UTTERANCE), qs)
     return ans["addressed"].p, ans[jevkit.GUARD_ID].p
 
 

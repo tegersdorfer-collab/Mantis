@@ -73,7 +73,13 @@ def _state(task: dict) -> dict[str, str]:
         "title": str(task.get("title") or "")[:2000],
         "description": str(task.get("description") or "")[:4000],
     }
-    return jevkit.untrusted(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    # Nur von Timo selbst eingegebene Tasks sind sicher Nutzerrede. Alle anderen Quellen
+    # (roadmap, test, fehlendes Feld) bleiben ungelabelt: die Herkunft ist nicht eindeutig
+    # Dritter, und THIRD_PARTY_CONTENT würde legitime Roadmap-Tasks blockieren.
+    if task.get("source") == "timo":
+        return jevkit.untrusted(text, source=jevkit.USER_UTTERANCE)
+    return jevkit.untrusted(text)
 
 
 def _mode(answer: decide.Answer) -> str:

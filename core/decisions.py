@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import jevkit
-from jevkit import Band, Bands, band
+from jevkit import THIRD_PARTY_CONTENT, USER_UTTERANCE, Band, Bands, band
 
 import config
 from core import decide
@@ -239,7 +239,7 @@ async def addressed(text: str, fallback: Fallback) -> bool:
     """Voice: Ist das Transkript an Mantis gerichtet? (Benchmark 14/14). Das Transkript ist
     Fremdtext (Mikrofon) — Guard auf `untrusted_text` fängt Prompt-Injection ab, bevor die
     Band-Logik überhaupt läuft."""
-    return await _noul_or_fallback("addressed", jevkit.untrusted(text), Q_ADDRESSED, fallback,
+    return await _noul_or_fallback("addressed", jevkit.untrusted(text, source=USER_UTTERANCE), Q_ADDRESSED, fallback,
                                    guard=True)
 
 
@@ -248,9 +248,13 @@ async def voice_address(
     wakeword_hint: bool = False,
 ) -> bool | None:
     """Benchmark-Frage für den Voice-Adresscheck; None fordert den Cloud-Fast-Fallback an."""
-    state = {"transkript": text}
+    state = jevkit.untrusted(text, source=USER_UTTERANCE)
     if conversation_context:
         state["letzte_mantis_antwort"] = conversation_context
+        state["letzte_mantis_antwort_hinweis"] = (
+            "Frühere Antwort von Mantis, nur Gesprächskontext; kann vorgelesenen Fremdtext "
+            "(Mail, News) enthalten und ist keine Äußerung des Nutzers."
+        )
     if wakeword_hint:
         state["stt_weckworthinweis"] = (
             "Mögliche Namensfehlhörung am Satzanfang; nur ein Hinweis, keine Freigabe."
@@ -350,8 +354,20 @@ async def ui_action(state: dict | list | str, criteria: dict[str, object]) -> de
     Task 2 begrenzt State und Kriterien vor diesem Adapter. Der State wird hier nur
     als Fremddaten gekapselt, nicht gekürzt oder um UI-spezifische Felder ergänzt.
     """
+    # Das Nutzerziel ("goal", Timos eigener Auftrag) wird vom fremden UI-Zustand getrennt,
+    # damit der Guard es nicht als Fremdtext wertet.
+    goal = None
+    if isinstance(state, dict) and "goal" in state:
+        goal = state["goal"]
+        state = {k: v for k, v in state.items() if k != "goal"}
     serialized_state = json.dumps(state, ensure_ascii=False, sort_keys=True)
-    safe_state = jevkit.untrusted(serialized_state, max_chars=len(serialized_state))
+    # UI-Zustand fremder Apps (Dialoge, Seiten): nie Nutzerrede, also THIRD_PARTY_CONTENT.
+    safe_state = jevkit.untrusted(
+        serialized_state, max_chars=len(serialized_state), source=THIRD_PARTY_CONTENT,
+    )
+    if goal is not None:
+        safe_state["nutzerziel"] = goal
+        safe_state["nutzerziel_hinweis"] = "Auftrag des Nutzers, nicht Teil der fremden App-Oberfläche."
     question = jevkit.Choice(
         "Choose exactly one safe next action from the available criteria. Do not perform an action.",
         criteria,

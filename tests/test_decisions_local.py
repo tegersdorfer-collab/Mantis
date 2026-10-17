@@ -40,6 +40,7 @@ def test_addressed_uses_fast_cloud_score_and_guards_untrusted_transcript(monkeyp
     assert calls[0][1]["addressed"] == decisions.Q_ADDRESSED
     assert jevkit.GUARD_ID in calls[0][1]
     assert calls[0][0]["untrusted_text"] == "mach das Licht an"
+    assert calls[0][0][jevkit.SOURCE_KEY] == jevkit.USER_UTTERANCE
 
 
 def test_guard_hit_or_uncertain_cloud_answer_uses_conservative_fallback(monkeypatch):
