@@ -40,7 +40,10 @@ WAKEWORD_FRAME_BYTES = 1280 * 2  # 2560 bytes
 # Segment. Der Sol-Repro mit Onset bei 576 ms ergibt dagegen −112 ms; darauf kommen
 # 150 ms Reserve. Das ergibt eine Toleranz von 262 ms und öffnet die alte
 # 384-ms-Toleranz nicht wieder.
-WAKEWORD_MAX_OBSERVED_PRESEGMENT_MS = 112
+# Live 17.10. 19:02: Timos echte "Mantis"-Treffer lagen −448/−464 ms vor dem
+# Segmentstart (STT hörte "Meint"/"Miałem") und wurden mit 262 ms verworfen.
+# Fehlauslösungen lagen bei −1152 ms bzw. ≤ −1300 ms (17:40).
+WAKEWORD_MAX_OBSERVED_PRESEGMENT_MS = 464
 WAKEWORD_SEGMENT_START_MARGIN_MS = 150
 WAKEWORD_SEGMENT_START_TOLERANCE_MS = (
     WAKEWORD_MAX_OBSERVED_PRESEGMENT_MS + WAKEWORD_SEGMENT_START_MARGIN_MS
