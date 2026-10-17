@@ -45,8 +45,10 @@ Logik in `domains/gym/plans.py`), `week` leer. „Choose a different workout“ 
   `scripts/build_gym_og.sh` (`npm ci --ignore-scripts`, `vite build`) → `web/gym_og/frontend/dist/`
   (~23 MB, **nicht** eingecheckt, `node_modules`/`dist` in .gitignore). Fehlt `dist`, liefert der
   Server weiter die alte App. Build gehört zum Merge-Ablauf. AGPL-Hinweis und NOTICE behalten.
-- Port 7782 wie bisher. Übergangsweise neue App unter `/og/`, alte unter `/`; Umschalten nach
-  Abnahme durch Timo.
+- Port 7782 wie bisher. Umgeschaltet (17.10.2026, für die iOS-Web-App): openGym unter `/`
+  (Build `--base=/`), API weiter unter `/og/api/*` (`VITE_MANTIS_API_BASE=/og`, `apiBase()` in
+  `src/lib/app-base.js`); alte App unter `/old/` (API unverändert `/api/*`), Token-Login unter
+  `/login?next=…` (nur interne Pfade). `/og/…` leitet auf `/` um. Fehlt `dist`, leitet `/` auf `/old/`.
 - Auth: bestehendes `mantis_gym`-Cookie + Origin-Prüfung für alle `/api/*`. Ohne gültige Session
   liefert der Server die bestehende Token-Login-Seite aus, **nie** die App im Gast-Modus (sonst
   landen Trainings nur im localStorage). Frontend: Gast-/Passkey-/Registrierungs-Pfade

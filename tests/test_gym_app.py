@@ -33,12 +33,12 @@ def logged_in(client):
     return client
 
 
-def test_shell_and_manifest_are_public_but_api_requires_auth(client):
-    shell = client.get("/")
+def test_login_shell_and_manifest_are_public_but_api_requires_auth(client):
+    shell = client.get("/login")
     assert shell.status_code == 200
     assert "text/html" in shell.headers["content-type"]
     assert shell.headers["cache-control"] == "no-cache"
-    assert client.get("/manifest.webmanifest").status_code == 200
+    assert client.get("/old/manifest.webmanifest").status_code == 200
     assert client.get("/api/state").status_code == 401
 
 

@@ -133,11 +133,11 @@ def test_revision_migration_covers_every_table_used_by_the_snapshot():
 
 
 def test_open_gym_requires_session_cookie_and_returns_to_login(og_client):
-    response = og_client.get("/og/")
+    response = og_client.get("/")
     data = og_client.get("/og/api/data")
 
     assert response.status_code == 307
-    assert response.headers["location"] == "/?next=%2Fog%2F"
+    assert response.headers["location"] == "/login?next=%2F"
     assert "openGym" not in response.text
     assert data.status_code == 401
 
@@ -185,8 +185,10 @@ def test_open_gym_static_gates_stay_closed_without_dashboard_token(og_client, mo
     forged, _ = gym_app._session_value()
     og_client.cookies.set(gym_app.COOKIE, forged)
 
-    assert og_client.get("/og/").status_code == 503
-    assert og_client.get("/og/sw.js").status_code == 503
+    assert og_client.get("/").status_code == 503
+    assert og_client.get("/sw.js").status_code == 503
+    assert og_client.get("/assets/main.js").status_code == 503
+    assert og_client.get("/old/").status_code == 503
     assert og_client.get("/og/api/data").status_code == 503
 
 
@@ -270,29 +272,86 @@ def test_unsupported_open_gym_endpoints_are_json_404(og_client, method, path):
 
 def test_open_gym_static_files_are_authenticated_and_missing_dist_falls_back(og_client, tmp_path, monkeypatch):
     dist = tmp_path / "dist"
-    dist.mkdir()
+    (dist / "assets").mkdir(parents=True)
     (dist / "index.html").write_text("<title>OG test</title>", encoding="utf-8")
+    (dist / "assets" / "main.js").write_text("console.log('og')", encoding="utf-8")
     (dist / "sw.js").write_text("self.addEventListener('install', () => {})", encoding="utf-8")
     (dist / "manifest.json").write_text(
         json.dumps({"start_url": "./", "scope": "./"}), encoding="utf-8"
     )
     monkeypatch.setattr(gym_app, "GYM_OG_DIST_DIR", dist)
 
-    assert og_client.get("/og/").headers["location"] == "/?next=%2Fog%2F"
-    assert og_client.get("/og/assets/main.js").headers["location"] == "/?next=%2Fog%2F"
+    for path in ("/", "/index.html", "/assets/main.js", "/sw.js", "/manifest.json"):
+        response = og_client.get(path)
+        assert response.status_code == 307, path
+        assert response.headers["location"] == "/login?next=%2F", path
+        assert "OG test" not in response.text
     sign_in(og_client)
-    assert "OG test" in og_client.get("/og/").text
-    worker = og_client.get("/og/sw.js")
-    assert worker.headers["service-worker-allowed"] == "/og/"
-    manifest = og_client.get("/og/manifest.json").json()
-    assert urljoin("http://testserver/og/manifest.json", manifest["scope"]) == "http://testserver/og/"
-    assert urljoin("http://testserver/og/manifest.json", manifest["start_url"]) == "http://testserver/og/"
-    assert og_client.get("/og/../index.html").status_code == 404
+    assert "OG test" in og_client.get("/").text
+    assert og_client.get("/assets/main.js").text == "console.log('og')"
+    worker = og_client.get("/sw.js")
+    assert worker.headers["content-type"].startswith("application/javascript")
+    assert worker.headers["service-worker-allowed"] == "/"
+    manifest = og_client.get("/manifest.json").json()
+    assert urljoin("http://testserver/manifest.json", manifest["scope"]) == "http://testserver/"
+    assert urljoin("http://testserver/manifest.json", manifest["start_url"]) == "http://testserver/"
+    assert og_client.get("/../index.html").status_code in {200, 404}
+    assert og_client.get("/%2e%2e/secret").status_code == 404
+    assert og_client.get("/missing.js").status_code == 404
 
     monkeypatch.setattr(gym_app, "GYM_OG_DIST_DIR", tmp_path / "missing")
-    missing = og_client.get("/og/")
+    missing = og_client.get("/")
     assert missing.status_code == 307
-    assert missing.headers["location"] == "/"
+    assert missing.headers["location"] == "/old/"
+
+
+@pytest.mark.parametrize("path", ["/og", "/og/", "/og/index.html", "/og/assets/main.js", "/og/sw.js"])
+def test_legacy_open_gym_paths_redirect_to_root(og_client, path):
+    response = og_client.get(path)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/"
+
+
+def test_old_app_lives_under_old_and_login_page_is_public(og_client):
+    old = og_client.get("/old/")
+    assert old.status_code == 307
+    assert old.headers["location"] == "/login?next=%2Fold%2F"
+    assert og_client.get("/old").headers["location"] == "/old/"
+
+    login = og_client.get("/login?next=%2Fold%2F")
+    assert login.status_code == 200
+    assert 'src="/old/app.js"' in login.text
+    assert og_client.get("/old/app.js").headers["content-type"].startswith("text/javascript")
+    assert og_client.get("/old/app.css").status_code == 200
+    assert og_client.get("/old/icon.png").headers["content-type"] == "image/png"
+    manifest = og_client.get("/old/manifest.webmanifest").json()
+    assert manifest["start_url"] == "/old/"
+    assert manifest["scope"] == "/old/"
+    assert og_client.get("/old/index.html").status_code == 404
+    assert og_client.get("/old/../gym_app.py").status_code in {307, 404}
+    assert og_client.get("/old/api/state").status_code in {307, 404}
+
+    sign_in(og_client)
+    page = og_client.get("/old/")
+    assert page.status_code == 200
+    assert 'href="/old/app.css"' in page.text
+
+
+def test_old_app_api_paths_are_unchanged_and_separate_from_open_gym(og_client):
+    assert og_client.get("/api/state").status_code == 401
+    assert og_client.get("/og/api/me").status_code == 401
+
+
+def test_built_open_gym_targets_root_assets_and_og_api():
+    root = gym_app.GYM_OG_DIST_DIR
+    if not (root / "index.html").is_file():
+        pytest.skip("openGym is not built (scripts/build_gym_og.sh)")
+    index = (root / "index.html").read_text(encoding="utf-8")
+    assert 'src="/assets/' in index
+    assert "/og/assets/" not in index
+    bundles = "".join(p.read_text(encoding="utf-8") for p in (root / "assets").glob("*.js"))
+    assert '"/og"' in bundles or "'/og'" in bundles or "`/og`" in bundles
 
 
 @pytest.mark.db

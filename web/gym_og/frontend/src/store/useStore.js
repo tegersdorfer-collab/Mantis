@@ -17,7 +17,7 @@ import { referencedHashes } from '../lib/media-refs.js'
 import { mediaStore, mediaStoreInUse } from '../lib/media-store.js'
 import { countChanges, syncFingerprint } from '../lib/sync-changes.js'
 import { saveWorkoutEdit, deleteEditedWorkout } from '../lib/session-edit.js'
-import { appBase } from '../lib/app-base.js'
+import { apiBase } from '../lib/app-base.js'
 import { linkTokenFromSearch, stripLinkFromUrl } from '../lib/device-link.js'
 import { loadRemote, chooseLocal, forgetRemote, connect, normalizeServerUrl, renewToken } from '../lib/remote.js'
 import { loadCfAccess } from '../lib/cf-access.js'
@@ -480,7 +480,7 @@ export const useStore = create((set, get) => {
   // under an earlier version, which kept no address.
   const serverBase = () => {
     if (MOBILE) return pairedBase
-    try { return location.origin && location.origin !== 'null' ? location.origin + appBase().replace(/\/$/, '') : null } catch { return null }
+    try { return location.origin && location.origin !== 'null' ? location.origin + apiBase().replace(/\/$/, '') : null } catch { return null }
   }
 
   initReminderSync(() => get().S)
@@ -1855,7 +1855,7 @@ export const useStore = create((set, get) => {
       try { await api('/api/logout', { method: 'POST', body: '{}' }) } catch (e) { if (!MOBILE) logoutOwed(true) }
       await clearLocalSession()
       // mantis: Return to the existing Mantis token login after clearing the session.
-      if (MANTIS_OG) window.location.assign('/?next=%2Fog%2F')
+      if (MANTIS_OG) window.location.assign('/login?next=%2F')
       return left.owed ? owedResult(left, { stashed: true }) : { owed: false }
     },
 

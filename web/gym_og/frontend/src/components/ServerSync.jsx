@@ -137,7 +137,7 @@ export function connectServer() {
 // something this browser can know.
 export function signInAgain() {
   // mantis: Expired Mantis sessions return to the existing token login, never passkeys.
-  if (MANTIS_OG) { window.location.assign('/?next=%2Fog%2F'); return }
+  if (MANTIS_OG) { window.location.assign('/login?next=%2F'); return }
   if (pwOn()) { openPasswordSignIn(webauthnOK() ? passkeySignIn : undefined); return }
   return passkeySignIn()
 }

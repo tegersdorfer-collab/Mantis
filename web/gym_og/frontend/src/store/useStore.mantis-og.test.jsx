@@ -185,7 +185,7 @@ describe('Mantis read-only preview', () => {
     await useStore.getState().signOut()
 
     expect(api).toHaveBeenCalledWith('/api/logout', { method: 'POST', body: '{}' })
-    expect(assign).toHaveBeenCalledWith('/?next=%2Fog%2F')
+    expect(assign).toHaveBeenCalledWith('/login?next=%2F')
     Object.defineProperty(window, 'location', oldLocation)
   })
 })

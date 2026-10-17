@@ -2034,6 +2034,13 @@ document.addEventListener("change", (event) => {
   }
 });
 
+// mantis: A login target must be a path on this origin: "/x" yes, "//host", "/\\host" or a URL no.
+function safeReturnPath(value) {
+  if (typeof value !== "string" || !value.startsWith("/")) return null;
+  if (value.startsWith("//") || /[\\\u0000-\u001f\u007f]/.test(value)) return null;
+  return value;
+}
+
 document.addEventListener("submit", async (event) => {
   const form = event.target;
   if (form.id === "login-form") {
@@ -2043,10 +2050,12 @@ document.addEventListener("submit", async (event) => {
     try {
       const { response, payload } = await requestJson("/auth/session", "POST", { token });
       if (!response.ok) throw new Error(payload?.detail || payload?.error || "Sign in failed.");
-      // mantis: Return to /og/ after the shared Mantis session is set.
-      const returnTo = new URLSearchParams(window.location.search).get("next");
-      if (returnTo === "/og/") {
-        window.location.assign("/og/");
+      // mantis: After the shared Mantis session is set, return to `next` (same-origin paths only);
+      // the bare /login page leads to openGym at the root.
+      const returnTo = safeReturnPath(new URLSearchParams(window.location.search || "").get("next"))
+        ?? (window.location.pathname === "/login" ? "/" : null);
+      if (returnTo) {
+        window.location.assign(returnTo);
         return;
       }
       screenMode = "loading";

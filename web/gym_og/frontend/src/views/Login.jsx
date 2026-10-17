@@ -89,7 +89,7 @@ export default function Login() {
       <div style={{ fontSize: 54, color: 'var(--acc)' }}><Icon name="dumbbell" /></div>
       <h1 style={{ fontSize: 28, margin: '10px 0' }}>{t('Session ended')}</h1>
       <div className="muted" style={{ marginBottom: 20 }}>{t('Sign in again to open your workouts.')}</div>
-      <Button variant="primary" onClick={() => { window.location.assign('/?next=%2Fog%2F') }}>{t('Open Mantis login')}</Button>
+      <Button variant="primary" onClick={() => { window.location.assign('/login?next=%2F') }}>{t('Open Mantis login')}</Button>
     </div>
   )
 
