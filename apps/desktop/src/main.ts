@@ -7,6 +7,7 @@ import type { UiEvent, WidgetSlot } from './ui-state-client';
 import { startVoiceCapture } from './voice-capture';
 import type { VoiceSegmentResult } from './voice-capture';
 import { startVoiceCaptureStream } from './voice-capture-stream';
+import { createVoiceCaptureReconnect } from './voice-capture-reconnect';
 import { initNavOverlay } from './nav-overlay';
 import { initHealthOverlay, widgetHtml as healthWidgetHtml } from './health-overlay';
 import { initSkilltreeOverlay, widgetHtml as skilltreeWidgetHtml } from './skilltree-overlay';
@@ -416,42 +417,49 @@ function renderVoiceStatus(result: VoiceSegmentResult): void {
   }
 }
 
+function renderVoiceReconnecting(): void {
+  const el = document.getElementById('voice-status');
+  if (el) el.textContent = '🎙️ verbinde neu…';
+}
+
+function renderVoiceConnected(): void {
+  const el = document.getElementById('voice-status');
+  if (el) el.textContent = '🎙️ verbunden';
+}
+
 export async function initVoiceCapture(
   baseUrl: string,
   onSegment: (r: VoiceSegmentResult) => void,
+  onClosed?: (reason: string) => void,
+  onConnected?: () => void,
 ): Promise<() => void> {
-  try {
-    const res = await authenticatedFetch(`${baseUrl}/api/voice/stream-mode`);
-    const { mode } = await res.json();
-    return mode === 'websocket'
-      ? startVoiceCaptureStream(baseUrl, onSegment)
-      : startVoiceCapture(baseUrl, onSegment);
-  } catch {
-    return startVoiceCapture(baseUrl, onSegment);
+  const res = await authenticatedFetch(`${baseUrl}/api/voice/stream-mode`);
+  if (!res.ok) throw new Error(`Voice stream mode unavailable (${res.status})`);
+  const { mode } = await res.json();
+  if (mode === 'websocket') {
+    return startVoiceCaptureStream(baseUrl, onSegment, undefined, onClosed, onConnected);
   }
+  const stop = startVoiceCapture(baseUrl, onSegment);
+  onConnected?.();
+  return stop;
 }
 
-let voiceCaptureEnabled = true;
-let stopVoiceCapture: (() => void) | null = null;
-let voiceCaptureStartPending = false;
+const voiceCaptureReconnect = createVoiceCaptureReconnect({
+  initialize: ({ onClosed, onConnected }) =>
+    initVoiceCapture(getBaseUrl(), renderVoiceStatus, onClosed, onConnected),
+  onReconnecting: renderVoiceReconnecting,
+  onConnected: renderVoiceConnected,
+});
 
 function ensureVoiceCapture(): void {
-  if (!voiceCaptureEnabled || stopVoiceCapture || voiceCaptureStartPending) return;
-  voiceCaptureStartPending = true;
-  void initVoiceCapture(getBaseUrl(), renderVoiceStatus).then((stop) => {
-    if (voiceCaptureEnabled) stopVoiceCapture = stop;
-    else stop();
-  }).finally(() => { voiceCaptureStartPending = false; });
+  voiceCaptureReconnect.ensure();
 }
 
 document.addEventListener('speaker-enrollment-opened', () => {
-  voiceCaptureEnabled = false;
-  stopVoiceCapture?.();
-  stopVoiceCapture = null;
+  voiceCaptureReconnect.setEnabled(false);
 });
 document.addEventListener('speaker-enrollment-closed', () => {
-  voiceCaptureEnabled = true;
-  ensureVoiceCapture();
+  voiceCaptureReconnect.setEnabled(true);
 });
 ensureVoiceCapture();
 // Overlays zuerst — sie registrieren sich, bevor nav-overlay die Registry liest.
