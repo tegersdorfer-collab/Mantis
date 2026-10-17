@@ -8,14 +8,19 @@ import tempfile
 import time
 import wave
 import logging
+from dataclasses import dataclass
 from collections import deque
 from collections.abc import Awaitable, Callable
+from numbers import Real
 
 import config
 from core import stt_runtime
 from core.vad import VadSegmenter, classify_utterance
 from core.voice_segments import record_voice_segment
-from core.voice_text import normalize_wakeword_transcript
+from core.voice_text import (
+    has_exact_initial_mantis,
+    normalize_wakeword_transcript,
+)
 
 SAMPLE_RATE = 16000
 WAKEWORD_SAFETY_MARGIN_MS = 150
@@ -29,11 +34,60 @@ WAKEWORD_SAFETY_MARGIN_MS = 150
 # independently per detector before dispatching full-size frames.
 VAD_FRAME_BYTES = 512 * 2  # 1024 bytes
 WAKEWORD_FRAME_BYTES = 1280 * 2  # 2560 bytes
+# 20 echte Mantis-Erstwort-Segmente (15.–17.10.2026) wurden mit VadSegmenter und
+# Silero erneut ausgewertet: der späteste Onset lag 416 ms nach dem ersten 32-ms-
+# RMS-Frame. Bei 384 ms Preroll und einem Hit-Ende bei 80 ms bleibt das 48 ms im
+# Segment. Der Sol-Repro mit Onset bei 576 ms ergibt dagegen −112 ms; darauf kommen
+# 150 ms Reserve. Das ergibt eine Toleranz von 262 ms und öffnet die alte
+# 384-ms-Toleranz nicht wieder.
+WAKEWORD_MAX_OBSERVED_PRESEGMENT_MS = 112
+WAKEWORD_SEGMENT_START_MARGIN_MS = 150
+WAKEWORD_SEGMENT_START_TOLERANCE_MS = (
+    WAKEWORD_MAX_OBSERVED_PRESEGMENT_MS + WAKEWORD_SEGMENT_START_MARGIN_MS
+)
 _DEFAULT_PARTIAL = object()
 PARTIAL_SKIP_REASONS = (
     "busy", "budget", "interval", "no_speech", "disabled", "not_wired",
 )
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class WakewordHit:
+    sample_index: int
+    score: float | None = None
+
+
+def _wakeword_score(detector) -> float | None:
+    score = getattr(detector, "hit_score", None)
+    if score is None:
+        score = getattr(detector, "max_score", None)
+    if not isinstance(score, Real):
+        return None
+    return float(score)
+
+
+def _resolve_wakeword_decision(
+    hit: WakewordHit | None,
+    segment_start_sample: int,
+    segment_end_sample: int,
+    transcript: str,
+    *,
+    allow_transcript_confirmation: bool = False,
+) -> tuple[bool, str | None]:
+    if hit is None:
+        return False, None
+    tolerance_samples = int(
+        SAMPLE_RATE * WAKEWORD_SEGMENT_START_TOLERANCE_MS / 1000
+    )
+    if (
+        segment_start_sample - tolerance_samples
+        <= hit.sample_index <= segment_end_sample
+    ):
+        return True, "in_segment"
+    if allow_transcript_confirmation and has_exact_initial_mantis(transcript):
+        return True, "transcript"
+    return False, "rejected_before_segment"
 
 
 async def transcribe_pcm(pcm_audio: bytes) -> tuple[str, bool]:
@@ -113,7 +167,8 @@ class VoiceStreamSession:
         self._segmenter = vad_segmenter
         self._wakeword = wakeword_detector
         self._conversation_active_fn = conversation_active_fn
-        self._wakeword_hits: deque[int] = deque()
+        self._wakeword_hits: deque[WakewordHit] = deque()
+        self._active_wakeword_hit: WakewordHit | None = None
         self._wakeword_detected = False
         self._wakeword_samples_processed = 0
         self._vad_samples_processed = 0
@@ -240,7 +295,18 @@ class VoiceStreamSession:
                     hit_sample = self._wakeword_samples_processed
                 if not 0 <= hit_sample <= self._wakeword_samples_processed:
                     hit_sample = self._wakeword_samples_processed
-                self._wakeword_hits.append(hit_sample)
+                hit = WakewordHit(hit_sample, _wakeword_score(self._wakeword))
+                self._wakeword_hits.append(hit)
+                self._active_wakeword_hit = hit
+            elif detected and self._active_wakeword_hit is not None:
+                score = _wakeword_score(self._wakeword)
+                if score is not None:
+                    prior_score = self._active_wakeword_hit.score
+                    self._active_wakeword_hit.score = (
+                        score if prior_score is None else max(prior_score, score)
+                    )
+            elif not detected:
+                self._active_wakeword_hit = None
             self._wakeword_detected = detected
 
         result = None
@@ -306,15 +372,20 @@ class VoiceStreamSession:
             segment_start_sample = max(
                 0, segment_end_sample - len(segment.audio) // 2,
             )
-            wakeword_hit_sample = self._wakeword_hit_for_range(
+            wakeword_hit = self._wakeword_hit_for_range(
                 segment_start_sample, segment_end_sample,
                 consume=True,
             )
-            wake_fired = wakeword_hit_sample is not None
+            wakeword_hit_sample = (
+                wakeword_hit.sample_index if wakeword_hit is not None else None
+            )
+            wake_fired, wakeword_decision = _resolve_wakeword_decision(
+                wakeword_hit, segment_start_sample, segment_end_sample, "",
+            )
             stt_audio, crop_start_sample = crop_wakeword_audio(
                 segment.audio,
                 segment_start_sample=segment_start_sample,
-                wakeword_hit_sample=wakeword_hit_sample,
+                wakeword_hit_sample=(wakeword_hit_sample if wake_fired else None),
             )
 
             turn_model_p = self._turn_model_p
@@ -342,14 +413,28 @@ class VoiceStreamSession:
                 wakeword_position_samples * 1000 / SAMPLE_RATE
                 if wakeword_position_samples is not None else None
             )
+            wakeword_hit_offset_ms = (
+                round(
+                    (wakeword_hit_sample - segment_start_sample)
+                    * 1000 / SAMPLE_RATE,
+                    1,
+                )
+                if wakeword_hit_sample is not None else None
+            )
+            wakeword_score = wakeword_hit.score if wakeword_hit is not None else None
 
-            if not wake_fired and not self._conversation_active_fn():
+            # Ein Treffer aus dem Preroll wird zunächst transkribiert: erst der
+            # Text kann bestätigen, dass der alte Treffer zu diesem Segment gehört.
+            if wakeword_hit is None and not self._conversation_active_fn():
                 await self._record_segment(
                     segment.audio,
                     transcript=None,
                     partial_transcripts=list(self._partial_transcripts),
                     wakeword_position_samples=wakeword_position_samples,
                     wakeword_position_ms=wakeword_position_ms,
+                    wakeword_score=None,
+                    wakeword_hit_offset_ms=None,
+                    wakeword_decision=None,
                     silence_used_ms=silence_used_ms,
                     turn_model_p=turn_model_p,
                     turn_model_ms=turn_model_ms,
@@ -409,9 +494,6 @@ class VoiceStreamSession:
 
                     wakeword_hint = has_voice_wakeword_hint(str(raw_text or ""))
                 raw_text = str(raw_text or "").strip()
-                text = normalize_wakeword_transcript(
-                    raw_text, wakeword_triggered=wake_fired,
-                )
             elif partial_as_final:
                 raw_text = str(self._partial_raw_text or text or "").strip()
                 from core.voice import has_voice_wakeword_hint
@@ -420,9 +502,13 @@ class VoiceStreamSession:
                     self._partial_wakeword_hint
                     or has_voice_wakeword_hint(raw_text)
                 )
-                text = normalize_wakeword_transcript(
-                    raw_text, wakeword_triggered=wake_fired,
-                )
+            wake_fired, wakeword_decision = _resolve_wakeword_decision(
+                wakeword_hit, segment_start_sample, segment_end_sample, raw_text,
+                allow_transcript_confirmation=True,
+            )
+            text = normalize_wakeword_transcript(
+                raw_text, wakeword_triggered=wake_fired,
+            )
             partial_text = self._partial_text or partial_text
             stt_ms = round((time.perf_counter() - stt_started) * 1000, 1)
             partial_transcripts = list(self._partial_transcripts)
@@ -448,6 +534,9 @@ class VoiceStreamSession:
                 "heuristic_class": heuristic_class,
                 "wakeword_position_ms": wakeword_position_ms,
                 "wakeword_position_samples": wakeword_position_samples,
+                "wakeword_score": wakeword_score,
+                "wakeword_hit_offset_ms": wakeword_hit_offset_ms,
+                "wakeword_decision": wakeword_decision,
                 "partial_transcripts": partial_transcripts,
                 "bargein": self._bargein_notified,
                 "overlapping": self._segment_overlapped,
@@ -459,6 +548,9 @@ class VoiceStreamSession:
                 partial_transcripts=partial_transcripts,
                 wakeword_position_samples=wakeword_position_samples,
                 wakeword_position_ms=wakeword_position_ms,
+                wakeword_score=wakeword_score,
+                wakeword_hit_offset_ms=wakeword_hit_offset_ms,
+                wakeword_decision=wakeword_decision,
                 silence_used_ms=silence_used_ms,
                 turn_model_p=turn_model_p,
                 turn_model_ms=turn_model_ms,
@@ -623,46 +715,65 @@ class VoiceStreamSession:
         )
 
     def _discard_wakeword_hits_through(self, sample_index: int) -> None:
-        while self._wakeword_hits and self._wakeword_hits[0] <= sample_index:
+        while (
+            self._wakeword_hits
+            and self._wakeword_hits[0].sample_index <= sample_index
+        ):
             self._wakeword_hits.popleft()
         # _wakeword_detected bleibt: Ein anhaltendes Detektorsignal ist keine neue Flanke.
 
     def _wakeword_fired_for_segment(self, start_sample: int, end_sample: int) -> bool:
-        return self._wakeword_hit_for_range(
+        hit = self._wakeword_hit_for_range(
             start_sample, end_sample, consume=True,
-        ) is not None
+        )
+        return _resolve_wakeword_decision(
+            hit, start_sample, end_sample, "",
+        )[0]
 
     def _wakeword_hit_for_range(
         self, start_sample: int, end_sample: int, *, consume: bool,
-    ) -> int | None:
+    ) -> WakewordHit | None:
         preroll_samples = int(
             max(0, float(getattr(config, "VOICE_WAKE_PREROLL_MS", 1500)))
             * SAMPLE_RATE / 1000
         )
         earliest_sample = max(0, start_sample - preroll_samples)
-        while self._wakeword_hits and self._wakeword_hits[0] < earliest_sample:
+        while (
+            self._wakeword_hits
+            and self._wakeword_hits[0].sample_index < earliest_sample
+        ):
             self._wakeword_hits.popleft()
+        candidates = [
+            hit for hit in self._wakeword_hits
+            if earliest_sample <= hit.sample_index <= end_sample
+        ]
+        tolerance_samples = int(
+            SAMPLE_RATE * WAKEWORD_SEGMENT_START_TOLERANCE_MS / 1000
+        )
         hit = next((
-            value for value in self._wakeword_hits
-            if earliest_sample <= value <= end_sample
-        ), None)
+            candidate for candidate in candidates
+            if candidate.sample_index >= start_sample - tolerance_samples
+        ), candidates[0] if candidates else None)
         if consume:
             self._discard_wakeword_hits_through(end_sample)
         return hit
 
     def _wakeword_fired_for_partial_audio(
         self, audio: bytes, audio_end_sample_index: int,
-    ) -> tuple[bytes, int, bool]:
+    ) -> tuple[bytes, int, WakewordHit | None, bool]:
         segment_start = max(0, audio_end_sample_index - len(audio) // 2)
         hit = self._wakeword_hit_for_range(
             segment_start, audio_end_sample_index, consume=False,
         )
+        wakeword_fired, _decision = _resolve_wakeword_decision(
+            hit, segment_start, audio_end_sample_index, "",
+        )
         cropped, crop_start = crop_wakeword_audio(
             audio,
             segment_start_sample=segment_start,
-            wakeword_hit_sample=hit,
+            wakeword_hit_sample=(hit.sample_index if wakeword_fired else None),
         )
-        return cropped, crop_start, hit is not None
+        return cropped, crop_start, hit, wakeword_fired
 
     async def _maybe_trigger_bargein(self) -> None:
         if (
@@ -737,7 +848,10 @@ class VoiceStreamSession:
             self._partial_skip_reasons["no_speech"] += 1
             return
         audio_end_sample_index = self._vad_samples_processed
-        audio, audio_start_sample_index, wakeword_fired = self._wakeword_fired_for_partial_audio(
+        segment_start_sample_index = max(
+            0, audio_end_sample_index - len(current_audio) // 2,
+        )
+        audio, audio_start_sample_index, wakeword_hit, wakeword_fired = self._wakeword_fired_for_partial_audio(
             bytes(current_audio), audio_end_sample_index,
         )
         audio_seconds = len(audio) / (2 * SAMPLE_RATE)
@@ -755,6 +869,9 @@ class VoiceStreamSession:
             self._run_partial(
                 audio, generation, len(current_audio) // 2,
                 wakeword_triggered=wakeword_fired,
+                wakeword_hit=wakeword_hit,
+                segment_start_sample_index=segment_start_sample_index,
+                segment_end_sample_index=audio_end_sample_index,
                 segment_offset_ms=(len(current_audio) // 2) * 1000 / SAMPLE_RATE,
             ),
             name="voice-partial-stt",
@@ -768,6 +885,9 @@ class VoiceStreamSession:
         audio_end_sample_index: int,
         *,
         wakeword_triggered: bool = False,
+        wakeword_hit: WakewordHit | None = None,
+        segment_start_sample_index: int | None = None,
+        segment_end_sample_index: int | None = None,
         segment_offset_ms: float | None = None,
     ) -> str | None:
         try:
@@ -792,12 +912,30 @@ class VoiceStreamSession:
         raw_text = str(text).strip()
         if not raw_text:
             return None
+        if wakeword_hit is None:
+            resolved_wakeword = wakeword_triggered
+        else:
+            segment_start = max(
+                0,
+                segment_start_sample_index
+                if segment_start_sample_index is not None
+                else audio_end_sample_index - len(audio) // 2,
+            )
+            segment_end = (
+                segment_end_sample_index
+                if segment_end_sample_index is not None
+                else segment_start + len(audio) // 2
+            )
+            resolved_wakeword, _decision = _resolve_wakeword_decision(
+                wakeword_hit, segment_start, segment_end, raw_text,
+            )
         text = normalize_wakeword_transcript(
-            raw_text, wakeword_triggered=wakeword_triggered,
+            raw_text, wakeword_triggered=resolved_wakeword,
         )
         if generation == self._segment_generation and not self._closed and (
             getattr(self._segmenter, "is_speaking", None) is True or self._finalizing
         ):
+            self._partial_wakeword_fired = resolved_wakeword
             self._partial_text = text
             self._partial_raw_text = raw_text
             self._partial_heuristic_text = raw_text

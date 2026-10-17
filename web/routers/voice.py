@@ -479,6 +479,9 @@ def _record_voice_latency(
     turn_model_ms: float | None = None,
     turn_decision: str | None = None,
     silence_used_ms: float | None = None,
+    wakeword_score: float | None = None,
+    wakeword_hit_offset_ms: float | None = None,
+    wakeword_decision: str | None = None,
     bargein: bool = False,
     bargein_ms: float | None = None,
     duck_ms: float | None = None,
@@ -516,6 +519,9 @@ def _record_voice_latency(
         "turn_model_ms": turn_model_ms,
         "turn_decision": turn_decision,
         "silence_used_ms": silence_used_ms,
+        "wakeword_score": wakeword_score,
+        "wakeword_hit_offset_ms": wakeword_hit_offset_ms,
+        "wakeword_decision": wakeword_decision,
         "bargein": bool(bargein),
         "bargein_ms": bargein_ms,
         "duck_ms": duck_ms,
@@ -1160,6 +1166,18 @@ async def sende_streaming_antwort(
                     ),
                     silence_used_ms=(
                         address_metrics.get("silence_used_ms")
+                        if address_metrics is not None else None
+                    ),
+                    wakeword_score=(
+                        address_metrics.get("wakeword_score")
+                        if address_metrics is not None else None
+                    ),
+                    wakeword_hit_offset_ms=(
+                        address_metrics.get("wakeword_hit_offset_ms")
+                        if address_metrics is not None else None
+                    ),
+                    wakeword_decision=(
+                        address_metrics.get("wakeword_decision")
                         if address_metrics is not None else None
                     ),
                     bargein=playback.interrupted,
@@ -1901,6 +1919,9 @@ def build_router(orch=None) -> APIRouter:
                         turn_model_ms=result.get("turn_model_ms"),
                         turn_decision=result.get("turn_decision"),
                         silence_used_ms=result.get("silence_used_ms"),
+                        wakeword_score=result.get("wakeword_score"),
+                        wakeword_hit_offset_ms=result.get("wakeword_hit_offset_ms"),
+                        wakeword_decision=result.get("wakeword_decision"),
                         speaker_score=result.get("speaker_score"),
                         speaker_ms=result.get("speaker_ms"),
                         speaker_decision="rejected",
@@ -1950,6 +1971,9 @@ def build_router(orch=None) -> APIRouter:
                     turn_model_ms=result.get("turn_model_ms"),
                     turn_decision=result.get("turn_decision"),
                     silence_used_ms=result.get("silence_used_ms"),
+                    wakeword_score=result.get("wakeword_score"),
+                    wakeword_hit_offset_ms=result.get("wakeword_hit_offset_ms"),
+                    wakeword_decision=result.get("wakeword_decision"),
                     speaker_score=result.get("speaker_score"),
                     speaker_ms=result.get("speaker_ms"),
                     speaker_decision=result.get("speaker_decision"),
@@ -2183,6 +2207,9 @@ def build_router(orch=None) -> APIRouter:
                         turn_model_ms=result.get("turn_model_ms"),
                         turn_decision=result.get("turn_decision"),
                         silence_used_ms=result.get("silence_used_ms"),
+                        wakeword_score=result.get("wakeword_score"),
+                        wakeword_hit_offset_ms=result.get("wakeword_hit_offset_ms"),
+                        wakeword_decision=result.get("wakeword_decision"),
                         speaker_score=result.get("speaker_score"),
                         speaker_ms=result.get("speaker_ms"),
                         speaker_decision=result.get("speaker_decision"),
@@ -2282,6 +2309,9 @@ def build_router(orch=None) -> APIRouter:
                             turn_model_ms=result.get("turn_model_ms"),
                             turn_decision=result.get("turn_decision"),
                             silence_used_ms=result.get("silence_used_ms"),
+                            wakeword_score=result.get("wakeword_score"),
+                            wakeword_hit_offset_ms=result.get("wakeword_hit_offset_ms"),
+                            wakeword_decision=result.get("wakeword_decision"),
                             speaker_score=result.get("speaker_score"),
                             speaker_ms=result.get("speaker_ms"),
                             speaker_decision=result.get("speaker_decision"),
@@ -2342,6 +2372,9 @@ def build_router(orch=None) -> APIRouter:
                         turn_model_ms=result.get("turn_model_ms"),
                         turn_decision=result.get("turn_decision"),
                         silence_used_ms=result.get("silence_used_ms"),
+                        wakeword_score=result.get("wakeword_score"),
+                        wakeword_hit_offset_ms=result.get("wakeword_hit_offset_ms"),
+                        wakeword_decision=result.get("wakeword_decision"),
                         speaker_score=result.get("speaker_score"),
                         speaker_ms=result.get("speaker_ms"),
                         speaker_decision=result.get("speaker_decision"),
