@@ -41,9 +41,10 @@ Logik in `domains/gym/plans.py`), `week` leer. „Choose a different workout“ 
 
 ## Auslieferung, Auth, Sicherheit
 - Fork-Quelle unter `web/gym_og/` (nur `frontend/` + nötige Skripte, ohne `exercise-media`,
-  Coach, Admin, Capacitor-Plattformen). Build `vite build --base=/` → `web/gym_og/dist/`
-  (eingecheckt, damit der Mantis-Start keinen Node-Build braucht). Build-Skript
-  `scripts/build_gym_og.sh`. AGPL-Hinweis und NOTICE behalten.
+  Capacitor-Plattformen; `api/coach/core` wird vom Frontend importiert und bleibt). Build per
+  `scripts/build_gym_og.sh` (`npm ci --ignore-scripts`, `vite build`) → `web/gym_og/frontend/dist/`
+  (~23 MB, **nicht** eingecheckt, `node_modules`/`dist` in .gitignore). Fehlt `dist`, liefert der
+  Server weiter die alte App. Build gehört zum Merge-Ablauf. AGPL-Hinweis und NOTICE behalten.
 - Port 7782 wie bisher. Übergangsweise neue App unter `/og/`, alte unter `/`; Umschalten nach
   Abnahme durch Timo.
 - Auth: bestehendes `mantis_gym`-Cookie + Origin-Prüfung für alle `/api/*`. Ohne gültige Session
